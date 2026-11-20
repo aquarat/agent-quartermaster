@@ -14,7 +14,20 @@ Not built yet. Scheduled after milestone 2 (Cloudflare) and the UI round have la
 4. **CI mirrors the repository to GitHub** as part of the release flow.
 5. Install location on a workstation: `~/.local/bin/aqmas` (Linux hosts: `/usr/local/bin/aqmas`).
 
-## Proposed design (for the owner to confirm before building)
+## Decisions
+
+- **Second hash source: GitHub.** The CLI (and aqmasd's updater) accept a release only if the
+  `SHA256SUMS` from the Forgejo release and from the GitHub mirror's release agree. GitHub also
+  makes the code history independently visible.
+- **Distribution:** aqmasd serves CLI releases (binaries + `SHA256SUMS`) over the mTLS agent API;
+  a **public GitHub repository** may also be used as a download/verification source.
+- Consequence of a public mirror: the repository must not contain site-specific details (LAN
+  addresses, tunnel/Access IDs, host keys, deploy progress notes). Move those to the fleet's
+  private ops docs  and keep generic examples in the repo; because the mirror
+  pushes full history, scrub history once (e.g. `git filter-repo`) **before** the first public
+  push, at a point when no workstream branches are open.
+
+## Proposed design (decisions above take precedence)
 
 ### Versioning and releases
 - `VERSION` file (semver). A PR that changes it is a release PR; after merge, a Forgejo Actions
