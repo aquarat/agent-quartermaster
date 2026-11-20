@@ -87,6 +87,7 @@ Paths are below `/client/v4`. Placeholders:
 | `{id}` | `[A-Za-z0-9_-]{1,64}` | – |
 | `{name}` | `[A-Za-z0-9_.-]{1,128}` | – |
 | `{key...}` | the rest of the path, ≥ 1 segment, percent-encoding allowed (R2 object keys) | – |
+| `{dbname}` | the NAME of a configured D1 database (wrangler looks databases up by name) | the `db` param |
 
 `cf.admin` accepts any well-formed id for `{zone}`/`{tunnel}`/`{db}` (configured or not) but
 still only the configured `{acct}`.
@@ -167,40 +168,60 @@ before-snapshot, must be allowed and equal the `phase` param when set).
 `{"files":[…]}`, 1-30 entries, each an `http(s)` URL (string, or `{"url":…}` object) whose host
 is the zone or below it).
 
-**`cf.workers.deploy`** (script, zone?): the calls `wrangler deploy` / `versions` / `secret` /
-`triggers` make for one script (the proxy workstream verifies this list against the wrangler
-bundle and the client's wrangler test, and documents the final table here):
+**`cf.workers.deploy`** (script, zone?): the calls wrangler 4.165's `deploy`, `versions
+upload|deploy`, `secret put|list|delete|bulk` and `triggers deploy` make for one script, read
+from its bundle (`S` = `/accounts/{acct}/workers/scripts/{script}`, `W` = `/accounts/{acct}/workers`):
 ```
-GET          /accounts/{acct}/workers/services/{script}
-GET|PUT      /accounts/{acct}/workers/scripts/{script}                     (PUT: U; GET is content: denied, section 3)
-GET|PATCH    /accounts/{acct}/workers/scripts/{script}/settings|script-settings   (S:workers-script-settings on PATCH)
-POST         /accounts/{acct}/workers/scripts/{script}/assets-upload-session
-POST         /accounts/{acct}/workers/assets/upload                         (U, J)
-GET|POST     /accounts/{acct}/workers/scripts/{script}/subdomain   GET /accounts/{acct}/workers/subdomain
-GET|PUT      /accounts/{acct}/workers/scripts/{script}/schedules
-GET|PUT      /accounts/{acct}/workers/scripts/{script}/secrets   GET|DELETE …/secrets/{name}
-GET|POST     /accounts/{acct}/workers/scripts/{script}/versions  GET …/versions/{id}   (POST: U)
-GET|POST     /accounts/{acct}/workers/scripts/{script}/deployments
-GET          /accounts/{acct}/workers/domains   PUT /accounts/{acct}/workers/domains (G:workers-domain)
-DELETE       /accounts/{acct}/workers/domains/{id}                          (G:workers-domain-remove, S:workers-domains)
-GET|PUT      /accounts/{acct}/workers/scripts/{script}/domains/records      (G:workers-domain)
-GET|POST     /zones/{zone}/workers/routes   PUT|DELETE /zones/{zone}/workers/routes/{id}  (G:workers-route, S:workers-routes)
-GET          /zones?name=…   /accounts/{acct}/workers/account-settings   /accounts/{acct}/workers/durable_objects/namespaces
+GET          W/services/{script}   W/services/{script}/environments/{name}[/bindings|routes|subdomain]
+GET          W/workers/{script}                                   (new Workers API: metadata, subdomain)
+PUT          S                                                    (U; first deploy, DO migrations, `secret put` stub; GET S is source: denied)
+GET|POST     S/versions   GET S/versions/{id}                     (POST: U, ?bindings_inherit=strict)
+GET|POST     S/deployments
+GET          S/settings|script-settings   PATCH S/settings|script-settings   (S:workers-script-settings)
+POST         S/assets-upload-session                              (parent token; answers the upload JWT)
+POST         W/assets/upload   W/assets/upload/{id}               (U, J: Bearer = the session JWT)
+GET|POST     S/subdomain   GET W/subdomain                        (wrangler POSTs S/subdomain on every deploy)
+GET|PUT      S/schedules
+GET|PUT      S/secrets   PATCH S/secrets-bulk   GET|DELETE S/secrets/{name}
+GET          S/routes   PUT S/routes                              (G:workers-route, S:workers-script-routes)
+GET|POST     /zones/{zone}/workers/routes   PUT|DELETE …/routes/{id}  (fallback; G:workers-route, S:workers-routes)
+GET          /zones                                               (wrangler: ?name=<host>&account.id=<acct>)
+GET          W/domains   W/domains/records   W/domains/records/{id}   S/domains/records
+PUT          W/domains   S/domains/records   POST S/domains/changeset (G:workers-domain; PUT: S:workers-domains)
+DELETE       W/domains/{id}   W/domains/records/{id}              (G:workers-domain-remove, S:workers-domains)
+GET          W/account-settings   W/durable_objects/namespaces
 ```
-G:workers-domain: every hostname must be in the `zone` param's zone (refused without `zone`)
-and `service`/`script` must equal the script. G:workers-route: `script` equals the script.
+G:workers-domain (scope check): every `hostname` in the body must be in the `zone` param's zone
+(refused without `zone`), every `service`/`script` must equal the script, `zone_id`/`zone_name`
+the zone. G:workers-route: on the zone routes `script` equals the script; on `PUT S/routes`
+(a JSON array) every pattern's host is in the `zone` param's zone (refused without `zone`
+unless the array is empty) and `zone_id`/`zone_name`/`script` match. Not covered (cf.admin):
+queues, workflows (`PUT /accounts/{acct}/workflows/{name}`), containers, dispatch namespaces,
+`PUT /accounts/{acct}/workers/subdomain` (registering the account's workers.dev subdomain),
+`PUT /accounts/{acct}/workers/triggers/{script}` (event subscriptions). With
+`CLOUDFLARE_API_TOKEN` and an account id set, wrangler makes no `/user/tokens/verify` or
+`/memberships` call; it does call them (all synthetic, 3.2) after an API error 10000/9106.
 
 **`cf.pages`** (project): GET/PATCH `/accounts/{acct}/pages/projects/{project}` (S:pages-project);
-GET/POST `…/{project}/deployments` (POST: U); GET/DELETE `…/deployments/{id}`, POST
-`…/deployments/{id}/retry|rollback`, GET `…/deployments/{id}/history/logs`; GET
-`…/{project}/upload-token`; `POST /pages/assets/check-missing|upload|upsert-hashes` (U, J);
-GET/POST `…/{project}/domains`, GET/PATCH/DELETE `…/domains/{name}`.
+GET/POST `…/{project}/deployments` (POST: U, multipart incl. `_worker.bundle`); GET/DELETE
+`…/deployments/{id}`, POST `…/deployments/{id}/retry|rollback`, GET
+`…/deployments/{id}/history/logs`; GET `…/{project}/upload-token`; `POST
+/pages/assets/check-missing|upload|upsert-hashes` (U, J: Bearer = the upload-token JWT);
+GET/POST `…/{project}/domains`, GET/PATCH/DELETE `…/domains/{name}`. That is all `wrangler pages
+deploy` calls for an existing project (project creation, `POST …/pages/projects`, is cf.admin;
+note wrangler turns `pages deploy` of a missing project into `wrangler deploy` when it detects
+an AI agent).
 
-**`cf.d1`** (db, access): GET `/accounts/{acct}/d1/database` (wrangler looks databases up by
-name), GET `…/database/{db}`; `POST …/database/{db}/query|raw` (G:d1: with `access=read` the
-`sql` must be only `SELECT`, `EXPLAIN`, `WITH … SELECT` or read-only `PRAGMA` (`table_list`,
-`table_info`, `table_xinfo`, `index_list`, `index_info`, `foreign_key_list`) statements; with
-`migrate` anything). Export is denied (section 3).
+**`cf.d1`** (db, access): GET `/accounts/{acct}/d1/database`, GET `…/database/{db}`, GET
+`…/database/{dbname}` (wrangler's lookup by name, `?fields=uuid,name`, when the binding has no
+`database_id`); `POST …/database/{db}/query|raw` (G:d1: with `access=read` every statement of
+the `sql` (also in a batch) must be `SELECT`, `EXPLAIN`, `WITH … SELECT` or a read-only
+`PRAGMA` (`table_list`, `table_info`, `table_xinfo`, `index_list`, `index_info`,
+`foreign_key_list`, never `= value`), and no write keyword may appear outside literals and
+comments; with `migrate` anything). `POST …/database/{db}/import` only with `access=migrate`
+(`d1 execute --file`: init/ingest/poll; the file itself goes to a presigned R2 URL that does
+not pass the proxy and is never checked). `migrations apply --remote` is only `/query` calls.
+Export is denied (section 3).
 
 **`cf.r2.admin`**: GET/POST `/accounts/{acct}/r2/buckets`, GET `…/buckets/{bucket*}`,
 GET/PUT/DELETE `…/buckets/{bucket*}/cors|lifecycle`, GET/POST `…/buckets/{bucket*}/domains/custom`,
@@ -216,9 +237,12 @@ GET/POST `/accounts/{acct}/email/routing/addresses`, GET/DELETE `…/addresses/{
 GET/POST/DELETE `/zones/{zone}/email/sending/{key...}`.
 
 **`cf.admin`**: any method on any path that passes normalisation (3.1) and is not denied
-(section 3). When the call also matches a route of another scope (ignoring parameter binding),
-that route's snapshot type and guard rails apply; guard rails can be overridden per call with
-`X-Aqmas-Override: <guard>[,<guard>]` (section 4), except the never-overridable ones.
+(section 3). When the call also matches a route of another scope (ignoring parameter binding,
+literals and ids compared case-insensitively, unconfigured objects allowed), that route's
+snapshot type and guard rails apply; guard rails can be overridden per call with
+`X-Aqmas-Override: <guard>[,<guard>]` (section 4), except the never-overridable ones. A path
+with a percent-encoded segment is accepted only when it matches such a route with `{key...}`
+at that position.
 
 ## 3. Deny-list (always wins, also for `cf.admin`)
 
@@ -234,8 +258,10 @@ Refused with 403 `denied` (and an audit row, and a push for the first four group
   `DELETE …/cfd_tunnel/*/connections` (rogue connectors / kicking the connector).
 - `POST /accounts/*/access/service_tokens`, `…/service_tokens/*/rotate|refresh`.
 - `GET /accounts/*/challenges/widgets/*` (single widget = Turnstile secret), `…/rotate_secret`.
-- `/accounts/*/workers/scripts/*/tails` and below; `GET /accounts/*/workers/scripts/*` and
-  `…/content` and below (script source).
+- `/accounts/*/workers/scripts/*/tails` and below, `/accounts/*/workers/tails` and below;
+  `GET /accounts/*/workers/scripts/*` and `…/content` and below,
+  `/accounts/*/workers/services/*/environments/*/content` and below, `GET
+  /accounts/*/workers/dispatch/namespaces/*/scripts/*` and its `…/content` (script source).
 - `POST /accounts/*/r2/temp-access-credentials`; `/accounts/*/d1/database/*/export`.
 - `/accounts/*/logpush` and `/zones/*/logpush` and below.
 - `/certificates` and below; `/zones/*/origin_tls_client_auth`, `/zones/*/custom_certificates`
@@ -243,10 +269,15 @@ Refused with 403 `denied` (and an audit row, and a push for the first four group
 - Writes under `/accounts/*/secrets_store`, `/accounts/*/hyperdrive`, `/accounts/*/teamnet`,
   `/accounts/*/devices`, `/accounts/*/gateway`; anything under `/accounts/*/registrar`,
   `/accounts/*/subscriptions`, `/zones/*/subscription`, `/user/billing`.
-- `POST /zones`, `DELETE /zones/*`; `/graphql`.
+- `POST /zones`, `DELETE /zones/*`; `/graphql`; any non-GET on `/accounts`.
 - `/accounts/{other}` for any account id but the configured one.
-- Anything in `[cloudflare.scopes."<scope>"].extra_deny` (`"METHOD /path/template"`, `*` for
-  any method or segment) for that scope.
+- Anything in `[cloudflare.scopes."<scope>"].extra_deny` (`"METHOD /path/template"`, `*` or
+  `{x}` for any method or segment; an entry covers its path and everything below it; invalid
+  entries are a start-up error) for that scope.
+
+Deny matching compares percent-decoded, lower-cased segments (`/User/%74okens` is denied),
+except that `/accounts/{acct}` must be the configured id byte for byte. The synthetic GETs
+(3.2) are never denied.
 
 ### 3.1 Path, query, method and header normalisation
 
@@ -260,8 +291,9 @@ Refused with 403 `denied` (and an audit row, and a push for the first four group
 - Query: at most 2048 bytes of `A-Za-z0-9 . _ ~ - % = & + , : *`, valid `%XX`; forwarded as is.
 - Upstream URL = `api_base` + escaped path + `?query`; the host is fixed (no SSRF), redirects
   are never followed (a 3xx becomes 502).
-- Request headers forwarded: `Content-Type`, `Accept`, `If-Match`, `If-None-Match` (and the
-  body). `Authorization` only on J routes. Everything else (cookies, `X-Auth-*`, `Cf-*`, the
+- Request headers forwarded: `Content-Type`, `Accept`, `If-Match`, `If-None-Match`,
+  `Cloudflare-Workers-Script-Api-Date` (wrangler sets it on `POST …/subdomain`; it selects the
+  API behaviour) (and the body). `Authorization` only on J routes. Everything else (cookies, `X-Auth-*`, `Cf-*`, the
   local shim's bearer) is dropped. aqmasd sets `Authorization: Bearer <proxy parent>` and its
   own `User-Agent`.
 - Response headers passed back: `Content-Type`, `Content-Disposition`, `Cf-Ray`, `Retry-After`,
@@ -283,7 +315,9 @@ depth: keys `secret`, `client_secret`, `tunnel_secret`, `token`, `private_key`, 
 `credentials_file` (case-insensitive) with a non-empty string value; and `value` inside any
 object under an `env_vars` key whose `type` is not `plain_text` (Pages secrets) — every such
 value becomes `"[redacted by aqmas]"`. Redaction adds `X-Aqmas-Warning: redacted N fields`.
-Non-JSON (R2 objects, logs) passes through unchanged. **Any write whose body contains the string
+Non-JSON (logs) and R2 object bodies (whatever their content type: they are the caller's data)
+pass through unchanged. A JSON answer that does not parse, or is larger than 32 MiB, answers
+502 rather than going out unchecked. Snapshots store the redacted form. **Any write whose body contains the string
 `[redacted by aqmas]` is refused** (never overridable): writing a redacted object back would
 destroy the secret.
 
@@ -323,21 +357,37 @@ ruleset rule DELETE.
 
 Scope enforcement (the DNS name glob, the Workers script/zone binding, D1 read-only SQL, cache
 purge `files` only, ruleset phases) is not a guard rail: it cannot be overridden, `cf.admin`
-simply is not limited by it.
+simply is not limited by it. A violation answers 403 `no_grant` (audited `cf_refused`) with
+`X-Aqmas-Needs-Scope` where one helps (`cf.dns.edit zone=…` without `name`, `cf.d1
+access=migrate;db=…`, `cf.admin` for purge-everything).
+
+`X-Aqmas-Override` with a non-admin grant, naming an unknown guard, or naming a
+never-overridable one answers 400 `bad_request` before anything is read or written.
+`tunnel-version`: a GET of `…/configurations` through any scope (cf.read included, also
+cf.admin) records the version for (host, tunnel) in memory; the version in the after-snapshot
+of the host's own successful PUT counts as read too. After an aqmasd restart every host reads
+again.
 
 ### 4.1 Writes: order of operations
 
 1. Normalise (3.1), deny-list (3), pick the grant (first offered grant whose scope matches),
-   rate limit (per host: `rate_per_minute`, writes `write_rate_per_minute`; 429 + `Retry-After`).
+   rate limit (per host: `rate_per_minute`, writes `write_rate_per_minute`; 429 + `Retry-After`;
+   JWT asset uploads count only towards `rate_per_minute`).
 2. Read the body (bounded), parse it if the route has guard rails.
-3. **Before-snapshot**: GET the object with the parent token; failure → 502, nothing written.
+3. **Before-snapshot**: GET the object with the parent token; failure → 502, nothing written
+   (a 404 counts as "missing" only for ruleset entrypoints; creates have no before GET). It is
+   stored only once the guard rails pass (a refused write leaves no snapshot).
 4. Guard rails (they see body + before-snapshot).
 5. Forward the write. On 2xx: **after-snapshot** (failure → warning only).
 6. Audit row `cf_write` (actor `host:<name>`, object `grant:<id>`, detail: method, path,
    status, `before=<id> after=<id>`, warnings count, overrides, for tunnel PUTs a hostname diff
    `+a ~b -c`), and an ntfy push `aqmas: <host> <METHOD> <object> [ref <grant ref>]`.
-   Refusals: audit `cf_refused` with code and guard. Reads: not in the audit table; one
-   structured log line each (method, path, status, grant, host, duration).
+   Refusals: audit `cf_refused` with code and guard (deny-list, guard rails, override misuse,
+   scope enforcement, and `no_grant` on writes; `no_grant` on reads, `bad_path`, 405 and 429
+   are only logged). Writes are audited whatever Cloudflare answered; the push goes out on 2xx
+   only, and not for JWT asset uploads or `access=read` D1 queries (audited, not pushed) unless
+   an override was used. Reads: not in the audit table; one structured log line each (method,
+   path, status, grant, host, duration).
 7. Response with `X-Aqmas-Grant-Used`, `X-Aqmas-Snapshot-Before/After`, `X-Aqmas-Warning`.
 
 Never logged anywhere: the parent token, child-token values, request or response bodies.
@@ -347,7 +397,7 @@ Never logged anywhere: the parent token, child-token values, request or response
 | Type | GET used | Object key |
 |---|---|---|
 | `tunnel-config` | `/accounts/{acct}/cfd_tunnel/{t}/configurations` | `tunnel-config:<tunnel id>` |
-| `access-app` | `/accounts/{acct}/access/apps/{id}` (POST: before = missing; after from `result.id`) | `access-app:<id>` |
+| `access-app` | `/accounts/{acct}/access/apps/{id}` (POST: before = missing; after from `result.id`; also for app-scoped policy writes) | `access-app:<id>` |
 | `access-policy` / `access-group` | `…/access/policies/{id}` / `…/access/groups/{id}` | `access-policy:<id>` / `access-group:<id>` |
 | `access-idp` / `access-org` | `…/identity_providers/{id}` / `…/access/organizations` | `access-idp:<id>` / `access-org` |
 | `dns-record` | `/zones/{z}/dns_records/{id}` | `dns-record:<zone id>:<id>` |
@@ -357,8 +407,13 @@ Never logged anywhere: the parent token, child-token values, request or response
 | `zone-setting` | `/zones/{z}/settings/{name}` or `/zones/{z}/settings` | `zone-setting:<zone id>:<name>` or `…:all` |
 | `email-rules` | `/zones/{z}/email/routing/rules` | `email-rules:<zone id>` |
 | `pages-project` | `/accounts/{acct}/pages/projects/{p}` | `pages-project:<p>` |
-| `workers-script-settings` | `…/workers/scripts/{s}/settings` | `workers-script-settings:<s>` |
+| `workers-script-settings` | the path written (`…/workers/scripts/{s}/settings` or `…/script-settings`) | `workers-script-settings:<s>` |
+| `workers-script-routes` | `…/workers/scripts/{s}/routes` | `workers-script-routes:<s>` |
 | `workers-routes` / `workers-domains` | `/zones/{z}/workers/routes` / `…/workers/domains` | `workers-routes:<zone id>` / `workers-domains` |
+
+Creates of policies, groups and IdPs work as `access-app` (before = missing, after from
+`result.id`). An after GET answering 404 (a DELETE) stores an after-snapshot with
+`missing: true`.
 
 Stored by aqmasd on .60 (design decision 3) under `snapshot_dir` (default
 `/var/lib/aqmas/cf-snapshots`): `<YYYY-MM-DD>/<id>.json` = the GET's `result` after redaction

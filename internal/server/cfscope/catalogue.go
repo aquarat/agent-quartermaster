@@ -224,6 +224,9 @@ func NewCatalogue(cfg *config.Cloudflare) (*Catalogue, error) {
 		c.scopes[sc.Name] = &sc
 		c.order = append(c.order, sc.Name)
 	}
+	if err := c.ValidateExtraDeny(); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
