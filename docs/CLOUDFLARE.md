@@ -363,6 +363,8 @@ naming the guard; warnings answer normally with `X-Aqmas-Warning`. Each guard ha
 | `zone-settings-policy` | settings PATCH | `always_use_https` off, `min_tls_version` < 1.2, `ssl` other than `strict`, HSTS (`security_header`) `include_subdomains` or `preload` true | yes |
 | `workers-domain-remove` | Workers custom-domain DELETE | always (dropping a custom domain deletes its DNS record) | yes |
 | `redacted-write` | any write | body contains `[redacted by aqmas]` | **never** |
+| `ruleset-protected-hostname` | ruleset writes (entrypoint PUT, ruleset PUT by id, rule POST/PATCH), all phases but logging and managed-ruleset ones | a new rule that could match a protected hostname; a changed rule that newly could; a rule that could match one changing its `action`, `action_parameters` or becoming enabled. Unchanged rules (same id, expression, action, parameters, enabled) are not re-checked | **never** |
+| `ruleset-protected-removal` | the same writes and rule DELETE in `http_request_late_transform` / `http_request_firewall_custom` | a rule that could match a protected hostname stops matching it or is removed (such rules usually protect it, e.g. dropping a spoofable header) | yes |
 | `email-forward` | email routing rule POST/PUT, catch-all PUT, destination address POST | a `forward` action to an address not in `email_forward_allow`, a `worker` (or any other non-`drop`) action, a destination address not in the list | yes |
 
 **Protected hostnames** = `protected_access_hostnames` ∪ `protected_dns_names` (both empty by
@@ -370,6 +372,15 @@ default: then nothing is protected, and aqmasd warns at start). A candidate (hos
 route pattern) touches one when, lower-cased and without scheme, port, path and trailing dot,
 it equals it, or a `*` wildcard in either covers the other (`*.example.com`, `*example.com`,
 `*`). Candidates that cannot be judged (non-ASCII, `%`, user info) count as touching.
+
+**Ruleset expressions** "could match" a protected hostname unless the expression is a
+top-level conjunction (`and`/`&&` only, parentheses allowed) containing `http.host eq "x"`,
+`http.host == "x"` or `http.host in {"x" "y"}` conjuncts whose names all avoid it (every such
+conjunct must exclude it). Anything else (`true`, a path test, `or`, `not`, `ne`, `lower(…)`,
+`ends_with`/`contains`/`wildcard`/`matches` on `http.host` or the URI) could. Adding or removing
+unprotected names in an `http.host in {…}` set of a rule that already covers a protected
+hostname is allowed when its action and parameters stay the same. A new
+`http_request_firewall_custom` rule with action `log` is not checked.
 
 **Strict JSON** on every route with a guard rail or scope check (and Pages project PATCH): the
 body must be `application/json` (aqmasd forwards it as exactly that), valid UTF-8, and no

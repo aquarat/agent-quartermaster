@@ -255,7 +255,7 @@ func TestAdminUnannotatedDenied(t *testing.T) {
 	h.grant("RS", api.CFScopeRulesets, map[string]string{"zone": "example.com"})
 	h.cf.result("GET "+z+"/rulesets/rs1", map[string]any{"id": "rs1", "phase": "http_request_dynamic_redirect", "rules": []any{map[string]any{"id": "r1"}}})
 	expectGuard(t, h.call("PUT", z+"/rulesets/rs1", map[string]any{"rules": []any{}}, g("RS")), GRulesetKeepRules)
-	expect(t, h.call("PUT", z+"/rulesets/rs1", map[string]any{"rules": []any{map[string]any{"id": "r1"}, map[string]any{"expression": "true"}}}, g("RS")), 200, "")
+	expect(t, h.call("PUT", z+"/rulesets/rs1", map[string]any{"rules": []any{map[string]any{"id": "r1"}, map[string]any{"expression": `http.host eq "app.example.com"`}}}, g("RS")), 200, "")
 }
 
 // ---- D1 body shapes ----

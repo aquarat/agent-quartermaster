@@ -367,12 +367,12 @@ func TestRulesets(t *testing.T) {
 	ep := "/zones/" + zoneA + "/rulesets/phases/http_request_dynamic_redirect/entrypoint"
 	h.cf.result("GET "+ep, map[string]any{"id": "rs1", "phase": "http_request_dynamic_redirect", "rules": []any{map[string]any{"id": "r1"}, map[string]any{"id": "r2"}}})
 	expect(t, h.call("PUT", ep, map[string]any{"rules": []any{map[string]any{"id": "r1"}}}, g("RS")), 403, api.CFErrGuardRail)
-	expect(t, h.call("PUT", ep, map[string]any{"rules": []any{map[string]any{"id": "r1"}, map[string]any{"id": "r2"}, map[string]any{"expression": "true"}}}, g("RS")), 200, "")
+	expect(t, h.call("PUT", ep, map[string]any{"rules": []any{map[string]any{"id": "r1"}, map[string]any{"id": "r2"}, map[string]any{"expression": `http.host eq "app.example.com"`}}}, g("RS")), 200, "")
 	expect(t, h.call("PUT", ep, map[string]any{"rules": []any{}}, gh("A", api.CFOverrideHeader, GRulesetKeepRules)), 200, "")
 	// No entrypoint yet: 404 before = missing.
 	ep2 := "/zones/" + zoneA + "/rulesets/phases/http_request_dynamic_redirect/entrypoint"
 	h.cf.on("GET "+ep2, func(w http.ResponseWriter, r *http.Request) { cfJSON(w, 404, nil) })
-	r := h.call("PUT", ep2, map[string]any{"rules": []any{map[string]any{"expression": "true"}}}, g("RS"))
+	r := h.call("PUT", ep2, map[string]any{"rules": []any{map[string]any{"expression": `http.host eq "app.example.com"`}}}, g("RS"))
 	expect(t, r, 200, "")
 	if b, _ := h.p.snaps.get(r.Header().Get(api.CFSnapshotBeforeHeader)); b == nil || !b.Missing {
 		t.Fatal("missing entrypoint snapshot")
@@ -380,15 +380,15 @@ func TestRulesets(t *testing.T) {
 	// Rule writes: the phase comes from the before-snapshot.
 	h.cf.result("GET /zones/"+zoneA+"/rulesets/rsw", map[string]any{"id": "rsw", "phase": "http_request_firewall_managed"})
 	h.cf.result("GET /zones/"+zoneA+"/rulesets/rsr", map[string]any{"id": "rsr", "phase": "http_request_dynamic_redirect"})
-	expect(t, h.call("POST", "/zones/"+zoneA+"/rulesets/rsw/rules", map[string]any{"expression": "true"}, g("RS")), 403, api.CFErrNoGrant)
-	expect(t, h.call("POST", "/zones/"+zoneA+"/rulesets/rsr/rules", map[string]any{"expression": "true"}, g("RS")), 200, "")
+	expect(t, h.call("POST", "/zones/"+zoneA+"/rulesets/rsw/rules", map[string]any{"expression": `http.host eq "app.example.com"`}, g("RS")), 403, api.CFErrNoGrant)
+	expect(t, h.call("POST", "/zones/"+zoneA+"/rulesets/rsr/rules", map[string]any{"expression": `http.host eq "app.example.com"`}, g("RS")), 200, "")
 	r = h.call("DELETE", "/zones/"+zoneA+"/rulesets/rsr/rules/x1", nil, g("RS"))
 	expect(t, r, 200, "")
 	if len(r.Header().Values(api.CFWarningHeader)) == 0 {
 		t.Fatal("rule delete warning")
 	}
 	// cf.admin is not limited by the phase.
-	expect(t, h.call("POST", "/zones/"+zoneA+"/rulesets/rsw/rules", map[string]any{"expression": "true"}, g("A")), 200, "")
+	expect(t, h.call("POST", "/zones/"+zoneA+"/rulesets/rsw/rules", map[string]any{"expression": `http.host eq "app.example.com"`}, g("A")), 200, "")
 }
 
 func TestZoneSettings(t *testing.T) {
