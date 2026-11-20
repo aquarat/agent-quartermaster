@@ -1,0 +1,17 @@
+{
+  "name": "aqmas-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p .",
+    "mock": "bun build.ts && bun mock/server.ts",
+    "mock:fresh": "bun build.ts && bun mock/server.ts --fresh"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.3",
+    "happy-dom": "20.11.1",
+    "typescript": "6.0.3"
+  }
+}
