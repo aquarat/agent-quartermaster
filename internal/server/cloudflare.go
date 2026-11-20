@@ -324,7 +324,7 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 			}
 			return s.issueCFGrant(ctx, q, req, ttl, now)
 		}
-		// Design decision 2: cf.read and cf.cache.purge in proxy mode need no approval.
+		// cf.read and cf.cache.purge in proxy mode need no approval.
 		if res.Scope.AutoApprove && res.Mode == api.CFModeProxy {
 			// Auto-approval needs no owner, so cap how many identical grants a host may hold:
 			// the CLI reuses an active grant; a flood is a sign of a loop or a compromise.

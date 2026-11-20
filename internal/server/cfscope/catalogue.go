@@ -91,7 +91,7 @@ var builtins = []builtin{
 		Description: "Reusable Access policies and groups. Editing a policy shared by several apps is refused.",
 		Risk:        api.CFRiskHigh, StandingAllowed: true, DefaultTTL: 2 * hour, MaxTTL: 8 * hour}},
 	{scope: Scope{Name: api.CFScopeAccessIdPOrg, Title: "Change Access login methods",
-		Description: "Identity providers (OIDC IdP, GitHub, PIN) and the Access organization settings. Affects every login.",
+		Description: "Identity providers (OIDC, GitHub, one-time PIN, ...) and the Access organization settings. Affects every login.",
 		Risk:        api.CFRiskHigh, DefaultTTL: hour, MaxTTL: 2 * hour}},
 	{scope: Scope{Name: api.CFScopeRulesets, Title: "Add and change zone rules",
 		Description: "WAF custom rules, rate limits, redirects, cache and transform rules in one zone (optionally one phase). Whole rulesets are never replaced.",

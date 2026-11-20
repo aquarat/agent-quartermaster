@@ -31,9 +31,9 @@ func TestMigrationFromM1(t *testing.T) {
 	for _, stmt := range []string{
 		fmt.Sprintf(`INSERT INTO enrollments(id, hostname, csr_pem, key_fingerprint, peer_address, status, created_at, expires_at) VALUES ('E', 'hosta', 'csr', 'fp', '127.0.0.1', 'approved', %d, %d)`, now, now),
 		fmt.Sprintf(`INSERT INTO hosts(id, name, cert_sha256, enrollment_id, created_at, not_after) VALUES (1, 'hosta', 'c', 'E', %d, %d)`, now, now+1e9),
-		fmt.Sprintf(`INSERT INTO standing(id, host_id, host_name, kind, target_host, login_user, max_ttl, created_at, expires_at, source_request_id, peer_address) VALUES ('S', 1, 'hosta', 'ssh', 'db-1', 'alice', 600, %d, %d, 'R', '127.0.0.1')`, now, now+1e9),
-		fmt.Sprintf(`INSERT INTO requests(id, host_id, host_name, peer_address, kind, target_host, login_user, public_key, key_fingerprint, reason, requester_json, ttl_requested, status, created_at, expires_at) VALUES ('R', 1, 'hosta', '127.0.0.1', 'ssh', 'db-1', 'alice', 'pk', 'SHA256:x', 'why', '{}', 600, 'approved', %d, %d)`, now, now+1e9),
-		fmt.Sprintf(`INSERT INTO grants(id, request_id, host_id, host_name, kind, target_host, login_user, principals, certificate, not_before, not_after) VALUES ('G', 'R', 1, 'hosta', 'ssh', 'db-1', 'alice', '["alice@db-1"]', 'cert', %d, %d)`, now, now+1e9),
+		fmt.Sprintf(`INSERT INTO standing(id, host_id, host_name, kind, target_host, login_user, max_ttl, created_at, expires_at, source_request_id, peer_address) VALUES ('S', 1, 'hosta', 'ssh', 'dbhost', 'alice', 600, %d, %d, 'R', '127.0.0.1')`, now, now+1e9),
+		fmt.Sprintf(`INSERT INTO requests(id, host_id, host_name, peer_address, kind, target_host, login_user, public_key, key_fingerprint, reason, requester_json, ttl_requested, status, created_at, expires_at) VALUES ('R', 1, 'hosta', '127.0.0.1', 'ssh', 'dbhost', 'alice', 'pk', 'SHA256:x', 'why', '{}', 600, 'approved', %d, %d)`, now, now+1e9),
+		fmt.Sprintf(`INSERT INTO grants(id, request_id, host_id, host_name, kind, target_host, login_user, principals, certificate, not_before, not_after) VALUES ('G', 'R', 1, 'hosta', 'ssh', 'dbhost', 'alice', '["alice@dbhost"]', 'cert', %d, %d)`, now, now+1e9),
 		"PRAGMA user_version = 2",
 	} {
 		if _, err := db.Exec(stmt); err != nil {
@@ -55,7 +55,7 @@ func TestMigrationFromM1(t *testing.T) {
 	}
 	q := st.Q()
 	r, err := q.GetRequest(ctx, "R")
-	if err != nil || r.TargetHost != "db-1" || r.KeyFingerprint != "SHA256:x" || r.Scope != "" || r.Mode != "" || r.IPCondition != "" {
+	if err != nil || r.TargetHost != "dbhost" || r.KeyFingerprint != "SHA256:x" || r.Scope != "" || r.Mode != "" || r.IPCondition != "" {
 		t.Fatalf("request %+v %v", r, err)
 	}
 	g, err := q.GetGrant(ctx, "G")
@@ -63,7 +63,7 @@ func TestMigrationFromM1(t *testing.T) {
 		t.Fatalf("grant %+v %v", g, err)
 	}
 	s, err := q.GetStanding(ctx, "S")
-	if err != nil || s.TargetHost != "db-1" || s.Scope != "" {
+	if err != nil || s.TargetHost != "dbhost" || s.Scope != "" {
 		t.Fatalf("standing %+v %v", s, err)
 	}
 	// SSH grants are never Cloudflare grants.

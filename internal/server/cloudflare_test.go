@@ -177,7 +177,7 @@ func cfConfig(t *testing.T, withMinter bool) *config.Config {
 		ProxyTokenFile:   writeSecret(t, tok, "proxy", testProxyToken+"\n", 0o600),
 		TokenIPCondition: []string{"203.0.113.7/32", "198.51.100.0/24"},
 		Zones:            []config.CFObject{{Name: "example.net", ID: testZoneID}},
-		Tunnels:          []config.CFObject{{Name: "home", ID: "aa11bb22-0000-4000-8000-000000000000"}},
+		Tunnels:          []config.CFObject{{Name: "home", ID: "7e570b05-0000-4000-8000-000000000000"}},
 		D1Databases:      []config.CFObject{{Name: "billing", ID: "11111111-2222-4333-8444-555555555555"}},
 		Scopes:           map[string]config.CFScopeOverride{},
 	}

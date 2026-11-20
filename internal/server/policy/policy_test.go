@@ -37,8 +37,8 @@ func TestApproverTTL(t *testing.T) {
 
 func TestMatches(t *testing.T) {
 	now := time.Now()
-	r := Rule{HostID: 1, PeerAddress: "192.0.2.50", Kind: "ssh", Target: "db-1", LoginUser: "alice", MaxTTL: 600, ExpiresAt: now.Add(time.Hour)}
-	c := Candidate{HostID: 1, PeerAddress: "192.0.2.50", Kind: "ssh", Target: "db-1", LoginUser: "alice", TTL: 600}
+	r := Rule{HostID: 1, PeerAddress: "192.0.2.50", Kind: "ssh", Target: "dbhost", LoginUser: "alice", MaxTTL: 600, ExpiresAt: now.Add(time.Hour)}
+	c := Candidate{HostID: 1, PeerAddress: "192.0.2.50", Kind: "ssh", Target: "dbhost", LoginUser: "alice", TTL: 600}
 	if !Matches(r, c, now) {
 		t.Fatal("identical candidate must match")
 	}
@@ -95,7 +95,7 @@ func TestMatchesCloudflare(t *testing.T) {
 		}
 	}
 	// An SSH rule never matches a Cloudflare candidate and vice versa.
-	ssh := Rule{HostID: 1, PeerAddress: "192.0.2.50", Kind: "ssh", Target: "db-1", LoginUser: "alice", MaxTTL: 600, ExpiresAt: now.Add(time.Hour)}
+	ssh := Rule{HostID: 1, PeerAddress: "192.0.2.50", Kind: "ssh", Target: "dbhost", LoginUser: "alice", MaxTTL: 600, ExpiresAt: now.Add(time.Hour)}
 	if Matches(ssh, c, now) {
 		t.Fatal("ssh rule matched a cloudflare candidate")
 	}
