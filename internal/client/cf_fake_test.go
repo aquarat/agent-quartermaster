@@ -226,7 +226,7 @@ func (f *fakeServer) statusCF(w http.ResponseWriter, id string, fr *fakeReq) {
 
 // mintChild mints a real fakecf child token with the parent token (in process).
 func (f *fakeServer) mintChild(grantID string, notAfter time.Time) (string, string) {
-	body, _ := json.Marshal(map[string]any{"name": "aqmas:" + grantID + ":build-box", "expires_on": notAfter.UTC().Format(time.RFC3339),
+	body, _ := json.Marshal(map[string]any{"name": "aqmas:" + grantID + ":agenthost", "expires_on": notAfter.UTC().Format(time.RFC3339),
 		"policies": []any{map[string]any{"effect": "allow", "resources": map[string]string{"com.cloudflare.api.account.zone." + testZoneID: "*"},
 			"permission_groups": []any{map[string]string{"id": "4755a26eedb94da69e1066d98aa820be"}}}}})
 	req := httptest.NewRequest(http.MethodPost, "/client/v4/user/tokens", bytes.NewReader(body))

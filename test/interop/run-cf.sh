@@ -54,7 +54,7 @@ PA=$(free_port) PW=$(free_port) PF=$(free_port)
 ORIGIN=https://aqmas.interop.test
 ACCT=0123456789abcdef0123456789abcdef
 ZID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-TUN=aa11bb22-0000-4000-8000-000000000000
+TUN=7e570b05-0000-4000-8000-000000000000
 DB=11111111-2222-4333-8444-555555555555
 FAKE=http://127.0.0.1:$PF
 # Fake parent tokens: random, never printed; the leak check at the end greps for them.
@@ -262,10 +262,10 @@ wait $RPID || { cat "$T/acc-req.err"; fail "cf request cf.access.apps"; }
 APPS=/accounts/$ACCT/access/apps
 fakeclear
 for body in '{"name":"x","type":"self_hosted","domain":"id.example.com"}' \
-	'{"name":"x","type":"self_hosted","domain":"ID.example.com:443/login"}' \
+	'{"name":"x","type":"self_hosted","domain":"ID.Example.com:443/login"}' \
 	'{"name":"x","type":"self_hosted","domain":"*.example.com"}' \
 	'{"name":"x","type":"self_hosted","domain":"ok.example.com","self_hosted_domains":["ok.example.com","id.example.com"]}' \
-	'{"name":"x","type":"self_hosted","domain":"ok.example.com","destinations":[{"type":"public","uri":"*.co.uk/x"}]}'; do
+	'{"name":"x","type":"self_hosted","domain":"ok.example.com","destinations":[{"type":"public","uri":"*.com/x"}]}'; do
 	RC=0
 	cfapi POST "$APPS" --data "$body" >/dev/null 2>"$T/acc.err" || RC=$?
 	((RC == 3)) && grep -q access-protected-hostname "$T/acc.err" || { cat "$T/acc.err"; fail "Access app not refused: $body"; }

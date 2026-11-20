@@ -40,7 +40,7 @@ func TestExampleConfigCloudflare(t *testing.T) {
 	text := strings.NewReplacer(
 		"<32 lowercase hex>", "0123456789abcdef0123456789abcdef",
 		"<32 hex zone id>", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		"<tunnel uuid>", "aa11bb22-0000-4000-8000-000000000000",
+		"<tunnel uuid>", "7e570b05-0000-4000-8000-000000000000",
 		"<database uuid>", "11111111-2222-4333-8444-555555555555",
 		"<static home IPv4>", "203.0.113.7",
 	).Replace(strings.Join(out, "\n"))

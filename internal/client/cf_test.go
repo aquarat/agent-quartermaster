@@ -218,7 +218,7 @@ func TestCFAPI(t *testing.T) {
 	}
 
 	// With a write grant: snapshots and (sanitized) warnings on stderr; --raw prints the body as is.
-	gid := f.approveCF("build-box", "cf.dns.edit", map[string]string{"zone": "example.com"})
+	gid := f.approveCF("agenthost", "cf.dns.edit", map[string]string{"zone": "example.com"})
 	reset(e)
 	if err := e.CFAPI(ctx, CFAPIOptions{Method: "POST", Path: "/zones/" + testZoneID + "/dns_records", Data: body, HasData: true, Raw: true}); err != nil {
 		t.Fatalf("%v\n%s", err, e.stderr)
@@ -333,7 +333,7 @@ func shimDo(t *testing.T, s *Shim, method, path, bearer string, body io.Reader, 
 
 func TestShimAuth(t *testing.T) {
 	f, e := cfEnv(t)
-	gid := f.approveCF("build-box", "cf.pages", map[string]string{"project": "site"})
+	gid := f.approveCF("agenthost", "cf.pages", map[string]string{"project": "site"})
 	s := startShim(t, f, e, ShimOptions{})
 	if g := s.Grants(); len(g) != 1 || g[0] != gid {
 		t.Fatalf("grants %v", g)
@@ -437,7 +437,7 @@ func (r *slowReader) Read(p []byte) (int, error) {
 
 func TestShimStreamsUploads(t *testing.T) {
 	f, e := cfEnv(t)
-	f.approveCF("build-box", "cf.workers.deploy", map[string]string{"script": "w"})
+	f.approveCF("agenthost", "cf.workers.deploy", map[string]string{"script": "w"})
 	s := startShim(t, f, e, ShimOptions{})
 	// An upload session for one 20 MiB asset, uploaded with chunked encoding (unknown length).
 	hash := "0123456789abcdef0123456789abcdef"
@@ -487,7 +487,7 @@ func TestShimRefreshesAfterNoGrant(t *testing.T) {
 		t.Errorf("hint printed %d times: %s", c, e.stderr)
 	}
 	// Approved elsewhere mid-run: the next call refreshes and retries (a small body is replayed).
-	gid := f.approveCF("build-box", "cf.dns.edit", map[string]string{"zone": "example.com"})
+	gid := f.approveCF("agenthost", "cf.dns.edit", map[string]string{"zone": "example.com"})
 	resp, body := shimDo(t, s, http.MethodPost, "/zones/"+testZoneID+"/dns_records", s.Bearer(),
 		strings.NewReader(`{"type":"A","name":"x","content":"192.0.2.1"}`), func(r *http.Request) { r.Header.Set("Content-Type", "application/json") })
 	if resp.StatusCode != 200 || resp.Header.Get(api.CFGrantUsedHeader) != gid {
@@ -545,7 +545,7 @@ func helperEnv(e *testEnv) {
 
 func TestCFEnvRunsCommand(t *testing.T) {
 	f, e := cfEnv(t)
-	gid := f.approveCF("build-box", "cf.read", nil)
+	gid := f.approveCF("agenthost", "cf.read", nil)
 	helperEnv(e)
 	code, err := e.CFEnv(context.Background(), CFEnvOptions{}, helperCmd("env"))
 	if err != nil || code != 7 {
@@ -575,7 +575,7 @@ func TestCFCurl(t *testing.T) {
 		t.Skip("curl not installed")
 	}
 	f, e := cfEnv(t)
-	f.approveCF("build-box", "cf.read", nil)
+	f.approveCF("agenthost", "cf.read", nil)
 	e.Environ = func() []string { return []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir()} }
 	code, err := e.CFCurl(context.Background(), CFEnvOptions{}, []string{"-sS", "https://api.cloudflare.com/client/v4/zones?name=example.com"})
 	if err != nil || code != 0 {
@@ -703,7 +703,7 @@ func TestCFTokenDeliveredElsewhere(t *testing.T) {
 
 func TestCFListAndStatus(t *testing.T) {
 	f, e := cfEnv(t)
-	gid := f.approveCF("build-box", "cf.dns.edit", map[string]string{"zone": "example.com", "name": "*.example.com"})
+	gid := f.approveCF("agenthost", "cf.dns.edit", map[string]string{"zone": "example.com", "name": "*.example.com"})
 	if err := e.List(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
@@ -738,14 +738,14 @@ func TestCFSnapshots(t *testing.T) {
 	now := time.Now()
 	f.cf.snapshots = []api.CFSnapshot{
 		{ID: "SNAP1", CreatedAt: now, Phase: "before", ObjectType: "tunnel-config", ObjectKey: "tunnel-config:" + testTunnelID + "\x1b[2J", Method: "PUT",
-			Path: "/accounts/x/cfd_tunnel/y/configurations", GrantID: "G1", Host: "build-box", Size: 20, Content: json.RawMessage(`{"config":{"ingress":[]}}`)},
+			Path: "/accounts/x/cfd_tunnel/y/configurations", GrantID: "G1", Host: "agenthost", Size: 20, Content: json.RawMessage(`{"config":{"ingress":[]}}`)},
 		{ID: "SNAP2", CreatedAt: now, Phase: "before", ObjectType: "dns-name", ObjectKey: "dns-name:z:foo", Missing: true, Method: "POST", GrantID: "G2"},
 	}
 	// Without a Cloudflare grant: 403 from the server, exit 1.
 	if err := e.CFSnapshotList(context.Background(), "", "", "", false); ExitCode(err) != ExitError {
 		t.Fatalf("no grant: %v", err)
 	}
-	f.approveCF("build-box", "cf.read", nil)
+	f.approveCF("agenthost", "cf.read", nil)
 	if err := e.CFSnapshotList(context.Background(), "", "tunnel-config", "", false); err != nil {
 		t.Fatal(err)
 	}

@@ -64,7 +64,7 @@ func TestUIFlowsCloudflare(t *testing.T) {
 		}
 		return rs
 	}
-	dnsParams := map[string]string{"zone": "example.com", "name": "*.example.com"}
+	dnsParams := map[string]string{"zone": "example.net", "name": "*.example.net"}
 	rc, st := e.cfRequest(host, "cf.dns.edit", dnsParams, "", 7200)
 	mustStatus(t, "dns request", st, 201)
 	rs := waitApproved(rc.ID)

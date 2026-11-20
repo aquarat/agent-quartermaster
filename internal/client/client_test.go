@@ -34,7 +34,7 @@ func mode(t *testing.T, path string) os.FileMode {
 
 func enroll(t *testing.T, f *fakeServer, e *testEnv) {
 	t.Helper()
-	if err := e.Enroll(context.Background(), EnrollOptions{Name: "build-box", Server: f.URL(), CAPin: f.pin()}); err != nil {
+	if err := e.Enroll(context.Background(), EnrollOptions{Name: "agenthost", Server: f.URL(), CAPin: f.pin()}); err != nil {
 		t.Fatalf("enroll: %v\nstderr: %s", err, e.stderr)
 	}
 }
@@ -49,7 +49,7 @@ func TestEnrollWithPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.HostName != "build-box" || cfg.Server != f.URL() || cfg.ServerCASHA256 != f.pin() {
+	if cfg.HostName != "agenthost" || cfg.Server != f.URL() || cfg.ServerCASHA256 != f.pin() {
 		t.Fatalf("config = %+v", cfg)
 	}
 	if got := mode(t, e.Paths.ConfigDir); got != 0o700 {
@@ -73,7 +73,7 @@ func TestEnrollWithPin(t *testing.T) {
 		t.Error("private key printed")
 	}
 	// Second enroll without --force is refused.
-	err = e.Enroll(context.Background(), EnrollOptions{Name: "build-box", Server: f.URL(), CAPin: f.pin()})
+	err = e.Enroll(context.Background(), EnrollOptions{Name: "agenthost", Server: f.URL(), CAPin: f.pin()})
 	if ExitCode(err) != ExitUsage {
 		t.Errorf("re-enroll without --force: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestEnrollWrongPin(t *testing.T) {
 	f := newFakeServer(t)
 	e := newTestEnv(t)
 	other := newTestCA(t, "someone else")
-	err := e.Enroll(context.Background(), EnrollOptions{Name: "build-box", Server: f.URL(), CAPin: FormatPin(CertPin(other.cert))})
+	err := e.Enroll(context.Background(), EnrollOptions{Name: "agenthost", Server: f.URL(), CAPin: FormatPin(CertPin(other.cert))})
 	if ExitCode(err) != ExitUnreachable {
 		t.Fatalf("wrong pin: err=%v code=%d", err, ExitCode(err))
 	}
@@ -100,7 +100,7 @@ func TestEnrollTOFU(t *testing.T) {
 
 	// Not a TTY: refused, nothing sent.
 	e := newTestEnv(t)
-	err := e.Enroll(context.Background(), EnrollOptions{Name: "build-box", Server: f.URL()})
+	err := e.Enroll(context.Background(), EnrollOptions{Name: "agenthost", Server: f.URL()})
 	if ExitCode(err) != ExitUsage || f.enrollPosts != 0 {
 		t.Fatalf("non-tty TOFU: %v posts=%d", err, f.enrollPosts)
 	}
@@ -109,7 +109,7 @@ func TestEnrollTOFU(t *testing.T) {
 	e = newTestEnv(t)
 	e.StdinIsTTY = true
 	e.Stdin = strings.NewReader("no\n")
-	if err := e.Enroll(context.Background(), EnrollOptions{Name: "build-box", Server: f.URL()}); err == nil || f.enrollPosts != 0 {
+	if err := e.Enroll(context.Background(), EnrollOptions{Name: "agenthost", Server: f.URL()}); err == nil || f.enrollPosts != 0 {
 		t.Fatalf("declined TOFU: %v posts=%d", err, f.enrollPosts)
 	}
 	if !strings.Contains(e.stderr.String(), f.pin()) {
@@ -120,7 +120,7 @@ func TestEnrollTOFU(t *testing.T) {
 	e = newTestEnv(t)
 	e.StdinIsTTY = true
 	e.Stdin = strings.NewReader("yes\n")
-	if err := e.Enroll(context.Background(), EnrollOptions{Name: "build-box", Server: f.URL()}); err != nil {
+	if err := e.Enroll(context.Background(), EnrollOptions{Name: "agenthost", Server: f.URL()}); err != nil {
 		t.Fatalf("TOFU: %v\n%s", err, e.stderr)
 	}
 	cfg, _ := LoadConfig(e.Paths)
@@ -133,7 +133,7 @@ func TestEnrollDenied(t *testing.T) {
 	f := newFakeServer(t)
 	f.enrollDecision = api.StatusDenied
 	e := newTestEnv(t)
-	err := e.Enroll(context.Background(), EnrollOptions{Name: "build-box", Server: f.URL(), CAPin: f.pin()})
+	err := e.Enroll(context.Background(), EnrollOptions{Name: "agenthost", Server: f.URL(), CAPin: f.pin()})
 	if ExitCode(err) != ExitDenied {
 		t.Fatalf("got %v", err)
 	}
@@ -198,7 +198,7 @@ func TestSSHFlowApproved(t *testing.T) {
 		t.Fatalf("reused=%v created=%d", p.Reused, f.created)
 	}
 	fr := f.requests["REQ0001"]
-	if fr.host != "build-box" || fr.req.Reason != "check backups" || fr.req.TTLSeconds != 1800 {
+	if fr.host != "agenthost" || fr.req.Reason != "check backups" || fr.req.TTLSeconds != 1800 {
 		t.Errorf("request = %+v host=%s", fr.req, fr.host)
 	}
 	want := api.Requester{Tool: ToolClaudeCode, SessionID: "sess-1", CWD: "/home/alice/Projects/x", PID: 4242, User: "alice"}
@@ -206,7 +206,7 @@ func TestSSHFlowApproved(t *testing.T) {
 		t.Errorf("requester = %+v", fr.req.Requester)
 	}
 	stderr := e.stderr.String()
-	for _, s := range []string{"request REQ0001 (Ref EQ0001): ssh alice@db-1 for 30m0s by claude-code on build-box: check backups", "approve at: https://aqmas.example/r/REQ0001", "approved: grant GREQ0001"} {
+	for _, s := range []string{"request REQ0001 (Ref EQ0001): ssh alice@db-1 for 30m0s by claude-code on agenthost: check backups", "approve at: https://aqmas.example/r/REQ0001", "approved: grant GREQ0001"} {
 		if !strings.Contains(stderr, s) {
 			t.Errorf("stderr lacks %q:\n%s", s, stderr)
 		}
@@ -519,8 +519,8 @@ func TestGrantValidation(t *testing.T) {
 		mut  func(*api.SSHGrant)
 		want []string
 	}{
-		"forgejo port": {func(g *api.SSHGrant) { g.TargetAddress = "build-box"; g.TargetPort = 2222 },
-			[]string{"-p", "2222", "--", "alice@build-box"}},
+		"forgejo port": {func(g *api.SSHGrant) { g.TargetAddress = "agenthost"; g.TargetPort = 2222 },
+			[]string{"-p", "2222", "--", "alice@agenthost"}},
 		"no known_hosts": {func(g *api.SSHGrant) { g.KnownHostsLine = "" }, []string{"--", "alice@192.0.2.61"}},
 		"ipv6":           {func(g *api.SSHGrant) { g.TargetAddress = "fd00::7" }, []string{"--", "alice@fd00::7"}},
 	} {
@@ -607,7 +607,7 @@ func TestCertValidity(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 
 	mk := func(after, before time.Time, typ uint32) []byte {
-		c := &ssh.Certificate{Key: upk, CertType: typ, KeyId: "aqmas:G1:build-box:db-1", Serial: 1,
+		c := &ssh.Certificate{Key: upk, CertType: typ, KeyId: "aqmas:G1:agenthost:db-1", Serial: 1,
 			ValidPrincipals: []string{"alice@db-1"}, ValidAfter: uint64(after.Unix()), ValidBefore: uint64(before.Unix()),
 			Permissions: ssh.Permissions{CriticalOptions: map[string]string{"source-address": "192.0.2.50/32"}, Extensions: map[string]string{"permit-pty": ""}}}
 		if err := c.SignCert(rand.Reader, ca); err != nil {
@@ -617,7 +617,7 @@ func TestCertValidity(t *testing.T) {
 	}
 	good := mk(now.Add(-time.Minute), now.Add(30*time.Minute), ssh.UserCert)
 	c, err := CertValidity(good, upk, now)
-	if err != nil || c.KeyId != "aqmas:G1:build-box:db-1" || c.CriticalOptions["source-address"] != "192.0.2.50/32" {
+	if err != nil || c.KeyId != "aqmas:G1:agenthost:db-1" || c.CriticalOptions["source-address"] != "192.0.2.50/32" {
 		t.Fatalf("good cert: %v", err)
 	}
 	if _, err := CertValidity(good, opk, now); err == nil {
@@ -656,7 +656,7 @@ func TestCertValidity(t *testing.T) {
 	}
 	run("-q", "-t", "ed25519", "-N", "", "-f", filepath.Join(dir, "ca"))
 	run("-q", "-t", "ed25519", "-N", "", "-f", filepath.Join(dir, "user"))
-	run("-q", "-s", filepath.Join(dir, "ca"), "-I", "aqmas:G2:build-box:db-1", "-n", "alice@db-1",
+	run("-q", "-s", filepath.Join(dir, "ca"), "-I", "aqmas:G2:agenthost:db-1", "-n", "alice@db-1",
 		"-V", "-1m:+30m", "-O", "source-address=192.0.2.50/32", filepath.Join(dir, "user.pub"))
 	certText, _ := os.ReadFile(filepath.Join(dir, "user-cert.pub"))
 	userText, _ := os.ReadFile(filepath.Join(dir, "user.pub"))

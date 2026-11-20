@@ -17,10 +17,10 @@ const req = {
   action: "approve",
   object: "request",
   id: "01JCF",
-  requesting_host: "build-box",
+  requesting_host: "agenthost",
   kind: "cloudflare",
   scope: "cf.dns.edit",
-  scope_params: "name=*.example.com;zone=example.com",
+  scope_params: "name=*.example.net;zone=example.net",
   mode: "proxy",
   ip_condition: "",
   ttl_seconds: 7200,
@@ -33,7 +33,7 @@ const grant = {
   action: "revoke",
   object: "grant",
   id: "g1",
-  requesting_host: "build-box",
+  requesting_host: "agenthost",
   kind: "cloudflare",
   scope: "cf.read",
   scope_params: "",
@@ -43,8 +43,8 @@ const grant = {
   nonce: "n",
   issued_at: "t",
 };
-const standing = { ...grant, object: "standing", id: "s1", scope: "cf.dns.edit", scope_params: "zone=example.com", ttl_seconds: 7200 };
-const token = { ...req, scope: "cf.workers.deploy", scope_params: "script=route-app-api;zone=example.com", mode: "token", ip_condition: "203.0.113.7/32" };
+const standing = { ...grant, object: "standing", id: "s1", scope: "cf.dns.edit", scope_params: "zone=example.net", ttl_seconds: 7200 };
+const token = { ...req, scope: "cf.workers.deploy", scope_params: "script=shopfront-api;zone=example.net", mode: "token", ip_condition: "203.0.113.7/32" };
 
 const parse = (o: Record<string, unknown>) => parseCanonical(canonicalJSON(o));
 const without = (o: Record<string, unknown>, k: string) => Object.fromEntries(Object.entries(o).filter(([x]) => x !== k));
@@ -92,30 +92,30 @@ describe("cloudflare canonical: key sets", () => {
     for (const sp of [
       "zone=",
       "zone",
-      "=example.com",
-      "zone=example.com;",
-      ";zone=example.com",
-      "zone=example.com;name=*.example.com", // unsorted
+      "=example.net",
+      "zone=example.net;",
+      ";zone=example.net",
+      "zone=example.net;name=*.example.net", // unsorted
       "zone=a.co.uk;zone=a.co.uk", // duplicate
       "zone=a=b",
-      "Zone=example.com",
-      " zone=example.com",
+      "Zone=example.net",
+      " zone=example.net",
     ]) {
       expect(() => parse({ ...req, scope_params: sp })).toThrow(CanonicalError);
     }
     expect(() => parse({ ...req, scope_params: "" })).toThrow(/needs parameter zone/);
-    expect(() => parse({ ...req, scope_params: "foo=bar;zone=example.com" })).toThrow(/takes no parameter "foo"/);
-    expect(() => parse({ ...req, scope_params: "name=*.example.com;zone=example.com" })).toThrow(/not inside zone/);
-    expect(() => parse({ ...req, scope_params: "name=evilexample.com;zone=example.com" })).toThrow(/not inside zone/);
-    expect(() => parse({ ...req, scope: "cf.d1", scope_params: "access=write;db=app-db" })).toThrow(/access must be one of read, migrate/);
-    expect(() => parse({ ...req, scope: "cf.rulesets", scope_params: "phase=http_request_origin;zone=example.com" })).toThrow(/phase/);
-    expect(() => parse({ ...grant, scope: "cf.read", scope_params: "zone=example.com" })).toThrow(/takes no parameter/);
+    expect(() => parse({ ...req, scope_params: "foo=bar;zone=example.net" })).toThrow(/takes no parameter "foo"/);
+    expect(() => parse({ ...req, scope_params: "name=*.example.com;zone=example.net" })).toThrow(/not inside zone/);
+    expect(() => parse({ ...req, scope_params: "name=evilexample.net;zone=example.net" })).toThrow(/not inside zone/);
+    expect(() => parse({ ...req, scope: "cf.d1", scope_params: "access=write;db=billing" })).toThrow(/access must be one of read, migrate/);
+    expect(() => parse({ ...req, scope: "cf.rulesets", scope_params: "phase=http_request_origin;zone=example.net" })).toThrow(/phase/);
+    expect(() => parse({ ...grant, scope: "cf.read", scope_params: "zone=example.net" })).toThrow(/takes no parameter/);
   });
 
   test("parseScopeParams / formatScopeParams", () => {
     expect(parseScopeParams("")).toEqual({});
-    expect(parseScopeParams("name=*.example.com;zone=example.com")).toEqual({ name: "*.example.com", zone: "example.com" });
-    expect(formatScopeParams({ zone: "example.com", name: "*.example.com" })).toBe("name=*.example.com;zone=example.com");
+    expect(parseScopeParams("name=*.example.net;zone=example.net")).toEqual({ name: "*.example.net", zone: "example.net" });
+    expect(formatScopeParams({ zone: "example.net", name: "*.example.net" })).toBe("name=*.example.net;zone=example.net");
     expect(() => parseScopeParams("b=1;a=2")).toThrow(ScopeParamsError);
   });
 
@@ -162,50 +162,50 @@ describe("cloudflare describe()", () => {
   test("the spec's example", () => {
     const d = describeAction(parse(req));
     expect(d.headline).toBe(
-      "Approve Cloudflare for build-box: edit DNS records in zone example.com (only names matching *.example.com) for 2 hours, through the aqmas proxy (no secret leaves aqmas).",
+      "Approve Cloudflare for agenthost: edit DNS records in zone example.net (only names matching *.example.net) for 2 hours, through the aqmas proxy (no secret leaves aqmas).",
     );
     expect(d.risk).toBe("high");
     expect(d.breakGlass).toBe(false);
     expect(d.warnings).toEqual([]);
     // Each parameter is its own line, values isolated; then the mode.
-    expect(d.details!.map(partsText)).toEqual(["Zone: example.com", "Only DNS names: *.example.com", "Mode: through the aqmas proxy"]);
-    expect(d.details![0]!.filter((p) => typeof p !== "string")).toEqual([{ value: "example.com" }]);
+    expect(d.details!.map(partsText)).toEqual(["Zone: example.net", "Only DNS names: *.example.net", "Mode: through the aqmas proxy"]);
+    expect(d.details![0]!.filter((p) => typeof p !== "string")).toEqual([{ value: "example.net" }]);
     // Values in the headline are separate parts.
-    expect(d.headlineParts.filter((p) => typeof p !== "string").map((p) => (p as { value: string }).value)).toEqual(["build-box", "example.com", "*.example.com", "2 hours"]);
+    expect(d.headlineParts.filter((p) => typeof p !== "string").map((p) => (p as { value: string }).value)).toEqual(["agenthost", "example.net", "*.example.net", "2 hours"]);
     // Every canonical field is listed.
     expect(d.fields.length).toBe(Object.keys(req).length);
-    expect(d.fields.find(([k]) => k === "Parameters")![1]).toBe("name=*.example.com;zone=example.com");
+    expect(d.fields.find(([k]) => k === "Parameters")![1]).toBe("name=*.example.net;zone=example.net");
     expect(d.fields.find(([k]) => k === "Token usable from")![1]).toBe("n/a (proxy)");
   });
 
   test("one wording per scope family", () => {
-    expect(head("cf.read")).toBe("Approve Cloudflare for build-box: read the Cloudflare configuration (allow-listed reads only) for 1 hour, through the aqmas proxy (no secret leaves aqmas).");
+    expect(head("cf.read")).toBe("Approve Cloudflare for agenthost: read the Cloudflare configuration (allow-listed reads only) for 1 hour, through the aqmas proxy (no secret leaves aqmas).");
     expect(head("cf.read.private")).toContain("read personal data in Cloudflare");
-    expect(head("cf.dns.edit", "name=www.example.com;zone=example.com")).toContain("edit DNS records in zone example.com (only the name www.example.com) for 1 hour");
-    expect(head("cf.dns.edit", "zone=example.com")).toContain("edit DNS records in zone example.com for 1 hour");
+    expect(head("cf.dns.edit", "name=www.example.net;zone=example.net")).toContain("edit DNS records in zone example.net (only the name www.example.net) for 1 hour");
+    expect(head("cf.dns.edit", "zone=example.net")).toContain("edit DNS records in zone example.net for 1 hour");
     expect(head("cf.tunnel.config", "tunnel=home")).toContain("replace the routes (ingress config) of tunnel home");
     expect(head("cf.access.apps")).toContain("create, change and delete Cloudflare Access apps");
     expect(head("cf.access.policies")).toContain("Access policies and groups");
     expect(head("cf.access.idp-org")).toContain("change Cloudflare Access login methods");
-    expect(head("cf.rulesets", "zone=example.com")).toContain("in zone example.com for 1 hour");
-    expect(head("cf.rulesets", "phase=http_request_dynamic_redirect;zone=example.com")).toContain("in zone example.com (only phase http_request_dynamic_redirect)");
-    expect(head("cf.zone-settings", "zone=example.com")).toContain("change the settings of zone example.com");
-    expect(head("cf.cache.purge", "zone=example.com")).toContain("purge listed URLs from the cache of zone example.com");
-    expect(head("cf.workers.deploy", "script=route-app-api")).toContain("deploy the Worker route-app-api (no routes or custom domains)");
-    expect(head("cf.workers.deploy", "script=route-app-api;zone=example.com")).toContain("deploy the Worker route-app-api (with routes and custom domains in zone example.com)");
-    expect(head("cf.pages", "project=route-app")).toContain("deploy the Pages project route-app");
-    expect(head("cf.d1", "access=read;db=app-db")).toContain("run read-only queries on D1 database app-db");
-    expect(head("cf.d1", "access=migrate;db=app-db")).toContain("run ANY SQL, including schema changes and data edits, on D1 database app-db");
+    expect(head("cf.rulesets", "zone=example.net")).toContain("in zone example.net for 1 hour");
+    expect(head("cf.rulesets", "phase=http_request_dynamic_redirect;zone=example.net")).toContain("in zone example.net (only phase http_request_dynamic_redirect)");
+    expect(head("cf.zone-settings", "zone=example.net")).toContain("change the settings of zone example.net");
+    expect(head("cf.cache.purge", "zone=example.net")).toContain("purge listed URLs from the cache of zone example.net");
+    expect(head("cf.workers.deploy", "script=shopfront-api")).toContain("deploy the Worker shopfront-api (no routes or custom domains)");
+    expect(head("cf.workers.deploy", "script=shopfront-api;zone=example.net")).toContain("deploy the Worker shopfront-api (with routes and custom domains in zone example.net)");
+    expect(head("cf.pages", "project=shopfront")).toContain("deploy the Pages project shopfront");
+    expect(head("cf.d1", "access=read;db=billing")).toContain("run read-only queries on D1 database billing");
+    expect(head("cf.d1", "access=migrate;db=billing")).toContain("run ANY SQL, including schema changes and data edits, on D1 database billing");
     expect(head("cf.r2.admin")).toContain("manage R2 buckets");
     expect(head("cf.r2.objects", "access=read;bucket=photos-bucket")).toContain("list and download objects in R2 bucket photos-bucket");
     expect(head("cf.r2.objects", "access=write;bucket=photos-bucket")).toContain("read, upload and delete objects in R2 bucket photos-bucket");
-    expect(head("cf.email", "zone=example.com")).toContain("change email routing and sending for zone example.com");
+    expect(head("cf.email", "zone=example.net")).toContain("change email routing and sending for zone example.net");
   });
 
   test("cf.admin is loud", () => {
     const d = describeAction(parse({ ...req, scope: "cf.admin", scope_params: "", ttl_seconds: 3600 }));
     expect(d.headline).toBe(
-      "Approve Cloudflare for build-box: use the WHOLE Cloudflare account (break-glass: everything except the deny-list) for 1 hour, through the aqmas proxy (no secret leaves aqmas).",
+      "Approve Cloudflare for agenthost: use the WHOLE Cloudflare account (break-glass: everything except the deny-list) for 1 hour, through the aqmas proxy (no secret leaves aqmas).",
     );
     expect(d.breakGlass).toBe(true);
     expect(d.risk).toBe("admin");
@@ -218,7 +218,7 @@ describe("cloudflare describe()", () => {
   test("token mode says a real token leaves aqmas, limited to the IP condition", () => {
     const d = describeAction(parse(token));
     expect(d.headline).toBe(
-      "Approve Cloudflare for build-box: deploy the Worker route-app-api (with routes and custom domains in zone example.com) for 2 hours, as a real API token that leaves aqmas, limited to 203.0.113.7/32.",
+      "Approve Cloudflare for agenthost: deploy the Worker shopfront-api (with routes and custom domains in zone example.net) for 2 hours, as a real API token that leaves aqmas, limited to 203.0.113.7/32.",
     );
     expect(d.warnings.join(" ")).toMatch(/real Cloudflare API token leaves aqmas/);
     expect(d.warnings.join(" ")).toMatch(/ANY Worker on the account/);
@@ -229,16 +229,16 @@ describe("cloudflare describe()", () => {
 
   test("standing, deny and revoke wording", () => {
     expect(describeAction(parse({ ...req, standing_hours: 4 })).standing).toBe(
-      "Also auto-approve the same Cloudflare request from build-box (cf.dns.edit name=*.example.com;zone=example.com, proxy) for the next 4 hours.",
+      "Also auto-approve the same Cloudflare request from agenthost (cf.dns.edit name=*.example.net;zone=example.net, proxy) for the next 4 hours.",
     );
     expect(describeAction(parse({ ...req, action: "deny", ttl_seconds: 0 })).headline).toBe(
-      "Deny Cloudflare for build-box: edit DNS records in zone example.com (only names matching *.example.com).",
+      "Deny Cloudflare for agenthost: edit DNS records in zone example.net (only names matching *.example.net).",
     );
-    expect(describeAction(parse(grant)).headline).toBe("Revoke build-box's Cloudflare access: read the Cloudflare configuration (allow-listed reads only).");
-    expect(describeAction(parse({ ...grant, scope: "cf.pages", scope_params: "project=route-app", mode: "token" })).headline).toBe(
-      "Revoke build-box's Cloudflare token (deleted at Cloudflare at once): deploy the Pages project route-app.",
+    expect(describeAction(parse(grant)).headline).toBe("Revoke agenthost's Cloudflare access: read the Cloudflare configuration (allow-listed reads only).");
+    expect(describeAction(parse({ ...grant, scope: "cf.pages", scope_params: "project=shopfront", mode: "token" })).headline).toBe(
+      "Revoke agenthost's Cloudflare token (deleted at Cloudflare at once): deploy the Pages project shopfront.",
     );
-    expect(describeAction(parse(standing)).headline).toBe("Stop auto-approving Cloudflare for build-box: edit DNS records in zone example.com (each grant up to 2 hours).");
+    expect(describeAction(parse(standing)).headline).toBe("Stop auto-approving Cloudflare for agenthost: edit DNS records in zone example.net (each grant up to 2 hours).");
   });
 
   test("unusual characters in any value are flagged", () => {
@@ -258,7 +258,7 @@ describe("cloudflare describe()", () => {
       id: "01JCF",
       ttl_seconds: 7200,
       standing_hours: 0,
-      requesting_host: "build-box",
+      requesting_host: "agenthost",
       kind: "cloudflare",
       scope: token.scope,
       scope_params: token.scope_params,
@@ -266,7 +266,7 @@ describe("cloudflare describe()", () => {
       ip_condition: "203.0.113.7/32",
     };
     expect(mismatches(c, want)).toEqual([]);
-    for (const [k, v] of Object.entries({ scope: "cf.pages", scope_params: "script=route-app-api", mode: "proxy", ip_condition: "", kind: "ssh", requesting_host: "dev-1", ttl_seconds: 3600 })) {
+    for (const [k, v] of Object.entries({ scope: "cf.pages", scope_params: "script=shopfront-api", mode: "proxy", ip_condition: "", kind: "ssh", requesting_host: "dev-1", ttl_seconds: 3600 })) {
       const m = mismatches(c, { ...want, [k]: v });
       expect(m.length).toBe(1);
       expect(m[0]).toStartWith(`${k}:`);
@@ -350,7 +350,7 @@ describe("cloudflare flows (mock)", () => {
     expect(dns.kind).toBe("cloudflare");
     expect(dns.ssh).toBeUndefined();
     expect(dns.risk).toBe("high");
-    expect(dns.cloudflare).toMatchObject({ scope: "cf.dns.edit", scope_params: "name=*.example.com;zone=example.com", mode: "proxy", ip_condition: "", risk: "high", standing_allowed: true });
+    expect(dns.cloudflare).toMatchObject({ scope: "cf.dns.edit", scope_params: "name=*.example.net;zone=example.net", mode: "proxy", ip_condition: "", risk: "high", standing_allowed: true });
     const tok = s.pending!.find((p) => p.id === "01JDEMO0CF0WORKER0TOKEN11")!;
     expect(tok.cloudflare).toMatchObject({ mode: "token", ip_condition: "203.0.113.7/32", standing_allowed: false });
     expect(tok.cloudflare!.permissions).toContain("Workers Scripts Write (account)");
@@ -364,15 +364,15 @@ describe("cloudflare flows (mock)", () => {
     const prep = await prepareAction(api, targetForPending(item), { action: "approve", ttl_seconds: 3600, standing_hours: 4 });
     expect(prep.canonicalText).toBe(canonicalJSON(prep.canonical));
     expect(Object.keys(prep.canonical).sort()).toEqual(Object.keys(req).sort());
-    expect(prep.description.headline).toContain("edit DNS records in zone example.com (only names matching *.example.com) for 1 hour");
+    expect(prep.description.headline).toContain("edit DNS records in zone example.net (only names matching *.example.net) for 1 hour");
     const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(prep.canonicalText)));
     expect(encode(prep.options.challenge as ArrayBuffer)).toBe(encode(digest));
     const res = (await completeAction(api, auth, prep)) as { status: string };
     expect(res.status).toBe("approved");
     expect(m.store.applied.at(-1)!.canonical).toMatchObject({ kind: "cloudflare", scope: "cf.dns.edit", ttl_seconds: 3600, standing_hours: 4, mode: "proxy", ip_condition: "" });
     const s = await api.state();
-    expect(s.grants!.some((g) => g.scope === "cf.dns.edit" && g.scope_params === "name=*.example.com;zone=example.com")).toBe(true);
-    expect(s.standing!.some((x) => x.scope === "cf.dns.edit" && x.scope_params === "name=*.example.com;zone=example.com" && x.max_ttl_seconds === 3600)).toBe(true);
+    expect(s.grants!.some((g) => g.scope === "cf.dns.edit" && g.scope_params === "name=*.example.net;zone=example.net")).toBe(true);
+    expect(s.standing!.some((x) => x.scope === "cf.dns.edit" && x.scope_params === "name=*.example.net;zone=example.net" && x.max_ttl_seconds === 3600)).toBe(true);
   });
 
   test("approve a token-mode request; a standing approval for it is refused by the server", async () => {
@@ -389,7 +389,7 @@ describe("cloudflare flows (mock)", () => {
     const { api, auth } = await signedIn(m);
     const item = (await api.state()).pending!.find((p) => p.id === "01JDEMO0CF0ADMIN000000012")!;
     const prep = await prepareAction(api, targetForPending(item), { action: "deny" });
-    expect(prep.description.headline).toBe("Deny Cloudflare for build-box: use the WHOLE Cloudflare account (break-glass: everything except the deny-list).");
+    expect(prep.description.headline).toBe("Deny Cloudflare for agenthost: use the WHOLE Cloudflare account (break-glass: everything except the deny-list).");
     expect((await completeAction(api, auth, prep)) as object).toMatchObject({ status: "denied" });
   });
 
@@ -399,12 +399,12 @@ describe("cloudflare flows (mock)", () => {
     const st = s.standing!.find((x) => x.id === "01JDEMO0CFSTANDING0000013")!;
     let prep = await prepareAction(api, targetForStanding(st), { action: "revoke" });
     expect(prep.canonical).toMatchObject({ object: "standing", kind: "cloudflare", ttl_seconds: 7200, standing_hours: 0 });
-    expect(prep.description.headline).toBe("Stop auto-approving Cloudflare for build-box: edit DNS records in zone example.com (each grant up to 2 hours).");
+    expect(prep.description.headline).toBe("Stop auto-approving Cloudflare for agenthost: edit DNS records in zone example.net (each grant up to 2 hours).");
     await completeAction(api, auth, prep);
     const g = s.grants!.find((x) => x.id === "01JDEMO0CFGRANT0READ00008")!;
     prep = await prepareAction(api, targetForGrant(g), { action: "revoke" });
     expect(prep.canonical).toMatchObject({ object: "grant", kind: "cloudflare", scope: "cf.read", scope_params: "", mode: "proxy", ttl_seconds: 0 });
-    expect(prep.description.headline).toBe("Revoke build-box's Cloudflare access: read the Cloudflare configuration (allow-listed reads only).");
+    expect(prep.description.headline).toBe("Revoke agenthost's Cloudflare access: read the Cloudflare configuration (allow-listed reads only).");
     await completeAction(api, auth, prep);
     s = await api.state();
     expect(s.standing!.some((x) => x.id === st.id)).toBe(false);
@@ -439,8 +439,8 @@ describe("a lying server is caught before a Cloudflare action is signed", () => 
     const evil: Api = { ...api, challenge: async (o, id, b) => rewrite(await api.challenge(o, id, b), change) };
     const item =
       mode === "token"
-        ? m.store.spawnCloudflare(mockPendingCloudflare("cf.dns.edit", { zone: "example.com" }, "token"))
-        : m.store.spawnCloudflare(mockPendingCloudflare("cf.dns.edit", { zone: "example.com", name: "*.example.com" }));
+        ? m.store.spawnCloudflare(mockPendingCloudflare("cf.dns.edit", { zone: "example.net" }, "token"))
+        : m.store.spawnCloudflare(mockPendingCloudflare("cf.dns.edit", { zone: "example.net", name: "*.example.net" }));
     const e = await prepareAction(evil, targetForPending(item), { action: "approve", ttl_seconds: 3600 }).catch((x) => x);
     expect(e).toBeInstanceOf(FlowError);
     expect(auth.gets.length).toBe(1); // only the login
@@ -451,7 +451,7 @@ describe("a lying server is caught before a Cloudflare action is signed", () => 
     expect(await tampered({ scope: "cf.admin", scope_params: "" })).toMatch(/scope/);
   });
   test("dropped name restriction", async () => {
-    expect(await tampered({ scope_params: "zone=example.com" })).toMatch(/scope_params/);
+    expect(await tampered({ scope_params: "zone=example.net" })).toMatch(/scope_params/);
   });
   test("switched to token mode", async () => {
     expect(await tampered({ mode: "token", ip_condition: "0.0.0.0/0" })).toMatch(/mode/);

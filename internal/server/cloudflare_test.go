@@ -176,9 +176,9 @@ func cfConfig(t *testing.T, withMinter bool) *config.Config {
 		Enabled: true, AccountID: testAcct,
 		ProxyTokenFile:   writeSecret(t, tok, "proxy", testProxyToken+"\n", 0o600),
 		TokenIPCondition: []string{"203.0.113.7/32", "198.51.100.0/24"},
-		Zones:            []config.CFObject{{Name: "example.com", ID: testZoneID}},
+		Zones:            []config.CFObject{{Name: "example.net", ID: testZoneID}},
 		Tunnels:          []config.CFObject{{Name: "home", ID: "aa11bb22-0000-4000-8000-000000000000"}},
-		D1Databases:      []config.CFObject{{Name: "app-db", ID: "11111111-2222-4333-8444-555555555555"}},
+		D1Databases:      []config.CFObject{{Name: "billing", ID: "11111111-2222-4333-8444-555555555555"}},
 		Scopes:           map[string]config.CFScopeOverride{},
 	}
 	if withMinter {
@@ -358,7 +358,7 @@ func TestCFRequestValidationAndTTL(t *testing.T) {
 	e := newCFEnv(t, cfConfig(t, true))
 	e.setupOwner()
 	c := e.agentClient(ptr(e.enrollHost("hosta")))
-	zone := map[string]string{"zone": "example.com"}
+	zone := map[string]string{"zone": "example.net"}
 	for name, tc := range map[string]struct {
 		scope  string
 		params map[string]string
@@ -368,10 +368,10 @@ func TestCFRequestValidationAndTTL(t *testing.T) {
 		"missing param":        {"cf.dns.edit", nil, ""},
 		"unconfigured zone":    {"cf.dns.edit", map[string]string{"zone": "example.com"}, ""},
 		"extra param":          {"cf.read", zone, ""},
-		"name outside zone":    {"cf.dns.edit", map[string]string{"zone": "example.com", "name": "x.example.com"}, ""},
+		"name outside zone":    {"cf.dns.edit", map[string]string{"zone": "example.net", "name": "x.example.com"}, ""},
 		"bad mode":             {"cf.dns.edit", zone, "both"},
 		"token for proxy-only": {"cf.tunnel.config", map[string]string{"tunnel": "home"}, "token"},
-		"bad value":            {"cf.d1", map[string]string{"db": "app-db", "access": "drop"}, ""},
+		"bad value":            {"cf.d1", map[string]string{"db": "billing", "access": "drop"}, ""},
 	} {
 		if _, st := e.cfRequest(c, tc.scope, tc.params, tc.mode, 0); st != 400 {
 			t.Errorf("%s: HTTP %d, want 400", name, st)
@@ -460,32 +460,32 @@ func TestCFAutoApprove(t *testing.T) {
 		t.Fatalf("auto-approval beyond the cap answered %d, want 429", st)
 	}
 
-	rc, _ = e.cfRequest(c, "cf.cache.purge", map[string]string{"zone": "example.com"}, "proxy", 0)
+	rc, _ = e.cfRequest(c, "cf.cache.purge", map[string]string{"zone": "example.net"}, "proxy", 0)
 	if rc.Status != "approved" {
 		t.Fatalf("cf.cache.purge proxy not auto-approved: %s", rc.Status)
 	}
-	if rs, _ := e.status(c, rc.ID, ""); rs.Grant.Cloudflare.Params["zone"] != "example.com" || rs.Grant.Cloudflare.ScopeParams != "zone=example.com" {
+	if rs, _ := e.status(c, rc.ID, ""); rs.Grant.Cloudflare.Params["zone"] != "example.net" || rs.Grant.Cloudflare.ScopeParams != "zone=example.net" {
 		t.Fatalf("purge grant %+v", rs.Grant.Cloudflare)
 	}
 	// Token mode is never auto-approved.
-	rc, _ = e.cfRequest(c, "cf.cache.purge", map[string]string{"zone": "example.com"}, "token", 0)
+	rc, _ = e.cfRequest(c, "cf.cache.purge", map[string]string{"zone": "example.net"}, "token", 0)
 	if rc.Status != "pending" {
 		t.Fatalf("token-mode purge: %s", rc.Status)
 	}
 	// Other scopes are never auto-approved.
-	rc, _ = e.cfRequest(c, "cf.dns.edit", map[string]string{"zone": "example.com"}, "", 0)
+	rc, _ = e.cfRequest(c, "cf.dns.edit", map[string]string{"zone": "example.net"}, "", 0)
 	if rc.Status != "pending" {
 		t.Fatalf("dns.edit: %s", rc.Status)
 	}
-	e.pushes.waitFor(t, "aqmas: hosta wants cf.dns.edit zone=example.com (2h)")
-	e.pushes.waitFor(t, "aqmas: hosta wants a Cloudflare token cf.cache.purge zone=example.com (1h)")
+	e.pushes.waitFor(t, "aqmas: hosta wants cf.dns.edit zone=example.net (2h)")
+	e.pushes.waitFor(t, "aqmas: hosta wants a Cloudflare token cf.cache.purge zone=example.net (1h)")
 	if strings.Contains(e.pushes.all(), "cf.read") {
 		t.Fatal("auto-approval was pushed")
 	}
 	// The agent's grant list carries the scope fields.
 	var gl api.GrantList
 	agentDo(t, c, "GET", e.agent.URL+"/v1/grants?active=1", nil, &gl)
-	if len(gl.Grants) != 1+MaxAutoCFGrants || gl.Grants[0].Scope != "cf.cache.purge" || gl.Grants[0].ScopeParams != "zone=example.com" ||
+	if len(gl.Grants) != 1+MaxAutoCFGrants || gl.Grants[0].Scope != "cf.cache.purge" || gl.Grants[0].ScopeParams != "zone=example.net" ||
 		gl.Grants[0].Mode != "proxy" || gl.Grants[1].Scope != "cf.read" || gl.Grants[0].TargetHost != "" || gl.Grants[0].RequestingHost != "" {
 		t.Fatalf("grants %+v", gl.Grants)
 	}
@@ -506,8 +506,8 @@ func TestCFApproveStandingAndRevoke(t *testing.T) {
 	e.setupOwner()
 	a := e.agentClient(ptr(e.enrollHost("hosta")))
 	b := e.agentClient(ptr(e.enrollHost("hostb")))
-	params := map[string]string{"zone": "example.com", "name": "*.example.com"}
-	const sp = "name=*.example.com;zone=example.com"
+	params := map[string]string{"zone": "Example.net", "name": "*.example.net"}
+	const sp = "name=*.example.net;zone=example.net"
 
 	rc, st := e.cfRequest(a, "cf.dns.edit", params, "", 0)
 	mustStatus(t, "create", st, 201)
@@ -522,7 +522,7 @@ func TestCFApproveStandingAndRevoke(t *testing.T) {
 	it := st0.Pending[0]
 	pc := it.Cloudflare
 	if it.Kind != "cloudflare" || it.SSH != nil || pc == nil || pc.Scope != "cf.dns.edit" || pc.ScopeParams != sp ||
-		pc.Params["zone"] != "example.com" || pc.Params["name"] != "*.example.com" || pc.Mode != "proxy" || pc.IPCondition != "" ||
+		pc.Params["zone"] != "example.net" || pc.Params["name"] != "*.example.net" || pc.Mode != "proxy" || pc.IPCondition != "" ||
 		pc.Title == "" || pc.Description == "" || pc.Risk != "high" || !pc.StandingAllowed || len(pc.Permissions) != 0 ||
 		it.Risk != "high" || it.TTLMax != 7200 || it.SimilarRecent != 0 || it.RequestingAddress != "127.0.0.1" {
 		t.Fatalf("card %+v / %+v", it, pc)
@@ -564,7 +564,7 @@ func TestCFApproveStandingAndRevoke(t *testing.T) {
 	sid := st1.Standing[0].ID
 
 	// Standing match: identical scope_params, same host and address, proxy, ttl within max.
-	r1, _ := e.cfRequest(a, "cf.dns.edit", map[string]string{"zone": "example.com", "name": "*.example.com"}, "proxy", 3600)
+	r1, _ := e.cfRequest(a, "cf.dns.edit", map[string]string{"zone": "example.net", "name": "*.example.net"}, "proxy", 3600)
 	if r1.Status != "approved" {
 		t.Fatalf("matching request: %s", r1.Status)
 	}
@@ -578,10 +578,10 @@ func TestCFApproveStandingAndRevoke(t *testing.T) {
 		mode   string
 		ttl    int
 	}{
-		"other params": {a, "cf.dns.edit", map[string]string{"zone": "example.com"}, "", 3600},
-		"other name":   {a, "cf.dns.edit", map[string]string{"zone": "example.com", "name": "x.example.com"}, "", 3600},
+		"other params": {a, "cf.dns.edit", map[string]string{"zone": "example.net"}, "", 3600},
+		"other name":   {a, "cf.dns.edit", map[string]string{"zone": "example.net", "name": "x.example.net"}, "", 3600},
 		"token mode":   {a, "cf.dns.edit", params, "token", 3600},
-		"other scope":  {a, "cf.rulesets", map[string]string{"zone": "example.com"}, "", 3600},
+		"other scope":  {a, "cf.rulesets", map[string]string{"zone": "example.net"}, "", 3600},
 		"longer ttl":   {a, "cf.dns.edit", params, "", 3601},
 		"default ttl":  {a, "cf.dns.edit", params, "", 0}, // 7200 > 3600
 		"other host":   {b, "cf.dns.edit", params, "", 3600},
@@ -599,7 +599,7 @@ func TestCFApproveStandingAndRevoke(t *testing.T) {
 	e.s.Store().DB().Exec("UPDATE standing SET peer_address = '127.0.0.1' WHERE id = ?", sid)
 	e.s.Store().DB().Exec("UPDATE requests SET status = 'cancelled' WHERE status = 'pending'")
 	// similar_recent counts the host's approved requests for the scope (rc and r1).
-	r9, _ := e.cfRequest(a, "cf.dns.edit", map[string]string{"zone": "example.com"}, "", 0)
+	r9, _ := e.cfRequest(a, "cf.dns.edit", map[string]string{"zone": "example.net"}, "", 0)
 	if it := e.item(r9.ID); it.SimilarRecent != 2 {
 		t.Fatalf("similar_recent %d, want 2", it.SimilarRecent)
 	}
@@ -653,7 +653,7 @@ func TestCFStandingRefusedAndAdminCap(t *testing.T) {
 	e := newCFEnv(t, cfConfig(t, true))
 	e.setupOwner()
 	c := e.agentClient(ptr(e.enrollHost("hosta")))
-	zone := map[string]string{"zone": "example.com"}
+	zone := map[string]string{"zone": "example.net"}
 
 	adm, _ := e.cfRequest(c, "cf.admin", nil, "", 28800)
 	e.pushes.waitFor(t, "aqmas: BREAK-GLASS cf.admin for hosta")
@@ -711,10 +711,10 @@ func TestCFTokenMintOnDelivery(t *testing.T) {
 	e.setupOwner()
 	c := e.agentClient(ptr(e.enrollHost("hosta")))
 	other := e.agentClient(ptr(e.enrollHost("hostb")))
-	rc, _ := e.cfRequest(c, "cf.dns.edit", map[string]string{"zone": "example.com"}, "token", 1800)
+	rc, _ := e.cfRequest(c, "cf.dns.edit", map[string]string{"zone": "example.net"}, "token", 1800)
 	pc := e.item(rc.ID).Cloudflare
 	const ipc = "198.51.100.0/24,203.0.113.7/32" // sorted
-	if pc.Mode != "token" || pc.IPCondition != ipc || !slices.Equal(pc.Permissions, []string{"DNS Write (zone example.com)", "Zone Read (zone example.com)"}) || len(pc.Notes) == 0 {
+	if pc.Mode != "token" || pc.IPCondition != ipc || !slices.Equal(pc.Permissions, []string{"DNS Write (zone example.net)", "Zone Read (zone example.net)"}) || len(pc.Notes) == 0 {
 		t.Fatalf("token card %+v", pc)
 	}
 	cr, st := e.challenge("/api/ui/requests/"+rc.ID, api.ChallengeRequest{Action: "approve", TTLSeconds: 900})
@@ -1117,8 +1117,8 @@ func TestCFGrantSource(t *testing.T) {
 		return g.ID
 	}
 	a1 := grantOf(a, "cf.read", nil, "", 0)
-	a2 := grantOf(a, "cf.cache.purge", map[string]string{"zone": "example.com"}, "", 0)
-	aShort := grantOf(a, "cf.zone-settings", map[string]string{"zone": "example.com"}, "", 60)
+	a2 := grantOf(a, "cf.cache.purge", map[string]string{"zone": "example.net"}, "", 0)
+	aShort := grantOf(a, "cf.zone-settings", map[string]string{"zone": "example.net"}, "", 60)
 	aTok := grantOf(a, "cf.pages", map[string]string{"project": "blog"}, "token", 0)
 	aRev := grantOf(a, "cf.r2.admin", nil, "", 0)
 	mustStatus(t, "revoke", e.approve("/api/ui/grants/"+aRev, "revoke", api.ChallengeRequest{Action: "revoke"}), 200)
@@ -1143,7 +1143,7 @@ func TestCFGrantSource(t *testing.T) {
 	if !slices.Equal(got, []string{a2, a1, aShort}) {
 		t.Fatalf("ProxyGrants = %v, want %v", got, []string{a2, a1, aShort})
 	}
-	if gs[0].Scope != "cf.cache.purge" || gs[0].ScopeParams != "zone=example.com" {
+	if gs[0].Scope != "cf.cache.purge" || gs[0].ScopeParams != "zone=example.net" {
 		t.Fatalf("grant fields %+v", gs[0])
 	}
 	if gs, _ := src.ProxyGrants(ctx, hb.ID, []string{a1, b1}, now); len(gs) != 1 || gs[0].ID != b1 {

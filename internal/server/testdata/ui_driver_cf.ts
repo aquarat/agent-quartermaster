@@ -52,7 +52,7 @@ step("approved enrollment");
 
 // 1. DNS edit, proxy mode: approve shorter TTL with a 1 h standing approval.
 const dns = await pendingScope("cf.dns.edit");
-if (dns.cloudflare.scope_params !== "name=*.example.com;zone=example.com") throw new Error("scope_params " + dns.cloudflare.scope_params);
+if (dns.cloudflare.scope_params !== "name=*.example.net;zone=example.net") throw new Error("scope_params " + dns.cloudflare.scope_params);
 let p = await flows.prepareAction(api, flows.targetForPending(dns), { action: "approve", ttl_seconds: 3600, standing_hours: 1 });
 step("dns canonical: " + p.canonicalText);
 const c = JSON.parse(p.canonicalText);

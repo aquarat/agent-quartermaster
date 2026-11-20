@@ -28,7 +28,7 @@ describe("Cloudflare cards", () => {
   let root: HTMLElement;
   let doc: Document;
   // Extra items the tests need, added before the first render.
-  const tokenStanding = m.store.spawnCloudflare({ ...mockPendingCloudflare("cf.pages", { project: "route-app" }, "token"), standing_allowed: true });
+  const tokenStanding = m.store.spawnCloudflare({ ...mockPendingCloudflare("cf.pages", { project: "shopfront" }, "token"), standing_allowed: true });
   const unknown = m.store.spawnCloudflare({ ...mockPendingCloudflare("cf.read"), scope: "cf.mystery", title: "Mystery" });
 
   const card = (id: string) => root.querySelector<HTMLElement>(`[data-id="${id}"]`)!;
@@ -64,13 +64,13 @@ describe("Cloudflare cards", () => {
 
   test("a DNS card reads in plain words, each parameter on its own", () => {
     const c = card("01JDEMO0CF0DNS0EDIT000009");
-    expect(c.querySelector("h3.target")!.textContent).toBe("Edit DNS records in zone example.com (only names matching *.example.com)");
+    expect(c.querySelector("h3.target")!.textContent).toBe("Edit DNS records in zone example.net (only names matching *.example.net)");
     expect(c.querySelectorAll("h3.target bdi").length).toBe(2);
     expect(c.querySelector(".badge")!.textContent).toBe("High risk");
     expect(c.querySelector(".badge")!.classList.contains("risk-high")).toBe(true);
     const facts = [...c.querySelectorAll(".facts dt")].map((d) => [d.textContent, d.nextElementSibling!.textContent]);
-    expect(facts).toContainEqual(["Zone", "example.com"]);
-    expect(facts).toContainEqual(["Only DNS names", "*.example.com"]);
+    expect(facts).toContainEqual(["Zone", "example.net"]);
+    expect(facts).toContainEqual(["Only DNS names", "*.example.net"]);
     expect(facts).toContainEqual(["Mode", "Through the aqmas proxy (no secret leaves aqmas)"]);
     expect(facts).toContainEqual(["Scope", "cf.dns.edit"]);
     expect(facts.find(([k]) => k === "Ref")![1]).toBe("000009");
@@ -92,7 +92,7 @@ describe("Cloudflare cards", () => {
     const c = card("01JDEMO0CF0WORKER0TOKEN11");
     const box = c.querySelector(".token-box")!;
     expect(box.textContent).toContain("A real API token leaves aqmas");
-    expect([...box.querySelectorAll(".perms li")].map((l) => l.textContent)).toContain("Workers Routes Write (zone example.com)");
+    expect([...box.querySelectorAll(".perms li")].map((l) => l.textContent)).toContain("Workers Routes Write (zone example.net)");
     expect(box.querySelector(".notes")!.textContent).toMatch(/ANY Worker/);
     expect(box.querySelector(".warn")!.textContent).toMatch(/ANY Worker on the account/);
     const mode = [...c.querySelectorAll(".facts dt")].find((d) => d.textContent === "Mode")!.nextElementSibling!.textContent;
@@ -124,7 +124,7 @@ describe("Cloudflare cards", () => {
     expect(dlg.querySelector("#sheet-title")!.textContent).toBe("Break-glass: check, then confirm");
     expect(dlg.querySelector(".headline")!.classList.contains("loud")).toBe(true);
     expect(dlg.querySelector(".headline")!.textContent).toBe(
-      "Approve Cloudflare for build-box: use the WHOLE Cloudflare account (break-glass: everything except the deny-list) for 1 hour, through the aqmas proxy (no secret leaves aqmas).",
+      "Approve Cloudflare for agenthost: use the WHOLE Cloudflare account (break-glass: everything except the deny-list) for 1 hour, through the aqmas proxy (no secret leaves aqmas).",
     );
     expect(dlg.querySelector("p.breakglass")!.textContent).toMatch(/^BREAK-GLASS/);
     expect(dlg.querySelector(".badge.risk-admin")).toBeTruthy();
@@ -158,16 +158,16 @@ describe("Cloudflare cards", () => {
     const g = card("01JDEMO0CFGRANT0READ00008");
     expect(g.querySelector("h3")!.textContent).toBe("Read the Cloudflare configuration (allow-listed reads only)");
     const st = card("01JDEMO0CFSTANDING0000013");
-    expect(st.querySelector("h3")!.textContent).toBe("Edit DNS records in zone example.com");
+    expect(st.querySelector("h3")!.textContent).toBe("Edit DNS records in zone example.net");
     const facts = [...st.querySelectorAll(".facts dt")].map((d) => [d.textContent, d.nextElementSibling!.textContent]);
-    expect(facts).toContainEqual(["Zone", "example.com"]);
+    expect(facts).toContainEqual(["Zone", "example.net"]);
     expect(facts).toContainEqual(["Mode", "Through the aqmas proxy"]);
 
     dialog()?.close();
     g.querySelector<HTMLButtonElement>("button.deny")!.click();
     const dlg = dialog();
     await until(() => !!dlg.querySelector("button.confirm"));
-    expect(dlg.querySelector(".headline")!.textContent).toBe("Revoke build-box's Cloudflare access: read the Cloudflare configuration (allow-listed reads only).");
+    expect(dlg.querySelector(".headline")!.textContent).toBe("Revoke agenthost's Cloudflare access: read the Cloudflare configuration (allow-listed reads only).");
     dlg.querySelector<HTMLButtonElement>("button.confirm")!.click();
     await until(() => !!dlg.querySelector("h2.neg") && dlg.querySelector("h2")!.textContent === "Revoked");
     expect(dlg.textContent).toContain("The aqmas proxy refuses it from the next call.");

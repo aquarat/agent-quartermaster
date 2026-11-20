@@ -241,7 +241,7 @@ export class MockStore {
       kind: "cloudflare",
       created_at: new Date(now).toISOString(),
       expires_at: new Date(now + 10 * 60_000).toISOString(),
-      requesting_host: "build-box",
+      requesting_host: "agenthost",
       requesting_address: "192.0.2.50",
       requester: { tool: "claude-code", session_id: crypto.randomUUID(), cwd: "/home/alice/src/app", pid: 5151, user: "alice" },
       reason: "Cloudflare change for the current task.",
@@ -349,33 +349,33 @@ export class MockStore {
       id: "01JDEMO0CFGRANT0READ00008",
       kind: "cloudflare",
       status: "approved",
-      requesting_host: "build-box",
+      requesting_host: "agenthost",
       scope: "cf.read",
       mode: "proxy",
       not_before: iso(-5 * 60_000),
       not_after: iso(8 * 3600_000 - 5 * 60_000),
     });
-    this.audit("host:build-box", "cf_auto_approve", "request:01JDEMO0CFREQ0READ0000008", "cf.read (proxy) 8h");
-    this.spawnCloudflare(mockPendingCloudflare("cf.dns.edit", { zone: "example.com", name: "*.example.com" }), {
+    this.audit("host:agenthost", "cf_auto_approve", "request:01JDEMO0CFREQ0READ0000008", "cf.read (proxy) 8h");
+    this.spawnCloudflare(mockPendingCloudflare("cf.dns.edit", { zone: "example.net", name: "*.example.net" }), {
       id: "01JDEMO0CF0DNS0EDIT000009",
       created_at: iso(-90_000),
       expires_at: iso(8 * 60_000),
-      reason: "Add a CNAME for app.example.com pointing at the home tunnel.",
+      reason: "Add a CNAME for app.example.net pointing at the home tunnel.",
       similar_recent: 1,
     });
     this.spawnCloudflare(mockPendingCloudflare("cf.tunnel.config", { tunnel: "home" }), {
       id: "01JDEMO0CF0TUNNEL00000010",
       created_at: iso(-80_000),
       expires_at: iso(8 * 60_000),
-      reason: "Route app.example.com through Traefik on .50.",
+      reason: "Route app.example.net through Traefik on .50.",
     });
-    this.spawnCloudflare(mockPendingCloudflare("cf.workers.deploy", { script: "route-app-api", zone: "example.com" }, "token"), {
+    this.spawnCloudflare(mockPendingCloudflare("cf.workers.deploy", { script: "shopfront-api", zone: "example.net" }, "token"), {
       id: "01JDEMO0CF0WORKER0TOKEN11",
       requesting_host: "dev-1",
       requesting_address: "192.0.2.62",
       created_at: iso(-70_000),
       expires_at: iso(9 * 60_000),
-      reason: "wrangler deploy for the route-app API (wrangler's asset upload needs a real token).",
+      reason: "wrangler deploy for the shopfront API (wrangler's asset upload needs a real token).",
     });
     this.spawnCloudflare(mockPendingCloudflare("cf.admin"), {
       id: "01JDEMO0CF0ADMIN000000012",
@@ -386,18 +386,18 @@ export class MockStore {
     });
     this.standing.push({
       id: "01JDEMO0CFSTANDING0000013",
-      requesting_host: "build-box",
+      requesting_host: "agenthost",
       kind: "cloudflare",
       target_host: "",
       login_user: "",
       scope: "cf.dns.edit",
-      scope_params: "zone=example.com",
+      scope_params: "zone=example.net",
       mode: "proxy",
       max_ttl_seconds: 7200,
       expires_at: iso(2 * 3600_000),
       uses: 1,
     });
-    this.audit("host:build-box", "cf_write", "grant:01JDEMO0CFGRANT0DNS000014", "POST /zones/…/dns_records 200 before=s1 after=s2");
+    this.audit("host:agenthost", "cf_write", "grant:01JDEMO0CFGRANT0DNS000014", "POST /zones/…/dns_records 200 before=s1 after=s2");
     this.audit("host:dev-1", "cf_token_mint", "grant:01JDEMO0CFGRANT0PAGES0015", "token 9f1c… Pages Write (account)");
   }
 }
