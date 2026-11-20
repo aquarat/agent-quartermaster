@@ -13,7 +13,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { resolve, sep, extname } from "node:path";
-import type { AuditEntry, GrantSummary, PendingItem, StandingApproval } from "../src/types";
+import type { AuditEntry, GrantSummary, PendingCloudflare, PendingItem, StandingApproval } from "../src/types";
 
 const b64url = (b: Uint8Array | Buffer) => Buffer.from(b).toString("base64url");
 const fromB64url = (s: string) => {
@@ -44,6 +44,105 @@ export function canonicalJSON(v: unknown): string {
     .replace(/&/g, "\\u0026")
     .replace(/\u2028/g, "\\u2028")
     .replace(/\u2029/g, "\\u2029");
+}
+
+// ---- Cloudflare (API.md section 5): a few catalogue entries as aqmasd's cfscope has them ----
+
+interface MockCFScope {
+  title: string;
+  description: string;
+  risk: "low" | "medium" | "high" | "admin";
+  standing: boolean;
+  maxTTL: number;
+  /** Child-token template: permissions in plain words and notes (token mode). */
+  token?: (p: Record<string, string>) => { permissions: string[]; notes: string[] };
+}
+
+export const MOCK_CF_SCOPES: Record<string, MockCFScope> = {
+  "cf.read": {
+    title: "Read Cloudflare configuration",
+    description: "GET only, on an allow-list: tunnels and their config, Access apps/policies/groups, zones, DNS, rulesets, zone settings, Workers/Pages/R2/D1 metadata. Never secrets, tokens, logs with personal data or object data.",
+    risk: "low",
+    standing: true,
+    maxTTL: 28800,
+  },
+  "cf.dns.edit": {
+    title: "Edit DNS records",
+    description: "Create, change and delete DNS records in one zone (optionally only names matching a pattern). Apex, mail (MX/SPF/DKIM/DMARC), NS, ACME and protected names are refused.",
+    risk: "high",
+    standing: true,
+    maxTTL: 28800,
+    token: (p) => ({
+      permissions: [`DNS Write (zone ${p.zone})`, `Zone Read (zone ${p.zone})`],
+      notes: [
+        ...(p.name ? ["A child token cannot be limited to a name pattern: it can change every record in the zone."] : []),
+        "A child token bypasses aqmas's guard rails and snapshots.",
+      ],
+    }),
+  },
+  "cf.tunnel.config": {
+    title: "Change a tunnel's routes",
+    description: "Read and replace the whole ingress config of one tunnel (what the internet reaches). aqmas snapshots it first and refuses unsafe rules.",
+    risk: "high",
+    standing: true,
+    maxTTL: 28800,
+  },
+  "cf.workers.deploy": {
+    title: "Deploy one Worker",
+    description: "Upload and deploy one Worker script with its assets, secrets, cron triggers, routes and custom domains (in the given zone).",
+    risk: "medium",
+    standing: true,
+    maxTTL: 28800,
+    token: (p) => ({
+      permissions: [
+        "Workers Scripts Write (account)",
+        "Account Settings Read (account)",
+        ...(p.zone ? [`Workers Routes Write (zone ${p.zone})`, `Zone Read (zone ${p.zone})`] : []),
+      ],
+      notes: ["Cloudflare cannot limit a token to one script: this child token can deploy or delete ANY Worker on the account until it expires."],
+    }),
+  },
+  "cf.admin": {
+    title: "BREAK-GLASS: full Cloudflare access",
+    description: "Any Cloudflare API call except the deny-list (API tokens, members, tunnel run tokens, ...), on any zone or tunnel, for at most 1 hour. Guard rails still apply unless the call names an override.",
+    risk: "admin",
+    standing: false,
+    maxTTL: 3600,
+  },
+};
+
+/** The token IP condition the mock's "config" has (token_ip_condition). */
+export const MOCK_TOKEN_IP_CONDITION = ["203.0.113.7/32"];
+
+/** Go's cfscope.CanonicalParams: "k=v" pairs, keys sorted bytewise, joined by ";". */
+export function mockScopeParams(p: Record<string, string>): string {
+  return Object.keys(p)
+    .filter((k) => p[k] !== "")
+    .sort()
+    .map((k) => `${k}=${p[k]}`)
+    .join(";");
+}
+
+/** PendingItem.cloudflare as aqmasd builds it (API.md 5.7). */
+export function mockPendingCloudflare(scope: string, params: Record<string, string> = {}, mode: "proxy" | "token" = "proxy"): PendingCloudflare {
+  const sc = MOCK_CF_SCOPES[scope] ?? { title: scope, description: "", risk: "high" as const, standing: false, maxTTL: 3600 };
+  const t = mode === "token" ? sc.token?.(params) : undefined;
+  const out: PendingCloudflare = {
+    scope,
+    params,
+    scope_params: mockScopeParams(params),
+    mode,
+    ip_condition: mode === "token" ? [...MOCK_TOKEN_IP_CONDITION].sort().join(",") : "",
+    title: sc.title,
+    description: sc.description,
+    risk: sc.risk,
+    standing_allowed: sc.standing && mode === "proxy",
+  };
+  if (t) {
+    out.permissions = t.permissions;
+    out.notes = t.notes;
+  }
+  return out;
 }
 
 interface ChallengeRec {
@@ -133,6 +232,31 @@ export class MockStore {
     return item;
   }
 
+  /** A pending Cloudflare request (kind "cloudflare"). */
+  spawnCloudflare(cf: PendingCloudflare, over: Partial<PendingItem> = {}): PendingItem {
+    const now = Date.now();
+    const maxTTL = MOCK_CF_SCOPES[cf.scope]?.maxTTL ?? 3600;
+    const item: PendingItem = {
+      id: ulidish(),
+      kind: "cloudflare",
+      created_at: new Date(now).toISOString(),
+      expires_at: new Date(now + 10 * 60_000).toISOString(),
+      requesting_host: "build-box",
+      requesting_address: "192.0.2.50",
+      requester: { tool: "claude-code", session_id: crypto.randomUUID(), cwd: "/home/alice/src/app", pid: 5151, user: "alice" },
+      reason: "Cloudflare change for the current task.",
+      cloudflare: cf,
+      ttl_requested: Math.min(7200, maxTTL),
+      ttl_max: maxTTL,
+      risk: cf.risk === "high" || cf.risk === "admin" ? "high" : "normal",
+      similar_recent: 0,
+      ...over,
+    };
+    this.pending.unshift(item);
+    this.audit(`host:${item.requesting_host}`, "request", `request:${item.id}`, `cloudflare ${cf.scope} ${cf.scope_params}`.trim());
+    return item;
+  }
+
   seed() {
     const now = Date.now();
     const iso = (ms: number) => new Date(now + ms).toISOString();
@@ -214,6 +338,67 @@ export class MockStore {
     );
     this.audit("owner", "approve", "request:01JDEMO0OLD00000000000007", "ssh alice@db-1 for 30 min");
     this.audit("system", "issue", "grant:01JDEMO0GRANT00000000005", "certificate serial 5");
+    this.seedCloudflare();
+  }
+
+  seedCloudflare() {
+    const now = Date.now();
+    const iso = (ms: number) => new Date(now + ms).toISOString();
+    // cf.read in proxy mode was auto-approved (aqmasd omits the empty scope_params).
+    this.grants.push({
+      id: "01JDEMO0CFGRANT0READ00008",
+      kind: "cloudflare",
+      status: "approved",
+      requesting_host: "build-box",
+      scope: "cf.read",
+      mode: "proxy",
+      not_before: iso(-5 * 60_000),
+      not_after: iso(8 * 3600_000 - 5 * 60_000),
+    });
+    this.audit("host:build-box", "cf_auto_approve", "request:01JDEMO0CFREQ0READ0000008", "cf.read (proxy) 8h");
+    this.spawnCloudflare(mockPendingCloudflare("cf.dns.edit", { zone: "example.com", name: "*.example.com" }), {
+      id: "01JDEMO0CF0DNS0EDIT000009",
+      created_at: iso(-90_000),
+      expires_at: iso(8 * 60_000),
+      reason: "Add a CNAME for app.example.com pointing at the home tunnel.",
+      similar_recent: 1,
+    });
+    this.spawnCloudflare(mockPendingCloudflare("cf.tunnel.config", { tunnel: "home" }), {
+      id: "01JDEMO0CF0TUNNEL00000010",
+      created_at: iso(-80_000),
+      expires_at: iso(8 * 60_000),
+      reason: "Route app.example.com through Traefik on .50.",
+    });
+    this.spawnCloudflare(mockPendingCloudflare("cf.workers.deploy", { script: "route-app-api", zone: "example.com" }, "token"), {
+      id: "01JDEMO0CF0WORKER0TOKEN11",
+      requesting_host: "dev-1",
+      requesting_address: "192.0.2.62",
+      created_at: iso(-70_000),
+      expires_at: iso(9 * 60_000),
+      reason: "wrangler deploy for the route-app API (wrangler's asset upload needs a real token).",
+    });
+    this.spawnCloudflare(mockPendingCloudflare("cf.admin"), {
+      id: "01JDEMO0CF0ADMIN000000012",
+      created_at: iso(-30_000),
+      expires_at: iso(9 * 60_000),
+      ttl_requested: 3600,
+      reason: "Second tunnel cc33dd44 is down; need to look at its config.",
+    });
+    this.standing.push({
+      id: "01JDEMO0CFSTANDING0000013",
+      requesting_host: "build-box",
+      kind: "cloudflare",
+      target_host: "",
+      login_user: "",
+      scope: "cf.dns.edit",
+      scope_params: "zone=example.com",
+      mode: "proxy",
+      max_ttl_seconds: 7200,
+      expires_at: iso(2 * 3600_000),
+      uses: 1,
+    });
+    this.audit("host:build-box", "cf_write", "grant:01JDEMO0CFGRANT0DNS000014", "POST /zones/…/dns_records 200 before=s1 after=s2");
+    this.audit("host:dev-1", "cf_token_mint", "grant:01JDEMO0CFGRANT0PAGES0015", "token 9f1c… Pages Write (account)");
   }
 }
 
@@ -358,6 +543,22 @@ export function startMock(opts: MockOptions = {}) {
         if (ttl > p.ttl_max) throw new HttpError(400, "bad_request", `ttl_seconds above the maximum ${p.ttl_max}`);
         standing = standingIn;
       }
+      if (p.kind === "cloudflare") {
+        const cf = p.cloudflare!;
+        // API.md 5.4: standing_hours only where the scope allows it, proxy mode only.
+        if (standing > 0 && (!cf.standing_allowed || cf.mode !== "proxy")) throw new HttpError(400, "bad_request", "standing approvals are not allowed for this request");
+        return {
+          ...base,
+          requesting_host: p.requesting_host,
+          kind: "cloudflare",
+          scope: cf.scope,
+          scope_params: cf.scope_params,
+          mode: cf.mode,
+          ip_condition: cf.ip_condition,
+          ttl_seconds: ttl,
+          standing_hours: standing,
+        };
+      }
       return {
         ...base,
         requesting_host: p.requesting_host,
@@ -373,10 +574,16 @@ export function startMock(opts: MockOptions = {}) {
     if (object === "standing") {
       const s = store.standing.find((x) => x.id === id);
       if (!s) throw new HttpError(404, "not_found", `no standing approval ${id}`);
+      if (s.kind === "cloudflare") {
+        return { ...base, requesting_host: s.requesting_host, kind: "cloudflare", scope: s.scope, scope_params: s.scope_params ?? "", mode: s.mode, ttl_seconds: s.max_ttl_seconds, standing_hours: 0 };
+      }
       return { ...base, requesting_host: s.requesting_host, kind: s.kind, target: s.target_host, login_user: s.login_user, ttl_seconds: 0, standing_hours: 0 };
     }
     const g = store.grants.find((x) => x.id === id);
     if (!g) throw new HttpError(404, "not_found", `no active grant ${id}`);
+    if (g.kind === "cloudflare") {
+      return { ...base, requesting_host: g.requesting_host, kind: "cloudflare", scope: g.scope, scope_params: g.scope_params ?? "", mode: g.mode, ttl_seconds: 0, standing_hours: 0 };
+    }
     return { ...base, requesting_host: g.requesting_host, kind: g.kind, target: g.target_host, login_user: g.login_user, ttl_seconds: 0, standing_hours: 0 };
   }
 
@@ -388,10 +595,13 @@ export function startMock(opts: MockOptions = {}) {
       const p = store.pending.find((x) => x.id === id);
       if (!p) throw new HttpError(409, "conflict", "already decided or expired");
       store.pending = store.pending.filter((x) => x.id !== id);
-      store.audit("owner", c.action as string, `${c.object}:${id}`, c.object === "request" ? `ssh ${c.login_user}@${c.target}` : (c.requesting_host as string));
+      const detail =
+        c.object !== "request" ? (c.requesting_host as string) : c.kind === "cloudflare" ? `cloudflare ${c.scope} ${c.scope_params} (${c.mode})` : `ssh ${c.login_user}@${c.target}`;
+      store.audit("owner", c.action as string, `${c.object}:${id}`, detail);
       if (c.object === "enrollment") return { id, status: c.action === "approve" ? "approved" : "denied" };
       if (c.action === "deny") return { id, kind: p.kind, status: "denied", decided_at: new Date(now).toISOString() };
       const ttl = c.ttl_seconds as number;
+      const cf = p.kind === "cloudflare" ? p.cloudflare! : undefined;
       const grant: GrantSummary = {
         id: ulidish(),
         kind: p.kind,
@@ -402,8 +612,27 @@ export function startMock(opts: MockOptions = {}) {
         not_before: new Date(now - 60_000).toISOString(),
         not_after: new Date(now + ttl * 1000).toISOString(),
       };
+      if (cf) {
+        grant.scope = cf.scope;
+        if (cf.scope_params) grant.scope_params = cf.scope_params;
+        grant.mode = cf.mode;
+      }
       store.grants.unshift(grant);
-      if ((c.standing_hours as number) > 0) {
+      if (cf && (c.standing_hours as number) > 0) {
+        store.standing.unshift({
+          id: ulidish(),
+          requesting_host: p.requesting_host,
+          kind: "cloudflare",
+          target_host: "",
+          login_user: "",
+          scope: cf.scope,
+          scope_params: cf.scope_params || undefined,
+          mode: cf.mode,
+          max_ttl_seconds: ttl,
+          expires_at: new Date(now + (c.standing_hours as number) * 3600_000).toISOString(),
+          uses: 0,
+        });
+      } else if ((c.standing_hours as number) > 0) {
         store.standing.unshift({
           id: ulidish(),
           requesting_host: p.requesting_host,
@@ -431,7 +660,10 @@ export function startMock(opts: MockOptions = {}) {
     if (c.object === "grant") {
       const g = store.grants.find((x) => x.id === id);
       if (g) g.status = "revoked";
-      store.audit("owner", "revoke", `grant:${id}`, "certificate stays valid until it expires (no KRL in M1)");
+      if (g?.kind === "cloudflare") {
+        store.audit("owner", "revoke", `grant:${id}`, `cloudflare ${g.scope} ${g.scope_params ?? ""} (${g.mode})`);
+        if (g.mode === "token") store.audit("system", "cf_token_delete", `grant:${id}`);
+      } else store.audit("owner", "revoke", `grant:${id}`, "certificate stays valid until it expires (no KRL in M1)");
       return { ok: true };
     }
     throw new HttpError(400, "bad_request", "unknown object");

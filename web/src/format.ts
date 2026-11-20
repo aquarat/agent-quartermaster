@@ -44,7 +44,22 @@ export function ago(at: string | number | Date, now = Date.now()): string {
 export function kindLabel(kind: string): string {
   if (kind === "ssh") return "SSH";
   if (kind === "enrollment") return "New host";
+  if (kind === "cloudflare") return "Cloudflare";
   return kind;
+}
+
+const AUDIT_LABELS: Record<string, string> = {
+  cf_auto_approve: "auto-approved Cloudflare",
+  cf_write: "Cloudflare write",
+  cf_refused: "Cloudflare call refused",
+  cf_token_mint: "Cloudflare token minted",
+  cf_token_delete: "Cloudflare token deleted",
+  cf_token_orphan: "stray Cloudflare token deleted",
+};
+
+/** Plain words for an audit action (unknown ones are shown as they are). */
+export function auditLabel(action: string): string {
+  return AUDIT_LABELS[action] ?? action;
 }
 
 export const TTL_PRESETS = [900, 1800, 3600, 14400, 28800];
