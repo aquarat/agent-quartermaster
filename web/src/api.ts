@@ -25,6 +25,7 @@ export class ApiError extends Error {
 
 /** Objects with a challenge endpoint, and the verb that applies the signed action. */
 export const OBJECT_PATHS = {
+  migration:{path:'migrations',apply:'activate'},
   host: {path:'hosts', apply:'revoke'},
   update: {path:'updates', apply:'decide'},
   request: { path: "requests", apply: "decide" },
@@ -41,6 +42,7 @@ export interface ApiOptions {
 }
 
 export interface Api {
+  migration?():Promise<{id:string;plan:string;recovery_sha256:string}|null>;
   hosts(): Promise<HostInfo[]>;
   updates(): Promise<import('./admin').UpdateView>;
   help(): Promise<HelpConfig>;
@@ -108,6 +110,7 @@ export function createApi(opts: ApiOptions = {}): Api {
   return {
     hosts: () => call('GET','/api/ui/hosts'),
     updates: () => call('GET','/api/ui/updates'),
+    migration: () => call('GET','/api/ui/migration'),
     help: () => call('GET','/api/ui/help'),
     state: () => call<UIState>("GET", "/api/ui/state"),
     request: (id) => call<PendingItem>("GET", `/api/ui/requests/${seg(id)}`),

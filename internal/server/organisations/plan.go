@@ -85,11 +85,12 @@ type Plan struct {
 	TTL            config.TTL `json:"legacy_ttl_policy"`
 	Services       []Service  `json:"services"`
 	// Cloudflare config contains credential references, never their contents.
-	Cloudflare *config.Cloudflare `json:"cloudflare_public_config,omitempty"`
-	Scopes     []api.CFScopeInfo  `json:"effective_cf_scopes,omitempty"`
-	ConfigHash string             `json:"public_config_sha256"`
-	Admissions []Admission        `json:"admit_to_personal_only"`
-	Retire     Retirement         `json:"retire"`
+	Cloudflare  *config.Cloudflare `json:"cloudflare_public_config,omitempty"`
+	Scopes      []api.CFScopeInfo  `json:"effective_cf_scopes,omitempty"`
+	BlockedMint []string           `json:"disabled_token_templates,omitempty"`
+	ConfigHash  string             `json:"public_config_sha256"`
+	Admissions  []Admission        `json:"admit_to_personal_only"`
+	Retire      Retirement         `json:"retire"`
 }
 
 // Namespaced by installation handle. Stable even when a repeat dry run is
@@ -130,9 +131,15 @@ func configPlan(cfg *config.Config, handle []byte, sshPin, clientPin string) (*P
 				continue
 			}
 			if slices.Contains(sc.Modes, api.CFModeToken) {
-				dns.Sets = append(dns.Sets, Set{object(handle, "personal/dns-cdn/mint", "mint"), "cloudflare-mint", nil})
-				break
+				// None of the current provider templates enforces the entire
+				// signed resource + route/guard restrictions. Keep the handle,
+				// not permission to issue an overbroad bearer credential.
+				p.BlockedMint = append(p.BlockedMint, sc.Name)
+				p.Scopes[i].Modes = []string{api.CFModeProxy}
 			}
+		}
+		if len(p.BlockedMint) != 0 {
+			dns.Sets = append(dns.Sets, Set{object(handle, "personal/dns-cdn/mint", "mint"), "cloudflare-mint", nil})
 		}
 		p.Services = append(p.Services, dns)
 	}
@@ -154,6 +161,14 @@ func configPlan(cfg *config.Config, handle []byte, sshPin, clientPin string) (*P
 }
 
 var ErrTooLarge = errors.New("organisation migration plan too large for a single review")
+
+func ConfigFingerprint(cfg *config.Config, handle []byte, sshPin, clientPin string) (string, error) {
+	p, err := configPlan(cfg, handle, sshPin, clientPin)
+	if err != nil {
+		return "", err
+	}
+	return p.ConfigHash, nil
+}
 
 // scan limits each inventory independently and never accepts a truncated plan.
 func scan(ctx context.Context, tx *sql.Tx, query string, visit func(*sql.Rows) error, args ...any) error {

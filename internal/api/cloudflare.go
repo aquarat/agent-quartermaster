@@ -203,6 +203,8 @@ type CFParamInfo struct {
 // CFSnapshot describes one stored snapshot of a Cloudflare object, taken by aqmasd before
 // (and after) a write through the proxy.
 type CFSnapshot struct {
+	ServiceID  string    `json:"service_id,omitempty"`
+	HostID     int64     `json:"host_id,omitempty"`
 	ID         string    `json:"id"`
 	CreatedAt  time.Time `json:"created_at"`
 	Phase      string    `json:"phase"`       // "before" | "after"

@@ -67,6 +67,7 @@ type GrantSource interface {
 
 // Options configures a Proxy.
 type Options struct {
+	ServiceID  string // empty on pre-cutover snapshots
 	Config     *config.Cloudflare
 	Catalogue  *cfscope.Catalogue
 	Grants     GrantSource

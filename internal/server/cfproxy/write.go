@@ -309,7 +309,7 @@ func (p *Proxy) serveWrite(w http.ResponseWriter, r *http.Request, c Caller, cal
 	// Store the before-snapshot.
 	var beforeID, afterID string
 	snapMeta := func(phase, key string) api.CFSnapshot {
-		return api.CFSnapshot{CreatedAt: p.now().UTC(), Phase: phase, ObjectType: spec.typ, ObjectKey: key, Method: call.Method, Path: call.Path, GrantID: gid, Host: c.HostName}
+		return api.CFSnapshot{ServiceID: p.o.ServiceID, HostID: c.HostID, CreatedAt: p.now().UTC(), Phase: phase, ObjectType: spec.typ, ObjectKey: key, Method: call.Method, Path: call.Path, GrantID: gid, Host: c.HostName}
 	}
 	beforeMeta := api.CFSnapshot{}
 	if spec != nil {

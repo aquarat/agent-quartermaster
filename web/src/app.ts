@@ -55,6 +55,7 @@ import { helpPage, type HelpConfig } from './help';
 
 function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/help' ? 'help' : 'queue'; }
 function nav(label:string,hash:string,title:string) { const a=h('a',{title,'aria-label':title},label); a.href=hash; return a; }
+function scopeHeading(f?:Record<string,string|number>){return f?h('h3',null,...['org_title','service_title','set_title'].map((k,i)=>h('span',null,i?' › ':'',h('bdi',null,vt(String(f[k]??'?')))))):null;}
 import { browserAuthenticator, type Authenticator } from "./webauthn";
 
 const POLL_MS = 5000;
@@ -82,6 +83,7 @@ export class App {
   private page = route();
   private hosts: HostInfo[]=[];
   private updates?: UpdateView;
+  private migration?:{id:string;plan:string;recovery_sha256:string}|null;
   private help?: HelpConfig;
   private rendered = new Map<string, string>();
   private login: PreparedLogin | null = null;
@@ -137,6 +139,7 @@ export class App {
     const requested=route();
     try {
       const s = await this.api.state();
+      this.migration=s.migration;
       if(requested==='admin') [this.hosts,this.updates]=await Promise.all([this.api.hosts(),this.api.updates()]);
       if(requested==='help') this.help=await this.api.help();
       if(requested!==route()) return;
@@ -401,7 +404,7 @@ export class App {
     if (!s || this.view !== "main") return;
     if(this.page!=='queue'){
       document.title=`${this.page==='admin'?'Admin':'Help'} · aqmas`;
-      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);if(this.updates)this.section('updates',this.updates,()=>[updateCard(this.updates!,t=>this.sheet.openUpdate(t))]);}
+      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);if(this.updates)this.section('updates',[this.updates,this.migration],()=>this.migration?[h('h3',null,'personal · Organisation cutover'),h('p',null,'Fleet access is paused. Compare the recovery digest and review each admission, credential set and authority retirement before signing.'),h('button',{type:'button',class:'btn approve',on:{click:()=>this.sheet.openMigration({object:'migration',id:this.migration!.id,facts:{plan:this.migration!.plan,recovery_sha256:this.migration!.recovery_sha256}})}},'Review personal activation…')]:[updateCard(this.updates!,t=>this.sheet.openUpdate(t))]);}
       else if(this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
       this.updateStatus();return;
     }
@@ -718,6 +721,7 @@ export class App {
     return h(
       "article",
       { class: `card request${high ? " high" : ""}`, "data-id": p.id, "aria-label": `${kindLabel(p.kind)} request from ${vt(p.requesting_host)}` },
+      scopeHeading(p.scoped_facts),
       h(
         "div",
         { class: "card-top" },
@@ -764,6 +768,7 @@ export class App {
         "data-id": p.id,
         "aria-label": `${admin ? "Break-glass " : ""}Cloudflare request from ${vt(p.requesting_host)}`,
       },
+      scopeHeading(p.scoped_facts),
       h(
         "div",
         { class: "card-top" },
@@ -1292,6 +1297,7 @@ class Sheet {
   openUpdate(target: ActionTarget): void {
     void this.prepare(this.begin(target),target,{action:'approve'});
   }
+  openMigration(target:ActionTarget):void{void this.prepare(this.begin(target),target,{action:'activate'});}
 
   openAddPasskey(): void {
     const target: ActionTarget = { ...PASSKEY_TARGET };
@@ -1405,6 +1411,7 @@ class Sheet {
       d.details?.length ? h("ul", { class: "cf-details" }, d.details.map((line) => h("li", null, renderParts(line)))) : null,
       d.standingParts ? h("p", { class: "warn" }, renderParts(d.standingParts)) : null,
       d.warnings.map((w, i) => h("p", { class: loud && i === 0 ? "breakglass" : "warn" }, vt(w))),
+      p.canonical.object==='migration' ? h('dl',{class:'facts'},d.fields.map(([k,v])=>fact(vt(k),h('bdi',null,vt(v))))) : null,
       removingCurrent ? h("p", { class: "warn" }, "This is the passkey you signed in with: you will be signed out here.") : null,
       h(
         "details",

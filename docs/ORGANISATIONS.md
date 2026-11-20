@@ -114,7 +114,34 @@ auto-approved. Check outstanding certificate expiries and resolve child-token pr
 the original issuer's records. An old grant ID, target name or scope alone proves no current
 service binding. Plans larger than 128 KiB (compact JSON) or 512 rows in any inventory are refused.
 The preview changes neither the backup nor the running catalogue. Re-run it after configuration,
-enrollment or grant changes. There is no live activation command in the preview.
+enrollment or grant changes.
+
+**Supervised activation:** Disable the automatic updater and prevent service-manager restarts for
+the maintenance window. Stop the broker, drain traffic, and wait for the old process (including
+mints, proxy calls and sweepers) to exit. Keep the old binary, signed-in owner's passkeys, config,
+both CAs, credential files and retained snapshot directories with the installation's recovery
+materials. Reconcile any live child IDs with the original issuer; an orphan name is not proof.
+Run `aqmasd -config CONFIG organisations-cutover` as the broker user with its normal RP origin
+and listeners. This mode holds the data-directory lock and both ports, fences the agent API,
+runs no sweeper or update poller, and saves a private consistent `pre-organisations-*/aqmas.db`.
+Copy that recovery point to independently encrypted backup storage and compare its SHA-256 to
+the logged digest. Do not change config, keys or host records during review.
+
+Sign in at the normal approval origin, open **Admin**, review the full personal plan and recovery
+digest, then activate with a passkey. A changed host inventory, elapsed validity boundary, or
+changed recovery file invalidates the review: restart maintenance and review the new point.
+The backfill, retirement, activation marker, audit and version 6 commit together. Stop maintenance
+and restart `serve`; check the personal catalogue with an admitted host before re-enabling updates.
+Before activation an aborted run leaves schema 5 usable. After activation fix forward unless it
+is proven safe to restore the matching recovery point (never lower `user_version` by hand).
+
+Old CF snapshots stay owner-only. New snapshots have a dedicated service directory and are
+identified by the writer's enrollment row. **All current M2 child-token templates are disabled
+at cutover:** none enforces the complete resource and write restrictions independently of the
+proxy. Zone DNS tokens, for example, cannot enforce the DNS guard rails; account Worker tokens
+cannot enforce a script name. The plan lists the affected templates. Use proxy mode instead.
+No minter is opened and no legacy child is deleted by an unverified parent. Issued children
+can continue to work until provider expiry; verify/revoke them with the original issuing parent.
 
 ### Delivery sequence
 

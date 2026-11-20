@@ -295,4 +295,11 @@ if(p.source_schema!==5 || p.organisation.slug!=="personal" || a.length!==1 || a[
 "$AQMAS" list --json >/dev/null || fail "inventory interrupted legacy service"
 ok "personal dry run identified live enrollment, target and outstanding SSH certificate"
 
+source "$ROOT/test/interop/cutover.sh"
+personal_cutover "${PIDS[0]}"
+"$AQMAS" ssh testhost --fresh --why "post-cutover" -- echo ok </dev/null >"$T/scoped.out" 2>"$T/scoped.err" &
+RPID=$!; RID=$(owner wait ssh interop-host 20); owner approve "$RID" 300 >/dev/null 2>"$T/scoped-owner.err"
+wait "$RPID"; grep -qx ok "$T/scoped.out" && grep -q '"org_slug":"personal"' "$T/scoped-owner.err" || fail 'scoped SSH approval'
+ok 'signed activation and personal SSH approval from the legacy CLI'
+
 echo "interop: ALL OK"

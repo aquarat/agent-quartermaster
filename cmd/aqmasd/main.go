@@ -32,6 +32,7 @@ const usage = `usage: aqmasd [-config PATH] <command>
 commands:
   serve                 run the agent API and the approval web UI
   organisations-plan BACKUP   preview the personal cutover from a standalone SQLite online backup
+  organisations-cutover       fence fleet access, create a recovery point and serve owner review
   passkey-enroll-code   print a one-time code (15 min, single use) to register the first passkey
   print-ssh-ca          print the SSH user CA public key (for TrustedUserCAKeys)
   print-client-ca       print the internal CA certificate (PEM; signs the agent-API server cert too)
@@ -94,9 +95,9 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(plan)
-	case "serve":
+	case "serve", "organisations-cutover":
 		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-		srv, err := server.New(server.Options{Config: cfg, Logger: log})
+		srv, err := server.New(server.Options{Config: cfg, Logger: log, Maintenance: cmd == "organisations-cutover"})
 		if err != nil {
 			return err
 		}

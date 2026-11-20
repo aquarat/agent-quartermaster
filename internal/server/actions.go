@@ -72,6 +72,9 @@ func (s *Server) issueGrant(ctx context.Context, q *store.Q, req *store.Request,
 // stored state and the approver's ttl/standing choice.
 func (s *Server) buildAction(ctx context.Context, object, id string, in api.ChallengeRequest) (canon.Action, error) {
 	q := s.store.Q()
+	if object == canon.Migration {
+		return s.migrationAction(id, in)
+	}
 	now := s.now()
 	if _, err := q.ExpireStale(ctx, now); err != nil {
 		return canon.Action{}, err
@@ -99,7 +102,11 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 			return a, errConflict("the requesting host's identity was revoked")
 		}
 		if r.Kind == api.KindCloudflare {
-			return s.buildCFRequestAction(a, r, in, s.cfg.TTL.ForHost(h.Class).MaxStandingHours)
+			a, err = s.buildCFRequestAction(a, r, in, s.cfg.TTL.ForHost(h.Class).MaxStandingHours)
+			if err != nil {
+				return a, err
+			}
+			return s.bindAction(ctx, q, a)
 		}
 		a.TargetAddress, a.TargetPort = r.TargetAddress, r.TargetPort
 		a.Address, a.Principal = r.PeerAddress, r.Principal
@@ -237,7 +244,7 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 	default:
 		return a, errBad("unknown object")
 	}
-	return a, nil
+	return s.bindAction(ctx, q, a)
 }
 
 // buildCFRequestAction is buildAction for a pending Cloudflare request (docs/API.md 5.4).
@@ -328,6 +335,21 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 	now := s.now()
 	a := sg.Action
 	return s.store.Tx(ctx, func(q *store.Q) error {
+		if q.Scoped() {
+			bound, err := s.bindAction(ctx, q, a)
+			if err != nil {
+				return err
+			}
+			if bound != a || a.OrgID != "" && sg.V != 2 {
+				return errConflict("authority changed since challenge")
+			}
+			if a.OrgID != "" {
+				sess, _ := ctx.Value(sessionBindingKey{}).(string)
+				if err := q.IsOrgOwner(ctx, a.OrgID, sess, passkeyID, now); err != nil {
+					return errConflict("owner membership changed")
+				}
+			}
+		}
 		// Which passkey signed (resolved before a remove deletes it) and the nonce prefix.
 		detail := fmt.Sprintf("signed by %s nonce=%s", s.passkeyRef(ctx, q, passkeyID), sg.Nonce[:8])
 		if _, err := q.ExpireStale(ctx, now); err != nil {

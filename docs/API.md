@@ -271,6 +271,35 @@ flagged).
 
 ## 3. CLI (`aqmas`)
 
+### Organisation cutover and canonical v2
+
+`GET /api/ui/migration` (owner session) returns `null` in ordinary operation and
+`{id,plan,recovery_sha256}` in supervised maintenance. `POST /api/ui/migrations/{id}/challenge`
+takes `{"action":"activate"}`. `.../activate` takes only the usual challenge ID and assertion.
+The v2 `migration:activate` canonical adds exactly `plan` and `recovery_sha256` to the common
+keys; `id` is the allocated personal org ID. `plan` is compact Go JSON in the fixed declaration
+order of `organisations.Plan` (with the typed nested records in `web/src/migration.ts`, nil
+lists/map encoded as null unless omitted by `omitempty`). The UI parses, checks key sets, order
+and scalar types, reserializes and renders the signed records. The SHA-256 is over the actual
+closed recovery DB bytes. No authority or plan is accepted from the decision body.
+
+After activation, legacy request approvals/denials and standing/grant revocations use **v2**
+even for a v1 CLI. They retain the kind's v1 key set, plus `org_id,org_slug,org_title,service_id,
+service_slug,service_title,set_id,set_slug,set_title,set_revision,service_revision,policy_revision,
+admission_generation,host_id,class,address,profile_revision,max_standing_hours`. `host_id` is
+the immutable enrollment ID; `profile_revision` the SHA-256 of the reviewed public catalogue.
+SSH also always signs `ssh_ca,host_key,cert_profile,principal,target_address,target_port,key_fingerprint`
+(no pin: `host_key="unpinned"`). CF also signs `account_id,resource_ids,ip_condition` (`resource_ids`
+uses sorted `db|tunnel|zone=id` pairs joined by `;`, empty for no named resources; mode proxy only).
+Duplicate keys where sets overlap appear exactly once. All v2 nonces are 32 bytes encoded as
+unpadded base64url. Source and destination are separate; a scoped page must refuse v1 and a v1
+page refuses the extra fields. Enrollment, login, passkeys, release distribution and updates stay global.
+
+Positive interop vectors: the signed `migration:activate` followed by `request:approve` for
+`personal/fleet/testhost` in `test/interop/run.sh`; the CF cutover in `run-cf.sh`. Negative
+cases include rewriting `v` alone, stripping any signed binding, adding an unknown plan field,
+or changing an enrollment generation between review and apply. None is a v2 approval.
+
 - Config `~/.config/aqmas/config.toml` (`server`, `server_ca` + `server_ca_sha256` pin,
   `host_name`, `client_cert`, `client_key`, `client_ca`, `default_ttl`); key and certificate
   in the same directory (0600, directory 0700). Overrides: `AQMAS_CONFIG_DIR`,

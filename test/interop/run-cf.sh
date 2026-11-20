@@ -393,4 +393,11 @@ if grep -rlF -e "$PROXY_TOK" -e "$MINTER_TOK" "$T" --exclude-dir=tok --exclude-d
 fi
 ok "no fake parent token value in logs, outputs, snapshots, the database or the client cache"
 
+source "$ROOT/test/interop/cutover.sh"
+personal_cutover "${PIDS[1]}"
+"$AQMAS" cf scopes --json | bun -e 'if ((await Bun.stdin.json()).scopes.some(s=>s.modes.includes("token"))) process.exit(1)' || fail 'unrestricted child template after activation'
+cfapi GET /zones --why 'post-cutover read' >/dev/null || fail 'post-cutover personal proxy'
+"$AQMAS" cf snapshot list --json | bun -e 'if ((await Bun.stdin.json()).snapshots.length) process.exit(1)' || fail 'legacy snapshots visible'
+ok 'signed activation, scoped proxy, archived legacy snapshots and provider template gate'
+
 echo "interop-cf: ALL OK"

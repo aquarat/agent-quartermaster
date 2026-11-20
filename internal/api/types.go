@@ -144,13 +144,14 @@ type RequestStatus struct {
 }
 
 type GrantSummary struct {
-	ID         string    `json:"id"`
-	Kind       string    `json:"kind"`
-	Status     string    `json:"status"`
-	TargetHost string    `json:"target_host,omitempty"`
-	LoginUser  string    `json:"login_user,omitempty"`
-	NotBefore  time.Time `json:"not_before"`
-	NotAfter   time.Time `json:"not_after"`
+	ScopedFacts map[string]any `json:"scoped_facts,omitempty"`
+	ID          string         `json:"id"`
+	Kind        string         `json:"kind"`
+	Status      string         `json:"status"`
+	TargetHost  string         `json:"target_host,omitempty"`
+	LoginUser   string         `json:"login_user,omitempty"`
+	NotBefore   time.Time      `json:"not_before"`
+	NotAfter    time.Time      `json:"not_after"`
 	// RequestingHost is set in the web UI's state (who holds the access); the agent API's
 	// GET /v1/grants omits it (always the calling host).
 	RequestingHost string `json:"requesting_host,omitempty"`
@@ -197,6 +198,7 @@ type PendingEnrollment struct {
 // web UI. For enrollments requesting_host is the proposed name, reason the enroll note, and
 // ttl_requested/ttl_max are 0.
 type PendingItem struct {
+	ScopedFacts       map[string]any     `json:"scoped_facts,omitempty"`
 	MaxStandingHours  int                `json:"max_standing_hours"`
 	ID                string             `json:"id"`
 	Kind              string             `json:"kind"` // ssh, enrollment, cloudflare
@@ -219,14 +221,15 @@ type PendingItem struct {
 }
 
 type StandingApproval struct {
-	ID             string    `json:"id"`
-	RequestingHost string    `json:"requesting_host"`
-	Kind           string    `json:"kind"`
-	TargetHost     string    `json:"target_host"`
-	LoginUser      string    `json:"login_user"`
-	MaxTTLSeconds  int       `json:"max_ttl_seconds"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	Uses           int       `json:"uses"`
+	ScopedFacts    map[string]any `json:"scoped_facts,omitempty"`
+	ID             string         `json:"id"`
+	RequestingHost string         `json:"requesting_host"`
+	Kind           string         `json:"kind"`
+	TargetHost     string         `json:"target_host"`
+	LoginUser      string         `json:"login_user"`
+	MaxTTLSeconds  int            `json:"max_ttl_seconds"`
+	ExpiresAt      time.Time      `json:"expires_at"`
+	Uses           int            `json:"uses"`
 	// Kind "cloudflare" (milestone 2); TargetHost and LoginUser are empty then.
 	Scope       string `json:"scope,omitempty"`
 	ScopeParams string `json:"scope_params,omitempty"`

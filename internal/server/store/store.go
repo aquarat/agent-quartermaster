@@ -25,7 +25,8 @@ var ErrConflict = errors.New("conflict")
 
 // Store wraps the database.
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	scoped bool
 }
 
 // querier is satisfied by *sql.DB and *sql.Tx.
@@ -36,7 +37,10 @@ type querier interface {
 }
 
 // Q runs queries against either the database or a transaction.
-type Q struct{ q querier }
+type Q struct {
+	q      querier
+	scoped bool
+}
 
 // Open opens (creating if needed) the database at path and applies migrations.
 func Open(path string) (*Store, error) {
@@ -79,6 +83,16 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if ver > len(migrations) {
+		// Version 6 is applied exclusively by the supervised signed cutover.
+		// Opening a schema-5 store must never select it (self-update rollback).
+		if ver == 6 && len(migrations) == 5 {
+			var marker int
+			if err := s.db.QueryRowContext(ctx, `SELECT singleton FROM personal_cutover WHERE singleton=1`).Scan(&marker); err != nil {
+				return fmt.Errorf("store: incomplete personal cutover: %w", err)
+			}
+			s.scoped = true
+			return nil
+		}
 		return fmt.Errorf("store: database schema version %d is newer than this binary (%d)", ver, len(migrations))
 	}
 	for i := ver; i < len(migrations); i++ {
@@ -172,7 +186,7 @@ func fixPasskeyNames(ctx context.Context, tx *sql.Tx) error {
 }
 
 // Q returns a querier on the database (do not use inside Tx callbacks).
-func (s *Store) Q() *Q { return &Q{s.db} }
+func (s *Store) Q() *Q { return &Q{s.db, s.scoped} }
 
 // Tx runs fn in an IMMEDIATE transaction. Inside fn, use only the given *Q.
 func (s *Store) Tx(ctx context.Context, fn func(q *Q) error) error {
@@ -180,7 +194,7 @@ func (s *Store) Tx(ctx context.Context, fn func(q *Q) error) error {
 	if err != nil {
 		return err
 	}
-	if err := fn(&Q{tx}); err != nil {
+	if err := fn(&Q{tx, s.scoped}); err != nil {
 		tx.Rollback()
 		return err
 	}
@@ -719,6 +733,7 @@ func (q *Q) HostGrants(ctx context.Context, hostID int64, activeOnly bool, now t
 		query += " AND revoked_at IS NULL AND not_after > ?"
 		args = append(args, ms(now))
 	}
+	query, args = q.personalOnly(query, args, "request_id", hostID, now)
 	query += " ORDER BY serial DESC LIMIT 200"
 	rows, err := q.q.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -789,9 +804,12 @@ func (q *Q) ActiveProxyGrants(ctx context.Context, hostID int64, ids []string, n
 			continue
 		}
 		seen[id] = true
-		g, err := scanGrant(q.q.QueryRowContext(ctx, "SELECT "+grantCols+" FROM grants WHERE id = ? AND host_id = ? AND mode = 'proxy' AND "+activeCF,
-			id, hostID, ms(now), ms(now)))
+		query, args := q.personalOnly("SELECT "+grantCols+" FROM grants WHERE id = ? AND host_id = ? AND mode = 'proxy' AND "+activeCF, []any{id, hostID, ms(now), ms(now)}, "request_id", hostID, now)
+		g, err := scanGrant(q.q.QueryRowContext(ctx, query, args...))
 		if errors.Is(err, ErrNotFound) {
+			if q.scoped {
+				return nil, nil
+			} // mixed or unknown ID: reject the entire set alike
 			continue
 		}
 		if err != nil {
@@ -807,14 +825,23 @@ func (q *Q) ActiveProxyGrants(ctx context.Context, hostID int64, ids []string, n
 // params and mode (caps auto-approved grants: an agent should reuse one, not mint many).
 func (q *Q) CountActiveCFGrantsLike(ctx context.Context, hostID int64, scope, scopeParams, mode string, now time.Time) (int, error) {
 	var n int
-	err := q.q.QueryRowContext(ctx, "SELECT count(*) FROM grants WHERE host_id = ? AND scope = ? AND scope_params = ? AND mode = ? AND "+activeCF,
-		hostID, scope, scopeParams, mode, ms(now), ms(now)).Scan(&n)
+	query, args := q.personalOnly("SELECT count(*) FROM grants WHERE host_id = ? AND scope = ? AND scope_params = ? AND mode = ? AND "+activeCF, []any{hostID, scope, scopeParams, mode, ms(now), ms(now)}, "request_id", hostID, now)
+	err := q.q.QueryRowContext(ctx, query, args...).Scan(&n)
 	return n, err
 }
 
 // ActiveCFScopes lists the distinct scopes of hostID's active Cloudflare grants (either mode).
 func (q *Q) ActiveCFScopes(ctx context.Context, hostID int64, now time.Time) ([]string, error) {
-	rows, err := q.q.QueryContext(ctx, "SELECT DISTINCT scope FROM grants WHERE host_id = ? AND "+activeCF, hostID, ms(now), ms(now))
+	return q.CFScopesAt(ctx, hostID, now, "")
+}
+
+func (q *Q) CFScopesAt(ctx context.Context, hostID int64, now time.Time, peer string) ([]string, error) {
+	query, args := q.personalOnly("SELECT DISTINCT scope FROM grants WHERE host_id = ? AND "+activeCF, []any{hostID, ms(now), ms(now)}, "request_id", hostID, now)
+	if q.scoped {
+		query += " AND peer_address=?"
+		args = append(args, peer)
+	}
+	rows, err := q.q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -832,7 +859,8 @@ func (q *Q) ActiveCFScopes(ctx context.Context, hostID int64, now time.Time) ([]
 
 func (q *Q) HasActiveCFGrant(ctx context.Context, hostID int64, now time.Time) (bool, error) {
 	var n int
-	err := q.q.QueryRowContext(ctx, "SELECT count(*) FROM grants WHERE host_id = ? AND "+activeCF, hostID, ms(now), ms(now)).Scan(&n)
+	query, args := q.personalOnly("SELECT count(*) FROM grants WHERE host_id = ? AND "+activeCF, []any{hostID, ms(now), ms(now)}, "request_id", hostID, now)
+	err := q.q.QueryRowContext(ctx, query, args...).Scan(&n)
 	return n > 0, err
 }
 
@@ -930,6 +958,7 @@ func (q *Q) ActiveStanding(ctx context.Context, hostID int64, now time.Time) ([]
 	if hostID != 0 {
 		query += " AND host_id = ?"
 		args = append(args, hostID)
+		query, args = q.personalOnly(query, args, "source_request_id", hostID, now)
 	}
 	rows, err := q.q.QueryContext(ctx, query+" ORDER BY created_at", args...)
 	if err != nil {

@@ -130,6 +130,7 @@ export function targetForPending(item: PendingItem): ActionTarget {
       facts: {
         requesting_host: item.requesting_host,
         kind: "cloudflare",
+        scoped_facts:item.scoped_facts,
         ...cfFacts(cf?.scope, cf?.scope_params, cf?.mode),
         ip_condition: cf?.ip_condition ?? "",
       },
@@ -141,6 +142,7 @@ export function targetForPending(item: PendingItem): ActionTarget {
     facts: {
       requesting_host: item.requesting_host,
       kind: item.kind,
+      scoped_facts:item.scoped_facts,
       target: item.ssh?.target_host ?? '', target_address:item.ssh?.target_address ?? '', target_port:item.ssh?.target_port ?? 0,
       principal:item.ssh?.principal ?? '',address:item.requesting_address ?? '',
       login_user: item.ssh?.login_user ?? '',
@@ -154,14 +156,14 @@ export function targetForStanding(s: StandingApproval): ActionTarget {
     return {
       object: "standing",
       id: s.id,
-      facts: { requesting_host: s.requesting_host, kind: "cloudflare", ...cfFacts(s.scope, s.scope_params, s.mode) },
+      facts: { scoped_facts:s.scoped_facts, requesting_host: s.requesting_host, kind: "cloudflare", ...cfFacts(s.scope, s.scope_params, s.mode) },
       revokeTTL: s.max_ttl_seconds,
     };
   }
   return {
     object: "standing",
     id: s.id,
-    facts: { requesting_host: s.requesting_host, kind: s.kind, target: s.target_host, login_user: s.login_user },
+    facts: { scoped_facts:s.scoped_facts, requesting_host: s.requesting_host, kind: s.kind, target: s.target_host, login_user: s.login_user },revokeTTL:s.scoped_facts?s.max_ttl_seconds:undefined,
   };
 }
 
@@ -170,14 +172,14 @@ export function targetForGrant(g: GrantSummary): ActionTarget {
     return {
       object: "grant",
       id: g.id,
-      facts: { requesting_host: g.requesting_host, kind: "cloudflare", ...cfFacts(g.scope, g.scope_params, g.mode) },
+      facts: { scoped_facts:g.scoped_facts, requesting_host: g.requesting_host, kind: "cloudflare", ...cfFacts(g.scope, g.scope_params, g.mode) },
       revokeTTL: 0,
     };
   }
   return {
     object: "grant",
     id: g.id,
-    facts: { requesting_host: g.requesting_host, kind: g.kind, target: g.target_host, login_user: g.login_user },
+    facts: { scoped_facts:g.scoped_facts, requesting_host: g.requesting_host, kind: g.kind, target: g.target_host, login_user: g.login_user },revokeTTL:0,
   };
 }
 
@@ -189,7 +191,7 @@ export function targetForPasskey(p: PasskeyInfo): ActionTarget {
 }
 
 export interface ActionChoice {
-  action: "approve" | "deny" | "revoke" | "add" | "rename" | "remove";
+  action: "approve" | "deny" | "revoke" | "add" | "rename" | "remove" | 'activate';
   ttl_seconds?: number;
   standing_hours?: number;
   /** rename: the new nickname; add: an optional nickname for the new passkey. Sent

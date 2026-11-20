@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/release"
 	"slices"
 	"time"
@@ -106,7 +107,10 @@ var objectActions = map[string][]string{
 
 // Action is everything the owner approves with one passkey assertion.
 type Action struct {
+	api.ScopeBinding
 	Update
+	Plan           string `json:"plan"`
+	RecoveryHash   string `json:"recovery_sha256"`
 	Principal      string `json:"principal"`
 	ReplacesID     string `json:"replaces_id"`
 	Class          string `json:"class"`
@@ -152,7 +156,8 @@ func NewNonce() string {
 }
 
 func (a Action) values() map[string]any {
-	return map[string]any{
+	m := map[string]any{
+		"plan": a.Plan, "recovery_sha256": a.RecoveryHash,
 		"from_version": a.FromVersion, "to_version": a.ToVersion, "from_commit": a.FromCommit, "to_commit": a.ToCommit, "daemon_sha256": a.DaemonHash, "linux_arm64_sha256": a.LinuxARM, "linux_amd64_sha256": a.LinuxAMD, "darwin_arm64_sha256": a.DarwinARM,
 		"principal": a.Principal, "replaces_id": a.ReplacesID,
 		"class": a.Class, "address": a.Address, "target_address": a.TargetAddress, "target_port": a.TargetPort,
@@ -171,6 +176,8 @@ func (a Action) values() map[string]any {
 		"nickname":        a.Nickname,
 		"new_nickname":    a.NewNickname,
 	}
+	bindingValues(a.ScopeBinding, m)
+	return m
 }
 
 func isZero(v any) bool {
@@ -196,7 +203,8 @@ func Build(a Action, nonce string, issuedAt time.Time) (string, error) {
 	if a.Action == "" || a.ID == "" {
 		return "", errors.New("canon: action and id are required")
 	}
-	keys, ok := keysFor(a.Object, a.Kind)
+	v := a.version()
+	keys, ok := actionKeys(v, a.Object, a.Kind)
 	if !ok {
 		return "", fmt.Errorf("canon: unknown object %q", a.Object)
 	}
@@ -206,11 +214,16 @@ func Build(a Action, nonce string, issuedAt time.Time) (string, error) {
 	if nonce == "" {
 		return "", errors.New("canon: nonce required")
 	}
+	if v == 2 {
+		if err := validateV2(a, nonce); err != nil {
+			return "", err
+		}
+	}
 	if a.TTLSeconds < 0 || a.StandingHours < 0 {
 		return "", errors.New("canon: negative ttl or standing hours")
 	}
 	m := map[string]any{
-		"v":         Version,
+		"v":         v,
 		"action":    a.Action,
 		"object":    a.Object,
 		"id":        a.ID,
@@ -256,7 +269,11 @@ func Parse(canonical string) (Signed, error) {
 	if k, ok := raw["kind"]; ok {
 		_ = json.Unmarshal(k, &kind)
 	}
-	keys, ok := keysFor(obj, kind)
+	var version int
+	if err := json.Unmarshal(raw["v"], &version); err != nil {
+		return Signed{}, errors.New("canon: invalid version")
+	}
+	keys, ok := actionKeys(version, obj, kind)
 	if !ok {
 		return Signed{}, fmt.Errorf("canon: unknown object %q", obj)
 	}
@@ -273,7 +290,7 @@ func Parse(canonical string) (Signed, error) {
 	if err := json.Unmarshal([]byte(canonical), &s); err != nil {
 		return Signed{}, fmt.Errorf("canon: %w", err)
 	}
-	if s.V != Version {
+	if s.V != s.Action.version() {
 		return Signed{}, fmt.Errorf("canon: unsupported version %d", s.V)
 	}
 	again, err := Build(s.Action, s.Nonce, s.IssuedAt)

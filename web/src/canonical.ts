@@ -7,7 +7,8 @@
 //      facts on the card (host, target, user, key).
 // So what is shown is exactly what is signed, and what is signed is what was asked for.
 
-import { bytesEqual, decode } from "./b64url";
+import { bytesEqual, decode, encode } from "./b64url";
+import { planRows } from './migration';
 import {
   ScopeParamsError,
   cfScope,
@@ -54,6 +55,7 @@ const COMMON_KEYS = ["v", "action", "object", "id", "nonce", "issued_at"];
 const UPDATE_KEYS = ['from_commit','to_commit','from_version','to_version','daemon_sha256','linux_arm64_sha256','linux_amd64_sha256','darwin_arm64_sha256'] as const;
 type UpdateFields = Partial<Record<typeof UPDATE_KEYS[number], string>>;
 const ALLOWED_KEYS: Record<string, string[]> = {
+  migration:[...COMMON_KEYS,'plan','recovery_sha256'],
   update: [...COMMON_KEYS,...UPDATE_KEYS],
   host: [...COMMON_KEYS, 'address','class','requesting_host'],
   request: [...COMMON_KEYS,'address','principal', 'target_address','target_port',"requesting_host", "kind", "target", "login_user", "key_fingerprint", "ttl_seconds", "standing_hours"],
@@ -70,6 +72,7 @@ const CF_KEYS: Record<string, string[]> = {
 };
 const STRING_KEYS = ["requesting_host", "kind", "target", "login_user", "key_fingerprint", "nickname", "new_nickname", "scope", "scope_params", "mode", "ip_condition", "nonce", "issued_at"] as const;
 const ALLOWED_ACTIONS: Record<string, string[]> = {
+  migration:['activate'],
   update:['approve'],
   host:['revoke'],
   request: ["approve", "deny"],
@@ -117,9 +120,11 @@ export function parseCanonical(text: string): Canonical {
   // Re-serialise with sorted keys: a mismatch means whitespace, unsorted or duplicate keys,
   // i.e. text whose meaning could be read two ways.
   const again = sortedJSON(v);
-  if (text !== again && text !== goEscape(again)) throw new CanonicalError("canonical action is not in canonical form");
+  if ((v as Canonical).v!==2 && text !== again && text !== goEscape(again)) throw new CanonicalError("canonical action is not in canonical form");
   const c = v as Canonical;
-  if (c.v !== 1) throw new CanonicalError(`unsupported canonical version ${String(c.v)}`);
+  if (c.v !== 1 && c.v!==2) throw new CanonicalError(`unsupported canonical version ${String(c.v)}`);
+  if(c.object==='migration' && c.v!==2) throw new CanonicalError('migration requires canonical v2');
+  if(c.v===2){if(text!==again.replace(/\u2028/g,'\\u2028').replace(/\u2029/g,'\\u2029') || typeof c.nonce!=='string' || decode(c.nonce).byteLength!==32 || encode(decode(c.nonce))!==c.nonce || typeof c.issued_at!=='string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(c.issued_at))throw new CanonicalError('invalid v2 encoding');}
   for (const k of ["action", "object", "id"] as const) {
     if (typeof c[k] !== "string" || c[k] === "") throw new CanonicalError(`canonical action has no ${k}`);
   }
@@ -127,7 +132,9 @@ export function parseCanonical(text: string): Canonical {
   // The key set depends on (object, kind): a Cloudflare request carries scope/params/mode
   // instead of target/user/key.
   const cf = c.kind === "cloudflare" && CF_KEYS[c.object] !== undefined;
-  const allowed = cf ? CF_KEYS[c.object]! : ALLOWED_KEYS[c.object]!;
+  let allowed = cf ? CF_KEYS[c.object]! : ALLOWED_KEYS[c.object]!;
+  if(c.object==='migration'){if(typeof c.recovery_sha256!=='string' || !/^[0-9a-f]{64}$/.test(c.recovery_sha256) || typeof c.plan!=='string')throw new CanonicalError('invalid migration');planRows(c.plan,c.id);}
+  else if(c.v===2){if(!['request','standing','grant'].includes(c.object)|| !['ssh','cloudflare'].includes(c.kind??''))throw new CanonicalError('unsupported scoped action');allowed=[...new Set([...allowed,...bindingKeys(c.kind)])];validateBinding(c);}
   if (!ALLOWED_ACTIONS[c.object]!.includes(c.action)) throw new CanonicalError(`unknown action ${JSON.stringify(c.action)} for ${c.object}`);
   const extra = Object.keys(c).filter((k) => !allowed.includes(k));
   if (extra.length) throw new CanonicalError(`canonical action has fields this page can't show (${extra.join(", ")})`);
@@ -218,6 +225,8 @@ export async function challengeCommitsTo(canonical: string, challengeB64url: str
 
 /** What the owner chose plus the facts on the card. Unset fields are not checked. */
 export interface Expectation extends UpdateFields {
+  scoped_facts?: Record<string,string|number>;
+  plan?: string; recovery_sha256?:string;
   principal?: string; replaces_id?: string;
   class?: string; address?: string; target_address?: string; target_port?: number;
   action: string;
@@ -251,6 +260,8 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
   cmp("action", c.action, e.action);
   cmp("object", c.object, e.object);
   cmp("id", c.id, e.id);
+  if(c.object==='migration'){cmp('plan',c.plan,e.plan??'');cmp('recovery_sha256',c.recovery_sha256,e.recovery_sha256??'');}
+  else if(e.scoped_facts || c.v===2){cmp('v',c.v,2);for(const k of bindingKeys(c.kind)){if(!e.scoped_facts || !Object.hasOwn(e.scoped_facts,k))out.push(`card lacks ${k}`);else cmp(k,c[k],e.scoped_facts[k]);}}
   if (e.object==='update') for (const k of UPDATE_KEYS) cmp(k,c[k],e[k]??'');
   cmp("requesting_host", c.requesting_host, e.requesting_host);
   cmp("kind", c.kind, e.kind);
@@ -367,6 +378,8 @@ function who(c: Canonical): Part[] {
 
 /** Describe the canonical action in plain words. Built only from canonical's own fields. */
 export function describe(c: Canonical): Description {
+  if(c.object==='migration'){const headline='personal: activate organisation admissions and retire previous authority.';return {headline,headlineParts:[headline],warnings:['Pending requests expire; standing approvals and broker grants end. Issued SSH certificates and unverified children can still work until their original expiry.'],fields:[['Recovery SHA-256',String(c.recovery_sha256)],...planRows(String(c.plan),c.id)]};}
+  if(c.v===2){const d=describe({...c,v:1});const path=[c.org_title,c.service_title,c.set_title].map(String).join(' › ');d.headline=`${path}: ${d.headline}`;d.headlineParts=[{value:path},': ',...d.headlineParts];d.fields=fieldList(c);return d;}
   if (c.kind === "cloudflare" && CF_KEYS[c.object]) return describeCloudflare(c);
   const kind = kindLabel(c.kind ?? "ssh");
   const host = c.requesting_host ?? "?";
@@ -439,6 +452,11 @@ export function describe(c: Canonical): Description {
     fields: fieldList(c),
   };
 }
+
+const revisions=['set_revision','service_revision','policy_revision','admission_generation'];
+function bindingKeys(kind:unknown):string[]{return ['org_id','org_slug','org_title','service_id','service_slug','service_title','set_id','set_slug','set_title',...revisions,'host_id','class','address','profile_revision','max_standing_hours',...(kind==='ssh'?['ssh_ca','host_key','cert_profile','principal','target_address','target_port','key_fingerprint']:['account_id','resource_ids','ip_condition'])];}
+function validateBinding(c:Canonical){for(const k of bindingKeys(c.kind)){const x=c[k];if(revisions.includes(k)||k==='max_standing_hours'||k==='target_port'){if(typeof x!=='number'||!Number.isSafeInteger(x)||x<(k==='max_standing_hours'?0:1))throw new CanonicalError(`invalid ${k}`);}else if(typeof x!=='string'||(!x && k!=='resource_ids'&&k!=='ip_condition'))throw new CanonicalError(`invalid ${k}`);}
+ if(c.kind==='cloudflare' && (c.mode!=='proxy'|| c.ip_condition!=='' || !/^[0-9a-f]{32}$/.test(String(c.account_id))))throw new CanonicalError('unverified Cloudflare template');if(!['agent','owner-device'].includes(c.class??''))throw new CanonicalError('unknown host class');if(c.kind==='ssh'&&c.cert_profile!=='source-address;permit-pty;permit-port-forwarding')throw new CanonicalError('unknown certificate profile');}
 
 function fieldList(c: Canonical): Array<[string, string]> {
   const keys = Object.keys(c).sort((a, b) => {

@@ -31,21 +31,26 @@ const (
 
 // AgentHandler returns the agent API handler (serve it with PKI().TLSConfig()).
 func (s *Server) AgentHandler() http.Handler {
+	if s.maintenance {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "organisation cutover: fleet access paused", http.StatusServiceUnavailable)
+		})
+	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /v1/releases/latest", s.requireHost(s.latestRelease))
 	mux.Handle("GET /v1/releases/{version}/{asset}", s.requireHost(s.releaseAsset))
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
 	mux.HandleFunc("GET /v1/enroll/{id}", s.handleEnrollStatus)
-	mux.Handle("POST /v1/requests", s.requireHost(s.handleCreateRequest))
-	mux.Handle("GET /v1/requests/{id}", s.requireHost(s.handleRequestStatus))
-	mux.Handle("POST /v1/requests/{id}/cancel", s.requireHost(s.handleCancel))
-	mux.Handle("GET /v1/grants", s.requireHost(s.handleGrants))
-	mux.Handle("GET /v1/ssh-ca", s.requireHost(s.handleSSHCA))
-	mux.Handle("GET /v1/ssh-target", s.requireHost(s.handleResolveTarget))
+	mux.Handle("POST /v1/requests", s.requirePersonal(s.handleCreateRequest))
+	mux.Handle("GET /v1/requests/{id}", s.requirePersonal(s.handleRequestStatus))
+	mux.Handle("POST /v1/requests/{id}/cancel", s.requirePersonal(s.handleCancel))
+	mux.Handle("GET /v1/grants", s.requirePersonal(s.handleGrants))
+	mux.Handle("GET /v1/ssh-ca", s.requirePersonal(s.handleSSHCA))
+	mux.Handle("GET /v1/ssh-target", s.requirePersonal(s.handleResolveTarget))
 	// Milestone 2 (404 when cloudflare.enabled is false).
-	mux.Handle("GET /v1/cf/catalogue", s.requireHost(s.handleCFCatalogue))
-	mux.Handle("GET /v1/cf/snapshots", s.requireHost(s.handleCFSnapshots))
-	mux.Handle("GET /v1/cf/snapshots/{id}", s.requireHost(s.handleCFSnapshot))
+	mux.Handle("GET /v1/cf/catalogue", s.requirePersonal(s.handleCFCatalogue))
+	mux.Handle("GET /v1/cf/snapshots", s.requirePersonal(s.handleCFSnapshots))
+	mux.Handle("GET /v1/cf/snapshots/{id}", s.requirePersonal(s.handleCFSnapshot))
 	proxy := s.requireHostCF(s.handleCFProxy)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -59,6 +64,16 @@ func (s *Server) AgentHandler() http.Handler {
 			return
 		}
 		mux.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) requirePersonal(next func(http.ResponseWriter, *http.Request, *store.Host)) http.Handler {
+	return s.requireHost(func(w http.ResponseWriter, r *http.Request, h *store.Host) {
+		if err := s.store.Q().PersonalAdmission(r.Context(), h.ID, s.now()); err != nil {
+			s.writeErr(w, r, mapNotFound(err))
+			return
+		}
+		next(w, r, h)
 	})
 }
 
@@ -262,8 +277,18 @@ func requireActiveIdentity(ctx context.Context, q *store.Q, id int64) error {
 func (s *Server) handleResolveTarget(w http.ResponseWriter, r *http.Request, h *store.Host) {
 	t, err := s.cfg.Resolve(r.URL.Query().Get("target"), r.URL.Query().Get("user"))
 	if err != nil {
+		if s.store.Q().Scoped() {
+			s.writeErr(w, r, errNotFound())
+			return
+		}
 		s.writeErr(w, r, errBad(err.Error()))
 		return
+	}
+	if s.store.Q().Scoped() {
+		if _, err := s.store.Q().PersonalResource(r.Context(), h.ID, "ssh-ca", t.Name, s.now()); err != nil {
+			s.writeErr(w, r, mapNotFound(err))
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, api.ResolvedTarget{Name: t.Name, Address: t.Address, Port: t.Port, MaxSeconds: s.cfg.TTL.ForHost(h.Class).MaxSeconds})
 }
@@ -304,6 +329,10 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 	}
 	tgt, err := s.cfg.Resolve(in.SSH.TargetHost, in.SSH.LoginUser)
 	if err != nil {
+		if s.store.Q().Scoped() {
+			s.writeErr(w, r, errNotFound())
+			return
+		}
 		s.writeErr(w, r, errBad(err.Error()))
 		return
 	}
@@ -345,6 +374,11 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
 			return err
 		}
+		if q.Scoped() {
+			if _, err := q.PersonalResource(ctx, h.ID, "ssh-ca", tgt.Name, s.now()); err != nil {
+				return mapNotFound(err)
+			}
+		}
 		rules, err := q.ActiveStanding(ctx, h.ID, now)
 		if err != nil {
 			return err
@@ -367,7 +401,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 			req.StandingID = st.ID
 			req.DecidedAt = &now
 			req.DecisionNote = "standing approval " + st.ID
-			if err := q.InsertRequest(ctx, req); err != nil {
+			if err := q.InsertPersonalRequest(ctx, req); err != nil {
 				return err
 			}
 			if err := q.UseStanding(ctx, st.ID, now); err != nil {
@@ -385,7 +419,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		} else if n >= MaxPendingPerHost {
 			return &apiErr{http.StatusTooManyRequests, api.ErrRateLimited, "too many pending requests from this host"}
 		}
-		if err := q.InsertRequest(ctx, req); err != nil {
+		if err := q.InsertPersonalRequest(ctx, req); err != nil {
 			return err
 		}
 		return q.Audit(ctx, now, "host:"+h.Name, "request", "request:"+req.ID,
@@ -409,7 +443,7 @@ func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request, h *
 	var req *store.Request
 	err := s.longPoll(ctx, parseWait(r.URL.Query().Get("wait")), func() (bool, error) {
 		var err error
-		req, err = s.store.Q().GetRequest(ctx, id)
+		req, err = s.store.Q().PersonalStatus(ctx, id, h.ID, s.now())
 		if err != nil {
 			return false, err
 		}
@@ -430,7 +464,18 @@ func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request, h *
 		s.writeErr(w, r, err)
 		return
 	}
-	out, err := s.requestStatus(ctx, s.store.Q(), req)
+	if ctx.Err() != nil {
+		return
+	}
+	var out *api.RequestStatus
+	err = s.store.Tx(ctx, func(q *store.Q) error {
+		req, err := q.PersonalStatus(ctx, id, h.ID, s.now())
+		if err != nil {
+			return mapNotFound(err)
+		}
+		out, err = s.requestStatus(ctx, q, req)
+		return err
+	})
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -487,7 +532,7 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request, h *store.H
 			return err
 		}
 		var err error
-		if req, err = q.GetRequest(ctx, id); err != nil || req.HostID != h.ID {
+		if req, err = q.PersonalStatus(ctx, id, h.ID, now); err != nil {
 			return errNotFound() // another host's request is indistinguishable from a missing one
 		}
 		if err := q.CancelRequest(ctx, id, h.ID, now); err != nil {

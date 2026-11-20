@@ -65,6 +65,11 @@ func Backfill(ctx context.Context, tx *sql.Tx, cfg *config.Config, sshPin, clien
 			if err := exec(`INSERT INTO personal_aliases VALUES(?,?,?)`, set.Kind, set.Slug, set.ID); err != nil {
 				return err
 			}
+			if set.Kind == "cloudflare-mint" && len(p.BlockedMint) > 0 {
+				if err := exec(`UPDATE credential_sets SET archived=1 WHERE id=?`, set.ID); err != nil {
+					return err
+				}
+			}
 			policy := func(scope string, def, cap int, auto, standing bool) error {
 				return exec(`INSERT INTO set_policies VALUES(?,1,?,?,?,0,?,?)`, set.ID, scope, min(def, cap), cap, auto, standing)
 			}

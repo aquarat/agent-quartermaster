@@ -47,6 +47,7 @@ export interface PendingCloudflare {
 }
 
 export interface PendingItem {
+  scoped_facts?: Record<string,string|number>;
   max_standing_hours?: number;
   id: string;
   kind: string; // "ssh" | "enrollment" | "cloudflare"
@@ -67,6 +68,7 @@ export interface PendingItem {
 }
 
 export interface StandingApproval {
+  scoped_facts?: Record<string,string|number>;
   id: string;
   requesting_host: string;
   kind: string;
@@ -82,6 +84,7 @@ export interface StandingApproval {
 }
 
 export interface GrantSummary {
+  scoped_facts?: Record<string,string|number>;
   id: string;
   kind: string;
   status: string;
@@ -144,6 +147,7 @@ export interface PasskeyInfo {
 }
 
 export interface UIState {
+  migration?:{id:string;plan:string;recovery_sha256:string};
   owner: UIOwner;
   pending: PendingItem[] | null;
   standing: StandingApproval[] | null;
@@ -152,7 +156,7 @@ export interface UIState {
   passkeys?: PasskeyInfo[] | null; // api.UIState.passkeys (absent on an older server)
 }
 
-export type Action = "approve" | "deny" | "revoke" | "add" | "rename" | "remove";
+export type Action = "approve" | "deny" | "revoke" | "add" | "rename" | "remove" | 'activate';
 
 export interface ChallengeRequest {
   action: Action;

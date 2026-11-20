@@ -85,7 +85,7 @@ func (s *Server) setupCloudflare(o Options) error {
 		return err
 	}
 	var minterTok string
-	if cf.MinterTokenCredential != "" || cf.MinterTokenFile != "" {
+	if !s.store.Q().Scoped() && (cf.MinterTokenCredential != "" || cf.MinterTokenFile != "") {
 		if minterTok, err = loadParentToken("minter", cf.MinterTokenCredential, cf.MinterTokenFile); err != nil {
 			return err
 		}
@@ -93,6 +93,13 @@ func (s *Server) setupCloudflare(o Options) error {
 	snapDir := cf.SnapshotDir
 	if snapDir == "" {
 		snapDir = filepath.Join(s.cfg.DataDir, "cf-snapshots")
+	}
+	var serviceID string
+	if s.store.Q().Scoped() {
+		if err := s.store.DB().QueryRow(`SELECT v.id FROM services v JOIN personal_cutover c ON c.org_id=v.org_id WHERE v.provider='cloudflare' AND v.slug='dns-cdn'`).Scan(&serviceID); err != nil {
+			return err
+		}
+		snapDir = filepath.Join(snapDir, "services", serviceID)
 	}
 	newProxy := o.newCFProxy
 	if newProxy == nil {
@@ -104,6 +111,7 @@ func (s *Server) setupCloudflare(o Options) error {
 		Grants:      cfGrantSource{s},
 		ProxyToken:  proxyTok,
 		SnapshotDir: snapDir,
+		ServiceID:   serviceID,
 		Notify:      func(title, text string) { s.notify.Send(title, text, s.cfg.PublicBaseURL+"/") },
 		Log:         s.log,
 		Now:         s.now,
@@ -233,10 +241,17 @@ var _ cfproxy.ScopeLister = cfGrantSource{}
 
 // ActiveScopes lists the scopes of the host's active Cloudflare grants (sensitive snapshots).
 func (gs cfGrantSource) ActiveScopes(ctx context.Context, hostID int64, now time.Time) ([]string, error) {
-	return gs.s.store.Q().ActiveCFScopes(ctx, hostID, now)
+	peer, _ := ctx.Value(snapshotPeerKey{}).(string)
+	return gs.s.store.Q().CFScopesAt(ctx, hostID, now, peer)
 }
 
+type snapshotPeerKey struct{}
+
 func (gs cfGrantSource) HasActiveGrant(ctx context.Context, hostID int64, now time.Time) (bool, error) {
+	if gs.s.store.Q().Scoped() {
+		scopes, err := gs.ActiveScopes(ctx, hostID, now)
+		return len(scopes) > 0, err
+	}
 	return gs.s.store.Q().HasActiveCFGrant(ctx, hostID, now)
 }
 
@@ -271,6 +286,16 @@ func (s *Server) ipCondition() string {
 }
 
 func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, h *store.Host, in *api.AccessRequest) {
+	if s.store.Q().Scoped() {
+		alias, kind := "proxy", "cloudflare-proxy"
+		if in.Cloudflare != nil && in.Cloudflare.Mode == api.CFModeToken {
+			alias, kind = "mint", "cloudflare-mint"
+		}
+		if _, err := s.store.Q().PersonalResource(r.Context(), h.ID, kind, alias, s.now()); err != nil {
+			s.writeErr(w, r, mapNotFound(err))
+			return
+		}
+	}
 	if s.cf.cat == nil {
 		s.writeErr(w, r, errBad("Cloudflare is not enabled on this aqmasd"))
 		return
@@ -320,9 +345,18 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 		if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
 			return err
 		}
+		if q.Scoped() {
+			kind, alias := "cloudflare-proxy", "proxy"
+			if req.Mode == api.CFModeToken {
+				kind, alias = "cloudflare-mint", "mint"
+			}
+			if _, err := q.PersonalResource(ctx, h.ID, kind, alias, s.now()); err != nil {
+				return mapNotFound(err)
+			}
+		}
 		approve := func(note string) (*store.Grant, error) {
 			req.Status, req.DecidedAt, req.DecisionNote = api.StatusApproved, &now, note
-			if err := q.InsertRequest(ctx, req); err != nil {
+			if err := q.InsertPersonalRequest(ctx, req); err != nil {
 				return nil, err
 			}
 			return s.issueCFGrant(ctx, q, req, ttl, now)
@@ -373,7 +407,7 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 		} else if n >= MaxPendingPerHost {
 			return &apiErr{http.StatusTooManyRequests, api.ErrRateLimited, "too many pending requests from this host"}
 		}
-		if err := q.InsertRequest(ctx, req); err != nil {
+		if err := q.InsertPersonalRequest(ctx, req); err != nil {
 			return err
 		}
 		return q.Audit(ctx, now, "host:"+h.Name, "request", "request:"+req.ID,
@@ -817,12 +851,24 @@ func (s *Server) handleCFProxy(w http.ResponseWriter, r *http.Request, h *store.
 	s.cf.proxy.Serve(w, r, s.cfCaller(r, h))
 }
 
-func (s *Server) handleCFCatalogue(w http.ResponseWriter, r *http.Request, _ *store.Host) {
+func (s *Server) handleCFCatalogue(w http.ResponseWriter, r *http.Request, h *store.Host) {
+	if s.store.Q().Scoped() {
+		if _, err := s.store.Q().PersonalResource(r.Context(), h.ID, "cloudflare-proxy", "proxy", s.now()); err != nil {
+			s.writeErr(w, r, mapNotFound(err))
+			return
+		}
+	}
 	if s.cf.cat == nil {
 		s.writeErr(w, r, errNotFound())
 		return
 	}
-	writeJSON(w, http.StatusOK, s.cf.cat.API())
+	cat := s.cf.cat.API()
+	if s.store.Q().Scoped() {
+		for i := range cat.Scopes {
+			cat.Scopes[i].Modes = []string{api.CFModeProxy}
+		}
+	}
+	writeJSON(w, http.StatusOK, cat)
 }
 
 // cfSnapshotAccess: snapshots need Cloudflare enabled and an active Cloudflare grant.
@@ -830,7 +876,7 @@ func (s *Server) cfSnapshotAccess(r *http.Request, h *store.Host) error {
 	if s.cf.proxy == nil {
 		return errNotFound()
 	}
-	ok, err := s.store.Q().HasActiveCFGrant(r.Context(), h.ID, s.now())
+	ok, err := (cfGrantSource{s}).HasActiveGrant(r.Context(), h.ID, s.now())
 	if err != nil {
 		return err
 	}
@@ -841,6 +887,7 @@ func (s *Server) cfSnapshotAccess(r *http.Request, h *store.Host) error {
 }
 
 func (s *Server) handleCFSnapshots(w http.ResponseWriter, r *http.Request, h *store.Host) {
+	r = r.WithContext(context.WithValue(r.Context(), snapshotPeerKey{}, peerIP(r)))
 	if err := s.cfSnapshotAccess(r, h); err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -849,6 +896,7 @@ func (s *Server) handleCFSnapshots(w http.ResponseWriter, r *http.Request, h *st
 }
 
 func (s *Server) handleCFSnapshot(w http.ResponseWriter, r *http.Request, h *store.Host) {
+	r = r.WithContext(context.WithValue(r.Context(), snapshotPeerKey{}, peerIP(r)))
 	if err := s.cfSnapshotAccess(r, h); err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -861,6 +909,13 @@ func (s *Server) handleCFSnapshot(w http.ResponseWriter, r *http.Request, h *sto
 func (s *Server) requireHostCF(next func(http.ResponseWriter, *http.Request, *store.Host)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h, err := s.hostFromTLS(r)
+		if err == nil {
+			err = mapNotFound(s.store.Q().PersonalAdmission(r.Context(), h.ID, s.now()))
+		}
+		if err == nil && s.store.Q().Scoped() {
+			_, err = s.store.Q().PersonalResource(r.Context(), h.ID, "cloudflare-proxy", "proxy", s.now())
+			err = mapNotFound(err)
+		}
 		if err != nil {
 			var ae *apiErr
 			if !errors.As(err, &ae) {
