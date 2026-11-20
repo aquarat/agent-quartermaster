@@ -37,14 +37,14 @@ const (
 )
 
 // neverOverridable guards refuse even with a cf.admin override.
-var neverOverridable = map[string]bool{GAccessProtected: true, GAccessPatch: true, GRedactedWrite: true, GRulesetPhase: true, GProtectedHost: true}
+var neverOverridable = map[string]bool{GAccessProtected: true, GAccessPatch: true, GRedactedWrite: true, GRulesetPhase: true, GProtectedHost: true, GRulesetProtected: true}
 
 // overridable lists the names X-Aqmas-Override accepts.
 var overridable = map[string]bool{
 	GTunnelWholeConfig: true, GTunnelCatchAll: true, GTunnelTraefikSNI: true, GTunnelPlainOrigin: true,
 	GTunnelNoTLSVerify: true, GTunnelAccessAud: true, GTunnelVersion: true, GAccessPolicyShared: true,
 	GIdPDelete: true, GDNSProtected: true, GRulesetKeepRules: true, GZoneSettingsPolicy: true, GWorkersDomainRm: true,
-	GEmailForward: true,
+	GEmailForward: true, GRulesetProtectedRemoval: true,
 }
 
 // finding is one guard-rail refusal.

@@ -652,6 +652,10 @@ func (p *Proxy) guards(ctx context.Context, g *guardCtx) ([]*finding, []string, 
 		if m == http.MethodDelete {
 			warns = append(warns, "a ruleset rule is being deleted")
 		}
+		phase, written, prior, removed := rulesetWrite(m, g.route.Snapshot, g.route.Vars, g.body, g.before)
+		for _, f := range guardRulesetProtected(phase, written, prior, removed, p.cfg.ProtectedHostnames()) {
+			add(f)
+		}
 	case cfscope.GuardZoneSettings:
 		add(guardZoneSettingsPolicy(zoneSettingItems(g.route.Vars["name"], g.body)))
 	case cfscope.GuardWorkersDomRm:
