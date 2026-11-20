@@ -1,0 +1,12 @@
+# Site policy for install-host-trust.sh. Install as /etc/aqmas/host-trust.conf on each host
+# (or pass --policy FILE). One rule per line, '#' starts a comment.
+#
+#   refuse NAME|ADDRESS   never configure this host, by host name or by a local address
+#   needs-approval NAME   only with --i-have-owner-approval
+#
+# The aqmas bastion should always be refused: it runs aqmasd and accepts only the owner's key.
+refuse bastion
+refuse 192.0.2.10
+
+# Hosts where changing sshd needs the owner's explicit go-ahead.
+needs-approval build-box

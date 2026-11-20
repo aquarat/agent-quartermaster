@@ -14,6 +14,14 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// testPolicy is the site policy the fixture installs at <root>/etc/aqmas/host-trust.conf.
+const testPolicy = `# test policy
+refuse bastion
+refuse 192.0.2.60   # the bastion's address
+needs-approval web-1
+needs-approval hub-1
+`
+
 type fixture struct {
 	t      *testing.T
 	root   string
@@ -41,6 +49,8 @@ func newFixture(t *testing.T, hostname string) *fixture {
 	must(os.WriteFile(filepath.Join(root, "etc/ssh/sshd_config.d/50-redhat.conf"), []byte("SyslogFacility AUTHPRIV\n"), 0o600))
 	must(os.WriteFile(filepath.Join(root, "etc/hostname"), []byte(hostname+"\n"), 0o644))
 	must(os.WriteFile(filepath.Join(root, "home/alice/.ssh/authorized_keys"), []byte("ssh-rsa AAAAB3Nza owner\n"), 0o600))
+	must(os.MkdirAll(filepath.Join(root, "etc/aqmas"), 0o755))
+	must(os.WriteFile(filepath.Join(root, "etc/aqmas/host-trust.conf"), []byte(testPolicy), 0o644))
 
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
 	pk, _ := ssh.NewPublicKey(pub)
@@ -67,7 +77,7 @@ func (f *fixture) run(env []string, args ...string) (string, error) {
 	f.t.Helper()
 	cmd := exec.Command("bash", append([]string{"install-host-trust.sh", "--root", f.root}, args...)...)
 	cmd.Env = append(os.Environ(), env...)
-	cmd.Env = append(cmd.Env, "SYSTEMCTL=/bin/false")
+	cmd.Env = append(cmd.Env, "SYSTEMCTL=/bin/false", "SUDO_USER=alice")
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -236,8 +246,8 @@ func TestRefusals(t *testing.T) {
 		{"web-1 by hostname", "web-1", []string{"--name", "web-1"}, nil, "owner's go-ahead"},
 		{"web-1 by name", "other", []string{"--name", "web-1"}, nil, "owner's go-ahead"},
 		{"hub", "hub-1", []string{"--name", "hub-1"}, nil, "owner's go-ahead"},
-		{"bastion", "bastion", []string{"--name", "bastion", "--i-have-owner-approval"}, nil, "aqmas bastion"},
-		{"bastion hostname", "bastion", []string{"--name", "x", "--i-have-owner-approval"}, nil, "aqmas bastion"},
+		{"bastion", "bastion", []string{"--name", "bastion", "--i-have-owner-approval"}, nil, "policy refuses"},
+		{"bastion hostname", "bastion", []string{"--name", "x", "--i-have-owner-approval"}, nil, "policy refuses"},
 		{"root principals", "db-1", []string{"--name", "db-1", "--user", "root"}, nil, "root"},
 		{"bad name", "db-1", []string{"--name", "db 1"}, nil, "plain lowercase"},
 		{"no name", "db-1", nil, nil, "--name is required"},
@@ -291,6 +301,42 @@ func TestRefusals(t *testing.T) {
 	}
 }
 
+func TestPolicySources(t *testing.T) {
+	// No policy file: nothing is refused.
+	f := newFixture(t, "web-1")
+	os.Remove(f.path("etc/aqmas/host-trust.conf"))
+	if out, err := f.run(nil, "--name", "web-1", "--ca-key", f.caKey); err != nil {
+		t.Fatalf("no policy: %v\n%s", err, out)
+	}
+	// Flags add to the (absent) file.
+	if out, err := f.run(nil, "--name", "web-1", "--ca-key", f.caKey, "--refuse", "web-1"); err == nil || !strings.Contains(out, "policy refuses") {
+		t.Fatalf("--refuse: %v\n%s", err, out)
+	}
+	if out, err := f.run(nil, "--name", "web-1", "--ca-key", f.caKey, "--needs-approval=web-1"); err == nil || !strings.Contains(out, "owner's go-ahead") {
+		t.Fatalf("--needs-approval: %v\n%s", err, out)
+	}
+	// An explicit --policy must exist and parse.
+	if out, err := f.run(nil, "--name", "web-1", "--ca-key", f.caKey, "--policy", f.path("nope.conf")); err == nil || !strings.Contains(out, "cannot read policy") {
+		t.Fatalf("missing --policy: %v\n%s", err, out)
+	}
+	bad := f.path("bad.conf")
+	os.WriteFile(bad, []byte("deny web-1\n"), 0o644)
+	if out, err := f.run(nil, "--name", "web-1", "--ca-key", f.caKey, "--policy", bad); err == nil || !strings.Contains(out, "unknown keyword") {
+		t.Fatalf("bad policy: %v\n%s", err, out)
+	}
+	// The example file parses and refuses its bastion.
+	g := newFixture(t, "bastion")
+	if out, err := g.run(nil, "--name", "x", "--ca-key", g.caKey, "--policy", "host-trust.conf.example"); err == nil || !strings.Contains(out, "policy refuses") {
+		t.Fatalf("example policy: %v\n%s", err, out)
+	}
+	// Without --user or $SUDO_USER there is no default login user.
+	cmd := exec.Command("bash", "install-host-trust.sh", "--root", f.root, "--name", "web-1", "--ca-key", f.caKey)
+	cmd.Env = append(os.Environ(), "SUDO_USER=", "SYSTEMCTL=/bin/false")
+	if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "--user is required") {
+		t.Fatalf("no user: %v\n%s", err, out)
+	}
+}
+
 func TestApplyOnRealSystemNeedsRoot(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root")
@@ -301,7 +347,7 @@ func TestApplyOnRealSystemNeedsRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, extra := range [][]string{nil, {"--root", "//"}, {"--root", link}} {
-		args := append([]string{"install-host-trust.sh", "--name", "db-1", "--ca-key", "/nonexistent", "--apply"}, extra...)
+		args := append([]string{"install-host-trust.sh", "--name", "db-1", "--user", "alice", "--ca-key", "/nonexistent", "--apply"}, extra...)
 		out, err := exec.Command("bash", args...).CombinedOutput()
 		if err == nil || !strings.Contains(string(out), "needs root") {
 			t.Fatalf("%v: got %v:\n%s", extra, err, out)

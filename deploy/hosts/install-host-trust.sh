@@ -6,6 +6,11 @@
 #   sudo ./install-host-trust.sh --name db-1 --ca-key aqmas_user_ca.pub --apply
 #   sudo ./install-host-trust.sh --uninstall [--name db-1] [--apply]
 #
+# Site policy (optional) comes from /etc/aqmas/host-trust.conf (--policy FILE to use another;
+# see host-trust.conf.example) and from --refuse / --needs-approval:
+#   refuse NAME|ADDRESS      never configure this host (e.g. the aqmas bastion)
+#   needs-approval NAME      only with --i-have-owner-approval
+#
 # Installs (all root:root 0644, principals dir 0755):
 #   /etc/ssh/aqmas_user_ca.pub             the CA public key given with --ca-key
 #   /etc/ssh/aqmas_principals/<user>       one line: <user>@<name>
@@ -19,11 +24,13 @@ umask 022
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MARKER="# managed by aqmas install-host-trust.sh"
 
-# Hosts this script must never configure. The bastion only accepts the owner's key.
-HARD_DENY=(bastion)
-HARD_DENY_ADDRS=(192.0.2.60)
-# Hosts that need the owner's explicit go-ahead.
-APPROVAL_DENY=(web-1 hub-1)
+# Hosts this script must never configure (names, and addresses checked against `ip addr`),
+# and hosts that need the owner's explicit go-ahead. Filled from the policy file and flags.
+HARD_DENY=()
+HARD_DENY_ADDRS=()
+APPROVAL_DENY=()
+POLICY=
+POLICY_GIVEN=0
 
 APPLY=0
 MODE=install
@@ -38,7 +45,7 @@ SSHD=
 SYSTEMCTL=${SYSTEMCTL:-systemctl}
 
 usage() {
-	sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
 	cat <<'EOF'
 
 Options:
@@ -46,11 +53,15 @@ Options:
   --ca-key FILE                the aqmas SSH user CA public key (required for install)
   --ca-fingerprint SHA256:...  refuse unless --ca-key has this fingerprint (as the owner read
                                it on the bastion: ssh-keygen -lf of aqmasd print-ssh-ca)
-  --user USER                  login user to write a principals file for (default alice;
+  --user USER                  login user to write a principals file for (default: $SUDO_USER;
                                repeatable; root is refused)
   --apply                      make the changes (default: dry run, print the plan)
   --uninstall                  remove what install created (dry run unless --apply)
-  --i-have-owner-approval      allow hosts that need the owner's go-ahead (web-1, hub-1)
+  --i-have-owner-approval      allow hosts listed as needs-approval
+  --policy FILE                site policy file (default /etc/aqmas/host-trust.conf, under --root
+                               when given; missing default file = no policy)
+  --refuse NAME|ADDRESS        never configure this host (repeatable)
+  --needs-approval NAME        require --i-have-owner-approval for this host (repeatable)
   --root DIR                   operate on DIR instead of / (tests); never reloads sshd
   --sshd PATH                  sshd binary for -t/-T (default: sshd; skipped with --root unless given)
 EOF
@@ -58,6 +69,12 @@ EOF
 
 die() { echo "install-host-trust: error: $*" >&2; exit 1; }
 say() { echo "install-host-trust: $*"; }
+
+# add_refuse NAME|ADDRESS: an IPv4/IPv6 address goes to the address list, anything else is a name.
+add_refuse() {
+	[[ -n $1 ]] || die "--refuse needs a host name or address"
+	if [[ $1 =~ ^[0-9.]+$ || $1 == *:* ]]; then HARD_DENY_ADDRS+=("$1"); else HARD_DENY+=("$1"); fi
+}
 
 while [[ $# -gt 0 ]]; do
 	case $1 in
@@ -76,12 +93,22 @@ while [[ $# -gt 0 ]]; do
 	--sshd) SSHD=${2:-}; shift ;;
 	--sshd=*) SSHD=${1#*=} ;;
 	--i-have-owner-approval) OWNER_OK=1 ;;
+	--policy) POLICY=${2:-}; POLICY_GIVEN=1; shift ;;
+	--policy=*) POLICY=${1#*=}; POLICY_GIVEN=1 ;;
+	--refuse) add_refuse "${2:-}"; shift ;;
+	--refuse=*) add_refuse "${1#*=}" ;;
+	--needs-approval) APPROVAL_DENY+=("${2:-}"); shift ;;
+	--needs-approval=*) APPROVAL_DENY+=("${1#*=}") ;;
 	-h | --help) usage; exit 0 ;;
 	*) usage >&2; die "unknown argument: $1" ;;
 	esac
 	shift
 done
-[[ ${#USERS[@]} -gt 0 ]] || USERS=(alice)
+if [[ ${#USERS[@]} -eq 0 && -n ${SUDO_USER:-} && ${SUDO_USER} != root ]]; then
+	USERS=("$SUDO_USER")
+elif [[ ${#USERS[@]} -eq 0 && $MODE == install ]]; then
+	die "--user is required (no non-root \$SUDO_USER to default to)"
+fi
 
 [[ -n $ROOT && -d $ROOT ]] || die "--root $ROOT is not a directory"
 # Physical path, so "//" or a symlink to / cannot pose as a test root and skip the checks
@@ -90,6 +117,25 @@ ROOT=$(cd "$ROOT" && pwd -P)
 [[ ! $ROOT =~ ^/+$ ]] || ROOT=/ # bash keeps "//" as is
 R=${ROOT%/} # prefix for paths; empty for the real system
 if [[ -z $SSHD && -z $R ]]; then SSHD=$(command -v sshd || echo /usr/sbin/sshd); fi
+
+# Site policy file: "refuse NAME|ADDRESS" and "needs-approval NAME" lines, '#' comments.
+[[ $POLICY_GIVEN -eq 1 ]] || POLICY=$R/etc/aqmas/host-trust.conf
+if [[ -e $POLICY || $POLICY_GIVEN -eq 1 ]]; then
+	[[ -r $POLICY ]] || die "cannot read policy file $POLICY"
+	lineno=0
+	while IFS= read -r line || [[ -n $line ]]; do
+		lineno=$((lineno + 1))
+		line=${line%%#*}
+		read -r kw arg extra <<<"$line" || true
+		[[ -n ${kw:-} ]] || continue
+		[[ -n ${arg:-} && -z ${extra:-} ]] || die "$POLICY:$lineno: want '<refuse|needs-approval> <host>'"
+		case $kw in
+		refuse) add_refuse "$arg" ;;
+		needs-approval) APPROVAL_DENY+=("$arg") ;;
+		*) die "$POLICY:$lineno: unknown keyword '$kw'" ;;
+		esac
+	done <"$POLICY"
+fi
 
 ETC_SSH=$R/etc/ssh
 CA_DST=$ETC_SSH/aqmas_user_ca.pub
@@ -103,9 +149,9 @@ BACKUP_ROOT=$R/var/backups/aqmas-host-trust
 # ---- checks that apply to every mode ----
 
 [[ -z $NAME || $NAME =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "--name '$NAME' is not a plain lowercase host name"
-for u in "${USERS[@]}"; do
+for u in ${USERS[@]+"${USERS[@]}"}; do
 	[[ $u =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "--user '$u' is not a valid login name"
-	[[ $u != root ]] || die "refusing a principals file for root (PermitRootLogin no fleet-wide)"
+	[[ $u != root ]] || die "refusing a principals file for root"
 done
 
 if [[ $APPLY -eq 1 && -z $R && $EUID -ne 0 ]]; then
@@ -119,10 +165,10 @@ if [[ -r $R/etc/hostname ]]; then host_names+=("$(head -n1 "$R/etc/hostname" | c
 # The machine we run on is checked even with --root.
 host_names+=("$(hostname -s 2>/dev/null || uname -n)")
 for h in "${host_names[@]}"; do
-	for d in "${HARD_DENY[@]}"; do
-		[[ $h != "$d" ]] || die "refusing to run on $d: it is the aqmas bastion and only accepts the owner's key"
+	for d in ${HARD_DENY[@]+"${HARD_DENY[@]}"}; do
+		[[ $h != "$d" ]] || die "refusing to run on $d: the site policy refuses it (e.g. the aqmas bastion)"
 	done
-	for d in "${APPROVAL_DENY[@]}"; do
+	for d in ${APPROVAL_DENY[@]+"${APPROVAL_DENY[@]}"}; do
 		if [[ $h == "$d" && $OWNER_OK -ne 1 ]]; then
 			die "$d needs the owner's go-ahead; re-run with --i-have-owner-approval once you have it"
 		fi
@@ -130,8 +176,8 @@ for h in "${host_names[@]}"; do
 done
 if command -v ip >/dev/null; then
 	addrs=$(ip -o addr show 2>/dev/null || true)
-	for a in "${HARD_DENY_ADDRS[@]}"; do
-		if grep -qF " $a/" <<<"$addrs"; then die "refusing to run on the aqmas bastion ($a)"; fi
+	for a in ${HARD_DENY_ADDRS[@]+"${HARD_DENY_ADDRS[@]}"}; do
+		if grep -qF " $a/" <<<"$addrs"; then die "refusing to run on $a: the site policy refuses it (e.g. the aqmas bastion)"; fi
 	done
 fi
 
@@ -217,7 +263,7 @@ sshd_check() {
 	say "ok         sshd -t"
 	[[ $MODE == install ]] || return 0
 	local eff u
-	for u in "${USERS[@]}"; do
+	for u in ${USERS[@]+"${USERS[@]}"}; do
 		eff=$("$SSHD" -T ${cfg[@]+"${cfg[@]}"} -C "user=$u,host=${NAME},addr=192.0.2.50" 2>&1) || { say "sshd -T failed: $eff"; return 1; }
 		if ! grep -qxi "trustedusercakeys /etc/ssh/aqmas_user_ca.pub" <<<"$eff" ||
 			! grep -qxi "authorizedprincipalsfile /etc/ssh/aqmas_principals/%u" <<<"$eff"; then
@@ -332,7 +378,7 @@ do_install() {
 	plan_file "$CA_DST" "$key_line"
 	plan_file "$CONF_DST" "$conf"
 	local u
-	for u in "${USERS[@]}"; do
+	for u in ${USERS[@]+"${USERS[@]}"}; do
 		plan_file "$PRINC_DIR/$u" "$u@$NAME"
 	done
 	if [[ -d $PRINC_DIR ]]; then :; else say "create     ${PRINC_DIR#"$R"}/ (0755)"; fi
@@ -352,7 +398,7 @@ do_install() {
 	chmod 0755 "$PRINC_DIR"
 	if [[ $EUID -eq 0 ]]; then chown root:root "$PRINC_DIR"; fi
 	put "$CA_DST" "$key_line"
-	for u in "${USERS[@]}"; do put "$PRINC_DIR/$u" "$u@$NAME"; done
+	for u in ${USERS[@]+"${USERS[@]}"}; do put "$PRINC_DIR/$u" "$u@$NAME"; done
 	put "$CONF_DST" "$conf"
 	if ! sshd_check; then
 		restore
@@ -377,7 +423,7 @@ do_uninstall() {
 		targets+=("$CA_DST")
 	fi
 	# Without --user, every principals file this script could have written.
-	local users=("${USERS[@]}")
+	local users=(${USERS[@]+"${USERS[@]}"})
 	if [[ $USERS_GIVEN -eq 0 && -d $PRINC_DIR ]]; then
 		users=()
 		for f in "$PRINC_DIR"/*; do [[ -f $f ]] && users+=("$(basename "$f")"); done
