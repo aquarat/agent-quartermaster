@@ -17,10 +17,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - id: version
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
           set -eu
+          if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git diff --quiet "$BEFORE" "$GITHUB_SHA" -- VERSION; then exit 0; fi
           v=$(cat VERSION)
-          test "$(wc -l < VERSION)" = 1 && printf '%s\n' "$v" | grep -qxE '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          test "$(wc -l < VERSION)" = 1
+          printf '%s\n' "$v" | grep -qxE '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
           if ! git rev-parse --verify --quiet "refs/tags/v$v"; then echo "tag=v$v" >> "$GITHUB_OUTPUT"; fi
       - if: steps.version.outputs.tag != ''
         run: |
@@ -32,11 +36,26 @@ jobs:
       - if: steps.version.outputs.tag != ''
         run: |
           set -eu
-          cd web && bun install --frozen-lockfile && bun test && bun run build && cd ..
-          make vet
-          go test -race ./...
-          make interop interop-cf
-          make release
+          # Exercise the real unprivileged SSH login, even in a rootless Docker
+          # job whose container root account is locked. Use only ephemeral state.
+          work=$(mktemp -d)
+          git clone -q --no-hardlinks "$GITHUB_WORKSPACE" "$work/src"
+          git -C "$work/src" checkout --quiet --detach "$GITHUB_SHA"
+          chown -R node:node "$work"
+          usermod --password "$(openssl rand -base64 48 | openssl passwd -6 -stdin)" node
+          runuser -u node -- env HOME=/home/node PATH="$PATH" bash -ec '
+            cd "$1/src"
+            (cd web && bun install --frozen-lockfile && bun test && bun run build)
+            make vet
+            go test -race ./...
+            make interop interop-cf
+            make release
+          ' bash "$work"
+          mkdir dist
+          for f in aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64 SHA256SUMS; do
+            test -f "$work/src/dist/$f" && test ! -L "$work/src/dist/$f"
+            runuser -u node -- cat "$work/src/dist/$f" > "dist/$f"
+          done
       - if: steps.version.outputs.tag != ''
         uses: https://github.com/actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3, Forgejo compatible
         with:
