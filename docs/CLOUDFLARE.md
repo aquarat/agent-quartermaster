@@ -1,18 +1,16 @@
 # aqmas milestone 2: Cloudflare access through aqmasd
 
-Status (2026-11-20): contract. Wire types: `internal/api/cloudflare.go`; agent and web API:
-`docs/API.md` section 5; catalogue metadata: `internal/server/cfscope/catalogue.go`. Evidence and
-owner decisions: branch `research/cloudflare`, `the research notes`
-(cited below as "research"; section 9 = design decisions 1-11).
+Status: built and tested (milestone 2). Wire types: `internal/api/cloudflare.go`; agent and web
+API: `docs/API.md` section 5; catalogue: `internal/server/cfscope/`; operator setup: section 8.
 
-Goal: the account-wide Cloudflare API token leaves the hosts where agents can read it,
-and lives only on the bastion (.60) inside aqmasd. Agents get **time-boxed area grants** (the
-research shows bursty project-day use: per-call approval would get in the way) and use them
+Goal: an account-wide Cloudflare API token should not sit on hosts where agents can read it; it
+lives only on the bastion inside aqmasd. Agents get **time-boxed area grants** (Cloudflare work
+comes in bursts on a project day: per-call approval would get in the way) and use them
 through aqmasd's **proxy**, which checks every call against the grant's scope, injects the
 parent token, enforces the owner's Cloudflare rules (guard rails) and snapshots objects before
 writing them. Tools that cannot use the proxy get a **minted child token** (fallback).
 
-Threat model (owner): almost every agent session is trustworthy; aqmas contains one compromised
+Threat model: almost every agent session is trustworthy; aqmas contains one compromised
 session or service on one host. So: reads are cheap (auto-approved), writes are scoped and
 time-boxed, nothing an agent holds is a long-lived Cloudflare secret, and every write leaves an
 audit row, a push notification and a revertable snapshot.
@@ -21,20 +19,21 @@ audit row, a push notification and a revertable snapshot.
 
 - A request of kind `cloudflare` names a **scope** from the built-in catalogue (section 2),
   its **parameters** (zone, tunnel, script, ...) and a **mode**:
-  - `proxy` (default, design decision 1): no secret is returned. The host calls
+  - `proxy` (default): no secret is returned. The host calls
     `https://<bastion>:8443/cf/client/v4/<cloudflare path>` with its mTLS client certificate and
     `X-Aqmas-Grant: <grant id>[,<id>...]`. Revoking the grant stops it at once.
   - `token` (fallback): aqmasd mints a child API token limited by a fixed per-scope template,
-    the grant's expiry and the static egress IP condition, and returns its value **once**.
+    the grant's expiry and the configured IP condition (`token_ip_condition`), and returns its value **once**.
 - Scope names and their parameter keys are **built into the code** (Go: `cfscope`; web:
   `web/src/cfscopes.ts`) so the approval page can always describe what it signs. aqmasd's config
   may only narrow scopes (section 6).
 - Parameters naming zones, tunnels and D1 databases use **names configured in aqmasd**
   (`[[cloudflare.zones]]` etc.); aqmasd maps them to ids. An unconfigured zone/tunnel/database
-  can only be reached with `cf.admin` (that is how a second tunnel is handled: it is simply not configured).
+  can only be reached with `cf.admin` (a tunnel that agents should not edit routinely is simply
+  left out of the config).
 - **Approval** works as in M1 (passkey per decision; the canonical text now carries
   `scope`, `scope_params`, `mode`, `ip_condition`; API.md 5.4). `cf.read` and `cf.cache.purge`
-  in proxy mode are **auto-approved** (design decision 2). "Approve similar for N hours" (standing
+  in proxy mode are **auto-approved** (config can turn that off). "Approve similar for N hours" (standing
   approvals) exists per scope, proxy mode only, matching host + address + scope + exact
   scope_params. Never for `cf.admin` or `cf.read.private`, never for token mode.
 - A proxy grant is usable only from the **address the request came from** (as M1 binds SSH
@@ -66,8 +65,8 @@ Every write scope also includes the GETs of the objects it writes, so one grant 
 | `cf.email` | `zone` | H | no | no | 1h / 8h | – |
 | `cf.admin` | – | A | never | never | 1h / 1h | – |
 
-Deferred (not in M2): `cf.token.ci:{repo}` (design decision 5: CI deploy tokens stay in Forgejo
-secrets for now); `cf.access.service-tokens` (the response carries `client_secret`; rare, done
+Deferred (not in M2): `cf.token.ci:{repo}` (minting long-lived CI deploy tokens into a CI
+secret store); `cf.access.service-tokens` (the response carries `client_secret`; rare, done
 by the owner in the dashboard; the proxy denies service-token creation, section 3).
 
 ### 2.1 Route tables
@@ -485,11 +484,12 @@ Creates of policies, groups and IdPs work as `access-app` (before = missing, aft
 `result.id`). An after GET answering 404 (a DELETE) stores an after-snapshot with
 `missing: true`.
 
-Stored by aqmasd on .60 (design decision 3) under `snapshot_dir` (default
+Stored by aqmasd on the bastion under `snapshot_dir` (default
 `/var/lib/aqmas/cf-snapshots`): `<YYYY-MM-DD>/<id>.json` = the GET's `result` after redaction
 (3.3), `<id>.meta.json` = `api.CFSnapshot` without content; files 0600, directories 0700.
 Retention: hourly prune deletes snapshots older than `snapshot_retention_days` (default and
-maximum 7) **except the newest snapshot of each object key**. Include it in the bastion's backups.
+maximum 7) **except the newest snapshot of each object key**. Include the directory in the
+bastion's backups if snapshots should outlive the host.
 
 Agents read snapshots with `aqmas cf snapshot list|get` (API.md 5.3); a host needs any active
 Cloudflare grant (cf.read is auto-approved, so this is cheap), and sees only snapshots of its
@@ -516,8 +516,9 @@ content back through the proxy with the matching write scope (it is snapshotted 
   mark is undone and the poll returns 502 (the CLI retries).
 - **Deletion**: on grant revoke (at once, best effort) and by the sweeper (every minute) for
   every token-mode grant past `not_after` whose token is not yet deleted (retries until 2xx or
-  404). Every 15 minutes the sweeper also lists upstream tokens named `aqmas:*`: one past its
-  expiry, or one aqmasd has no record of, is deleted, audited `cf_token_orphan` and pushed.
+  404). Every 15 minutes the sweeper also lists upstream tokens named exactly
+  `aqmas:<grant id>:<host>` (other names, including other `aqmas…` tokens, are never touched):
+  one past its expiry, or one aqmasd has no record of, is deleted, audited `cf_token_orphan` and pushed.
 - Audit: `cf_token_mint` (grant, token id, permissions), `cf_token_delete`.
 
 ## 6. Configuration (`[cloudflare]` in `/etc/aqmas/config.toml`)
@@ -529,7 +530,7 @@ account_id = "<32 hex>"
 # api_base = "https://api.cloudflare.com/client/v4"
 proxy_token_credential  = "cf-proxy-token"    # systemd LoadCredential= name (preferred)
 minter_token_credential = "cf-minter-token"   # optional: token mode off without it
-token_ip_condition = ["<static home IPv4>/32"] # design decision 4; configurable
+token_ip_condition = ["203.0.113.7/32"]        # your static egress address(es)
 # snapshot_dir = "/var/lib/aqmas/cf-snapshots"; snapshot_retention_days = 7
 # rate_per_minute = 600; write_rate_per_minute = 60
 # All of the following default to empty (the guards that need them then do not apply):
@@ -568,13 +569,13 @@ Overrides can only narrow: `disabled`, a lower `max_ttl_seconds`, `default_ttl_s
 `max_ttl_seconds` above the built-in maximum are start-up errors. `cf.admin` (1 h, never auto,
 never standing) and `cf.read.private` (never auto, never standing) are fixed.
 
-Parent tokens: two new tokens (design decision 9: without Memberships Write / User Details
-Write), both IP-conditioned to the static egress address (design decision 4): the **proxy parent**
+Parent tokens: two tokens (without Memberships Write / User Details Write), both
+IP-conditioned to the site's egress address: the **proxy parent**
 (everything the scopes need, no API Tokens permission) and the **minter parent** (API Tokens
 Write only). Each is a root-owned file in `/etc/aqmas/` handed to aqmasd by systemd
 `LoadCredential=` (read once at start from `$CREDENTIALS_DIRECTORY/<name>`; `*_token_file` is
 the alternative: a file owned by user `aqmas`, mode 0600/0400, refused otherwise). Never logged,
-never in the database. Plan: `docs/DEPLOY-M2.md`.
+never in the database. Setup: section 8.
 
 ## 7. Agent-side tools (API.md 5.6)
 
@@ -582,3 +583,36 @@ never in the database. Plan: `docs/DEPLOY-M2.md`.
 with `CLOUDFLARE_API_BASE_URL` pointing at a **local shim** on `127.0.0.1` (random port, random
 per-run bearer as `CLOUDFLARE_API_TOKEN`), which forwards to the proxy with mTLS and the grant
 list. Unmodified wrangler, curl and scripts work through it.
+
+## 8. Operator setup (generic)
+
+1. **Config values only the operator knows** (all empty by default; the guards that need them
+   are off until set, and aqmasd logs a warning at start): `protected_access_hostnames` (the
+   identity provider's hostname, at least), `protected_dns_names`, `traefik_origin` /
+   `traefik_plain_origins` (if a reverse proxy behind the tunnel needs `originServerName`),
+   `email_forward_allow` (if `cf.email` is used), `[[cloudflare.worker_bindings]]` for every
+   Worker or Pages project with data bindings (D1, R2, KV, services, queues: without an entry,
+   deploys that bind data are refused), and the zones/tunnels/D1 databases agents may name.
+2. **Two parent tokens**, created in the Cloudflare dashboard (My Profile → API Tokens), both
+   with a client IP filter for the site's egress address and no TTL (rotate yearly):
+
+   | Token | Permissions |
+   |---|---|
+   | proxy parent | Account: Account Settings Read; Cloudflare Tunnel Write; Access: Apps and Policies Write; Access: Organizations, Identity Providers, and Groups Write; Access: Service Tokens Read; Access: Audit Logs Read; Access: Users Read; Workers Scripts Write; Workers R2 Storage Write; Cloudflare Pages Write; D1 Write; Email Routing Addresses Write (and Email Sending if used); Turnstile Sites Read. Zone (the zones agents may use): Zone Read; Zone Settings Write; DNS Write; Zone WAF Write; Transform Rules Write; Dynamic URL Redirects Write; Cache Rules / Cache Settings Write; Cache Purge; Workers Routes Write; Email Routing Rules Write; Page Rules Read; Bot Management Read |
+   | minter parent | User: API Tokens Write only (needed for token mode; Cloudflare lets it create tokens with any permission the user holds, so it must live only in aqmasd's credential) |
+
+   Leave out: API Tokens on the proxy parent, Memberships, User Details, Logs/Logpush, SSL and
+   Certificates, Zero Trust devices/gateway/teamnet, Secrets Store, Hyperdrive, Registrar,
+   Billing, Workers Tail, Access: Service Tokens Write. Check the exact permission names in
+   `GET /user/tokens/permission_groups`; they drift.
+3. **Install** each value as a root-owned 0600 file (`/etc/aqmas/cf-proxy-token`,
+   `/etc/aqmas/cf-minter-token`, written from stdin, never on a command line), enable the
+   commented `LoadCredential=` lines of `deploy/bastion/aqmasd.service` in a drop-in, fill
+   `[cloudflare]` (section 6), restart aqmasd, check the log (Cloudflare enabled, warnings) and
+   run `aqmas cf scopes` and `aqmas cf api GET /zones` from an enrolled host.
+4. **Verify** with a throw-away write (`cf.dns.edit` with a `name` limited to a test name: create
+   and delete a TXT record; check the card, the pushes, the snapshots and the audit rows), and a
+   short token-mode grant (the child token appears in the dashboard with expiry and IP filter
+   and disappears after expiry).
+5. **Cut over**: delete the old account-wide token, revoke tool OAuth grants (wrangler, editor
+   plugins) that bypass aqmas, and remove token copies from agent hosts.

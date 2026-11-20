@@ -9,7 +9,11 @@
 //	enrollment: + requesting_host, kind, key_fingerprint, replaces, ttl_seconds, standing_hours
 //	standing:   + requesting_host, kind, target, login_user, ttl_seconds, standing_hours
 //	grant:      + requesting_host, kind, target, login_user, ttl_seconds, standing_hours
-//	passkey:    common only
+//	passkey:    + nickname, new_nickname
+//
+// For passkey "add" the id is "new" and both nicknames are ""; for "rename" and "remove" the
+// id is the passkey's id (hex of the first 16 bytes of SHA-256 of the credential ID),
+// nickname its current nickname and new_nickname the new one (rename) or "" (remove).
 //
 // For kind "cloudflare" (milestone 2) the request, standing and grant objects carry a different
 // set instead (docs/API.md 5.4); the set is chosen by (object, kind):
@@ -39,7 +43,9 @@ const (
 	ActionApprove = "approve"
 	ActionDeny    = "deny"
 	ActionRevoke  = "revoke"
-	ActionAdd     = "add" // add another passkey
+	ActionAdd     = "add"    // add another passkey
+	ActionRename  = "rename" // rename a passkey
+	ActionRemove  = "remove" // remove a passkey
 )
 
 // Objects.
@@ -59,7 +65,7 @@ var objectKeys = map[string][]string{
 	ObjectEnrollment: {"requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"},
 	ObjectStanding:   {"requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"},
 	ObjectGrant:      {"requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"},
-	ObjectPasskey:    {},
+	ObjectPasskey:    {"nickname", "new_nickname"},
 }
 
 // KindCloudflare is the request kind whose objects carry the Cloudflare key sets.
@@ -88,7 +94,7 @@ var objectActions = map[string][]string{
 	ObjectEnrollment: {ActionApprove, ActionDeny},
 	ObjectStanding:   {ActionRevoke},
 	ObjectGrant:      {ActionRevoke},
-	ObjectPasskey:    {ActionAdd},
+	ObjectPasskey:    {ActionAdd, ActionRename, ActionRemove},
 }
 
 // Action is everything the owner approves with one passkey assertion.
@@ -110,6 +116,8 @@ type Action struct {
 	ScopeParams string `json:"scope_params"`
 	Mode        string `json:"mode"`
 	IPCondition string `json:"ip_condition"`
+	Nickname    string `json:"nickname"`     // passkey: its current nickname
+	NewNickname string `json:"new_nickname"` // passkey rename: the new nickname
 }
 
 // Signed is a parsed canonical text: the action plus the challenge metadata.
@@ -143,6 +151,8 @@ func (a Action) values() map[string]any {
 		"scope_params":    a.ScopeParams,
 		"mode":            a.Mode,
 		"ip_condition":    a.IPCondition,
+		"nickname":        a.Nickname,
+		"new_nickname":    a.NewNickname,
 	}
 }
 

@@ -151,7 +151,13 @@ BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 ALTER TABLE standing ADD COLUMN peer_address TEXT NOT NULL DEFAULT '';
 ALTER TABLE enrollments ADD COLUMN poll_token_hash TEXT NOT NULL DEFAULT '';
 `,
-	// 3 (milestone 2): Cloudflare requests, grants and standing approvals. SSH rows keep these
+	// 3 (passkey management): every passkey gets a valid, unique nickname. Done in Go
+	// (fixPasskeyNames, run by migrate in the same transaction) so the nickname rules apply:
+	// rows without a usable name become "Passkey 1", "Passkey 2", ... in registration order,
+	// skipping names already taken. AAGUID, transports, backup flags and sign count already
+	// live in credential_json (go-webauthn's credential record).
+	`SELECT 1;`,
+	// 4 (milestone 2): Cloudflare requests, grants and standing approvals. SSH rows keep these
 	// empty; Cloudflare rows keep the SSH columns (target_host, login_user, public_key,
 	// key_fingerprint, principals, certificate) empty. grants.peer_address is the address of the
 	// request that created the grant (the proxy only serves calls from it). Child-token values

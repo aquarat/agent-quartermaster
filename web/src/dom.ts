@@ -24,6 +24,8 @@ export interface Attrs {
   dir?: string;
   datetime?: string;
   open?: boolean;
+  placeholder?: string;
+  maxlength?: string;
   [aria: `aria-${string}`]: string | undefined;
   [data: `data-${string}`]: string | undefined;
   on?: { [K in keyof HTMLElementEventMap]?: (ev: HTMLElementEventMap[K]) => void };
@@ -32,7 +34,7 @@ export interface Attrs {
 const BOOL = new Set(["hidden", "disabled", "checked", "open"]);
 const ALLOWED = new Set([
   "class", "id", "role", "type", "name", "value", "for", "title", "autocomplete", "inputmode",
-  "enterkeyhint", "spellcheck", "tabindex", "dir", "datetime",
+  "enterkeyhint", "spellcheck", "tabindex", "dir", "datetime", "placeholder", "maxlength",
 ]);
 
 export function append(parent: Node, children: Child[]): void {
@@ -71,4 +73,10 @@ export function $(sel: string, root: ParentNode = document): HTMLElement {
   const el = root.querySelector(sel);
   if (!el) throw new Error(`missing ${sel}`);
   return el as HTMLElement;
+}
+
+/** obj[key] only when key is obj's own property: lookups keyed by server or browser strings
+ * must not reach Object.prototype ("constructor", "__proto__", ...). */
+export function own<V>(obj: Record<string, V>, key: string): V | undefined {
+  return Object.hasOwn(obj, key) ? obj[key] : undefined;
 }

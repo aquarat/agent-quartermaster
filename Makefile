@@ -4,7 +4,10 @@
 GO      ?= $(shell command -v go 2>/dev/null || echo $(HOME)/.local/toolchains/go/bin/go)
 BUN     ?= bun
 VERSION ?= $(shell git describe --always --dirty --tags 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X main.version=$(VERSION)
+MODULE  := github.com/aquarat/agent-quartermaster
+# aqmasd reads main.version; the aqmas CLI reads internal/client.Version (an -X for a symbol a
+# binary doesn't link is ignored, so both binaries get both).
+LDFLAGS := -s -w -X main.version=$(VERSION) -X $(MODULE)/internal/client.Version=$(VERSION)
 GOBUILD := CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)"
 
 .PHONY: all build aqmasd aqmas web webui test vet clean interop interop-cf

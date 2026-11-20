@@ -270,13 +270,6 @@ func (e *env) item(id string) api.PendingItem {
 	return it
 }
 
-func (e *env) state() api.UIState {
-	e.t.Helper()
-	var st api.UIState
-	mustStatus(e.t, "state", e.webDo("GET", "/api/ui/state", nil, &st), 200)
-	return st
-}
-
 func (e *env) audited(action, object string) *api.AuditEntry {
 	e.t.Helper()
 	for _, en := range e.state().Recent {

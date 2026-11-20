@@ -4,8 +4,9 @@
 
 `deploy/hosts/install-host-trust.sh` installs (dry run by default, `--apply` to change, backs
 up what it replaces to `/var/backups/aqmas-host-trust/<UTC time>/`, validates with `sshd -t`
-and `sshd -T` before reloading sshd, restores the backup on a failed check, `--uninstall`
-reverses it):
+and `sshd -T` before reloading sshd, restores the backup on a failed check, then waits up to
+10 s (`SSHD_WAIT_SECONDS`) for sshd's port(s) to listen again, since Fedora's reload briefly
+closes the socket; `--uninstall` reverses it):
 
 - `/etc/ssh/aqmas_user_ca.pub` (root:root 0644): the SSH user CA, from `aqmasd print-ssh-ca`
   on the bastion (the same key `GET /v1/ssh-ca` publishes). Only an `ssh-ed25519` line is

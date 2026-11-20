@@ -246,7 +246,7 @@ describe("cloudflare describe()", () => {
     const d = describeAction(parse({ ...req, scope_params: `name=*.ex${cyrillicA}mple.com;zone=ex${cyrillicA}mple.com` }));
     expect(d.warnings.join(" ")).toMatch(/Zone value contains unusual characters/);
     expect(d.warnings.join(" ")).toMatch(/Only DNS names value contains unusual characters/);
-    expect(describeAction(parse({ ...req, requesting_host: "host‮name" })).warnings.join(" ")).toMatch(/requesting host name contains unusual/);
+    expect(describeAction(parse({ ...req, requesting_host: "agent‮host" })).warnings.join(" ")).toMatch(/requesting host name contains unusual/);
     expect(describeAction(parse({ ...req, scope: "cf.pages", scope_params: "project=My Site" })).warnings.join(" ")).toMatch(/Pages project value/);
   });
 
@@ -266,7 +266,7 @@ describe("cloudflare describe()", () => {
       ip_condition: "203.0.113.7/32",
     };
     expect(mismatches(c, want)).toEqual([]);
-    for (const [k, v] of Object.entries({ scope: "cf.pages", scope_params: "script=shopfront-api", mode: "proxy", ip_condition: "", kind: "ssh", requesting_host: "dev-1", ttl_seconds: 3600 })) {
+    for (const [k, v] of Object.entries({ scope: "cf.pages", scope_params: "script=shopfront-api", mode: "proxy", ip_condition: "", kind: "ssh", requesting_host: "hosta", ttl_seconds: 3600 })) {
       const m = mismatches(c, { ...want, [k]: v });
       expect(m.length).toBe(1);
       expect(m[0]).toStartWith(`${k}:`);

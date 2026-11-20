@@ -141,7 +141,7 @@ describe("Cloudflare cards", () => {
     const dlg = await openApprove("01JDEMO0CF0TUNNEL00000010");
     [...dlg.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent === "Continue")!.click();
     await until(() => !!dlg.querySelector("button.confirm"));
-    expect([...dlg.querySelectorAll(".cf-details li")].map((l) => l.textContent)).toEqual(["Tunnel: home", "Mode: through the aqmas proxy"]);
+    expect([...dlg.querySelectorAll(".cf-details li")].map((l) => l.textContent)).toEqual(["Tunnel: main", "Mode: through the aqmas proxy"]);
     dialog().close();
   });
 
@@ -174,10 +174,28 @@ describe("Cloudflare cards", () => {
     expect(m.store.applied.at(-1)!.canonical).toMatchObject({ object: "grant", kind: "cloudflare", scope: "cf.read" });
   });
 
-  test("Cloudflare audit entries are readable", () => {
-    const labels = [...root.querySelectorAll("#sec-recent .audit strong")].map((s) => s.textContent);
-    expect(labels).toContain("auto-approved Cloudflare");
-    expect(labels).toContain("Cloudflare token minted");
-    expect(labels).toContain("Cloudflare write");
+  test("Cloudflare activity rows: own glyphs and colours, a cloud mark, their own filter", async () => {
+    const sec = root.querySelector<HTMLElement>("#sec-recent")!;
+    await until(() => !!sec.querySelector(".ev-cf"));
+    const rows = [...sec.querySelectorAll<HTMLElement>(".ev")];
+    const row = (label: string) => rows.find((r) => r.querySelector(".ev-label")!.textContent === label)!;
+    expect(row("Cloudflare auto-approved").classList.contains("ev-auto")).toBe(true);
+    expect(row("Cloudflare write").classList.contains("ev-cfwrite")).toBe(true);
+    expect(row("Cloudflare refused").classList.contains("ev-warning")).toBe(true);
+    expect(row("Token minted").classList.contains("ev-token")).toBe(true);
+    // The owner's approval of cf.admin earlier in this file, and the revoke of the cf.read grant.
+    expect(row("Cloudflare approved").classList.contains("ev-approve")).toBe(true);
+    for (const r of rows.filter((x) => x.classList.contains("ev-cf"))) {
+      expect(r.querySelector(".ev-glyph .cf-mark")!.getAttribute("aria-hidden")).toBe("true");
+      expect(r.querySelector(".ev-label")!.textContent).toMatch(/Cloudflare|Token/);
+    }
+    // SSH rows carry no cloud mark.
+    expect(rows.filter((x) => !x.classList.contains("ev-cf")).every((r) => !r.querySelector(".cf-mark"))).toBe(true);
+    const btn = (id: string) => root.querySelector<HTMLButtonElement>(`.filters [data-filter="${id}"]`)!;
+    btn("cloudflare").click();
+    const shown = [...sec.querySelectorAll<HTMLElement>(".ev")];
+    expect(shown.length).toBeGreaterThan(3);
+    expect(shown.every((r) => r.classList.contains("ev-cf"))).toBe(true);
+    btn("all").click();
   });
 });

@@ -88,7 +88,7 @@ const SCOPES: CFScopeDesc[] = [
     token: false,
     params: [],
     phrase: () => ["read personal data in Cloudflare (Access logs and users, identity providers, email addresses, audit logs)"],
-    can: ["Read Access request logs and users (household emails, IP addresses), identity provider settings, email routing addresses, full Pages project and Worker settings, the account audit log."],
+    can: ["Read Access request logs and users (emails, IP addresses), identity provider settings, email routing addresses, full Pages project and Worker settings, the account audit log."],
     cannot: ["Change anything.", "Read API tokens or tunnel run tokens."],
   },
   {
@@ -119,7 +119,7 @@ const SCOPES: CFScopeDesc[] = [
     params: [{ key: "tunnel", label: "Tunnel", required: true, shape: CF_NAME_RE }],
     phrase: (p) => ["replace the routes (ingress config) of tunnel ", v(p["tunnel"])],
     can: ["Read and replace the whole ingress config of this tunnel: which hostnames the internet reaches and where they go. aqmas snapshots it first."],
-    cannot: ["Create, delete or re-key tunnels, or read a tunnel's run token.", "Write rules the guard rails refuse (missing catch-all, Traefik without SNI, removing an Access check)."],
+    cannot: ["Create, delete or re-key tunnels, or read a tunnel's run token.", "Write rules the guard rails refuse (missing catch-all, reverse proxy without SNI, removing an Access check)."],
   },
   {
     name: "cf.access.apps",
@@ -151,7 +151,7 @@ const SCOPES: CFScopeDesc[] = [
     token: false,
     params: [],
     phrase: () => ["change Cloudflare Access login methods (identity providers and organization settings)"],
-    can: ["Change identity providers (OIDC IdP, GitHub, PIN) and the Access organization settings. This affects every login."],
+    can: ["Change identity providers (OIDC, GitHub, one-time PIN, ...) and the Access organization settings. This affects every login."],
     cannot: ["Delete an identity provider (guard rail)."],
   },
   {

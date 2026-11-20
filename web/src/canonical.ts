@@ -39,6 +39,8 @@ export interface Canonical {
   scope_params?: string;
   mode?: string;
   ip_condition?: string;
+  nickname?: string;
+  new_nickname?: string;
   nonce?: string;
   issued_at?: string;
   [k: string]: unknown;
@@ -52,7 +54,7 @@ const ALLOWED_KEYS: Record<string, string[]> = {
   enrollment: [...COMMON_KEYS, "requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"],
   standing: [...COMMON_KEYS, "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"],
   grant: [...COMMON_KEYS, "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"],
-  passkey: COMMON_KEYS,
+  passkey: [...COMMON_KEYS, "nickname", "new_nickname"],
 };
 // kind "cloudflare" (API.md 5.4): a different, exact key set for request/standing/grant.
 const CF_KEYS: Record<string, string[]> = {
@@ -60,13 +62,13 @@ const CF_KEYS: Record<string, string[]> = {
   standing: [...COMMON_KEYS, "requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"],
   grant: [...COMMON_KEYS, "requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"],
 };
-const STRING_KEYS = ["requesting_host", "kind", "target", "login_user", "key_fingerprint", "scope", "scope_params", "mode", "ip_condition", "nonce", "issued_at"] as const;
+const STRING_KEYS = ["requesting_host", "kind", "target", "login_user", "key_fingerprint", "nickname", "new_nickname", "scope", "scope_params", "mode", "ip_condition", "nonce", "issued_at"] as const;
 const ALLOWED_ACTIONS: Record<string, string[]> = {
   request: ["approve", "deny"],
   enrollment: ["approve", "deny"],
   standing: ["revoke"],
   grant: ["revoke"],
-  passkey: ["add"],
+  passkey: ["add", "rename", "remove"],
 };
 
 export class CanonicalError extends Error {
@@ -210,6 +212,10 @@ export interface Expectation {
   scope_params?: string;
   mode?: string;
   ip_condition?: string;
+  /** Passkey actions: the passkey's current nickname ("" for add). */
+  nickname?: string;
+  /** Passkey rename: the new nickname ("" for add and remove). */
+  new_nickname?: string;
 }
 
 /** List of human-readable mismatches between canonical and the expectation (empty = ok). */
@@ -232,6 +238,11 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
   cmp("mode", c.mode, e.mode);
   cmp("ip_condition", c.ip_condition, e.ip_condition);
   if (e.object === "enrollment") cmp("replaces", c.replaces ?? false, e.replaces ?? false);
+  if (e.object === "passkey") {
+    // Every passkey action carries both nicknames; add and remove must not rename anything.
+    cmp("nickname", c.nickname, e.nickname ?? "");
+    cmp("new_nickname", c.new_nickname, e.action === "rename" || e.action === "add" ? (e.new_nickname ?? "") : "");
+  }
   if (e.action === "approve") {
     cmp("ttl_seconds", c.ttl_seconds ?? 0, e.ttl_seconds);
     cmp("standing_hours", c.standing_hours ?? 0, e.standing_hours ?? 0);
@@ -249,7 +260,7 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
 export type Part = string | { value: string };
 
 export interface Description {
-  /** One sentence, e.g. "Approve SSH as alice@db-1 for 30 min, requested by build-box." */
+  /** One sentence, e.g. "Approve SSH as alice@db-1 for 30 min, requested by web-1." */
   headline: string;
   headlineParts: Part[];
   /** Extra sentence for a standing approval, shown as a warning. */
@@ -281,6 +292,8 @@ const FIELD_LABELS: Record<string, string> = {
   ttl_seconds: "Access lasts",
   standing_hours: "Auto-approve similar",
   replaces: "Replaces existing host",
+  nickname: "Passkey",
+  new_nickname: "New name",
   key_fingerprint: "Key",
   id: "ID",
   issued_at: "Issued",
@@ -295,6 +308,7 @@ function fieldValue(k: string, v: unknown): string {
   if (k === "replaces" && typeof v === "boolean") return v ? "yes" : "no";
   if (k === "scope_params" && v === "") return "none";
   if (k === "ip_condition" && v === "") return "n/a (proxy)";
+  if ((k === "nickname" || k === "new_nickname") && v === "") return "(none)";
   if (typeof v === "string") return v;
   return JSON.stringify(v);
 }
@@ -314,6 +328,11 @@ function t(strings: TemplateStringsArray, ...vals: Array<string | Part[]>): Part
 
 export function partsText(parts: Part[]): string {
   return parts.map((p) => (typeof p === "string" ? p : p.value)).join("");
+}
+
+/** Short id of a passkey as the UI shows it on the tile: the last 6 hex digits, upper case. */
+export function shortId(id: string): string {
+  return id.slice(-6).toUpperCase();
 }
 
 function who(c: Canonical): Part[] {
@@ -352,10 +371,22 @@ export function describe(c: Canonical): Description {
       headline = t`Revoke ${host}'s ${kind} access as ${who(c)}.`;
       break;
     case "passkey:add":
-      headline = ["Allow adding a new passkey to aqmas."];
+      headline = c.new_nickname ? t`Allow adding a new passkey named ${c.new_nickname} to aqmas.` : ["Allow adding a new passkey to aqmas (named after its authenticator)."];
+      break;
+    case "passkey:rename":
+      headline = t`Rename the passkey ${c.nickname ?? "?"} (id ${shortId(c.id)}) to ${c.new_nickname ?? "?"}.`;
+      break;
+    case "passkey:remove":
+      headline = t`Remove the passkey ${c.nickname ?? "?"} (id ${shortId(c.id)}). It can no longer sign in or approve anything.`;
       break;
     default:
       headline = t`${c.action} ${c.object} ${c.id}.`;
+  }
+  for (const k of ["nickname", "new_nickname"] as const) {
+    const v = c[k];
+    if (typeof v === "string" && v !== "" && !/^[\x20-\x7e]+$/.test(v)) {
+      warnings.push(`The passkey name ${JSON.stringify(v)} has characters outside plain ASCII, which can look like other letters: go by the id.`);
+    }
   }
   for (const [k, label] of [
     ["requesting_host", "requesting host"],

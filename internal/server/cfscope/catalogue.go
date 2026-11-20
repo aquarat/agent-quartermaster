@@ -14,7 +14,7 @@ import (
 // Built-in limits.
 const (
 	hour        = 3600
-	AdminMaxTTL = hour // design decision 8: cf.admin grants last at most 1 hour
+	AdminMaxTTL = hour // cf.admin (break-glass) grants last at most 1 hour
 )
 
 // AllowedPhases are the ruleset phases cf.rulesets may write (docs/CLOUDFLARE.md 2).
@@ -51,7 +51,7 @@ type paramSpec struct {
 type builtin struct {
 	scope  Scope
 	params []paramSpec
-	// autoEligible: config may leave auto-approval on (design decision 2); nothing else can be
+	// autoEligible: config may leave auto-approval on; nothing else can be
 	// auto-approved.
 	autoEligible bool
 	// tokenFor builds the child-token template for resolved params (nil: proxy only).
@@ -212,13 +212,13 @@ func NewCatalogue(cfg *config.Cloudflare) (*Catalogue, error) {
 		if o.NoStanding {
 			sc.StandingAllowed = false
 		}
-		if sc.Name == api.CFScopeAdmin { // design decision 8, not configurable
+		if sc.Name == api.CFScopeAdmin { // fixed: never auto, never standing, at most 1 h
 			sc.AutoApprove, sc.StandingAllowed = false, false
 			if sc.MaxTTL > AdminMaxTTL {
 				sc.MaxTTL = AdminMaxTTL
 			}
 		}
-		if sc.Name == api.CFScopeReadPrivate { // design decision 7: never auto
+		if sc.Name == api.CFScopeReadPrivate { // personal data: never auto, never standing
 			sc.AutoApprove, sc.StandingAllowed = false, false
 		}
 		c.scopes[sc.Name] = &sc

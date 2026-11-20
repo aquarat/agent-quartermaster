@@ -40,11 +40,14 @@ export interface Api {
   state(): Promise<UIState>;
   request(id: string): Promise<PendingItem>;
   challenge(object: ObjectKind, id: string, body: ChallengeRequest): Promise<ChallengeResponse>;
-  apply(object: ObjectKind, id: string, challengeId: string, assertion: unknown): Promise<unknown>;
+  /** Apply a signed action. Passkey rename/remove need `action` (it picks the endpoint; the
+   * server also checks it against what was signed). */
+  apply(object: ObjectKind, id: string, challengeId: string, assertion: unknown, action?: string): Promise<unknown>;
   loginBegin(): Promise<BeginResponse>;
   loginFinish(challengeId: string | undefined, assertion: unknown): Promise<unknown>;
   registerBegin(body: { enroll_code?: string; challenge_id?: string; assertion?: unknown }): Promise<BeginResponse>;
-  registerFinish(challengeId: string | undefined, credential: unknown): Promise<unknown>;
+  /** `name`: the nickname (omitted = the server names it after the authenticator). */
+  registerFinish(challengeId: string | undefined, credential: unknown, name?: string): Promise<unknown>;
 }
 
 const seg = encodeURIComponent;
@@ -99,11 +102,17 @@ export function createApi(opts: ApiOptions = {}): Api {
     state: () => call<UIState>("GET", "/api/ui/state"),
     request: (id) => call<PendingItem>("GET", `/api/ui/requests/${seg(id)}`),
     challenge: (object, id, body) => {
-      if (object === "passkey") return call<ChallengeResponse>("POST", "/api/ui/passkeys/challenge", body);
+      if (object === "passkey") {
+        if (id === "new") return call<ChallengeResponse>("POST", "/api/ui/passkeys/challenge", body);
+        return call<ChallengeResponse>("POST", `/api/ui/passkeys/${seg(id)}/challenge`, body);
+      }
       return call<ChallengeResponse>("POST", `/api/ui/${objectPath(object).path}/${seg(id)}/challenge`, body);
     },
-    apply: (object, id, challengeId, assertion) => {
-      if (object === "passkey") throw new Error("passkey actions are applied by registerBegin");
+    apply: (object, id, challengeId, assertion, action) => {
+      if (object === "passkey") {
+        if (action !== "rename" && action !== "remove") throw new Error("adding a passkey is applied by registerBegin");
+        return call<unknown>("POST", `/api/ui/passkeys/${seg(id)}/${action}`, { challenge_id: challengeId, assertion });
+      }
       const p = objectPath(object);
       return call<unknown>("POST", `/api/ui/${p.path}/${seg(id)}/${p.apply}`, { challenge_id: challengeId, assertion });
     },
@@ -111,11 +120,10 @@ export function createApi(opts: ApiOptions = {}): Api {
     loginFinish: (challengeId, assertion) =>
       call<unknown>("POST", "/api/ui/login/finish", challengeId ? { challenge_id: challengeId, assertion } : { assertion }),
     registerBegin: (body) => call<BeginResponse>("POST", "/api/ui/passkeys/register/begin", body),
-    registerFinish: (challengeId, credential) =>
-      call<unknown>(
-        "POST",
-        "/api/ui/passkeys/register/finish",
-        challengeId ? { challenge_id: challengeId, credential } : { credential },
-      ),
+    registerFinish: (challengeId, credential, name) => {
+      const body: Record<string, unknown> = challengeId ? { challenge_id: challengeId, credential } : { credential };
+      if (name) body["name"] = name;
+      return call<unknown>("POST", "/api/ui/passkeys/register/finish", body);
+    },
   };
 }

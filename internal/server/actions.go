@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
+	"github.com/aquarat/agent-quartermaster/internal/server/aaguid"
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/pki"
@@ -156,8 +158,58 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 		a.RequestingHost, a.Kind, a.Target, a.LoginUser = g.HostName, g.Kind, g.TargetHost, g.LoginUser
 		a.Scope, a.ScopeParams, a.Mode = g.Scope, g.ScopeParams, g.Mode // kind "cloudflare"; empty for ssh
 	case canon.ObjectPasskey:
-		if in.Action != canon.ActionAdd || in.TTLSeconds != 0 || in.StandingHours != 0 {
-			return a, errBad(`action must be "add"`)
+		if in.TTLSeconds != 0 || in.StandingHours != 0 {
+			return a, errBad("passkey actions take no ttl_seconds or standing_hours")
+		}
+		switch in.Action {
+		case canon.ActionAdd:
+			if id != "new" {
+				return a, errBad(`adding a passkey: POST /api/ui/passkeys/challenge {"action":"add"}`)
+			}
+			// An optional nickname for the new passkey is part of what the owner signs;
+			// register/finish then uses exactly it.
+			if strings.TrimSpace(in.Nickname) != "" {
+				n, err := normalizeNickname(in.Nickname)
+				if err != nil {
+					return a, err
+				}
+				all, err := loadPasskeys(ctx, q)
+				if err != nil {
+					return a, err
+				}
+				if nicknameTaken(all, n, 0) {
+					return a, errConflict("another passkey already has that name")
+				}
+				a.NewNickname = n
+			}
+		case canon.ActionRename, canon.ActionRemove:
+			p, all, err := findPasskey(ctx, q, id)
+			if err != nil {
+				return a, err
+			}
+			a.Nickname = p.Name
+			if in.Action == canon.ActionRemove {
+				if in.Nickname != "" {
+					return a, errBad("remove takes no nickname")
+				}
+				if len(all) <= 1 {
+					return a, errConflict("refusing to remove the last passkey: add another one first")
+				}
+				break
+			}
+			n, err := normalizeNickname(in.Nickname)
+			if err != nil {
+				return a, err
+			}
+			if n == p.Name {
+				return a, errBad("that is already its name")
+			}
+			if nicknameTaken(all, n, p.ID) {
+				return a, errConflict("another passkey already has that name")
+			}
+			a.NewNickname = n
+		default:
+			return a, errBad("action must be add, rename or remove")
 		}
 	default:
 		return a, errBad("unknown object")
@@ -250,8 +302,9 @@ func statusErr(status string) error {
 func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) error {
 	now := s.now()
 	a := sg.Action
-	detail := fmt.Sprintf("passkey=%d nonce=%s", passkeyID, sg.Nonce[:8])
 	return s.store.Tx(ctx, func(q *store.Q) error {
+		// Which passkey signed (resolved before a remove deletes it) and the nonce prefix.
+		detail := fmt.Sprintf("signed by %s nonce=%s", s.passkeyRef(ctx, q, passkeyID), sg.Nonce[:8])
 		if _, err := q.ExpireStale(ctx, now); err != nil {
 			return err
 		}
@@ -273,6 +326,10 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 			if a.Action == canon.ActionDeny {
 				if err := q.DecideRequest(ctx, r.ID, api.StatusDenied, "denied by owner", now); err != nil {
 					return decideErr(err)
+				}
+				if r.Kind == api.KindCloudflare {
+					return q.Audit(ctx, now, "owner", "deny", "request:"+r.ID,
+						fmt.Sprintf("cloudflare %s mode=%s for %s %s", cfDesc(r.Scope, r.ScopeParams), r.Mode, r.HostName, detail))
 				}
 				return q.Audit(ctx, now, "owner", "deny", "request:"+r.ID, detail)
 			}
@@ -372,6 +429,10 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 			if err := q.RevokeStanding(ctx, a.ID, now); err != nil {
 				return decideErr(err)
 			}
+			if st.Kind == api.KindCloudflare {
+				return q.Audit(ctx, now, "owner", "standing_revoke", "standing:"+a.ID,
+					fmt.Sprintf("host=%s cloudflare %s mode=%s %s", st.HostName, cfDesc(st.Scope, st.ScopeParams), st.Mode, detail))
+			}
 			return q.Audit(ctx, now, "owner", "standing_revoke", "standing:"+a.ID, detail)
 
 		case canon.ObjectGrant:
@@ -411,9 +472,48 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				if g.Mode == api.CFModeToken {
 					what = "child token deleted upstream"
 				}
-				return q.Audit(ctx, now, "owner", "grant_revoke", "grant:"+a.ID, "cloudflare "+cfDesc(g.Scope, g.ScopeParams)+": "+what+" "+detail)
+				return q.Audit(ctx, now, "owner", "grant_revoke", "grant:"+a.ID, "cloudflare "+cfDesc(g.Scope, g.ScopeParams)+" — "+what+" "+detail)
 			}
 			return q.Audit(ctx, now, "owner", "grant_revoke", "grant:"+a.ID, "certificate stays valid until "+g.NotAfter.Format(time.RFC3339)+" "+detail)
+
+		case canon.ObjectPasskey:
+			// Adding is applied by register/begin, never here.
+			if a.Action != canon.ActionRename && a.Action != canon.ActionRemove {
+				return errBad("unsupported passkey action")
+			}
+			p, all, err := findPasskey(ctx, q, a.ID)
+			if err != nil {
+				return err
+			}
+			// The passkey must still be the one that was signed, by the nickname shown.
+			if p.Name != a.Nickname {
+				return errConflict("the passkey was renamed since the challenge was issued; start again")
+			}
+			if a.Action == canon.ActionRename {
+				n, err := normalizeNickname(a.NewNickname)
+				if err != nil || n != a.NewNickname {
+					return errConflict("signed nickname is not valid")
+				}
+				if nicknameTaken(all, n, p.ID) {
+					return errConflict("another passkey already has that name")
+				}
+				if err := q.RenamePasskey(ctx, p.ID, p.Name, n); err != nil {
+					return decideErr(err)
+				}
+				return q.Audit(ctx, now, "owner", "passkey_rename", "passkey:"+p.id, fmt.Sprintf("from %q to %q %s", p.Name, n, detail))
+			}
+			// Never remove the last passkey: the owner could no longer sign in, and only the
+			// enroll code on the bastion could recover (enforced here, inside the transaction).
+			if len(all) <= 1 {
+				return errConflict("refusing to remove the last passkey: add another one first")
+			}
+			ended, err := q.DeletePasskey(ctx, p.ID)
+			if err != nil {
+				return mapNotFound(err)
+			}
+			u, au := aaguid.Lookup(p.cred.Authenticator.AAGUID)
+			return q.Audit(ctx, now, "owner", "passkey_remove", "passkey:"+p.id,
+				fmt.Sprintf("nickname=%q authenticator=%q aaguid=%s sessions_ended=%d %s", p.Name, au.Name, u, ended, detail))
 		}
 		return errBad("unsupported action")
 	})

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -103,6 +104,29 @@ func TestUIFlowsCloudflare(t *testing.T) {
 	}
 	if !e.minter.wasDeleted(tokenID) {
 		t.Fatal("revoking the token grant did not delete the child token")
+	}
+	// The activity log (web/src/audit.ts) recognises Cloudflare decisions by these anchored
+	// detail formats; keep them in step.
+	cfRow := map[string]*regexp.Regexp{
+		"approve":         regexp.MustCompile(`^grant=\S+ cloudflare cf\.[a-z0-9.-]+( |$)`),
+		"standing_create": regexp.MustCompile(`^host=\S+ cloudflare cf\.[a-z0-9.-]+( |$)`),
+		"standing_revoke": regexp.MustCompile(`^host=\S+ cloudflare cf\.[a-z0-9.-]+( |$)`),
+		"grant_revoke":    regexp.MustCompile(`^cloudflare cf\.[a-z0-9.-]+( |$)`),
+	}
+	for action, re := range cfRow {
+		found := false
+		recent, err := e.s.Store().Q().RecentAudit(context.Background(), 200)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range recent {
+			if a.Action == action && re.MatchString(a.Detail) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no %s audit row in the format the web UI parses", action)
+		}
 	}
 	if rc3, _ := e.cfRequest(host, "cf.dns.edit", dnsParams, "", 600); rc3.Status != "pending" {
 		t.Fatal("standing approval still used after the UI revoke")

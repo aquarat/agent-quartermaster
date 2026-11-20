@@ -68,7 +68,7 @@ type Cloudflare struct {
 	WorkerBindings []CFBindings `toml:"worker_bindings"`
 
 	Zones       []CFObject `toml:"zones"`        // [[cloudflare.zones]] name, id
-	Tunnels     []CFObject `toml:"tunnels"`      // [[cloudflare.tunnels]] name, id (a second tunnel is deliberately absent)
+	Tunnels     []CFObject `toml:"tunnels"`      // [[cloudflare.tunnels]] name, id (tunnels left out can only be reached with cf.admin)
 	D1Databases []CFObject `toml:"d1_databases"` // [[cloudflare.d1_databases]] name, id
 
 	// Scopes narrows built-in scopes: [cloudflare.scopes."cf.read"] ... Unknown scope names

@@ -28,6 +28,27 @@
   --admin: #b0121b;
   --admin-ink: #ffffff;
   --admin-bg: #fde6e6;
+  /* Activity event kinds: ink colour (AA on --surface and on its tint) + tint. */
+  --ev-approve: #0b6650;
+  --ev-approve-bg: #dcf0e8;
+  --ev-deny: #a3261d;
+  --ev-deny-bg: #fae2df;
+  --ev-revoke: #8a4500;
+  --ev-revoke-bg: #fbe9d2;
+  --ev-request: #1d55ad;
+  --ev-request-bg: #e0eafa;
+  --ev-auto: #08646b;
+  --ev-auto-bg: #d6eff0;
+  --ev-passkey: #6935a8;
+  --ev-passkey-bg: #ece2f8;
+  --ev-system: #4d5965;
+  --ev-system-bg: #e4e9ee;
+  --ev-cfwrite: #9b1f63;
+  --ev-cfwrite-bg: #f8e0ec;
+  --ev-token: #6f5200;
+  --ev-token-bg: #f5ebc6;
+  --ev-cf: #c2410c;
+  --topbar-h: calc(54px + env(safe-area-inset-top));
   --radius-card: 14px;
   --radius-ctl: 10px;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
@@ -62,6 +83,25 @@
     --admin: #ff5c63;
     --admin-ink: #1d0204;
     --admin-bg: #3b0d10;
+    --ev-approve: #5fd0a8;
+    --ev-approve-bg: #12302a;
+    --ev-deny: #f4877e;
+    --ev-deny-bg: #3a1714;
+    --ev-revoke: #f2b45e;
+    --ev-revoke-bg: #382810;
+    --ev-request: #8db6ff;
+    --ev-request-bg: #16253d;
+    --ev-auto: #5dd3da;
+    --ev-auto-bg: #0f3134;
+    --ev-passkey: #c7a6ff;
+    --ev-passkey-bg: #2a1d40;
+    --ev-system: #a9b5c1;
+    --ev-system-bg: #24303b;
+    --ev-cfwrite: #f48cc0;
+    --ev-cfwrite-bg: #3a1528;
+    --ev-token: #e8c65e;
+    --ev-token-bg: #33290b;
+    --ev-cf: #fb923c;
   }
 }
 
@@ -114,6 +154,17 @@ p {
 }
 .mono.block {
   display: block;
+}
+.small {
+  font-size: 0.875rem;
+}
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 :focus-visible {
@@ -254,10 +305,17 @@ input[type="text"] {
   gap: 32px;
   padding-top: 20px;
 }
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-bottom: 10px;
+}
 .section h2 {
   font-size: 1.0625rem;
   font-weight: 700;
-  margin-bottom: 10px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -276,6 +334,7 @@ input[type="text"] {
 }
 .list {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
 }
 .empty {
@@ -436,32 +495,432 @@ time.countdown.over {
   grid-template-columns: 1fr;
 }
 
-/* ---- audit ---- */
+/* ---- tiles (grants, auto-approvals, passkeys) ---- */
 
-.audit {
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr));
+  gap: 12px;
+}
+.list.tiles > .empty {
+  grid-column: 1 / -1;
+}
+
+/* ---- passkeys ---- */
+
+.pk {
+  align-content: start;
+}
+.pk.current {
+  border-color: var(--ev-passkey);
+  box-shadow: inset 4px 0 0 var(--ev-passkey);
+}
+.pk-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.pk-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  background: var(--ev-passkey-bg);
+  color: var(--ev-passkey);
+}
+.pk-names {
+  min-width: 0;
+}
+.pk-name {
+  font-size: 1.125rem;
+  font-weight: 700;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.pk-auth {
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+.pk-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-top: 4px;
+}
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px 2px 7px;
+  border-radius: 999px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+.badge.synced {
+  background: var(--ev-request-bg);
+  border-color: transparent;
+  color: var(--ev-request);
+}
+.badge.bound {
+  background: var(--ev-system-bg);
+  border-color: transparent;
+  color: var(--ev-system);
+}
+.badge.this {
+  background: var(--ev-passkey);
+  border-color: var(--ev-passkey);
+  color: var(--surface);
+}
+.glyph {
+  flex: none;
+}
+.glyph.small {
+  width: 15px;
+  height: 15px;
+}
+
+/* ---- fields ---- */
+
+.field {
+  display: grid;
+  gap: 6px;
+}
+input.text {
+  font: 500 1.0625rem/1.3 var(--font);
+  letter-spacing: normal;
+}
+.hint {
+  font-size: 0.875rem;
+}
+.btn.small {
+  min-height: 40px;
+  padding: 8px 12px;
+  font-size: 0.9375rem;
+}
+
+/* ---- activity ---- */
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.filter {
+  appearance: none;
+  font: 600 0.875rem/1 var(--font);
+  min-height: 36px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  /* --muted, not --line: the chip's outline must reach 3:1 against the page (WCAG 1.4.11). */
+  border: 1.5px solid var(--muted);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.filter[aria-pressed="true"] {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--bg);
+}
+@media (pointer: coarse) {
+  .filter {
+    min-height: 44px;
+  }
+}
+
+.ev-day + .ev-day {
+  margin-top: 6px;
+}
+.ev-day-h {
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: 1;
+  background: var(--bg);
+  padding: 8px 0 6px;
+  font-size: 0.875rem;
+  font-weight: 700;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+.ev-list {
   list-style: none;
   margin: 0;
   padding: 0;
-  display: grid;
-  gap: 0;
-  font-size: 0.9375rem;
 }
-.audit li {
-  padding: 8px 0;
+.ev {
+  position: relative;
   border-bottom: 1px solid var(--line);
-  overflow-wrap: anywhere;
 }
-.audit time {
+/* The day's timeline: a faint rule threading the event glyphs. */
+.ev::before {
+  content: "";
+  position: absolute;
+  left: 13px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--line);
+}
+.ev-line {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.ev-toggle {
+  appearance: none;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 4px 6px 0;
+  border: none;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.9375rem;
+  text-align: left;
+  cursor: pointer;
+}
+.ev-glyph {
+  position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+}
+.ev-glyph .glyph {
+  width: 17px;
+  height: 17px;
+}
+.ev-label {
+  flex: 0 1 auto;
+  min-width: 4em;
+  max-width: max-content;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.ev-obj {
+  min-width: 0;
+  flex: 0 100 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--muted);
   font-size: 0.875rem;
 }
-.audit .actor {
+.ev-time {
+  margin-left: auto;
+  flex: none;
+  padding-left: 6px;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ev-toggle .chevron {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+}
+.ev-toggle[aria-expanded="true"] .chevron {
+  transform: rotate(90deg);
+}
+.ev-jump {
+  appearance: none;
+  flex: none;
+  min-height: 44px;
+  padding: 0 4px 0 8px;
+  border: none;
+  background: none;
+  color: var(--focus);
+  font: 600 0.875rem/1 var(--font);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.ev-more {
+  display: grid;
+  gap: 8px;
+  padding: 2px 0 12px 38px;
+  font-size: 0.875rem;
+}
+.ev-more .facts dt {
+  font-size: 0.875rem;
+}
+.ev-detail-plain {
+  color: var(--muted);
+  white-space: pre-wrap;
+}
+.ev-detail .mono {
+  white-space: pre-wrap;
+}
+
+/* actor chips: shape and text differ, not only colour */
+.actor {
+  flex: 0 1 auto;
+  min-width: 3.2em;
+  max-width: 9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.8125rem;
   font-weight: 600;
+  line-height: 1.5;
 }
-.audit .detail {
-  display: block;
+.actor-owner {
+  background: var(--ink);
+  color: var(--bg);
+}
+.actor-host {
+  border: 1.5px solid var(--ev-request);
+  color: var(--ev-request);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+}
+.actor-system,
+.actor-other {
+  border: 1.5px dashed var(--line);
   color: var(--muted);
-  font-size: 0.875rem;
+}
+
+.ev-approve .ev-glyph { background: var(--ev-approve-bg); color: var(--ev-approve); }
+.ev-deny .ev-glyph { background: var(--ev-deny-bg); color: var(--ev-deny); }
+.ev-revoke .ev-glyph { background: var(--ev-revoke-bg); color: var(--ev-revoke); }
+.ev-request .ev-glyph { background: var(--ev-request-bg); color: var(--ev-request); }
+.ev-auto .ev-glyph { background: var(--ev-auto-bg); color: var(--ev-auto); }
+.ev-passkey .ev-glyph { background: var(--ev-passkey-bg); color: var(--ev-passkey); }
+.ev-system .ev-glyph { background: var(--ev-system-bg); color: var(--ev-system); }
+.ev-cfwrite .ev-glyph { background: var(--ev-cfwrite-bg); color: var(--ev-cfwrite); }
+.ev-token .ev-glyph { background: var(--ev-token-bg); color: var(--ev-token); }
+/* Cloudflare rows: a small cloud in the glyph's corner; the decision keeps its own colour. */
+.ev-glyph .glyph.cf-mark {
+  position: absolute;
+  right: -5px;
+  bottom: -4px;
+  width: 13px;
+  height: 13px;
+  padding: 1px;
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--ev-cf);
+  stroke-width: 2.5;
+}
+/* A warning stays grey but inverted and bold, so it can't be skimmed past. */
+.ev-warning .ev-glyph { background: var(--ev-system); color: var(--surface); }
+.ev-warning .ev-label { text-decoration: underline wavy var(--high) 1px; text-underline-offset: 4px; }
+.ev-deny .ev-label { color: var(--ev-deny); }
+
+/* In a narrow activity column the object reference gives way to the label and actor; it
+   is in the expanded details either way. */
+.col-activity {
+  container-type: inline-size;
+}
+@container (max-width: 31rem) {
+  .ev-obj {
+    display: none;
+  }
+}
+.pk .actions {
+  grid-template-columns: 1fr 1fr;
+}
+
+/* ---- wide screens ---- */
+
+.sections {
+  grid-template-columns: minmax(0, 1fr);
+}
+.col {
+  display: grid;
+  gap: 32px;
+  align-content: start;
+  min-width: 0;
+}
+
+/* Tablets: one column, but wide enough for tiles two across. */
+@media (min-width: 44rem) {
+  .app {
+    max-width: 52rem;
+    padding-left: 24px;
+    padding-right: 24px;
+  }
+}
+
+@media (min-width: 60rem) {
+  .app {
+    max-width: 100rem;
+    padding-left: 24px;
+    padding-right: 24px;
+  }
+  .sections {
+    grid-template-columns: minmax(0, 1fr) minmax(21rem, 27rem);
+    grid-template-areas: "queue activity" "access activity";
+    gap: 32px 28px;
+    align-items: start;
+  }
+  .col-queue { grid-area: queue; }
+  .col-access { grid-area: access; }
+  .col-activity {
+    grid-area: activity;
+    position: sticky;
+    top: calc(var(--topbar-h) + 12px);
+    max-height: calc(100vh - var(--topbar-h) - 24px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    /* Room for the 3px focus outline (offset 2px) on both sides of this scroll box, and keep
+       a focused row clear of the sticky day header. */
+    padding: 0 6px 16px 6px;
+    margin-left: -6px;
+    scroll-padding-top: 2.5rem;
+  }
+  .col-activity .ev-day-h {
+    top: 0;
+  }
+  #sec-pending .list,
+  #sec-enroll .list {
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 24rem), 1fr));
+    align-items: start;
+  }
+}
+
+@media (min-width: 100rem) {
+  .app {
+    max-width: 170rem;
+  }
+  .sections {
+    grid-template-columns: minmax(26rem, 36rem) minmax(0, 1fr) minmax(22rem, 28rem);
+    grid-template-areas: "queue access activity";
+  }
+  #sec-pending .list,
+  #sec-enroll .list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (min-width: 150rem) {
+  .sections {
+    grid-template-columns: minmax(28rem, 40rem) minmax(0, 1fr) minmax(24rem, 32rem);
+  }
 }
 
 /* ---- sheet ---- */
@@ -713,4 +1172,21 @@ dialog.sheet::backdrop {
   .card.focus {
     transition: box-shadow 0.3s;
   }
+}
+
+/* Values from the signed text, set off from our own words so a name with spaces
+   ("YubiKey on keyring") reads as one value. */
+.headline .val {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 5px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+/* "owner" and "system" are short fixed words: never truncate them; host names may. */
+.actor-owner,
+.actor-system {
+  flex-shrink: 0;
+  min-width: auto;
 }

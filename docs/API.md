@@ -140,9 +140,11 @@ lives on the server, keyed by `challenge_id` (no state in cookies).
 | `POST /api/ui/login/finish` | `LoginFinish {challenge_id, assertion}` | `OK {ok}` + session cookie |
 | `POST /api/ui/logout` | `{}` | `OK` |
 | `POST /api/ui/passkeys/register/begin` | `RegisterBegin`: first passkey `{enroll_code}`; later ones (session) `{challenge_id, assertion}` for a signed `passkey add` | `CeremonyBegin` (creation options; `residentKey` and UV required, `credProps` requested) |
-| `POST /api/ui/passkeys/register/finish` | `RegisterFinish {challenge_id, credential, name?}` | `OK` |
-| `POST /api/ui/passkeys/challenge` | `{action: "add"}` | `ChallengeResponse` (object `passkey`, id `new`) |
-| `GET /api/ui/state` | | `UIState {owner, pending: [PendingItem], standing: [StandingApproval], grants: [GrantSummary], recent: [AuditEntry]}` |
+| `POST /api/ui/passkeys/register/finish` | `RegisterFinish {challenge_id, credential, name?}` (`name` = nickname) | `RegisterResult {ok, passkey: PasskeyInfo}` |
+| `POST /api/ui/passkeys/challenge` | `{action: "add", nickname?}` | `ChallengeResponse` (object `passkey`, id `new`, `new_nickname` = the nickname) |
+| `POST /api/ui/passkeys/{id}/challenge` | `{action: "rename", nickname}` or `{action: "remove"}` | `ChallengeResponse` (object `passkey`, id `{id}`) |
+| `POST /api/ui/passkeys/{id}/rename`, `.../remove` | `DecideRequest` | `PasskeyChange {ok, id, action, nickname, signed_out}` |
+| `GET /api/ui/state` | | `UIState {owner, pending: [PendingItem], standing: [StandingApproval], grants: [GrantSummary], recent: [AuditEntry], passkeys: [PasskeyInfo]}` |
 | `GET /api/ui/requests/{id}`, `GET /api/ui/enrollments/{id}` | | `PendingItem` plus `status` |
 | `POST /api/ui/requests/{id}/challenge` | `ChallengeRequest {action: approve\|deny, ttl_seconds?, standing_hours?}` | `ChallengeResponse {challenge_id, canonical, public_key}` |
 | `POST /api/ui/requests/{id}/decide` | `DecideRequest {challenge_id, assertion}` | `RequestStatus` **without** `grant` (browsers never get certificates) |
@@ -162,6 +164,34 @@ lives on the server, keyed by `challenge_id` (no state in cookies).
   replaces a host. `similar_recent` counts the host's requests for the same target and user in
   the last 7 days.
 - `GrantSummary` in `UIState.grants` carries `requesting_host` (active grants, newest first).
+- `PasskeyInfo {id, nickname, authenticator, icon, aaguid, transports[], backup_eligible,
+  backup_state, sign_count, created_at, last_used_at?, current}`: `id` is the hex of the first
+  16 bytes of SHA-256(credential ID); `authenticator`/`icon` come from the AAGUID via an
+  embedded copy of the community passkey-authenticator-aaguids list (`internal/server/aaguid`;
+  "Unknown authenticator" for all-zero or unlisted AAGUIDs: with `none` attestation the AAGUID
+  is the authenticator's unverified claim, display only); `backup_eligible` = a synced passkey,
+  otherwise device-bound; `current` = the passkey this session signed in with. `last_used_at`
+  and `sign_count` update on every assertion (sign-in and signed actions).
+- **Nicknames** (`internal/server/nickname`): runs of any Unicode space become one space,
+  trimmed; 1-64 UTF-8 bytes; control, format (bidi, zero-width), private-use, separator and
+  combining characters refused; unique ignoring case (409 `conflict` for a taken name). A
+  nickname chosen when adding a passkey is **signed** with the add action (`new_nickname`) and
+  register/finish uses exactly it (a different `name` there is 400); `name` at register/finish
+  only names the first, enroll-code passkey. Without a chosen nickname the server uses the
+  authenticator's name ("Bitwarden"), or "Passkey N" when unknown, made unique with " 2",
+  " 3"... Look-alike letters from other scripts are not detected: the UI warns about non-ASCII
+  nicknames and shows the passkey's short id (last 6 hex digits, upper case) on its tile and
+  in every rename/remove confirmation. Migration 3 (Go, `fixPasskeyNames`) gives existing
+  passkeys valid unique names: valid names are kept, the rest become "Passkey N" (N = the
+  position in registration order, or the next free number).
+- **Passkey rename/remove** are signed actions like approvals. The endpoint's verb must equal
+  the signed `action` (400 otherwise), the challenge is bound to the passkey's id, and on apply
+  the passkey must still have the signed `nickname` (409 otherwise). Removing the **last**
+  passkey is refused (409) both when the challenge is asked for and inside the apply
+  transaction. Removing a passkey ends every web session that signed in with it; when that is
+  the calling session, `signed_out` is true and the cookie is cleared. Each change is audited
+  (`passkey_register`, `passkey_rename`, `passkey_remove`, object `passkey:<id>`) and pushed
+  to ntfy, as is every new passkey.
 - **TTL choice:** `ttl_seconds` above the card's `ttl_max` or below `ttl.min_seconds` is
   **rejected with 400**, never clamped (a clamped value in `canonical` would differ from the
   owner's choice). `standing_hours` above `ttl.max_standing_hours` (24) -> 400; the UI offers
@@ -187,7 +217,10 @@ object (a missing or extra key cannot be built by the server and is refused by t
 | `enrollment` | `approve`, `deny` | `requesting_host, kind` (`"enrollment"`), `key_fingerprint` (CSR key), `replaces`, `ttl_seconds` (0), `standing_hours` (0) |
 | `standing` | `revoke` | `requesting_host, kind, target, login_user, ttl_seconds` (the rule's max TTL), `standing_hours` |
 | `grant` | `revoke` | `requesting_host, kind, target, login_user, ttl_seconds` (0), `standing_hours` |
-| `passkey` | `add` | none (`id` is `"new"`) |
+| `passkey` | `add`, `rename`, `remove` | `nickname` (the passkey's current nickname; `""` for add), `new_nickname` (rename: the new one; add: the chosen nickname or `""`; remove: `""`). For add `id` is `"new"`, otherwise the passkey's id |
+
+The `passkey` object gained `nickname`/`new_nickname` (for `add` too) without a version bump:
+a page from before this change refuses the new add text (unknown keys), which fails safe.
 
 The key sets above are for `kind` `ssh`. For `kind` `cloudflare` (M2) the `request`,
 `standing` and `grant` objects carry a different set (section 5.4); the parser picks the set
@@ -206,9 +239,10 @@ Before calling `navigator.credentials.get` the UI (`web/src/canonical.ts`, `flow
 that `canonical` re-serialises byte for byte, has only the known keys for its object, that
 `SHA-256(canonical)` equals the options' challenge, and that every field equals what the owner
 chose and the card showed (action, object, id, host, kind, target, login user, key/CSR
-fingerprint, `replaces`, TTL, standing hours). The text shown at confirmation is rendered from
-the canonical fields only (each value isolated in `<bdi>`, invisible/bidi characters shown as
-`⟨U+XXXX⟩`, names outside `[A-Za-z0-9._-]` flagged).
+fingerprint, `replaces`, TTL, standing hours, passkey nickname and new nickname). The text
+shown at confirmation is rendered from the canonical fields only (each value isolated in
+`<bdi>`, invisible/bidi characters shown as `⟨U+XXXX⟩`, names outside `[A-Za-z0-9._-]`
+flagged).
 
 ## 3. CLI (`aqmas`)
 
