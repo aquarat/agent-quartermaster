@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -71,9 +72,9 @@ KbdInteractiveAuthentication no
 LogLevel VERBOSE
 `, port, dir)
 	os.WriteFile(filepath.Join(dir, "sshd_config"), []byte(cfg), 0o600)
-	var sshdLog bytes.Buffer
+	sshdLog := &lockedBuffer{}
 	cmd := exec.Command(sshd, "-D", "-e", "-f", filepath.Join(dir, "sshd_config"))
-	cmd.Stdout, cmd.Stderr = &sshdLog, &sshdLog
+	cmd.Stdout, cmd.Stderr = sshdLog, sshdLog
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start sshd: %v", err)
 	}
@@ -127,4 +128,22 @@ LogLevel VERBOSE
 	if out, err := run.CombinedOutput(); err == nil || !strings.Contains(string(out), "HOST IDENTIFICATION HAS CHANGED") {
 		t.Fatalf("login with a wrong pinned host key: err=%v\n%s", err, out)
 	}
+}
+
+// lockedBuffer is written by the sshd output goroutine and read by the test.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
