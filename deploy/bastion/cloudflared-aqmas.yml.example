@@ -1,0 +1,20 @@
+# Separate Cloudflare tunnel connector on the bastion (.60), NOT .50's tunnel.
+# Install as /etc/cloudflared/aqmas.yml (root:root 0600) for a locally-managed tunnel:
+#   cloudflared tunnel create aqmas            -> writes /etc/cloudflared/<TUNNEL-UUID>.json
+#   cloudflared tunnel route dns aqmas approvals.example.com
+# Put the hostname behind a Cloudflare Access app (owner, OIDC IdP). No LAN DNS override.
+tunnel: <TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+no-autoupdate: true
+
+ingress:
+  - hostname: approvals.example.com
+    service: http://127.0.0.1:8080
+    originRequest:
+      httpHostHeader: approvals.example.com
+  - service: http_status:404
+
+# Remotely-managed alternative (ingress configured in the dashboard): run
+#   cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/aqmas.token
+# with /etc/cloudflared/aqmas.token (root 0600) containing <TUNNEL-TOKEN> and the public
+# hostname approvals.example.com -> http://127.0.0.1:8080 set on the tunnel.
