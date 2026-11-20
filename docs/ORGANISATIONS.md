@@ -35,7 +35,7 @@ A **service** identifies the authority that accepts the credentials (one account
 Admission allows a host to **ask for every set** in the org. Requests still pass through the org's approval rules. This matters when adding a host to `personal`: if `cf.read` is enabled for policy auto-approval, the host can obtain that access immediately. The admission card must say which accesses will need no further tap, or **none**. Standing approvals never transfer from another enrollment. For a hard boundary on *who can ask*, use separate orgs and check who can administer each admitted host, including by SSH. Access to the account holding its mTLS key is effectively access as that host.
 
 1. Authenticate with the existing pinned-CA mTLS path. Resolve the leaf fingerprint to a live `hosts.id` (not CN), check expiry/revocation and derive the peer address from the connection. Resolve the path/ID in a join restricted to this enrollment's admitted orgs. Reject invisible, missing and mismatched resources alike (404), before returning metadata, counting similar requests, enqueueing, notifying, or considering auto/standing approval. Never accept an org, class or host identity asserted by requester metadata.
-2. Intersect limits. Effective max = smallest of server/class ceiling, org max, set/target max and kind/scope max. For omitted TTL use the smallest applicable default within that range; refuse an empty range. Clamp agent TTL as today, show the result; the owner's signed choice can only shorten and is **rejected**, not silently corrected, if out of range. Cap standing duration separately. Deny/archive beats any allow. A new `client-a` or `club` starts empty: no hosts, no silent approvals, proposed 10 min default / 30 min max. Migrated `personal` retains the existing SSH and per-scope defaults/ceilings.
+2. Intersect limits. Effective max = smallest of server/class ceiling, org max, set/target max and kind/scope max. For omitted TTL use the smallest applicable default within that range; refuse an empty range. Clamp agent TTL as today, show the result; the owner's signed choice can only shorten and is **rejected**, not silently corrected, if out of range. Cap standing duration separately. Deny/archive beats any allow. A new `client-a` or `club` starts empty: no hosts, no silent approvals, default 1 h / soft cap 24 h (see Owner decisions). Migrated `personal` retains the existing SSH and per-scope defaults/ceilings.
 3. Distinguish **policy auto** (no prompt on each matching request) from **standing** (a signed, expiring exception created on a specific approval). Outside migrated personal, both are off until enabled by a signed owner action for the org and specific set/scope. Policy auto can only narrow the catalogue's eligible proxy scopes (`cf.read`, `cf.cache.purge`); an org cannot invent eligibility. Standing also requires the owner to choose a duration on the card. Match exact org/service/set/revision, current policy version, enrollment, observed address, kind, mode, target + user or scope + canonical params, and TTL ≤ signed max. Recheck high-risk SSH exclusions and current scope rules even on a match. No silent grant of any kind for env values, minted children, `cf.admin` or `cf.read.private`. Preserve host-wide pending limits across orgs and the M2 identical-auto-grant cap within a set.
 4. **Owner devices** may receive the parallel design's longer SSH/standing ceilings only where org policy allows them. Use server-held, passkey-approved enrollment class; missing class means ordinary fleet. Never add org memberships implicitly, waive high-risk rules, or extend CF/env TTL because of class. Sign class and resulting durations. Class change/replacement invalidates affected pending decisions and rules. An allowed owner laptop with a 30-minute client cap still gets at most 30 minutes.
 
@@ -111,12 +111,52 @@ Use session-protected `/api/ui/` read views and the existing `challenge` → `de
 
 **Rollback.** Restore an older binary only with its matching pre-activation recovery point and proof no intervening authority changes are lost. Otherwise fix forward. On disaster recovery reconcile issuer tokens, host revocations, passkeys and rotated secrets in isolation; expire sessions/challenges/rules/grants and review admissions before reopening. Preserve post-backup audit separately. Never serve a stale allow-list.
 
-## Open questions for the owner
+## Owner decisions (2026-11-20)
 
-- Is 10 min default / 30 min max right for client and club work? Start both with no standing permissions, even on owner devices?
-- Which current enrollments should retain personal access at cutover, and which, if any, should be explicitly admitted to the first client pilot?
-- Is `run` sufficient for the first project, and which tool/platform needs the RAM-backed `.env` holder first?
-- Who holds the offline master-key recovery copy, and how often should an isolated restore and upstream rotation be rehearsed?
+1. **Durations are per-organisation policy, edited on the Admin page** (passkey-signed), for each
+   organisation and optionally per service/set: a default, a **soft cap** and whether
+   **indefinite** is offered. Starting values for a new organisation: default **1 hour**, soft cap
+   **24 hours**, indefinite available but never preselected. Choosing a duration above the soft cap
+   is marked on the card and in the canonical ("beyond soft cap"); choosing indefinite needs a
+   separate explicit selection and is shown prominently on the card, in the activity log and in
+   the active-access list. Standing approvals are configured the same way (default, soft cap,
+   indefinite allowed or not). This replaces the earlier 10 min / 30 min proposal.
+   - What "indefinite" means per kind: proxied grants (e.g. Cloudflare) and env-set grants stay
+     active until revoked, and the broker checks them on every use, so revocation works. **SSH
+     certificates cannot be recalled once issued**, so indefinite SSH certificates require a
+     revocation mechanism first: a KRL (OpenSSH key revocation list) published by aqmasd and
+     installed by every trusting host (`RevokedKeys`), refreshed on a timer, with hosts refusing
+     certificates when the KRL is stale. Until that ships, SSH durations above the soft cap are
+     capped at the soft cap, and indefinite is not offered for SSH. Owner devices with mosh rarely
+     need it: an open session outlives its certificate anyway.
+2. **No host gets de facto unfettered access to any organisation, including the owner's own.**
+   Every organisation requires explicit, signed admission per enrolled host, and every request
+   still needs approval except scopes the owner explicitly marks as policy-auto for that
+   organisation. Migration admits the currently enrolled hosts to the owner's organisation only;
+   their requests keep needing approval as today. Client and club organisations start with no
+   admitted hosts.
+3. **Env-set delivery commands** (CLI-first):
+   - `aqmas run <org>/<service>/<set> [--ttl] --why "..." -- <command>`: values only in the child
+     process environment (as designed above).
+   - `aqmas checkout <set> [--file .env]` (alias `co`): materialise the RAM-backed `.env` (as in
+     the file-only design above) and return; `aqmas checkin <set>` (alias `ci`) removes it and ends
+     the grant early. `checkin` is also what the holder does at expiry.
+   - `aqmas checkout-shell <set>` (alias `cos`) and `aqmas checkin-shell <set>` (alias `cis`):
+     print `export`/`unset` statements for the current shell, used as
+     `eval "$(aqmas cos client-a/paas/staging-env --why ...)"`. This deliberately relaxes the
+     "no export script" rule above for the owner's convenience, so it comes with guards: refuse to
+     print when stdout is a terminal (only into `eval`/a pipe), shell-quote every value safely,
+     refuse names that would change shell or loader behaviour (`PATH`, `LD_*`, `BASH_ENV`,
+     `PROMPT_COMMAND`, ...), record that a shell-mode release happened, and remind that every
+     command started from that shell inherits the values until `cis` runs (and that they remain
+     readable to the same user via `/proc` while set).
+4. **Recovery and rotation:** the owner holds the offline recovery copy of the master key. No
+   rotation-rehearsal tooling for now: upstream rotation is a blanket replacement of a set with
+   newly supplied values (the client supplies them), or a custom process for the club's systems.
+   aqmas only needs `aqmas set import` to replace a set wholesale and to record which revisions
+   were released to whom.
+5. **Approvers:** the structure supports several approvers per organisation; the owner is the only
+   approver for the foreseeable future. **No per-organisation audit export for now.**
 
 ## Appendix: SQLite sketch
 
