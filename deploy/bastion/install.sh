@@ -81,7 +81,7 @@ Next steps (by hand, on the bastion):
      (owner, OIDC IdP) on approvals.example.com.
   6. sudo -u aqmas aqmasd passkey-enroll-code, open https://approvals.example.com within 15 minutes
      and register the owner passkey.
-  7. Cloudflare (optional, milestone 2; docs/DEPLOY-M2.md): put the parent tokens in
+  7. Cloudflare (optional, milestone 2; docs/CLOUDFLARE.md section 8): put the parent tokens in
      /etc/aqmas/cf-proxy-token and /etc/aqmas/cf-minter-token (root:root 0600), add the
      LoadCredential= drop-in described in aqmasd.service, fill [cloudflare] in config.toml,
      then systemctl daemon-reload && systemctl restart aqmasd.

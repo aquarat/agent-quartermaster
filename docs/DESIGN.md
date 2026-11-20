@@ -2,8 +2,8 @@
 
 Status (2026-11-20): milestone 2 (Cloudflare API access through aqmasd: proxy with scoped,
 time-boxed grants, guard rails, snapshots, child tokens) is built and tested, not deployed:
-design `docs/CLOUDFLARE.md`, wire contract `docs/API.md` section 5, plans `docs/DEPLOY-M2.md`
-and `docs/MIGRATION-M2.md`. Milestone 1 is built and tested (unit tests, `TestUIFlows`, and
+design and operator setup `docs/CLOUDFLARE.md`, wire contract `docs/API.md` section 5 (the
+site's deployment and migration plans live in the operator's private ops repository). Milestone 1 is built and tested (unit tests, `TestUIFlows`, and
 `test/interop/run.sh` with the real binaries), not deployed. Deployment plan:
 `docs/DEPLOY-M1.md`. Wire contract: `docs/API.md`; host and Forgejo trust: `docs/HOSTS.md`.
 
@@ -128,8 +128,7 @@ internal/testutil/fakecf/      M2: fake Cloudflare API for tests and interop (cl
 deploy/bastion/                aqmasd.service, install.sh, cloudflared unit + config template
 deploy/hosts/                  10-aqmas.conf, install-host-trust.sh, forgejo-ca.md
 test/interop/                  run.sh (real binaries end to end), owner.ts, softauthn.ts
-docs/                          DESIGN.md, API.md, HOSTS.md, DEPLOY-M1.md, CLOUDFLARE.md,
-                               DEPLOY-M2.md, MIGRATION-M2.md
+docs/                          DESIGN.md, API.md, HOSTS.md, DEPLOY-M1.md, CLOUDFLARE.md
 ```
 
 Build and test: `make vet test build` (aqmasd linux/arm64; aqmas linux/arm64 and amd64, with
