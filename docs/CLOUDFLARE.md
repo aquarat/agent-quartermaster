@@ -63,7 +63,7 @@ Every write scope also includes the GETs of the objects it writes, so one grant 
 | `cf.d1` | `db`, `access`=read\|migrate | M | no | yes | 1h / 8h | acct: D1 Read or D1 Write, Account Settings Read |
 | `cf.r2.admin` | – | M | no | yes | 1h / 8h | – |
 | `cf.r2.objects` | `bucket`, `access`=read\|write | M | no | yes | 1h / 8h | acct: Workers R2 Storage Read or Write |
-| `cf.email` | `zone` | M | no | yes | 1h / 8h | – |
+| `cf.email` | `zone` | H | no | no | 1h / 8h | – |
 | `cf.admin` | – | A | never | never | 1h / 1h | – |
 
 Deferred (not in M2): `cf.token.ci:{repo}` (design decision 5: CI deploy tokens stay in Forgejo
@@ -174,10 +174,10 @@ from its bundle (`S` = `/accounts/{acct}/workers/scripts/{script}`, `W` = `/acco
 ```
 GET          W/services/{script}   W/services/{script}/environments/{name}[/bindings|routes|subdomain]
 GET          W/workers/{script}                                   (new Workers API: metadata, subdomain)
-PUT          S                                                    (U; first deploy, DO migrations, `secret put` stub; GET S is source: denied)
-GET|POST     S/versions   GET S/versions/{id}                     (POST: U, ?bindings_inherit=strict)
+PUT          S                                                    (U, G:workers-bindings; first deploy, DO migrations, `secret put` stub; GET S is source: denied)
+GET|POST     S/versions   GET S/versions/{id}                     (POST: U, G:workers-bindings, ?bindings_inherit=strict)
 GET|POST     S/deployments
-GET          S/settings|script-settings   PATCH S/settings|script-settings   (S:workers-script-settings)
+GET          S/settings|script-settings   PATCH S/settings|script-settings   (S:workers-script-settings, G:workers-bindings)
 POST         S/assets-upload-session                              (parent token; answers the upload JWT)
 POST         W/assets/upload   W/assets/upload/{id}               (U, J: Bearer = the session JWT)
 GET|POST     S/subdomain   GET W/subdomain                        (wrangler POSTs S/subdomain on every deploy)
@@ -202,12 +202,13 @@ queues, workflows (`PUT /accounts/{acct}/workflows/{name}`), containers, dispatc
 `CLOUDFLARE_API_TOKEN` and an account id set, wrangler makes no `/user/tokens/verify` or
 `/memberships` call; it does call them (all synthetic, 3.2) after an API error 10000/9106.
 
-**`cf.pages`** (project): GET/PATCH `/accounts/{acct}/pages/projects/{project}` (S:pages-project);
+**`cf.pages`** (project): GET/PATCH `/accounts/{acct}/pages/projects/{project}` (S:pages-project; PATCH: G:pages-bindings);
 GET/POST `…/{project}/deployments` (POST: U, multipart incl. `_worker.bundle`); GET/DELETE
 `…/deployments/{id}`, POST `…/deployments/{id}/retry|rollback`, GET
 `…/deployments/{id}/history/logs`; GET `…/{project}/upload-token`; `POST
 /pages/assets/check-missing|upload|upsert-hashes` (U, J: Bearer = the upload-token JWT);
-GET/POST `…/{project}/domains`, GET/PATCH/DELETE `…/domains/{name}`. That is all `wrangler pages
+GET/POST `…/{project}/domains`, GET/PATCH/DELETE `…/domains/{name}` (writes: G:pages-domain,
+protected hostnames). That is all `wrangler pages
 deploy` calls for an existing project (project creation, `POST …/pages/projects`, is cf.admin;
 note wrangler turns `pages deploy` of a missing project into `wrangler deploy` when it detects
 an AI agent).
@@ -225,15 +226,17 @@ Export is denied (section 3).
 
 **`cf.r2.admin`**: GET/POST `/accounts/{acct}/r2/buckets`, GET `…/buckets/{bucket*}`,
 GET/PUT/DELETE `…/buckets/{bucket*}/cors|lifecycle`, GET/POST `…/buckets/{bucket*}/domains/custom`,
-GET/PUT/DELETE `…/domains/custom/{name}`, GET/PUT `…/domains/managed`.
+GET/PUT/DELETE `…/domains/custom/{name}`, GET/PUT `…/domains/managed`. Custom-domain writes
+(G:r2-domain): the domain must lie in a configured zone (and `zoneId`, when given, be its id;
+scope check) and never touch a protected hostname.
 
 **`cf.r2.objects`** (bucket, access): GET `/accounts/{acct}/r2/buckets/{bucket}/objects`,
 GET `…/objects/{key...}`; with `access=write` also PUT (U) / DELETE `…/objects/{key...}`.
 
 **`cf.email`** (zone): GET/POST `/zones/{zone}/email/routing/rules`, GET/PUT/DELETE
-`…/rules/{id}`, GET/PUT `…/rules/catch_all` (S:email-rules); GET/POST/PATCH/DELETE
+`…/rules/{id}`, GET/PUT `…/rules/catch_all` (S:email-rules, G:email-forward); GET/POST/PATCH/DELETE
 `/zones/{zone}/email/routing/dns`; POST `/zones/{zone}/email/routing/enable|disable`;
-GET/POST `/accounts/{acct}/email/routing/addresses`, GET/DELETE `…/addresses/{id}`;
+GET/POST `/accounts/{acct}/email/routing/addresses` (POST: G:email-forward), GET/DELETE `…/addresses/{id}`;
 GET/POST/DELETE `/zones/{zone}/email/sending/{key...}`.
 
 **`cf.admin`**: any method on any path that passes normalisation (3.1) and is not denied
@@ -271,6 +274,18 @@ Refused with 403 `denied` (and an audit row, and a push for the first four group
   `/accounts/*/subscriptions`, `/zones/*/subscription`, `/user/billing`.
 - `POST /zones`, `DELETE /zones/*`; `/graphql`; any non-GET on `/accounts`.
 - `/accounts/{other}` for any account id but the configured one.
+- Other shapes of objects a guarded route owns, and hostname-bearing objects nobody manages
+  through aqmas (they would bypass guard rails and snapshots, also for cf.admin): non-GET
+  `/zones/*/access` and below; `/zones/*/dns_records/batch|import` and below; `PUT|PATCH|DELETE
+  /zones/*/dns_records`; non-GET `/accounts/*/access/apps/*/settings`; non-GET
+  `/accounts/*/tunnels` and `/accounts/*/warp_connector` and below (pushed); `PUT|PATCH
+  /zones/*`; non-GET under `/zones/*/hostnames/settings`, `/zones/*/pagerules`,
+  `/zones/*/snippets`, `/zones/*/workers/filters`, `/zones/*/load_balancers`,
+  `/zones/*/spectrum`, `/zones/*/custom_hostnames`, `/accounts/*/workers/services`,
+  `/accounts/*/workers/workers`; `POST /zones/*/rulesets` (PUT the phase entrypoint instead),
+  `DELETE /zones/*/rulesets/*`; `PUT|PATCH|POST /accounts/*/workers/domains/*` and below.
+  (`PUT /zones/{zone}/rulesets/{id}` is a cf.rulesets route with S:ruleset and
+  `ruleset-keep-rules`.)
 - Anything in `[cloudflare.scopes."<scope>"].extra_deny` (`"METHOD /path/template"`, `*` or
   `{x}` for any method or segment; an entry covers its path and everything below it; invalid
   entries are a start-up error) for that scope.
@@ -335,9 +350,10 @@ naming the guard; warnings answer normally with `X-Aqmas-Warning`. Each guard ha
 | `tunnel-traefik-sni` | tunnel PUT | a rule with `service == traefik_origin` whose `originRequest.originServerName != hostname` (warns when `matchSNItoHost`/`http2Origin` are not true) | yes |
 | `tunnel-plain-origin` | tunnel PUT | a rule whose service is in `traefik_plain_origins` (redirect loop) | yes |
 | `tunnel-no-tls-verify` | tunnel PUT | `noTLSVerify: true` on a rule that did not have it before | yes |
-| `tunnel-access-aud` | tunnel PUT | removing or changing `originRequest.access` of a hostname that had it (the `fj` rule carries Forgejo's Access aud) | yes |
+| `tunnel-access-aud` | tunnel PUT | removing or changing `originRequest.access` of a hostname that had it (e.g. a rule whose origin checks the Access aud) | yes |
 | `tunnel-version` | tunnel PUT | live config `version` differs from the version this host last read through the proxy (or the host never read it): 409, "GET the config again and re-apply your change" | yes |
-| `access-protected-hostname` | Access app POST/PUT | `domain`, any `self_hosted_domains[]`, or any `destinations[].uri` covering a `protected_access_hostnames` entry: exact host, a wildcard covering it (`*.example.com`, `*.co.uk` …), with or without path | **never** |
+| `access-protected-hostname` | Access app POST/PUT | `domain`, any `self_hosted_domains[]`, or any `destinations[].uri`/`hostname` touching a protected hostname (below) | **never** |
+| `protected-hostname` | Workers custom domains (`PUT W/domains`, `S/domains/records`, `POST S/domains/changeset`; DELETE of one by id), Workers routes (`pattern`, also of the existing route on PUT/DELETE by id), Pages domains, R2 custom domains, DNS records (body, merged PATCH, before-snapshot), tunnel PUT | a hostname touching a protected hostname. Tunnel: the ingress rules for protected hostnames must stay byte-identical and in the same order (none added, removed or changed, no wildcard rule covering one added), and the config-wide `originRequest` must not change while such a rule exists | **never** |
 | `access-patch` | Access app PATCH | always: "PATCH on Access apps fails with 10405: GET it, change it, PUT the whole object" | **never** |
 | `access-policy-shared` | policy/group PUT/DELETE | a `reusable` policy (or a group) referenced by more than one app (aqmasd counts via GET apps): "change which policy the app references instead" | yes |
 | `idp-delete` | IdP DELETE | always | yes |
@@ -347,6 +363,21 @@ naming the guard; warnings answer normally with `X-Aqmas-Warning`. Each guard ha
 | `zone-settings-policy` | settings PATCH | `always_use_https` off, `min_tls_version` < 1.2, `ssl` other than `strict`, HSTS (`security_header`) `include_subdomains` or `preload` true | yes |
 | `workers-domain-remove` | Workers custom-domain DELETE | always (dropping a custom domain deletes its DNS record) | yes |
 | `redacted-write` | any write | body contains `[redacted by aqmas]` | **never** |
+| `email-forward` | email routing rule POST/PUT, catch-all PUT, destination address POST | a `forward` action to an address not in `email_forward_allow`, a `worker` (or any other non-`drop`) action, a destination address not in the list | yes |
+
+**Protected hostnames** = `protected_access_hostnames` ∪ `protected_dns_names` (both empty by
+default: then nothing is protected, and aqmasd warns at start). A candidate (hostname, URL,
+route pattern) touches one when, lower-cased and without scheme, port, path and trailing dot,
+it equals it, or a `*` wildcard in either covers the other (`*.example.com`, `*example.com`,
+`*`). Candidates that cannot be judged (non-ASCII, `%`, user info) count as touching.
+
+**Strict JSON** on every route with a guard rail or scope check (and Pages project PATCH): the
+body must be `application/json` (aqmasd forwards it as exactly that), valid UTF-8, and no
+object may have two keys that are equal ignoring case (Unicode simple folding, exact
+duplicates included) or a key that folds to a field aqmasd reads without being spelled exactly
+so (`Domain`, `OriginRequest`, `ſql`, …): 400 `bad_request`. Workers uploads (`PUT S`, `POST
+S/versions`, multipart `PATCH S/settings`) must be `multipart/form-data` with exactly one
+`metadata` (`settings`) part, spelled exactly, without a transfer encoding, holding such JSON.
 
 Warnings (never refuse): tunnel PUT adds a hostname with no proxied DNS record in a configured
 zone or no Access app (best effort, from GETs aqmasd makes after the PUT); DNS write of a
@@ -355,14 +386,42 @@ Access app with `session_duration` above `730h`; a policy with `decision: bypass
 `everyone` include; DELETE of an Access app whose domain is a hostname in a tunnel config;
 ruleset rule DELETE.
 
-Scope enforcement (the DNS name glob, the Workers script/zone binding, D1 read-only SQL, cache
-purge `files` only, ruleset phases) is not a guard rail: it cannot be overridden, `cf.admin`
+Scope enforcement (the DNS name glob, the Workers script/zone binding and route ownership, data
+bindings, D1 body shape and read-only SQL, cache purge `files` only, ruleset phases, R2 custom
+domains in configured zones) is not a guard rail: it cannot be overridden, `cf.admin`
 simply is not limited by it. A violation answers 403 `no_grant` (audited `cf_refused`) with
 `X-Aqmas-Needs-Scope` where one helps (`cf.dns.edit zone=…` without `name`, `cf.d1
 access=migrate;db=…`, `cf.admin` for purge-everything).
 
 `X-Aqmas-Override` with a non-admin grant, naming an unknown guard, or naming a
 never-overridable one answers 400 `bad_request` before anything is read or written.
+**Data bindings** (cf.workers.deploy, cf.pages): the `bindings[]` of a Workers upload's
+`metadata` part or settings PATCH, its `tail_consumers[]` (a tail consumer receives the
+script's logs), and the `deployment_configs.{production,preview}` bindings of a Pages project
+PATCH may only name data listed for that script / project in `[[cloudflare.worker_bindings]]`
+(`d1:<configured db name>`, `r2:<bucket>`, `kv:<namespace-id>`, `service:<script>`,
+`queue:<name>`, `durable_object:<script or namespace id>`, `hyperdrive:<id>`,
+`vectorize:<index>`, `analytics_engine:<dataset>`, `secrets_store:<store>/<secret>`,
+`dispatch_namespace:<ns>`, `mtls:<certificate id>`, `workflow:<name>`, `pipeline:<name>`,
+`send_email:<binding name>`). Free: `plain_text`, `secret_text`, `json`, `assets`,
+`version_metadata`, `ai`, `browser`, `inherit`, `wasm_module`, `text_blob`, `data_blob`,
+`images`, `ratelimit`, `media`, `secret_key`, a service binding to itself, Durable Objects and
+workflows of the script itself. Unknown binding types and unknown Pages config keys are
+refused. No entry = no data bindings. (Pages deployments carry no bindings: `wrangler pages
+deploy` uploads only `_worker.bundle`, `_routes.json` and the manifest.) Child tokens cannot
+enforce any of this (noted on the card).
+
+**D1 bodies**: exactly `{"sql", "params"?}`, `{"batch": [{"sql", "params"?}…]}` or
+`[{"sql", "params"?}…]`; any other key is refused (both access levels) and every `sql` is
+checked with `access=read`.
+
+**Workers routes by id** (PUT/DELETE `/zones/{zone}/workers/routes/{id}`): the route in the
+before-snapshot must exist and belong to the grant's script.
+
+`tunnel-traefik-sni` and `tunnel-plain-origin` compare services as URLs: scheme, port
+(default by scheme, leading zeros dropped) and host, IPs canonicalised (IPv4-mapped IPv6, and
+dotted quads with leading zeros read both as decimal and as octal).
+
 `tunnel-version`: a GET of `…/configurations` through any scope (cf.read included, also
 cf.admin) records the version for (host, tunnel) in memory; the version in the after-snapshot
 of the host's own successful PUT counts as read too. After an aqmasd restart every host reads
@@ -422,7 +481,12 @@ Retention: hourly prune deletes snapshots older than `snapshot_retention_days` (
 maximum 7) **except the newest snapshot of each object key**. Include it in the bastion's backups.
 
 Agents read snapshots with `aqmas cf snapshot list|get` (API.md 5.3); a host needs any active
-Cloudflare grant (cf.read is auto-approved, so this is cheap). Reverting = PUT the snapshot's
+Cloudflare grant (cf.read is auto-approved, so this is cheap), and sees only snapshots of its
+own writes (`host` = its name; another host's id answers 404). `access-idp`, `pages-project`
+and `workers-script-settings` snapshots additionally need an active grant of
+`cf.read.private`, of the scope that writes them (`cf.access.idp-org`, `cf.pages`,
+`cf.workers.deploy`) or `cf.admin` (core reports the host's active scopes through the optional
+`cfproxy.ScopeLister`; without it these types are never served). Reverting = PUT the snapshot's
 content back through the proxy with the matching write scope (it is snapshotted again).
 
 ## 5. Child tokens (token mode)
@@ -457,20 +521,30 @@ minter_token_credential = "cf-minter-token"   # optional: token mode off without
 token_ip_condition = ["<static home IPv4>/32"] # design decision 4; configurable
 # snapshot_dir = "/var/lib/aqmas/cf-snapshots"; snapshot_retention_days = 7
 # rate_per_minute = 600; write_rate_per_minute = 60
-# protected_access_hostnames = ["id.example.com"]
-# traefik_origin = "https://192.0.2.50:9443"
-# traefik_plain_origins = ["http://192.0.2.50", "http://192.0.2.50:80"]
+# All of the following default to empty (the guards that need them then do not apply):
+protected_access_hostnames = ["id.example.com"]   # e.g. the identity provider; aqmasd warns when empty
 # protected_dns_names = ["id.example.com"]
+# traefik_origin = "https://192.0.2.10:443"
+# traefik_plain_origins = ["http://192.0.2.10", "http://192.0.2.10:80"]
+# email_forward_allow = ["owner@example.net"]
 
 [[cloudflare.zones]]
 name = "example.com"
 id   = "<zone id>"
 [[cloudflare.tunnels]]
 name = "home"
-id   = "aa11bb22-…"
+id   = "<tunnel uuid>"
 [[cloudflare.d1_databases]]
 name = "app-db"
 id   = "<uuid>"
+
+# Data bindings a Worker / Pages project may have when deployed through aqmas (default: none).
+[[cloudflare.worker_bindings]]
+script = "hello"
+allow  = ["d1:app-db", "r2:assets", "kv:<namespace-id>", "service:auth"]
+[[cloudflare.worker_bindings]]
+pages_project = "site"
+allow  = ["d1:app-db"]
 
 [cloudflare.scopes."cf.read"]
 # no_auto_approve = true

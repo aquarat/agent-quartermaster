@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,9 +25,9 @@ const (
 	zoneA      = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	zoneB      = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	zoneX      = "cccccccccccccccccccccccccccccccc" // not configured
-	tunHome    = "aa11bb22-0000-4000-8000-000000000000"
+	tunHome    = "0b1c2d3e-0000-4000-8000-000000000000"
 	dbTT       = "11111111-2222-4333-8444-555555555555"
-	peer       = "192.0.2.50"
+	peer       = "192.0.2.10"
 )
 
 // ---- fake Cloudflare ----
@@ -109,6 +110,13 @@ type fakeGrants struct {
 	grants map[string]Grant
 	audits []auditRow
 	active bool
+	scopes []string // ActiveScopes
+}
+
+func (g *fakeGrants) ActiveScopes(context.Context, int64, time.Time) ([]string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.scopes...), nil
 }
 
 func (g *fakeGrants) ProxyGrants(_ context.Context, hostID int64, ids []string, now time.Time) ([]Grant, error) {
@@ -177,8 +185,8 @@ func testConfig(apiBase string) *config.Cloudflare {
 		UploadMaxBodyBytes:       4 << 20,
 		SnapshotRetentionDays:    7,
 		ProtectedAccessHostnames: []string{"id.example.com"},
-		TraefikOrigin:            "https://192.0.2.50:9443",
-		TraefikPlainOrigins:      []string{"http://192.0.2.50", "http://192.0.2.50:80"},
+		TraefikOrigin:            "https://192.0.2.10:8443",
+		TraefikPlainOrigins:      []string{"http://192.0.2.10", "http://192.0.2.10:80"},
 		ProtectedDNSNames:        []string{"id.example.com"},
 		Scopes:                   map[string]config.CFScopeOverride{},
 	}
@@ -197,7 +205,7 @@ func newHarness(t *testing.T, mod ...func(*config.Cloudflare)) *harness {
 	}
 	h := &harness{t: t, cf: cf, cfg: cfg, cat: cat, grants: &fakeGrants{grants: map[string]Grant{}, active: true},
 		logs: &bytes.Buffer{}, now: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC),
-		caller: Caller{HostID: 1, HostName: "build-box", PeerAddress: peer}}
+		caller: Caller{HostID: 1, HostName: "hosta", PeerAddress: peer}}
 	p, err := New(Options{Config: cfg, Catalogue: cat, Grants: h.grants, ProxyToken: fakeParent, SnapshotDir: t.TempDir(),
 		Notify: func(title, text string) {
 			h.pmu.Lock()
@@ -238,7 +246,7 @@ func (h *harness) grant(id, scope string, params map[string]string) {
 	if _, err := h.cat.Reparse(scope, sp, api.CFModeProxy); err != nil {
 		h.t.Fatal(err)
 	}
-	h.grants.grants[id] = Grant{ID: id, HostID: 1, HostName: "build-box", PeerAddress: peer, Scope: scope, ScopeParams: sp,
+	h.grants.grants[id] = Grant{ID: id, HostID: 1, HostName: "hosta", PeerAddress: peer, Scope: scope, ScopeParams: sp,
 		Mode: api.CFModeProxy, NotAfter: h.now.Add(time.Hour), Ref: "REF" + id}
 }
 
@@ -317,3 +325,15 @@ const (
 	time1h = time.Hour
 	time1m = time.Minute
 )
+
+// multipartBody builds a Workers upload: a "metadata" JSON part and a script part.
+func multipartBody(metadata, script string) (string, string) {
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	pw, _ := mw.CreateFormField("metadata")
+	_, _ = pw.Write([]byte(metadata))
+	fw, _ := mw.CreateFormFile("w.js", "w.js")
+	_, _ = fw.Write([]byte(script))
+	_ = mw.Close()
+	return b.String(), mw.FormDataContentType()
+}

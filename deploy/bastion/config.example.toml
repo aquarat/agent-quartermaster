@@ -43,10 +43,12 @@ owner_email = ""  # if set, the Access identity's email must match; sessions are
 # # snapshot_retention_days = 7                    # 1..7; newest per object always kept
 # # rate_per_minute = 600
 # # write_rate_per_minute = 60
-# # protected_access_hostnames = ["id.example.com"]
-# # traefik_origin = "https://192.0.2.50:9443"
-# # traefik_plain_origins = ["http://192.0.2.50", "http://192.0.2.50:80"]
+# # Guard-rail facts, all empty by default (a guard that needs one then does not apply):
+# protected_access_hostnames = ["id.example.com"] # never an Access app, Workers route/domain, tunnel rule change; aqmasd warns when empty
 # # protected_dns_names = ["id.example.com"]
+# # traefik_origin = "https://192.0.2.10:443"       # tunnel services here need originServerName = hostname
+# # traefik_plain_origins = ["http://192.0.2.10"]  # refused as tunnel services (redirect loop)
+# # email_forward_allow = ["owner@example.net"]    # cf.email forwards only here
 #
 # # Names agents use in scope parameters; aqmasd maps them to ids. Anything not listed here can
 # # only be reached with cf.admin.
@@ -59,6 +61,15 @@ owner_email = ""  # if set, the Access identity's email must match; sessions are
 # [[cloudflare.d1_databases]]
 # name = "app-db"
 # id   = "<database uuid>"
+#
+# # Data bindings a Worker or Pages project may have when deployed through cf.workers.deploy /
+# # cf.pages (default: none; plain/secret vars, assets, AI etc. are always allowed).
+# [[cloudflare.worker_bindings]]
+# script = "hello"
+# allow  = ["d1:app-db", "r2:<bucket>", "kv:<namespace-id>", "service:<script>", "queue:<name>"]
+# [[cloudflare.worker_bindings]]
+# pages_project = "<project>"
+# allow  = ["d1:app-db"]
 #
 # # Built-in scopes can only be narrowed:
 # [cloudflare.scopes."cf.read"]

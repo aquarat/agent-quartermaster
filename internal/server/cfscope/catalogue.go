@@ -85,7 +85,7 @@ var builtins = []builtin{
 		Risk:        api.CFRiskHigh, StandingAllowed: true, DefaultTTL: 2 * hour, MaxTTL: 8 * hour},
 		params: []paramSpec{{api.CFParamTunnel, pTunnel, true}}},
 	{scope: Scope{Name: api.CFScopeAccessApps, Title: "Create, change and delete Access apps",
-		Description: "Access applications (who may reach which hostname). Never on protected hostnames such as id.example.com.",
+		Description: "Access applications (who may reach which hostname). Never on aqmasd's protected hostnames.",
 		Risk:        api.CFRiskHigh, StandingAllowed: true, DefaultTTL: 2 * hour, MaxTTL: 8 * hour}},
 	{scope: Scope{Name: api.CFScopeAccessPolicies, Title: "Create, change and delete Access policies and groups",
 		Description: "Reusable Access policies and groups. Editing a policy shared by several apps is refused.",
@@ -110,7 +110,7 @@ var builtins = []builtin{
 			return &TokenTemplate{Zone: []string{"Cache Purge", "Zone Read"}, Notes: []string{"A child token can also purge everything in the zone."}}
 		}},
 	{scope: Scope{Name: api.CFScopeWorkersDeploy, Title: "Deploy one Worker",
-		Description: "Upload and deploy one Worker script with its assets, secrets, cron triggers, routes and custom domains (in the given zone).",
+		Description: "Upload and deploy one Worker script with its assets, secrets, cron triggers, routes and custom domains (in the given zone). Data bindings (D1, R2, KV, services, queues, ...) only as listed for the script in aqmasd's worker_bindings; never on protected hostnames.",
 		Risk:        api.CFRiskMedium, StandingAllowed: true, DefaultTTL: 2 * hour, MaxTTL: 8 * hour},
 		params: []paramSpec{{api.CFParamScript, pScript, true}, {api.CFParamZone, pZone, false}},
 		tokenFor: func(p map[string]string) *TokenTemplate {
@@ -122,7 +122,7 @@ var builtins = []builtin{
 			return t
 		}},
 	{scope: Scope{Name: api.CFScopePages, Title: "Deploy one Pages project",
-		Description: "Upload deployments, roll back, and manage custom domains of one Pages project.",
+		Description: "Upload deployments, roll back, and manage custom domains of one Pages project. Data bindings only as listed for the project in aqmasd's worker_bindings; never on protected hostnames.",
 		Risk:        api.CFRiskMedium, StandingAllowed: true, DefaultTTL: 2 * hour, MaxTTL: 8 * hour},
 		params: []paramSpec{{api.CFParamProject, pProject, true}},
 		tokenFor: func(map[string]string) *TokenTemplate {
@@ -142,7 +142,7 @@ var builtins = []builtin{
 				Notes: []string{"Cloudflare cannot limit a token to one database: this child token reaches EVERY D1 database on the account, and the SQL is not checked."}}
 		}},
 	{scope: Scope{Name: api.CFScopeR2Admin, Title: "Manage R2 buckets",
-		Description: "List and create buckets; bucket CORS, lifecycle and custom domains. No object data, never temporary S3 credentials.",
+		Description: "List and create buckets; bucket CORS, lifecycle and custom domains (in configured zones, never protected hostnames). No object data, never temporary S3 credentials.",
 		Risk:        api.CFRiskMedium, StandingAllowed: true, DefaultTTL: hour, MaxTTL: 8 * hour}},
 	{scope: Scope{Name: api.CFScopeR2Objects, Title: "Read or write objects in one R2 bucket",
 		Description: "access=read: list and download objects. access=write: also upload and delete.",
@@ -157,8 +157,8 @@ var builtins = []builtin{
 				Notes: []string{"Cloudflare cannot limit this token to one bucket: it reaches EVERY R2 bucket on the account."}}
 		}},
 	{scope: Scope{Name: api.CFScopeEmail, Title: "Change email routing and sending",
-		Description: "Email routing rules and DNS in one zone, destination addresses, and email sending subdomains.",
-		Risk:        api.CFRiskMedium, StandingAllowed: true, DefaultTTL: hour, MaxTTL: 8 * hour},
+		Description: "Email routing rules and DNS in one zone, destination addresses, and email sending subdomains. Mail is forwarded only to addresses in aqmasd's email_forward_allow.",
+		Risk:        api.CFRiskHigh, DefaultTTL: hour, MaxTTL: 8 * hour},
 		params: []paramSpec{{api.CFParamZone, pZone, true}}},
 	{scope: Scope{Name: api.CFScopeAdmin, Title: "BREAK-GLASS: full Cloudflare access",
 		Description: "Any Cloudflare API call except the deny-list (API tokens, members, tunnel run tokens, ...), on any zone or tunnel, for at most 1 hour. Guard rails still apply unless the call names an override.",

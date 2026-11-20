@@ -1,6 +1,7 @@
 package cfproxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -294,6 +295,57 @@ func (s *snapStore) prune(now time.Time, days int) (int, error) {
 
 // ---- agent endpoints ----
 
+// ScopeLister is implemented by core (optional): the scopes of hostID's active Cloudflare
+// grants, either mode. Without it the sensitive snapshot types are never served.
+type ScopeLister interface {
+	ActiveScopes(ctx context.Context, hostID int64, now time.Time) ([]string, error)
+}
+
+// sensitiveSnapshots: object types whose content is personal or settings data; reading them
+// needs an active grant of one of these scopes (cf.read.private, the scope that writes them,
+// or cf.admin).
+var sensitiveSnapshots = map[string][]string{
+	cfscope.SnapAccessIdP:             {api.CFScopeReadPrivate, api.CFScopeAccessIdPOrg, api.CFScopeAdmin},
+	cfscope.SnapPagesProject:          {api.CFScopeReadPrivate, api.CFScopePages, api.CFScopeAdmin},
+	cfscope.SnapWorkersScriptSettings: {api.CFScopeReadPrivate, api.CFScopeWorkersDeploy, api.CFScopeAdmin},
+}
+
+// snapReader decides which snapshots a host may read: only those taken for its own writes,
+// and the sensitive types only with a matching active grant.
+type snapReader struct {
+	host   string
+	scopes map[string]bool
+}
+
+func (sr snapReader) may(m api.CFSnapshot) bool {
+	if m.Host != sr.host {
+		return false
+	}
+	if need, ok := sensitiveSnapshots[m.ObjectType]; ok {
+		for _, s := range need {
+			if sr.scopes[s] {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func (p *Proxy) snapReaderFor(ctx context.Context, c Caller) (snapReader, error) {
+	sr := snapReader{host: c.HostName, scopes: map[string]bool{}}
+	if sl, ok := p.o.Grants.(ScopeLister); ok {
+		scopes, err := sl.ActiveScopes(ctx, c.HostID, p.now())
+		if err != nil {
+			return sr, err
+		}
+		for _, s := range scopes {
+			sr.scopes[s] = true
+		}
+	}
+	return sr, nil
+}
+
 func (p *Proxy) snapshotAllowed(w http.ResponseWriter, r *http.Request, c Caller) bool {
 	ok, err := p.o.Grants.HasActiveGrant(r.Context(), c.HostID, p.now())
 	if err != nil {
@@ -336,7 +388,11 @@ func (p *Proxy) ServeSnapshotList(w http.ResponseWriter, r *http.Request, c Call
 		}
 		limit = min(n, 500)
 	}
-	all, err := p.snaps.all()
+	sr, err := p.snapReaderFor(r.Context(), c)
+	var all []snapFile
+	if err == nil {
+		all, err = p.snaps.all()
+	}
 	if err != nil {
 		p.log.Error("cf snapshots: list", "error", err)
 		writeAPIError(w, http.StatusInternalServerError, "internal", "internal error")
@@ -345,7 +401,7 @@ func (p *Proxy) ServeSnapshotList(w http.ResponseWriter, r *http.Request, c Call
 	out := api.CFSnapshotList{Snapshots: []api.CFSnapshot{}}
 	for _, f := range all {
 		m := f.meta
-		if (q.Get("object") != "" && m.ObjectKey != q.Get("object")) || (q.Get("type") != "" && m.ObjectType != q.Get("type")) || (q.Get("grant") != "" && m.GrantID != q.Get("grant")) {
+		if !sr.may(m) || (q.Get("object") != "" && m.ObjectKey != q.Get("object")) || (q.Get("type") != "" && m.ObjectType != q.Get("type")) || (q.Get("grant") != "" && m.GrantID != q.Get("grant")) {
 			continue
 		}
 		m.Content = nil
@@ -362,7 +418,20 @@ func (p *Proxy) ServeSnapshotGet(w http.ResponseWriter, r *http.Request, c Calle
 	if !p.snapshotAllowed(w, r, c) {
 		return
 	}
+	sr, err := p.snapReaderFor(r.Context(), c)
+	if err != nil {
+		p.log.Error("cf snapshots: scopes", "error", err)
+		writeAPIError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
 	m, err := p.snaps.get(id)
+	if err == nil && m.Host != c.HostName {
+		err = os.ErrNotExist // another host's snapshot: as if it did not exist
+	}
+	if err == nil && !sr.may(*m) {
+		writeAPIError(w, http.StatusForbidden, "forbidden", "this snapshot type needs an active cf.read.private grant (or of the scope that wrote it)")
+		return
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		writeAPIError(w, http.StatusNotFound, "not_found", "not found")
 		return

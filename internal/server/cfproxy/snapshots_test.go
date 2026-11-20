@@ -153,7 +153,7 @@ func TestHelpers(t *testing.T) {
 		ok        bool
 	}{
 		{"*.example.com", "id.example.com", true},
-		{"*.co.uk", "id.example.com", true},
+		{"*.com", "id.example.com", true},
 		{"*", "id.example.com", true},
 		{"example.com", "id.example.com", false},
 		{"*.example.org", "id.example.com", false},
@@ -166,7 +166,7 @@ func TestHelpers(t *testing.T) {
 	if _, ok := hostOf("id.example.com@evil"); ok {
 		t.Error("user info")
 	}
-	if h, ok := hostOf("HTTPS://Id.example.com.:8443/a?b"); !ok || h != "id.example.com" {
+	if h, ok := hostOf("HTTPS://Id.Example.com.:8443/a?b"); !ok || h != "id.example.com" {
 		t.Errorf("hostOf %q", h)
 	}
 	l := newLimiter()

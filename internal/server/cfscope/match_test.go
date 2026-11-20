@@ -13,8 +13,8 @@ const (
 	tZone   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	tZoneB  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	tUnconf = "cccccccccccccccccccccccccccccccc"
-	tTunnel = "aa11bb22-0000-4000-8000-000000000000"
-	tOffice = "cc33dd44-0000-4000-8000-000000000000"
+	tTunnel = "0b1c2d3e-0000-4000-8000-000000000000"
+	tOffice = "0f0f0f0f-0000-4000-8000-000000000000"
 	tDB     = "11111111-2222-4333-8444-555555555555"
 )
 
@@ -89,8 +89,8 @@ func TestMatchBinding(t *testing.T) {
 		t.Fatal("foreign account")
 	}
 	// Script binding.
-	wk := grant(t, c, api.CFScopeWorkersDeploy, map[string]string{"script": "my-worker"})
-	if m, ok := c.Match(wk, call("PUT", "/accounts/"+tAcct+"/workers/scripts/my-worker")); !ok || !m.Upload {
+	wk := grant(t, c, api.CFScopeWorkersDeploy, map[string]string{"script": "hello"})
+	if m, ok := c.Match(wk, call("PUT", "/accounts/"+tAcct+"/workers/scripts/hello")); !ok || !m.Upload {
 		t.Fatal("script put")
 	}
 	if _, ok := c.Match(wk, call("PUT", "/accounts/"+tAcct+"/workers/scripts/other")); ok {
@@ -101,14 +101,14 @@ func TestMatchBinding(t *testing.T) {
 	if _, ok := c.Match(wk, rc); ok {
 		t.Fatal("route without zone param")
 	}
-	if h := c.NeedsScopeFor(rc, []*Resolved{wk}); h != "cf.workers.deploy script=my-worker;zone=example.com" {
+	if h := c.NeedsScopeFor(rc, []*Resolved{wk}); h != "cf.workers.deploy script=hello;zone=example.com" {
 		t.Fatalf("held hint %q", h)
 	}
 	if h := c.NeedsScope(rc); h != "cf.admin" {
 		t.Fatalf("hint without held %q", h)
 	}
 	// Alternation and the JWT route.
-	if m, ok := c.Match(wk, call("PATCH", "/accounts/"+tAcct+"/workers/scripts/my-worker/script-settings")); !ok || m.Snapshot != SnapWorkersScriptSettings {
+	if m, ok := c.Match(wk, call("PATCH", "/accounts/"+tAcct+"/workers/scripts/hello/script-settings")); !ok || m.Snapshot != SnapWorkersScriptSettings {
 		t.Fatal("script-settings")
 	}
 	if m, ok := c.Match(wk, call("POST", "/accounts/"+tAcct+"/workers/assets/upload")); !ok || !m.JWTPassthrough {
@@ -195,12 +195,12 @@ func TestDenyList(t *testing.T) {
 		{"POST", a + "/access/service_tokens/abc/refresh", false},
 		{"GET", a + "/challenges/widgets/abc", false},
 		{"POST", a + "/challenges/widgets/abc/rotate_secret", false},
-		{"GET", a + "/workers/scripts/my-worker/tails", false},
-		{"POST", a + "/workers/scripts/my-worker/tails/abc", false},
-		{"GET", a + "/workers/scripts/my-worker", false},
-		{"GET", a + "/workers/scripts/my-worker/content", false},
-		{"GET", a + "/workers/scripts/my-worker/content/v2", false},
-		{"GET", a + "/workers/services/my-worker/environments/production/content", false},
+		{"GET", a + "/workers/scripts/hello/tails", false},
+		{"POST", a + "/workers/scripts/hello/tails/abc", false},
+		{"GET", a + "/workers/scripts/hello", false},
+		{"GET", a + "/workers/scripts/hello/content", false},
+		{"GET", a + "/workers/scripts/hello/content/v2", false},
+		{"GET", a + "/workers/services/hello/environments/production/content", false},
 		{"POST", a + "/r2/temp-access-credentials", false},
 		{"POST", a + "/d1/database/" + tDB + "/export", false},
 		{"GET", a + "/logpush/jobs", false},
@@ -304,8 +304,8 @@ func TestNeedsScopeNarrowest(t *testing.T) {
 		"POST /zones/" + tZone + "/purge_cache":                                 "cf.cache.purge zone=example.com",
 		"PUT /accounts/" + tAcct + "/cfd_tunnel/" + tTunnel + "/configurations": "cf.tunnel.config tunnel=home",
 		"POST /accounts/" + tAcct + "/d1/database/" + tDB + "/query":            "cf.d1 access=read;db=app-db",
-		"PUT /accounts/" + tAcct + "/workers/scripts/my-worker":                     "cf.workers.deploy script=my-worker",
-		"GET /accounts/" + tAcct + "/workers/scripts/my-worker/settings":            "cf.workers.deploy script=my-worker",
+		"PUT /accounts/" + tAcct + "/workers/scripts/hello":                     "cf.workers.deploy script=hello",
+		"GET /accounts/" + tAcct + "/workers/scripts/hello/settings":            "cf.workers.deploy script=hello",
 		"GET /accounts/" + tAcct + "/access/logs/access_requests":               "cf.read.private",
 		"PATCH /zones/" + tZone + "/settings/ssl":                               "cf.zone-settings zone=example.com",
 		"POST /accounts/" + tAcct + "/pages/projects/blog/deployments":          "cf.pages project=blog",
@@ -313,7 +313,7 @@ func TestNeedsScopeNarrowest(t *testing.T) {
 		"PUT /zones/" + tZone + "/rulesets/phases/http_request_sbfm/entrypoint": "cf.admin",
 		"PUT /accounts/" + tAcct + "/access/organizations":                      "cf.access.idp-org",
 		"DELETE /zones/" + tZone + "/email/routing/rules/abc":                   "cf.email zone=example.com",
-		"POST /accounts/" + tAcct + "/workers/scripts/my-worker/tails":              "",
+		"POST /accounts/" + tAcct + "/workers/scripts/hello/tails":              "",
 	}
 	for k, want := range cases {
 		m, p, _ := strings.Cut(k, " ")
