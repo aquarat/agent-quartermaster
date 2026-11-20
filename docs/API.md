@@ -1,4 +1,4 @@
-# aqmas API contract (milestone 1, as built)
+# aqmas API contract (milestone 1 as built; milestone 2 Cloudflare contract in section 5)
 
 All bodies are JSON (`Content-Type: application/json`), timestamps RFC 3339 UTC, IDs are
 opaque ASCII strings (ULID). Go types live in `internal/api` and are the source of truth; the
@@ -63,7 +63,7 @@ checks it against `ca_cert_pem`.
 `AccessRequest {kind, ssh?: SSHRequest, reason, ttl_seconds, requester: Requester}` ->
 `201 RequestCreated {id, status, approve_url, poll_after_ms, expires_at}`.
 
-- `kind`: `"ssh"` in M1.
+- `kind`: `"ssh"` (M1) or `"cloudflare"` (M2, section 5).
 - `SSHRequest {target_host, login_user, public_key}`: `target_host` is a `[[targets]]` name
   in aqmasd's config, `login_user` one of that target's `users`, `public_key` an Ed25519 key in
   authorized_keys format (ephemeral, generated per request by the CLI).
@@ -189,6 +189,10 @@ object (a missing or extra key cannot be built by the server and is refused by t
 | `grant` | `revoke` | `requesting_host, kind, target, login_user, ttl_seconds` (0), `standing_hours` |
 | `passkey` | `add` | none (`id` is `"new"`) |
 
+The key sets above are for `kind` `ssh`. For `kind` `cloudflare` (M2) the `request`,
+`standing` and `grant` objects carry a different set (section 5.4); the parser picks the set
+from (`object`, `kind`).
+
 Fingerprints: SSH keys `SHA256:<base64>` (OpenSSH style), CSR keys `SHA256:<hex>` of the PKIX
 public key. Deny and revoke carry `standing_hours` 0.
 
@@ -249,3 +253,160 @@ the canonical fields only (each value isolated in `<bdi>`, invisible/bidi charac
 `print-ssh-ca` (for `TrustedUserCAKeys`), `print-client-ca` (internal CA PEM),
 `tls-fingerprint` (the `--ca-pin` value), `revoke-host NAME` (revoke a host's client
 certificate at once; there is no web action for this in M1), `version`.
+
+
+## 5. Cloudflare (milestone 2 contract)
+
+Design, scope catalogue, deny-list, guard rails, snapshots and config: `docs/CLOUDFLARE.md`.
+Types: `internal/api/cloudflare.go`. Everything in sections 1-4 still applies; this section only
+adds.
+
+### 5.1 Requesting: POST /v1/requests with kind "cloudflare"
+
+`AccessRequest {kind: "cloudflare", cloudflare: CloudflareRequest {scope, params?, mode?},
+reason, ttl_seconds, requester}`.
+
+- `scope`: a catalogue name (`cf.read`, `cf.dns.edit`, ... `cf.admin`); unknown or disabled
+  -> 400. `params`: exactly the scope's keys (`zone`, `tunnel`, `script`, `project`, `db`,
+  `bucket`, `access`, `phase`, `name`), required ones present; zone/tunnel/db are **names**
+  configured in aqmasd. `mode`: `proxy` (default) or `token` (only scopes with a token
+  template, and only when aqmasd has a minter token and `token_ip_condition`).
+- `ttl_seconds`: 0 = the scope's default; clamped into `[ttl.min_seconds, scope max]`
+  (`cf.admin` max 3600). The clamped value is the card's `ttl_max`.
+- **Auto-approval**: `cf.read` and `cf.cache.purge` in proxy mode are approved at once
+  (status `approved` in the 201), audited `cf_auto_approve`, no push. Otherwise a matching
+  standing approval (same host connecting from the same address, kind, scope, **identical**
+  `scope_params`, mode `proxy`, TTL within the rule's max) approves it. Otherwise `pending`,
+  pushed as `aqmas: <host> wants <scope> <scope_params> (<ttl>)` (`cf.admin`:
+  `aqmas: BREAK-GLASS cf.admin for <host>`).
+- The same pending limits as SSH (5 per host) apply. `similar_recent` counts the host's
+  requests for the same scope in 7 days.
+
+### 5.2 Grants
+
+`GET /v1/requests/{id}` -> `RequestStatus.grant` with `kind: "cloudflare"`,
+`cloudflare: CloudflareGrant {scope, params, scope_params, mode, account_id, proxy_path,
+token?, token_id?, token_delivered?, ip_condition?, permissions?}`.
+
+- Proxy mode: no secret. Use the proxy (5.5) with `X-Aqmas-Grant: <grant id>`.
+- Token mode: the **first** poll after approval mints the child token and returns `token`
+  (never stored by aqmasd); later polls return `token_id` and `token_delivered: true` only. A
+  failed mint answers 502 and can be retried by polling again. The token expires at
+  `not_after` and works only from `ip_condition`; aqmasd deletes it upstream at expiry or
+  revoke.
+- `GET /v1/grants?active=1`: `GrantSummary` gains `scope`, `scope_params`, `mode` for
+  Cloudflare grants (`target_host`/`login_user` empty).
+- Revoking a proxy grant (web UI) stops it at the next call; revoking a token grant deletes the
+  child token upstream at once.
+
+### 5.3 Catalogue and snapshots (agent API, client certificate required)
+
+- `GET /v1/cf/catalogue` -> `CFCatalogue {account_id, zones[], tunnels[], d1_databases[],
+  scopes: [CFScopeInfo {name, title, description, params[{key, required, values?}], risk,
+  auto_approve, standing_allowed, modes[], default_ttl_seconds, max_ttl_seconds}]}`. Any
+  enrolled host. 404 when Cloudflare is not enabled.
+- `GET /v1/cf/snapshots?object=<object key>&type=<type>&grant=<id>&limit=<n>` ->
+  `CFSnapshotList {snapshots: [CFSnapshot]}` newest first, without `content` (limit default
+  50, max 500).
+- `GET /v1/cf/snapshots/{id}` -> `CFSnapshot` with `content` (the object as Cloudflare
+  returned it, redacted as proxied reads are).
+- Both need the calling host to hold an active Cloudflare grant (any scope or mode), else 403.
+
+### 5.4 Canonical approval text for kind "cloudflare"
+
+Same scheme as section 2 (sorted keys, no whitespace, strings/integers/booleans only,
+`SHA-256(canonical)` is the WebAuthn challenge, exactly this key set):
+
+| object | actions | keys besides `v`, `action`, `object`, `id`, `nonce`, `issued_at` |
+|---|---|---|
+| `request` (kind `cloudflare`) | `approve`, `deny` | `requesting_host, kind, scope, scope_params, mode, ip_condition, ttl_seconds, standing_hours` |
+| `standing` (kind `cloudflare`) | `revoke` | `requesting_host, kind, scope, scope_params, mode, ttl_seconds` (the rule's max TTL), `standing_hours` |
+| `grant` (kind `cloudflare`) | `revoke` | `requesting_host, kind, scope, scope_params, mode, ttl_seconds` (0), `standing_hours` (0) |
+
+- `scope_params`: the canonical parameter string, `k=v` pairs with keys sorted bytewise,
+  joined by `;` (`name=*.example.com;zone=example.com`), `""` when none. Values never
+  contain `;` or `=` (validated). Zone/tunnel/db values are the configured **names**.
+- `mode`: `proxy` or `token`. `ip_condition`: `""` in proxy mode; in token mode the token's
+  CIDRs sorted and joined by `,`.
+- `standing_hours` must be 0 when the scope does not allow standing approvals, in token mode,
+  and for deny/revoke; the server refuses (400) otherwise. `ttl_seconds` follows the M1 rules
+  (shorten only; refused, not clamped).
+- On `decide` the server re-checks that the stored request still has this scope, scope_params
+  and mode, and that `Reparse` of them still succeeds against the current config (a zone
+  removed from the config since → 409).
+- The UI checks every one of these fields against the card before signing (as in section 2)
+  and describes the scope in its **own** words (`web/src/cfscopes.ts`): it refuses to sign a
+  scope it has no description for, shows `cf.admin` as break-glass, and shows each
+  `scope_params` pair separately.
+
+### 5.5 The proxy: ANY /cf/client/v4/{cloudflare path}
+
+On the agent API listener (`:8443`, mTLS client certificate required).
+
+- Request header `X-Aqmas-Grant: <id>[,<id>...]` (at most 8): the grants the caller offers.
+  aqmasd uses the first one that is the caller's, kind `cloudflare`, mode `proxy`, active,
+  requested **from the same address as this connection**, and whose scope allows the call.
+- Path, query, method and header rules: `docs/CLOUDFLARE.md` 3.1. Forwarded to the fixed
+  `api_base` with the proxy parent token; the caller's `Authorization` is dropped (except on
+  JWT-passthrough upload routes).
+- Responses are Cloudflare's (status, body after redaction, whitelisted headers) plus
+  `X-Aqmas-Grant-Used`, and for writes `X-Aqmas-Snapshot-Before`/`-After` and repeated
+  `X-Aqmas-Warning`.
+- aqmasd's own refusals are Cloudflare-shaped so tools print them:
+  `{"success":false,"errors":[{"code":10403,"message":"aqmas <code>: <text>"}],"messages":[],"result":null}`
+  with `X-Aqmas-Error: <code>`: `no_grant` (403; with `X-Aqmas-Needs-Scope: <scope>
+  <scope_params>` when a scope would allow the call), `denied` (403, deny-list), `guard_rail`
+  (403, or 409 for a stale tunnel config), `bad_path`/`bad_request` (400), 405, 413,
+  `rate_limited` (429, `Retry-After`), `upstream` (502).
+- Synthetic: `GET /user/tokens/verify`, `GET /user`, `GET /memberships`, `GET /accounts`
+  (CLOUDFLARE.md 3.2).
+- Overrides: `X-Aqmas-Override: <guard>[,...]` with a `cf.admin` grant only; with any other
+  grant the header is refused (400).
+
+### 5.6 CLI (`aqmas cf ...`)
+
+- `aqmas cf scopes [--json]`: the catalogue.
+- `aqmas cf request SCOPE [key=value...] [--mode proxy|token] [--ttl 2h] [--why TEXT] [--json]`:
+  request, print approve URL + Ref, wait; prints the grant id and validity. `--why` is
+  required when stdin is not a terminal (as for `ssh`).
+- `aqmas cf api METHOD PATH [--data @FILE|@-|TEXT] [-H 'Name: value'] [--grant ID]...
+  [--override GUARD] [--raw] [--why TEXT]`: one call through the proxy. PATH is relative to
+  `/client/v4` (a full `https://api.cloudflare.com/client/v4/...` URL is accepted). Without
+  `--grant` it offers all of the host's active proxy grants. A GET with no grant at all
+  auto-requests `cf.read`. On `no_grant` it prints the `X-Aqmas-Needs-Scope` hint as a ready
+  `aqmas cf request ...` command line. Body to stdout (pretty JSON unless `--raw`), aqmas
+  headers (grant used, snapshots, warnings) to stderr. Exit 0 on 2xx, 1 on an upstream non-2xx,
+  3 on an aqmas refusal (`no_grant`, `denied`, `guard_rail`), 5 unreachable.
+- `aqmas cf env [--grant ID]... [--request SCOPE [k=v...]]... [--ttl D] [--why T] -- CMD...`:
+  starts the local shim on `127.0.0.1:<random>` and runs CMD with
+  `CLOUDFLARE_API_BASE_URL=http://127.0.0.1:<port>/client/v4`, `CLOUDFLARE_API_TOKEN` and
+  `CF_API_TOKEN` = a random per-run bearer, `CLOUDFLARE_ACCOUNT_ID`/`CF_ACCOUNT_ID`, `CF_API_BASE`
+  = the base URL; unsets `CLOUDFLARE_API_KEY`, `CLOUDFLARE_EMAIL`, `CF_API_KEY`, `CF_API_EMAIL`.
+  The shim accepts only requests with that bearer and `Host: 127.0.0.1:<port>` (JWT-passthrough
+  upload paths excepted, where the upload JWT is forwarded), forwards them to the proxy with
+  mTLS and the grant list, and exits with CMD. Exit status = CMD's.
+- `aqmas cf curl [curl args...]`: `aqmas cf env -- curl` with every
+  `https://api.cloudflare.com/client/v4` URL argument rewritten to the shim and the shim bearer
+  added as a header.
+- `aqmas cf token SCOPE [key=value...] [--ttl D] [--why T] [-- CMD...]`: a token-mode grant.
+  With CMD: runs it with `CLOUDFLARE_API_TOKEN`/`CF_API_TOKEN` = the child token and the
+  account id (never printed). Without CMD: prints the token to stdout only when stdout is not a
+  terminal or with `--print`. The token is cached 0600 under the cache dir for reuse by the same
+  Unix user until 2 min before expiry, then deleted.
+- `aqmas cf snapshot list [--object KEY] [--type T] [--grant ID] [--json]`,
+  `aqmas cf snapshot get ID [-o FILE]` (content as pretty JSON).
+- `aqmas list` shows Cloudflare grants (scope, params, mode, validity).
+
+### 5.7 Web API additions
+
+- `PendingItem` of kind `cloudflare` carries `cloudflare: PendingCloudflare {scope, params,
+  scope_params, mode, ip_condition, title, description, risk (low|medium|high|admin),
+  standing_allowed, permissions?, notes?}`; `ssh` is absent; `risk` is `normal` for low/medium,
+  `high` for high/admin. `ttl_requested`/`ttl_max` as for SSH.
+- `StandingApproval` and `GrantSummary` carry `scope`, `scope_params`, `mode` for Cloudflare.
+- Challenges/decisions use the same endpoints (`/api/ui/requests/{id}/challenge|decide`,
+  `/api/ui/standing/{id}/...`, `/api/ui/grants/{id}/...`) with the 5.4 canonical text.
+- After every Cloudflare decision aqmasd pushes what it applied:
+  `aqmas: approve cloudflare cf.dns.edit zone=example.com (proxy) for hosta, ttl 7200s, standing 0h [ref ABC123]`.
+- Audit entries for Cloudflare: `cf_auto_approve`, `cf_write`, `cf_refused`, `cf_token_mint`,
+  `cf_token_delete`, `cf_token_orphan` (object `grant:<id>` or `request:<id>`).

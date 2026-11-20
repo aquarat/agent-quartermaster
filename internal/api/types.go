@@ -38,9 +38,10 @@ const (
 	ErrInternal        = "internal"
 )
 
-// Request kinds. Only KindSSH exists in milestone 1.
+// Request kinds. KindSSH since milestone 1; KindCloudflare since milestone 2 (cloudflare.go).
 const (
-	KindSSH = "ssh"
+	KindSSH        = "ssh"
+	KindCloudflare = "cloudflare"
 )
 
 // Byte limits the server enforces on untrusted text (UTF-8 bytes, not characters).
@@ -96,11 +97,12 @@ type SSHRequest struct {
 }
 
 type AccessRequest struct {
-	Kind       string      `json:"kind"`
-	SSH        *SSHRequest `json:"ssh,omitempty"`
-	Reason     string      `json:"reason"` // untrusted, display only, max 500 chars
-	TTLSeconds int         `json:"ttl_seconds"`
-	Requester  Requester   `json:"requester"`
+	Kind       string             `json:"kind"`
+	SSH        *SSHRequest        `json:"ssh,omitempty"`
+	Cloudflare *CloudflareRequest `json:"cloudflare,omitempty"` // kind "cloudflare" (milestone 2)
+	Reason     string             `json:"reason"`               // untrusted, display only, max 500 chars
+	TTLSeconds int                `json:"ttl_seconds"`
+	Requester  Requester          `json:"requester"`
 }
 
 type RequestCreated struct {
@@ -127,6 +129,8 @@ type Grant struct {
 	NotBefore time.Time `json:"not_before"`
 	NotAfter  time.Time `json:"not_after"`
 	SSH       *SSHGrant `json:"ssh,omitempty"`
+	// Cloudflare is set for kind "cloudflare" (milestone 2).
+	Cloudflare *CloudflareGrant `json:"cloudflare,omitempty"`
 }
 
 type RequestStatus struct {
@@ -149,6 +153,10 @@ type GrantSummary struct {
 	// RequestingHost is set in the web UI's state (who holds the access); the agent API's
 	// GET /v1/grants omits it (always the calling host).
 	RequestingHost string `json:"requesting_host,omitempty"`
+	// Kind "cloudflare" (milestone 2): scope, canonical scope parameters and mode.
+	Scope       string `json:"scope,omitempty"`
+	ScopeParams string `json:"scope_params,omitempty"`
+	Mode        string `json:"mode,omitempty"`
 }
 
 // SSHCA is the body of GET /v1/ssh-ca: the SSH user CA that signs every grant certificate.
@@ -181,7 +189,7 @@ type PendingEnrollment struct {
 // ttl_requested/ttl_max are 0.
 type PendingItem struct {
 	ID                string             `json:"id"`
-	Kind              string             `json:"kind"` // ssh, enrollment
+	Kind              string             `json:"kind"` // ssh, enrollment, cloudflare
 	CreatedAt         time.Time          `json:"created_at"`
 	ExpiresAt         time.Time          `json:"expires_at"`
 	RequestingHost    string             `json:"requesting_host"`
@@ -194,6 +202,7 @@ type PendingItem struct {
 	Risk              string             `json:"risk"` // normal, high
 	SimilarRecent     int                `json:"similar_recent"`
 	Enrollment        *PendingEnrollment `json:"enrollment,omitempty"`
+	Cloudflare        *PendingCloudflare `json:"cloudflare,omitempty"` // kind "cloudflare" (milestone 2)
 	// Status is set by GET /api/ui/requests/{id} and /api/ui/enrollments/{id} (the item may
 	// have been decided since); UIState.pending items are always pending and omit it.
 	Status string `json:"status,omitempty"`
@@ -208,6 +217,10 @@ type StandingApproval struct {
 	MaxTTLSeconds  int       `json:"max_ttl_seconds"`
 	ExpiresAt      time.Time `json:"expires_at"`
 	Uses           int       `json:"uses"`
+	// Kind "cloudflare" (milestone 2); TargetHost and LoginUser are empty then.
+	Scope       string `json:"scope,omitempty"`
+	ScopeParams string `json:"scope_params,omitempty"`
+	Mode        string `json:"mode,omitempty"`
 }
 
 type AuditEntry struct {

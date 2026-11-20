@@ -31,6 +31,9 @@ type Config struct {
 	Ntfy    Ntfy     `toml:"ntfy"`
 	Access  Access   `toml:"access"`
 	Targets []Target `toml:"targets"`
+	// Cloudflare configures milestone 2 (docs/CLOUDFLARE.md section 6). Absent or
+	// enabled=false: kind "cloudflare" requests are refused and /cf/ is not served.
+	Cloudflare Cloudflare `toml:"cloudflare"`
 }
 
 // TTL is the grant lifetime policy.
@@ -190,6 +193,9 @@ func (c *Config) Validate() error {
 	}
 	if (c.Access.TeamDomain == "") != (c.Access.AUD == "") {
 		return fmt.Errorf("config: access.team_domain and access.aud must be set together")
+	}
+	if err := c.Cloudflare.validate(); err != nil {
+		return err
 	}
 	if c.Access.TeamDomain != "" && strings.ContainsAny(c.Access.TeamDomain, "/:") {
 		return fmt.Errorf("config: access.team_domain is a bare host name, e.g. example.cloudflareaccess.com")
