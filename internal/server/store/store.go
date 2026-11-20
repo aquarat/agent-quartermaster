@@ -724,6 +724,15 @@ func (q *Q) ActiveProxyGrants(ctx context.Context, hostID int64, ids []string, n
 }
 
 // HasActiveCFGrant reports whether hostID holds any active Cloudflare grant (either mode).
+// CountActiveCFGrantsLike counts hostID's active Cloudflare grants with this scope, canonical
+// params and mode (caps auto-approved grants: an agent should reuse one, not mint many).
+func (q *Q) CountActiveCFGrantsLike(ctx context.Context, hostID int64, scope, scopeParams, mode string, now time.Time) (int, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, "SELECT count(*) FROM grants WHERE host_id = ? AND scope = ? AND scope_params = ? AND mode = ? AND "+activeCF,
+		hostID, scope, scopeParams, mode, ms(now), ms(now)).Scan(&n)
+	return n, err
+}
+
 func (q *Q) HasActiveCFGrant(ctx context.Context, hostID int64, now time.Time) (bool, error) {
 	var n int
 	err := q.q.QueryRowContext(ctx, "SELECT count(*) FROM grants WHERE host_id = ? AND "+activeCF, hostID, ms(now), ms(now)).Scan(&n)

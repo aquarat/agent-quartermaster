@@ -450,6 +450,16 @@ func TestCFAutoApprove(t *testing.T) {
 		t.Fatal("auto-approval not audited")
 	}
 
+	// Auto-approval is capped per host, scope and params (the CLI reuses an active grant).
+	for i := 1; i < MaxAutoCFGrants; i++ {
+		if rc, st := e.cfRequest(c, "cf.read", nil, "", 0); st != 201 || rc.Status != "approved" {
+			t.Fatalf("cf.read #%d: %d %s", i+1, st, rc.Status)
+		}
+	}
+	if _, st := e.cfRequest(c, "cf.read", nil, "", 0); st != 429 {
+		t.Fatalf("auto-approval beyond the cap answered %d, want 429", st)
+	}
+
 	rc, _ = e.cfRequest(c, "cf.cache.purge", map[string]string{"zone": "example.com"}, "proxy", 0)
 	if rc.Status != "approved" {
 		t.Fatalf("cf.cache.purge proxy not auto-approved: %s", rc.Status)
@@ -475,7 +485,7 @@ func TestCFAutoApprove(t *testing.T) {
 	// The agent's grant list carries the scope fields.
 	var gl api.GrantList
 	agentDo(t, c, "GET", e.agent.URL+"/v1/grants?active=1", nil, &gl)
-	if len(gl.Grants) != 2 || gl.Grants[0].Scope != "cf.cache.purge" || gl.Grants[0].ScopeParams != "zone=example.com" ||
+	if len(gl.Grants) != 1+MaxAutoCFGrants || gl.Grants[0].Scope != "cf.cache.purge" || gl.Grants[0].ScopeParams != "zone=example.com" ||
 		gl.Grants[0].Mode != "proxy" || gl.Grants[1].Scope != "cf.read" || gl.Grants[0].TargetHost != "" || gl.Grants[0].RequestingHost != "" {
 		t.Fatalf("grants %+v", gl.Grants)
 	}
@@ -833,11 +843,13 @@ func TestCFSweeper(t *testing.T) {
 	// Orphans: unknown names, superseded tokens of a live grant, upstream-expired tokens.
 	now := e.clock.Now()
 	e.minter.mu.Lock()
-	e.minter.live["x1"] = cfproxy.UpstreamToken{ID: "x1", Name: "aqmas:01UNKNOWNGRANT:hosta", ExpiresOn: now.Add(time.Hour)}
+	e.minter.live["x1"] = cfproxy.UpstreamToken{ID: "x1", Name: "aqmas:01ZZZZZZZZZZZZZZZZZZZZZZZZ:hosta", ExpiresOn: now.Add(time.Hour)}
 	e.minter.live["x2"] = cfproxy.UpstreamToken{ID: "x2", Name: "aqmas:" + long.ID + ":hosta", ExpiresOn: now.Add(time.Hour)} // not the recorded id
 	e.minter.live["x3"] = cfproxy.UpstreamToken{ID: "x3", Name: "aqmas:" + long.ID + ":hostb", ExpiresOn: now.Add(time.Hour)} // wrong host
-	e.minter.live["x4"] = cfproxy.UpstreamToken{ID: "x4", Name: "aqmas:junk", ExpiresOn: now.Add(-time.Minute)}
-	e.minter.live["x5"] = cfproxy.UpstreamToken{ID: "x5", Name: "someone-else", ExpiresOn: now.Add(time.Hour)} // not ours: never listed
+	e.minter.live["x4"] = cfproxy.UpstreamToken{ID: "x4", Name: "aqmas:01ZZZZZZZZZZZZZZZZZZZZZZZY:hosta", ExpiresOn: now.Add(-time.Minute)}
+	e.minter.live["x6"] = cfproxy.UpstreamToken{ID: "x6", Name: "aqmas:junk", ExpiresOn: now.Add(-time.Minute)} // not aqmasd's form: left alone
+	e.minter.live["x7"] = cfproxy.UpstreamToken{ID: "x7", Name: "aqmas: proxy parent", ExpiresOn: time.Time{}}  // the owner's parent tokens
+	e.minter.live["x5"] = cfproxy.UpstreamToken{ID: "x5", Name: "someone-else", ExpiresOn: now.Add(time.Hour)}  // not ours: never listed
 	e.minter.mu.Unlock()
 	e.s.sweepOrphans(context.Background())
 	for _, id := range []string{"x1", "x2", "x3", "x4"} {
@@ -845,13 +857,13 @@ func TestCFSweeper(t *testing.T) {
 			t.Errorf("orphan %s kept", id)
 		}
 	}
-	if e.minter.wasDeleted(long.Cloudflare.TokenID) || e.minter.wasDeleted("x5") {
+	if e.minter.wasDeleted(long.Cloudflare.TokenID) || e.minter.wasDeleted("x5") || e.minter.wasDeleted("x6") || e.minter.wasDeleted("x7") {
 		t.Fatal("live or foreign token deleted")
 	}
 	if e.audited("cf_token_orphan", "token:x1") == nil || e.audited("cf_token_orphan", "grant:"+long.ID) == nil {
 		t.Fatal("orphan deletes not audited")
 	}
-	e.pushes.waitFor(t, "aqmas: deleted Cloudflare token aqmas:01UNKNOWNGRANT:hosta (unknown to aqmasd)")
+	e.pushes.waitFor(t, "aqmas: deleted Cloudflare token aqmas:01ZZZZZZZZZZZZZZZZZZZZZZZZ:hosta (unknown to aqmasd)")
 
 	// A grant whose token is being minted right now is left alone.
 	rc, _ := e.cfRequest(c, "cf.workers.deploy", map[string]string{"script": "api"}, "token", 0)

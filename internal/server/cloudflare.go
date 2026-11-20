@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"syscall"
@@ -315,6 +316,14 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 		}
 		// Design decision 2: cf.read and cf.cache.purge in proxy mode need no approval.
 		if res.Scope.AutoApprove && res.Mode == api.CFModeProxy {
+			// Auto-approval needs no owner, so cap how many identical grants a host may hold:
+			// the CLI reuses an active grant; a flood is a sign of a loop or a compromise.
+			if n, err := q.CountActiveCFGrantsLike(ctx, h.ID, req.Scope, req.ScopeParams, req.Mode, now); err != nil {
+				return err
+			} else if n >= MaxAutoCFGrants {
+				return &apiErr{http.StatusTooManyRequests, api.ErrRateLimited,
+					fmt.Sprintf("this host already holds %d active %s grants; reuse one (aqmas list)", n, req.Scope)}
+			}
 			g, err := approve("auto-approved (" + req.Scope + ")")
 			if err != nil {
 				return err
@@ -476,6 +485,12 @@ func (s *Server) cfGrantView(g *store.Grant) *api.Grant {
 
 // tokenName is the upstream name of a grant's child token.
 func tokenName(g *store.Grant) string { return "aqmas:" + g.ID + ":" + g.HostName }
+
+// tokenNameRE matches tokenName's form exactly: ids are 26-character ULIDs, hosts valid names.
+var tokenNameRE = regexp.MustCompile(`^aqmas:[0-9A-HJKMNP-TV-Z]{26}:[a-z0-9][a-z0-9-]{0,62}$`)
+
+// MaxAutoCFGrants caps a host's active auto-approved grants of one scope+params.
+const MaxAutoCFGrants = 4
 
 var errMintFailed = &apiErr{http.StatusBadGateway, api.CFErrUpstream, "minting the Cloudflare token failed; poll again to retry"}
 
@@ -720,6 +735,11 @@ func (s *Server) sweepOrphans(ctx context.Context) {
 // orphanReason says why an upstream aqmas:* token must go ("" = it is a live grant's token, or
 // one being minted right now). The grant is returned when the name refers to one.
 func (s *Server) orphanReason(ctx context.Context, up cfproxy.UpstreamToken, now time.Time) (*store.Grant, string) {
+	// Only ever touch tokens aqmasd itself names ("aqmas:<grant id>:<host>"): a token the owner
+	// happens to name "aqmas: ..." (e.g. the parents) is never deleted.
+	if !tokenNameRE.MatchString(up.Name) {
+		return nil, ""
+	}
 	if !up.ExpiresOn.IsZero() && !now.Before(up.ExpiresOn) {
 		g, _ := s.grantForTokenName(ctx, up.Name)
 		return g, "expired"
