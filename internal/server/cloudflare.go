@@ -220,7 +220,7 @@ func (gs cfGrantSource) ProxyGrants(ctx context.Context, hostID int64, gids []st
 	out := make([]cfproxy.Grant, 0, len(gl))
 	for _, g := range gl {
 		out = append(out, cfproxy.Grant{ID: g.ID, HostID: g.HostID, HostName: g.HostName, PeerAddress: g.PeerAddress,
-			Scope: g.Scope, ScopeParams: g.ScopeParams, Mode: g.Mode, NotAfter: g.NotAfter})
+			Scope: g.Scope, ScopeParams: g.ScopeParams, Mode: g.Mode, NotAfter: g.NotAfter, Ref: ref(g.RequestID)})
 	}
 	return out, nil
 }

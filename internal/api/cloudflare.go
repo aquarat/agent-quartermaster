@@ -206,7 +206,7 @@ type CFSnapshot struct {
 	ID         string    `json:"id"`
 	CreatedAt  time.Time `json:"created_at"`
 	Phase      string    `json:"phase"`       // "before" | "after"
-	ObjectType string    `json:"object_type"` // tunnel-config, access-app, access-policy, dns-record, dns-name, ruleset-entrypoint, ruleset, zone-setting, access-idp, access-org, email-rules, pages-project, workers-script-settings
+	ObjectType string    `json:"object_type"` // docs/CLOUDFLARE.md 4.2: tunnel-config, access-app, access-policy, access-group, access-idp, access-org, dns-record, dns-name, ruleset-entrypoint, ruleset, zone-setting, email-rules, pages-project, workers-script-settings, workers-routes, workers-domains, workers-script-routes
 	ObjectKey  string    `json:"object_key"`  // e.g. "tunnel-config:<tunnel id>", "dns-record:<zone id>:<record id>"
 	Method     string    `json:"method"`      // the write it belongs to
 	Path       string    `json:"path"`        // Cloudflare path of the write (no query)
