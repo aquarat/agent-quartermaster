@@ -7,7 +7,7 @@ VERSION ?= $(shell git describe --always --dirty --tags 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 GOBUILD := CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)"
 
-.PHONY: all build aqmasd aqmas web webui test vet clean interop
+.PHONY: all build aqmasd aqmas web webui test vet clean interop interop-cf
 
 all: build
 
@@ -40,6 +40,11 @@ test: vet
 # Real binaries end to end: aqmasd + aqmas + a throwaway sshd on 127.0.0.1 (test/interop/run.sh).
 interop:
 	test/interop/run.sh
+
+# Milestone 2: real aqmasd + aqmas against the fake Cloudflare API (test/interop/run-cf.sh);
+# WRANGLER=1 also deploys with wrangler through `aqmas cf env` (installs wrangler with bun).
+interop-cf: webui
+	test/interop/run-cf.sh
 
 clean:
 	rm -rf bin
