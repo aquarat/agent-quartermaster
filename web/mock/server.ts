@@ -522,7 +522,7 @@ export function startMock(opts: MockOptions = {}) {
     if (p === "/api/ui/passkeys/challenge" && isPost) {
       needSession();
       if (body.action !== "add") throw new HttpError(400, "bad_request", "action must be add");
-      const canonical = { v: 1, action: "add", object: "passkey", id: "new", nonce: rid(32), issued_at: new Date().toISOString().replace(/\.\d+Z$/, "Z") };
+      const canonical = { v: 1, action: "add", object: "passkey", id: "new", nickname: "", new_nickname: "", nonce: rid(32), issued_at: new Date().toISOString().replace(/\.\d+Z$/, "Z") };
       const text = canonicalJSON(canonical);
       const { id, rec } = issue("action", { canonical, canonicalText: text, sessionBound: session }, createHash("sha256").update(text, "utf8").digest());
       return json({ challenge_id: id, canonical: text, public_key: requestOptions(req, rec.challenge, true) });

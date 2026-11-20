@@ -76,20 +76,73 @@ export interface UIOwner {
   passkeys: number;
 }
 
+/** Icon keys the server sends in PasskeyInfo.icon (api.PasskeyIcon*). */
+export type PasskeyIcon =
+  | "apple"
+  | "bitwarden"
+  | "onepassword"
+  | "google"
+  | "chrome"
+  | "windows"
+  | "microsoft"
+  | "samsung"
+  | "yubikey"
+  | "manager"
+  | "unknown";
+
+/** One registered owner passkey (api.PasskeyInfo). */
+export interface PasskeyInfo {
+  /** Hex of the first 16 bytes of SHA-256(credential ID); the canonical "passkey" id. */
+  id: string;
+  nickname: string;
+  /** Friendly name from the AAGUID, or "Unknown authenticator". */
+  authenticator: string;
+  icon: PasskeyIcon | string;
+  aaguid: string; // "" when the authenticator reported none
+  transports: string[] | null;
+  /** Synced (multi-device) passkey; false = device-bound (e.g. a hardware key). */
+  backup_eligible: boolean;
+  backup_state: boolean;
+  sign_count: number;
+  created_at: string;
+  last_used_at?: string;
+  /** The passkey this session signed in with. */
+  current: boolean;
+}
+
 export interface UIState {
   owner: UIOwner;
   pending: PendingItem[] | null;
   standing: StandingApproval[] | null;
   recent: AuditEntry[] | null;
   grants?: GrantSummary[] | null; // active grants (api.UIState.grants)
+  passkeys?: PasskeyInfo[] | null; // api.UIState.passkeys (absent on an older server)
 }
 
-export type Action = "approve" | "deny" | "revoke" | "add";
+export type Action = "approve" | "deny" | "revoke" | "add" | "rename" | "remove";
 
 export interface ChallengeRequest {
   action: Action;
   ttl_seconds?: number;
   standing_hours?: number;
+  /** Passkey rename: the new nickname. */
+  nickname?: string;
+}
+
+/** Response of register/finish (api.RegisterResult). */
+export interface RegisterResult {
+  ok: boolean;
+  passkey?: PasskeyInfo;
+}
+
+/** Response of /api/ui/passkeys/{id}/rename and /remove (api.PasskeyChange). */
+export interface PasskeyChange {
+  ok: boolean;
+  id: string;
+  action: "rename" | "remove";
+  nickname: string;
+  /** The removed passkey was this session's: signed out. */
+  signed_out: boolean;
 }
 
 /** Response of every .../challenge endpoint. `public_key` is go-webauthn's
