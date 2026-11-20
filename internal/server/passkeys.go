@@ -99,7 +99,7 @@ func (s *Server) verifyAssertion(ctx context.Context, challenge []byte, assertio
 	}
 	if cred.Authenticator.CloneWarning {
 		s.log.Warn("passkey sign count did not increase; possible clone", "credential", base64.RawURLEncoding.EncodeToString(cred.ID))
-		_ = s.store.Q().Audit(ctx, s.now(), "system", "passkey_clone_warning", "passkey", "sign count regressed; assertion refused")
+		_ = s.store.Q().Audit(ctx, s.now(), "system", "passkey_clone_warning", "passkey:"+passkeyID(cred.ID), "sign count regressed; assertion refused")
 		return 0, errForbidden("passkey sign count regressed")
 	}
 	newJSON, err := json.Marshal(cred)
