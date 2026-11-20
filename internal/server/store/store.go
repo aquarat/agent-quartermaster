@@ -733,6 +733,24 @@ func (q *Q) CountActiveCFGrantsLike(ctx context.Context, hostID int64, scope, sc
 	return n, err
 }
 
+// ActiveCFScopes lists the distinct scopes of hostID's active Cloudflare grants (either mode).
+func (q *Q) ActiveCFScopes(ctx context.Context, hostID int64, now time.Time) ([]string, error) {
+	rows, err := q.q.QueryContext(ctx, "SELECT DISTINCT scope FROM grants WHERE host_id = ? AND "+activeCF, hostID, ms(now), ms(now))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sc string
+		if err := rows.Scan(&sc); err != nil {
+			return nil, err
+		}
+		out = append(out, sc)
+	}
+	return out, rows.Err()
+}
+
 func (q *Q) HasActiveCFGrant(ctx context.Context, hostID int64, now time.Time) (bool, error) {
 	var n int
 	err := q.q.QueryRowContext(ctx, "SELECT count(*) FROM grants WHERE host_id = ? AND "+activeCF, hostID, ms(now), ms(now)).Scan(&n)

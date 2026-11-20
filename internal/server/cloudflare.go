@@ -126,6 +126,9 @@ func (s *Server) setupCloudflare(o Options) error {
 	}
 	s.log.Info("cloudflare enabled", "account", cf.AccountID, "zones", len(cf.Zones), "tunnels", len(cf.Tunnels),
 		"d1_databases", len(cf.D1Databases), "scopes", len(cat.Scopes()), "token_mode", tokenMode, "snapshot_dir", snapDir)
+	for _, w := range cf.Warnings() {
+		s.log.Warn("cloudflare: " + w)
+	}
 	return nil
 }
 
@@ -224,6 +227,13 @@ func (gs cfGrantSource) ProxyGrants(ctx context.Context, hostID int64, gids []st
 			Scope: g.Scope, ScopeParams: g.ScopeParams, Mode: g.Mode, NotAfter: g.NotAfter, Ref: ref(g.RequestID)})
 	}
 	return out, nil
+}
+
+var _ cfproxy.ScopeLister = cfGrantSource{}
+
+// ActiveScopes lists the scopes of the host's active Cloudflare grants (sensitive snapshots).
+func (gs cfGrantSource) ActiveScopes(ctx context.Context, hostID int64, now time.Time) ([]string, error) {
+	return gs.s.store.Q().ActiveCFScopes(ctx, hostID, now)
 }
 
 func (gs cfGrantSource) HasActiveGrant(ctx context.Context, hostID int64, now time.Time) (bool, error) {
