@@ -20,6 +20,7 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
         run: |
+          umask 022
           set -eu
           if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git diff --quiet "$BEFORE" "$GITHUB_SHA" -- VERSION; then exit 0; fi
           v=$(cat VERSION)
@@ -28,6 +29,7 @@ jobs:
           if ! git rev-parse --verify --quiet "refs/tags/v$v"; then echo "tag=v$v" >> "$GITHUB_OUTPUT"; fi
       - if: steps.version.outputs.tag != ''
         run: |
+          umask 022
           apt-get update && apt-get install -y --no-install-recommends unzip jq openssh-server
           mkdir -p /run/sshd
           bash ci/toolchains.sh /opt/aqmas-tools
@@ -35,6 +37,7 @@ jobs:
           echo /opt/aqmas-tools/go/bin >> "$GITHUB_PATH"
       - if: steps.version.outputs.tag != ''
         run: |
+          umask 022
           set -eu
           # Exercise the real unprivileged SSH login, even in a rootless Docker
           # job whose container root account is locked. Use only ephemeral state.
@@ -81,6 +84,7 @@ jobs:
           TAG: ${{ needs.build.outputs.tag }}
         shell: bash
         run: |
+          umask 022
           set -euo pipefail
           [[ $TAG =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           cd dist
