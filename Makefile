@@ -19,6 +19,7 @@ aqmasd: webui
 aqmas:
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o bin/aqmas-linux-arm64 ./cmd/aqmas
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o bin/aqmas-linux-amd64 ./cmd/aqmas
+	GOOS=darwin GOARCH=arm64 $(GOBUILD) -o bin/aqmas-darwin-arm64 ./cmd/aqmas
 
 # Build the TypeScript UI into web/dist (embedded into aqmasd by the webui target).
 web:

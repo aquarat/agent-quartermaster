@@ -271,13 +271,14 @@ reason, ttl_seconds, requester}`.
   `bucket`, `access`, `phase`, `name`), required ones present; zone/tunnel/db are **names**
   configured in aqmasd. `mode`: `proxy` (default) or `token` (only scopes with a token
   template, and only when aqmasd has a minter token and `token_ip_condition`).
-- `ttl_seconds`: 0 = the scope's default; clamped into `[ttl.min_seconds, scope max]`
+- `ttl_seconds`: 0 = the scope's default; clamped into `[ttl.min_seconds, min(scope max, ttl.max_seconds)]`
   (`cf.admin` max 3600). The clamped value is the card's `ttl_max`.
 - **Auto-approval**: `cf.read` and `cf.cache.purge` in proxy mode are approved at once
   (status `approved` in the 201), audited `cf_auto_approve`, no push. Otherwise a matching
   standing approval (same host connecting from the same address, kind, scope, **identical**
   `scope_params`, mode `proxy`, TTL within the rule's max) approves it. Otherwise `pending`,
-  pushed as `aqmas: <host> wants <scope> <scope_params> (<ttl>)` (`cf.admin`:
+  pushed as `aqmas: <host> wants <scope> <scope_params> (<ttl>)` (token mode: `aqmas: <host>
+  wants a Cloudflare token <scope> <scope_params> (<ttl>)`; `cf.admin`:
   `aqmas: BREAK-GLASS cf.admin for <host>`).
 - The same pending limits as SSH (5 per host) apply. `similar_recent` counts the host's
   requests for the same scope in 7 days.
@@ -291,13 +292,16 @@ token?, token_id?, token_delivered?, ip_condition?, permissions?}`.
 - Proxy mode: no secret. Use the proxy (5.5) with `X-Aqmas-Grant: <grant id>`.
 - Token mode: the **first** poll after approval mints the child token and returns `token`
   (never stored by aqmasd); later polls return `token_id` and `token_delivered: true` only. A
-  failed mint answers 502 and can be retried by polling again. The token expires at
+  failed mint answers 502 (`upstream`) and can be retried by polling again. The token expires at
   `not_after` and works only from `ip_condition`; aqmasd deletes it upstream at expiry or
   revoke.
 - `GET /v1/grants?active=1`: `GrantSummary` gains `scope`, `scope_params`, `mode` for
   Cloudflare grants (`target_host`/`login_user` empty).
 - Revoking a proxy grant (web UI) stops it at the next call; revoking a token grant deletes the
-  child token upstream at once.
+  child token upstream at once. Revoking or replacing a host (`aqmasd revoke-host`, re-enrollment)
+  revokes its Cloudflare grants too (their child tokens are then deleted by the sweeper).
+- Before the proxy sees a call, a missing/invalid client certificate gets a Cloudflare-shaped
+  401/403 body (no `X-Aqmas-Error`).
 
 ### 5.3 Catalogue and snapshots (agent API, client certificate required)
 
@@ -385,9 +389,11 @@ On the agent API listener (`:8443`, mTLS client certificate required).
   The shim accepts only requests with that bearer and `Host: 127.0.0.1:<port>` (JWT-passthrough
   upload paths excepted, where the upload JWT is forwarded), forwards them to the proxy with
   mTLS and the grant list, and exits with CMD. Exit status = CMD's.
-- `aqmas cf curl [curl args...]`: `aqmas cf env -- curl` with every
+- `aqmas cf curl [aqmas flags] [--] [curl args...]`: `aqmas cf env -- curl` with every
   `https://api.cloudflare.com/client/v4` URL argument rewritten to the shim and the shim bearer
-  added as a header.
+  added from a 0600 header file (`-H @file`, never on the command line).
+- The shim also refuses requests carrying a browser `Origin` header, and adds `127.0.0.1` to
+  CMD's `NO_PROXY`.
 - `aqmas cf token SCOPE [key=value...] [--ttl D] [--why T] [-- CMD...]`: a token-mode grant.
   With CMD: runs it with `CLOUDFLARE_API_TOKEN`/`CF_API_TOKEN` = the child token and the
   account id (never printed). Without CMD: prints the token to stdout only when stdout is not a
