@@ -1,0 +1,460 @@
+package server
+
+import (
+	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"net/http"
+	"unicode/utf8"
+
+	"golang.org/x/crypto/ssh"
+
+	"github.com/aquarat/agent-quartermaster/internal/api"
+	"github.com/aquarat/agent-quartermaster/internal/server/config"
+	"github.com/aquarat/agent-quartermaster/internal/server/ids"
+	"github.com/aquarat/agent-quartermaster/internal/server/pki"
+	"github.com/aquarat/agent-quartermaster/internal/server/policy"
+	"github.com/aquarat/agent-quartermaster/internal/server/sshcert"
+	"github.com/aquarat/agent-quartermaster/internal/server/store"
+)
+
+type ctxKey int
+
+const (
+	ctxHost ctxKey = iota
+	ctxSession
+	ctxAccessSub
+)
+
+// AgentHandler returns the agent API handler (serve it with PKI().TLSConfig()).
+func (s *Server) AgentHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
+	mux.HandleFunc("GET /v1/enroll/{id}", s.handleEnrollStatus)
+	mux.Handle("POST /v1/requests", s.requireHost(s.handleCreateRequest))
+	mux.Handle("GET /v1/requests/{id}", s.requireHost(s.handleRequestStatus))
+	mux.Handle("POST /v1/requests/{id}/cancel", s.requireHost(s.handleCancel))
+	mux.Handle("GET /v1/grants", s.requireHost(s.handleGrants))
+	mux.Handle("GET /v1/ssh-ca", s.requireHost(s.handleSSHCA))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if r.TLS == nil {
+			s.writeErr(w, r, errForbidden("TLS required"))
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// requireHost authenticates the caller by its verified client certificate: issued by the
+// internal CA (checked in the TLS handshake), known to the store, not revoked, CN matching.
+func (s *Server) requireHost(next func(http.ResponseWriter, *http.Request, *store.Host)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h, err := s.hostFromTLS(r)
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		next(w, r, h)
+	})
+}
+
+func (s *Server) hostFromTLS(r *http.Request) (*store.Host, error) {
+	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.VerifiedChains[0]) == 0 {
+		return nil, errUnauth("client certificate required")
+	}
+	leaf := r.TLS.VerifiedChains[0][0]
+	// Belt and braces: the handshake already verified against ClientCAs with clientAuth usage.
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:       s.pki.ClientCAPool(),
+		CurrentTime: s.now(),
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return nil, errUnauth("client certificate not valid")
+	}
+	h, err := s.store.Q().HostByCert(r.Context(), pki.CertFingerprint(leaf.Raw))
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, errForbidden("host not enrolled")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if h.RevokedAt != nil {
+		return nil, errForbidden("host enrollment revoked")
+	}
+	if h.Name != leaf.Subject.CommonName {
+		return nil, errForbidden("certificate name mismatch")
+	}
+	return h, nil
+}
+
+// approveURL links to the UI with the item highlighted (fragment: no server routing needed).
+func (s *Server) approveURL(id string) string {
+	return s.cfg.PublicBaseURL + "/#r=" + id
+}
+
+// ---- enrollment ----
+
+func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
+	var in api.EnrollRequest
+	if err := decode(r, &in); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	if !config.ValidName(in.Hostname) {
+		s.writeErr(w, r, errBad("hostname must match [a-z0-9][a-z0-9-]{0,62}"))
+		return
+	}
+	if len(in.Note) > MaxReasonLen || !utf8.ValidString(in.Note) || hasControl(in.Note, true) {
+		s.writeErr(w, r, errBad("note too long or contains control characters"))
+		return
+	}
+	if len(in.SSHHostKeyFingerprints) > 16 {
+		s.writeErr(w, r, errBad("too many ssh_host_key_fingerprints"))
+		return
+	}
+	for _, fp := range in.SSHHostKeyFingerprints {
+		if len(fp) > 200 || hasControl(fp, false) {
+			s.writeErr(w, r, errBad("bad ssh_host_key_fingerprints entry"))
+			return
+		}
+	}
+	csr, err := pki.ParseCSR(in.CSRPEM)
+	if err != nil {
+		s.writeErr(w, r, errBad(err.Error()))
+		return
+	}
+	now := s.now()
+	e := &store.Enrollment{
+		ID:             ids.New(),
+		Hostname:       in.Hostname,
+		CSRPEM:         in.CSRPEM,
+		KeyFingerprint: pki.PublicKeyFingerprint(csr.PublicKey),
+		SSHHostKeyFPs:  in.SSHHostKeyFingerprints,
+		Note:           in.Note,
+		PeerAddress:    peerIP(r),
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(secs(s.cfg.TTL.EnrollmentExpirySeconds)),
+	}
+	ctx := r.Context()
+	err = s.store.Tx(ctx, func(q *store.Q) error {
+		if _, err := q.ExpireStale(ctx, now); err != nil {
+			return err
+		}
+		n, err := q.CountPendingEnrollments(ctx, now)
+		if err != nil {
+			return err
+		}
+		if n >= MaxPendingEnrolls {
+			return &apiErr{http.StatusTooManyRequests, "conflict", "too many pending enrollments"}
+		}
+		if n, err := q.CountPendingEnrollmentsFrom(ctx, e.PeerAddress, now); err != nil {
+			return err
+		} else if n >= MaxPendingEnrollsPerIP {
+			return &apiErr{http.StatusTooManyRequests, "conflict", "too many pending enrollments from this address"}
+		}
+		if err := q.InsertEnrollment(ctx, e); err != nil {
+			return err
+		}
+		return q.Audit(ctx, now, "system", "enroll_request", "enrollment:"+e.ID,
+			fmt.Sprintf("hostname=%s from=%s key=%s", e.Hostname, e.PeerAddress, e.KeyFingerprint))
+	})
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	s.bcast.notify()
+	url := s.approveURL(e.ID)
+	s.notify.Send("aqmas: enrollment", fmt.Sprintf("aqmas: %s wants to enroll as %s", e.PeerAddress, e.Hostname), url)
+	writeJSON(w, http.StatusCreated, api.EnrollResponse{ID: e.ID, Status: api.StatusPending, ApproveURL: url, PollAfterMS: PollAfterMS})
+}
+
+func (s *Server) handleEnrollStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ctx := r.Context()
+	var e *store.Enrollment
+	err := s.longPoll(ctx, parseWait(r.URL.Query().Get("wait")), func() (bool, error) {
+		var err error
+		e, err = s.store.Q().GetEnrollment(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		// Expiry is applied in memory here (the sweeper persists it): polling causes no writes.
+		if e.Status == api.StatusPending && !s.now().Before(e.ExpiresAt) {
+			e.Status = api.StatusExpired
+		}
+		return e.Status != api.StatusPending, nil
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		s.writeErr(w, r, errNotFound())
+		return
+	}
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	out := api.EnrollStatus{ID: e.ID, Status: e.Status}
+	if e.Status == api.StatusApproved && !e.CertDelivered {
+		ok, err := s.store.Q().MarkCertDelivered(ctx, e.ID)
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		if ok {
+			out.ClientCertPEM = e.CertPEM
+			out.CACertPEM = string(s.pki.CAPEM)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ---- access requests ----
+
+func validRequester(rq api.Requester) error {
+	if len(rq.Tool) > 32 || len(rq.SessionID) > 128 || len(rq.CWD) > 1024 || len(rq.User) > 64 || rq.PID < 0 {
+		return errBad("requester field too long")
+	}
+	for _, f := range []string{rq.Tool, rq.SessionID, rq.CWD, rq.User} {
+		if !utf8.ValidString(f) || hasControl(f, false) {
+			return errBad("requester contains control characters")
+		}
+	}
+	return nil
+}
+
+func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *store.Host) {
+	var in api.AccessRequest
+	if err := decode(r, &in); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	if in.Kind != api.KindSSH || in.SSH == nil {
+		s.writeErr(w, r, errBad(`kind must be "ssh" with an ssh object`))
+		return
+	}
+	if len(in.Reason) > MaxReasonLen || !utf8.ValidString(in.Reason) || hasControl(in.Reason, true) {
+		s.writeErr(w, r, errBad("reason must be at most 500 bytes of text"))
+		return
+	}
+	if err := validRequester(in.Requester); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	tgt, ok := s.cfg.Target(in.SSH.TargetHost)
+	if !ok {
+		s.writeErr(w, r, errBad("unknown target_host"))
+		return
+	}
+	if !tgt.AllowsUser(in.SSH.LoginUser) {
+		s.writeErr(w, r, errBad("login_user not allowed on this target"))
+		return
+	}
+	pub, err := sshcert.ParseEd25519(in.SSH.PublicKey)
+	if err != nil {
+		s.writeErr(w, r, errBad(err.Error()))
+		return
+	}
+	now := s.now()
+	ttl := policy.ClampTTL(in.TTLSeconds, s.cfg.TTL)
+	if tgt.MaxTTLSeconds > 0 && ttl > tgt.MaxTTLSeconds {
+		ttl = max(tgt.MaxTTLSeconds, s.cfg.TTL.MinSeconds)
+	}
+	req := &store.Request{
+		ID:             ids.New(),
+		HostID:         h.ID,
+		HostName:       h.Name,
+		PeerAddress:    peerIP(r),
+		Kind:           in.Kind,
+		TargetHost:     tgt.Name,
+		LoginUser:      in.SSH.LoginUser,
+		PublicKey:      string(ssh.MarshalAuthorizedKey(pub)),
+		KeyFingerprint: ssh.FingerprintSHA256(pub),
+		Reason:         in.Reason,
+		Requester:      in.Requester,
+		TTLRequested:   ttl,
+		Status:         api.StatusPending,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(secs(s.cfg.TTL.PendingExpirySeconds)),
+	}
+	if _, err := sshcert.SourceAddress(req.PeerAddress); err != nil {
+		s.writeErr(w, r, errBad("cannot determine peer address"))
+		return
+	}
+	ctx := r.Context()
+	err = s.store.Tx(ctx, func(q *store.Q) error {
+		rules, err := q.ActiveStanding(ctx, h.ID, now)
+		if err != nil {
+			return err
+		}
+		cand := policy.Candidate{HostID: h.ID, Kind: req.Kind, Target: req.TargetHost, LoginUser: req.LoginUser, TTL: ttl}
+		for _, st := range rules {
+			rule := policy.Rule{HostID: st.HostID, Kind: st.Kind, Target: st.TargetHost, LoginUser: st.LoginUser,
+				MaxTTL: st.MaxTTL, ExpiresAt: st.ExpiresAt, Revoked: st.RevokedAt != nil}
+			if !policy.Matches(rule, cand, now) {
+				continue
+			}
+			req.Status = api.StatusApproved
+			req.StandingID = st.ID
+			req.DecidedAt = &now
+			req.DecisionNote = "standing approval " + st.ID
+			if err := q.InsertRequest(ctx, req); err != nil {
+				return err
+			}
+			if err := q.UseStanding(ctx, st.ID, now); err != nil {
+				return err
+			}
+			g, err := s.issueGrant(ctx, q, req, ttl, now)
+			if err != nil {
+				return err
+			}
+			return q.Audit(ctx, now, "system", "auto_approve", "request:"+req.ID,
+				fmt.Sprintf("standing=%s grant=%s host=%s %s@%s ttl=%d key=%s from=%s", st.ID, g.ID, h.Name, req.LoginUser, req.TargetHost, ttl, req.KeyFingerprint, req.PeerAddress))
+		}
+		if n, err := q.CountPendingRequests(ctx, h.ID, now); err != nil {
+			return err
+		} else if n >= MaxPendingPerHost {
+			return &apiErr{http.StatusTooManyRequests, "conflict", "too many pending requests from this host"}
+		}
+		if err := q.InsertRequest(ctx, req); err != nil {
+			return err
+		}
+		return q.Audit(ctx, now, "host:"+h.Name, "request", "request:"+req.ID,
+			fmt.Sprintf("%s %s@%s ttl=%d key=%s from=%s", req.Kind, req.LoginUser, req.TargetHost, ttl, req.KeyFingerprint, req.PeerAddress))
+	})
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	s.bcast.notify()
+	url := s.approveURL(req.ID)
+	if req.Status == api.StatusPending {
+		s.notify.Send("aqmas: "+h.Name, fmt.Sprintf("aqmas: %s wants ssh %s@%s", h.Name, req.LoginUser, req.TargetHost), url)
+	}
+	writeJSON(w, http.StatusCreated, api.RequestCreated{ID: req.ID, Status: req.Status, ApproveURL: url, PollAfterMS: PollAfterMS, ExpiresAt: req.ExpiresAt})
+}
+
+func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request, h *store.Host) {
+	id := r.PathValue("id")
+	ctx := r.Context()
+	var req *store.Request
+	err := s.longPoll(ctx, parseWait(r.URL.Query().Get("wait")), func() (bool, error) {
+		var err error
+		req, err = s.store.Q().GetRequest(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		// Host isolation: another host's request is indistinguishable from a missing one.
+		if req.HostID != h.ID {
+			return false, store.ErrNotFound
+		}
+		if req.Status == api.StatusPending && !s.now().Before(req.ExpiresAt) {
+			req.Status = api.StatusExpired
+		}
+		return req.Status != api.StatusPending, nil
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		s.writeErr(w, r, errNotFound())
+		return
+	}
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	out, err := s.requestStatus(ctx, s.store.Q(), req)
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// requestStatus builds the agent-facing status; the grant (with certificate) is included only
+// while the request is approved.
+func (s *Server) requestStatus(ctx context.Context, q *store.Q, req *store.Request) (*api.RequestStatus, error) {
+	out := &api.RequestStatus{ID: req.ID, Kind: req.Kind, Status: req.Status, DecidedAt: req.DecidedAt, DecisionNote: req.DecisionNote}
+	if req.Status != api.StatusApproved {
+		return out, nil
+	}
+	g, err := q.GrantByRequest(ctx, req.ID)
+	if err != nil {
+		return nil, err
+	}
+	tgt, _ := s.cfg.Target(g.TargetHost)
+	out.Grant = &api.Grant{
+		ID: g.ID, Kind: g.Kind, NotBefore: g.NotBefore, NotAfter: g.NotAfter,
+		SSH: &api.SSHGrant{
+			Certificate:    g.Certificate,
+			Principals:     g.Principals,
+			TargetHost:     g.TargetHost,
+			TargetAddress:  tgt.Address,
+			TargetPort:     tgt.Port,
+			LoginUser:      g.LoginUser,
+			KnownHostsLine: sshcert.KnownHostsLine(tgt.Name, tgt.Address, tgt.Port, tgt.HostKey),
+		},
+	}
+	return out, nil
+}
+
+// StatusCancelled is the status of a request its host withdrew (proposed for internal/api).
+const StatusCancelled = "cancelled"
+
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request, h *store.Host) {
+	id := r.PathValue("id")
+	ctx := r.Context()
+	now := s.now()
+	var req *store.Request
+	err := s.store.Tx(ctx, func(q *store.Q) error {
+		if _, err := q.ExpireStale(ctx, now); err != nil {
+			return err
+		}
+		var err error
+		if req, err = q.GetRequest(ctx, id); err != nil || req.HostID != h.ID {
+			return errNotFound() // another host's request is indistinguishable from a missing one
+		}
+		if err := q.CancelRequest(ctx, id, h.ID, now); err != nil {
+			return statusErr(req.Status)
+		}
+		if req, err = q.GetRequest(ctx, id); err != nil {
+			return err
+		}
+		return q.Audit(ctx, now, "host:"+h.Name, "request_cancel", "request:"+id, "")
+	})
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	s.bcast.notify()
+	writeJSON(w, http.StatusOK, api.RequestStatus{ID: req.ID, Kind: req.Kind, Status: req.Status, DecidedAt: req.DecidedAt, DecisionNote: req.DecisionNote})
+}
+
+// handleSSHCA publishes the SSH user CA public key (proposed: GET /v1/ssh-ca).
+func (s *Server) handleSSHCA(w http.ResponseWriter, r *http.Request, _ *store.Host) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"public_key":  s.pki.SSHCAPublicLine(),
+		"fingerprint": ssh.FingerprintSHA256(s.pki.SSHSigner.PublicKey()),
+	})
+}
+
+func (s *Server) handleGrants(w http.ResponseWriter, r *http.Request, h *store.Host) {
+	active := r.URL.Query().Get("active")
+	now := s.now()
+	gs, err := s.store.Q().HostGrants(r.Context(), h.ID, active == "1" || active == "true", now)
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	out := api.GrantList{Grants: []api.GrantSummary{}}
+	for _, g := range gs {
+		out.Grants = append(out.Grants, api.GrantSummary{ID: g.ID, Kind: g.Kind, Status: g.Status(now), TargetHost: g.TargetHost,
+			LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// pemCert encodes DER as a PEM certificate.
+func pemCert(der []byte) string {
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}

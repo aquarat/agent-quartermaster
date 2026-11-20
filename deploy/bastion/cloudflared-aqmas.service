@@ -1,0 +1,25 @@
+# cloudflared for aqmas only, on the bastion. Config: /etc/cloudflared/aqmas.yml
+# (from cloudflared-aqmas.yml.example); tunnel credentials /etc/cloudflared/<TUNNEL-UUID>.json (0600).
+[Unit]
+Description=cloudflared tunnel for approvals.example.com
+After=network-online.target aqmasd.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/cloudflared --no-autoupdate --config /etc/cloudflared/aqmas.yml tunnel run
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
