@@ -174,11 +174,12 @@ try {
       console.log(JSON.stringify((await api.state()).passkeys ?? []));
       break;
     case "add-passkey": {
-      const p = await flows.prepareAction(api, flows.PASSKEY_TARGET, { action: "add" });
+      // The nickname is part of the signed add action.
+      const p = await flows.prepareAction(api, flows.PASSKEY_TARGET, { action: "add", nickname: args[0] ?? "" });
       console.error("owner: signing " + p.canonicalText);
       const reg = await flows.authorizeAddPasskey(api, auth, p);
       const fresh = await softAuthenticator(origin);
-      const res = (await flows.completeRegistration(api, fresh, reg, args[0] ?? "")) as { passkey?: { nickname?: string } };
+      const res = (await flows.completeRegistration(api, fresh, reg)) as { passkey?: { nickname?: string } };
       const name = res.passkey?.nickname;
       if (!name) throw new Error("register/finish returned no passkey nickname");
       keys[name] = await fresh.save();

@@ -135,7 +135,7 @@ describe("App in a DOM", () => {
     input.value = "Desk key";
     [...dlg.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent === "Continue")!.click();
     await until(() => !!dlg.querySelector("button.confirm"));
-    expect(dlg.querySelector(".headline")!.textContent).toBe("Rename the passkey YubiKey on keyring to Desk key.");
+    expect(dlg.querySelector(".headline")!.textContent).toMatch(/^Rename the passkey YubiKey on keyring \(id [0-9A-F]{6}\) to Desk key\.$/);
     dlg.close();
   });
 

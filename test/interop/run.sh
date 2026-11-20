@@ -131,7 +131,7 @@ FIRST=$(owner passkeys | bun -e 'const p = await Bun.stdin.json(); if (p.length 
 [[ $FIRST == "Passkey 1" ]] || fail "first passkey is named '$FIRST', want 'Passkey 1'"
 SECOND=$(owner add-passkey "interop second" 2>"$T/owner-add.err")
 [[ $SECOND == "interop second" ]] || { cat "$T/owner-add.err"; fail "add-passkey printed '$SECOND'"; }
-grep -q '"action":"add".*"object":"passkey"' "$T/owner-add.err" || fail "passkey add was not signed"
+grep -q '"action":"add".*"new_nickname":"interop second","nickname":"".*"object":"passkey"' "$T/owner-add.err" || fail "passkey add (with its nickname) was not signed"
 owner rename-passkey "interop second" "interop backup" >/dev/null 2>"$T/owner-rename.err" || { cat "$T/owner-rename.err"; fail "rename-passkey"; }
 grep -q '"action":"rename".*"new_nickname":"interop backup","nickname":"interop second"' "$T/owner-rename.err" ||
 	{ cat "$T/owner-rename.err"; fail "rename canonical lacks the nicknames"; }

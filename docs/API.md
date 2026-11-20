@@ -141,7 +141,7 @@ lives on the server, keyed by `challenge_id` (no state in cookies).
 | `POST /api/ui/logout` | `{}` | `OK` |
 | `POST /api/ui/passkeys/register/begin` | `RegisterBegin`: first passkey `{enroll_code}`; later ones (session) `{challenge_id, assertion}` for a signed `passkey add` | `CeremonyBegin` (creation options; `residentKey` and UV required, `credProps` requested) |
 | `POST /api/ui/passkeys/register/finish` | `RegisterFinish {challenge_id, credential, name?}` (`name` = nickname) | `RegisterResult {ok, passkey: PasskeyInfo}` |
-| `POST /api/ui/passkeys/challenge` | `{action: "add"}` | `ChallengeResponse` (object `passkey`, id `new`) |
+| `POST /api/ui/passkeys/challenge` | `{action: "add", nickname?}` | `ChallengeResponse` (object `passkey`, id `new`, `new_nickname` = the nickname) |
 | `POST /api/ui/passkeys/{id}/challenge` | `{action: "rename", nickname}` or `{action: "remove"}` | `ChallengeResponse` (object `passkey`, id `{id}`) |
 | `POST /api/ui/passkeys/{id}/rename`, `.../remove` | `DecideRequest` | `PasskeyChange {ok, id, action, nickname, signed_out}` |
 | `GET /api/ui/state` | | `UIState {owner, pending: [PendingItem], standing: [StandingApproval], grants: [GrantSummary], recent: [AuditEntry], passkeys: [PasskeyInfo]}` |
@@ -172,11 +172,18 @@ lives on the server, keyed by `challenge_id` (no state in cookies).
   is the authenticator's unverified claim, display only); `backup_eligible` = a synced passkey,
   otherwise device-bound; `current` = the passkey this session signed in with. `last_used_at`
   and `sign_count` update on every assertion (sign-in and signed actions).
-- **Nicknames:** trimmed, 1-64 UTF-8 bytes, no control/format/private-use/separator characters,
-  unique ignoring case (409 `conflict` on a rename to a taken name; at registration a taken or
-  empty name is made unique with " 2", " 3"...). An empty `name` at registration means the
-  authenticator's name ("Bitwarden"), or "Passkey N" when unknown. Migration 3 names existing
-  unnamed passkeys "Passkey 1", "Passkey 2", ... in registration order.
+- **Nicknames** (`internal/server/nickname`): runs of any Unicode space become one space,
+  trimmed; 1-64 UTF-8 bytes; control, format (bidi, zero-width), private-use, separator and
+  combining characters refused; unique ignoring case (409 `conflict` for a taken name). A
+  nickname chosen when adding a passkey is **signed** with the add action (`new_nickname`) and
+  register/finish uses exactly it (a different `name` there is 400); `name` at register/finish
+  only names the first, enroll-code passkey. Without a chosen nickname the server uses the
+  authenticator's name ("Bitwarden"), or "Passkey N" when unknown, made unique with " 2",
+  " 3"... Look-alike letters from other scripts are not detected: the UI warns about non-ASCII
+  nicknames and shows the passkey's short id (last 6 hex digits, upper case) on its tile and
+  in every rename/remove confirmation. Migration 3 (Go, `fixPasskeyNames`) gives existing
+  passkeys valid unique names: valid names are kept, the rest become "Passkey N" (N = the
+  position in registration order, or the next free number).
 - **Passkey rename/remove** are signed actions like approvals. The endpoint's verb must equal
   the signed `action` (400 otherwise), the challenge is bound to the passkey's id, and on apply
   the passkey must still have the signed `nickname` (409 otherwise). Removing the **last**
@@ -210,7 +217,10 @@ object (a missing or extra key cannot be built by the server and is refused by t
 | `enrollment` | `approve`, `deny` | `requesting_host, kind` (`"enrollment"`), `key_fingerprint` (CSR key), `replaces`, `ttl_seconds` (0), `standing_hours` (0) |
 | `standing` | `revoke` | `requesting_host, kind, target, login_user, ttl_seconds` (the rule's max TTL), `standing_hours` |
 | `grant` | `revoke` | `requesting_host, kind, target, login_user, ttl_seconds` (0), `standing_hours` |
-| `passkey` | `add`, `rename`, `remove` | `nickname` (the passkey's current nickname; `""` for add), `new_nickname` (rename: the new one; otherwise `""`). For add `id` is `"new"`, otherwise the passkey's id |
+| `passkey` | `add`, `rename`, `remove` | `nickname` (the passkey's current nickname; `""` for add), `new_nickname` (rename: the new one; add: the chosen nickname or `""`; remove: `""`). For add `id` is `"new"`, otherwise the passkey's id |
+
+The `passkey` object gained `nickname`/`new_nickname` (for `add` too) without a version bump:
+a page from before this change refuses the new add text (unknown keys), which fails safe.
 
 Fingerprints: SSH keys `SHA256:<base64>` (OpenSSH style), CSR keys `SHA256:<hex>` of the PKIX
 public key. Deny and revoke carry `standing_hours` 0.

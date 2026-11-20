@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
@@ -157,8 +158,24 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 		}
 		switch in.Action {
 		case canon.ActionAdd:
-			if id != "new" || in.Nickname != "" {
+			if id != "new" {
 				return a, errBad(`adding a passkey: POST /api/ui/passkeys/challenge {"action":"add"}`)
+			}
+			// An optional nickname for the new passkey is part of what the owner signs;
+			// register/finish then uses exactly it.
+			if strings.TrimSpace(in.Nickname) != "" {
+				n, err := normalizeNickname(in.Nickname)
+				if err != nil {
+					return a, err
+				}
+				all, err := loadPasskeys(ctx, q)
+				if err != nil {
+					return a, err
+				}
+				if nicknameTaken(all, n, 0) {
+					return a, errConflict("another passkey already has that name")
+				}
+				a.NewNickname = n
 			}
 		case canon.ActionRename, canon.ActionRemove:
 			p, all, err := findPasskey(ctx, q, id)

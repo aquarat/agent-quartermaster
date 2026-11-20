@@ -308,6 +308,9 @@ func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		c.ObjectType, c.ObjectID, c.SessionHash = "session", s.passkeyRef(ctx, s.store.Q(), pkID), sess
+		// The nickname the owner signed for the new passkey ("" = name it after the
+		// authenticator); register/finish uses exactly this.
+		c.Canonical = sg.NewNickname
 	}
 	var excl []protocol.CredentialDescriptor
 	for _, cr := range o.creds {
@@ -423,6 +426,15 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 		case "session":
 			if n == 0 {
 				return errConflict("no existing passkey")
+			}
+			// Only the signed nickname counts (see register/begin); a different name sent
+			// here is refused rather than silently dropped.
+			if nickname != "" && nickname != c.Canonical {
+				return errBad("name differs from the nickname signed with the add action")
+			}
+			nickname = c.Canonical
+			if nickname != "" && nicknameTaken(all, nickname, 0) {
+				return errConflict("another passkey took that name meanwhile; remove or rename it, then add again")
 			}
 			detail = "approved by " + c.ObjectID
 		default:

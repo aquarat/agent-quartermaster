@@ -594,7 +594,8 @@ input.text {
   min-height: 36px;
   padding: 6px 12px;
   border-radius: 999px;
-  border: 1.5px solid var(--line);
+  /* --muted, not --line: the chip's outline must reach 3:1 against the page (WCAG 1.4.11). */
+  border: 1.5px solid var(--muted);
   background: var(--surface);
   color: var(--ink);
   cursor: pointer;
@@ -843,7 +844,11 @@ input.text {
     max-height: calc(100vh - var(--topbar-h) - 24px);
     overflow-y: auto;
     overscroll-behavior: contain;
-    padding: 0 6px 16px 0;
+    /* Room for the 3px focus outline (offset 2px) on both sides of this scroll box, and keep
+       a focused row clear of the sticky day header. */
+    padding: 0 6px 16px 6px;
+    margin-left: -6px;
+    scroll-padding-top: 2.5rem;
   }
   .col-activity .ev-day-h {
     top: 0;

@@ -55,6 +55,8 @@ interface ChallengeRec {
   canonical?: Record<string, unknown>;
   canonicalText?: string;
   sessionBound?: string;
+  /** register challenges after a signed "passkey add": the nickname that was signed ("" = default). */
+  signedName?: string;
 }
 
 export interface MockOptions {
@@ -95,9 +97,9 @@ const AUTHENTICATORS: Record<string, { authenticator: string; icon: string; sync
 /** Server rules for nicknames (api.MaxNicknameBytes, no control/format characters). */
 function checkNickname(n: unknown): string {
   if (typeof n !== "string") throw new HttpError(400, "bad_request", "nickname required");
-  const t = n.trim();
-  if (!t || Buffer.byteLength(t, "utf8") > 64 || /[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/u.test(t)) {
-    throw new HttpError(400, "bad_request", "nickname must be 1-64 bytes without control or invisible characters");
+  const t = n.replace(/\p{Zs}+/gu, " ").trim();
+  if (!t || Buffer.byteLength(t, "utf8") > 64 || /[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}\p{Mn}\p{Me}]/u.test(t)) {
+    throw new HttpError(400, "bad_request", "nickname must be 1-64 bytes without control, invisible or combining characters");
   }
   return t;
 }
@@ -627,6 +629,7 @@ export function startMock(opts: MockOptions = {}) {
       return json({ ok: true }, 200, { "Set-Cookie": `aqmas_session=${sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800` });
     }
     if (p === "/api/ui/passkeys/register/begin" && isPost) {
+      let signedName: string | undefined; // the nickname signed with "passkey add" (as aqmasd)
       if (typeof body.enroll_code === "string") {
         if (!store.enrollCode || body.enroll_code.trim() !== store.enrollCode) throw new HttpError(403, "forbidden", "enroll code is wrong or already used");
       } else {
@@ -635,15 +638,21 @@ export function startMock(opts: MockOptions = {}) {
         if (rec.sessionBound !== session || rec.canonical?.object !== "passkey") throw new HttpError(403, "forbidden", "not a passkey challenge");
         checkCredential(body.assertion, rec, "webauthn.get");
         store.applied.push({ object: "passkey", action: "add", canonical: rec.canonical });
+        signedName = String(rec.canonical.new_nickname ?? "");
       }
-      const { id, rec } = issue("register");
+      const { id, rec } = issue("register", { signedName });
       return json({ challenge_id: id, public_key: creationOptions(req, rec.challenge) });
     }
     if (p === "/api/ui/passkeys/register/finish" && isPost) {
       const rec = take(body.challenge_id, "register");
       checkCredential(body.credential, rec, "webauthn.create");
       const cred = body.credential as { id: string };
-      const name = body.name === undefined ? "" : checkNickname(body.name);
+      let name = body.name === undefined ? "" : checkNickname(body.name);
+      if (rec.signedName !== undefined) {
+        // Later passkeys: only the nickname signed with the add action counts.
+        if (name && name !== rec.signedName) throw new HttpError(400, "bad_request", "name differs from the nickname signed with the add action");
+        name = rec.signedName;
+      }
       const pk = store.addPasskey("bitwarden", name, Date.now(), undefined, cred.id);
       store.enrollCode = null; // one-time
       store.audit("owner", "passkey_register", "passkey:" + pk.info.id, `now ${store.passkeys.length}`);
@@ -652,7 +661,9 @@ export function startMock(opts: MockOptions = {}) {
     if (p === "/api/ui/passkeys/challenge" && isPost) {
       needSession();
       if (body.action !== "add") throw new HttpError(400, "bad_request", "action must be add");
-      const canonical = { v: 1, action: "add", object: "passkey", id: "new", nickname: "", new_nickname: "", nonce: rid(32), issued_at: new Date().toISOString().replace(/\.\d+Z$/, "Z") };
+      const wanted = typeof body.nickname === "string" && body.nickname.trim() ? checkNickname(body.nickname) : "";
+      if (wanted && store.passkeys.some((p) => p.info.nickname.toLowerCase() === wanted.toLowerCase())) throw new HttpError(409, "conflict", "name already used");
+      const canonical = { v: 1, action: "add", object: "passkey", id: "new", nickname: "", new_nickname: wanted, nonce: rid(32), issued_at: new Date().toISOString().replace(/\.\d+Z$/, "Z") };
       const text = canonicalJSON(canonical);
       const { id, rec } = issue("action", { canonical, canonicalText: text, sessionBound: session }, createHash("sha256").update(text, "utf8").digest());
       return json({ challenge_id: id, canonical: text, public_key: requestOptions(req, rec.challenge, true) });

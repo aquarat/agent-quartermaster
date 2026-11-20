@@ -74,3 +74,9 @@ export function $(sel: string, root: ParentNode = document): HTMLElement {
   if (!el) throw new Error(`missing ${sel}`);
   return el as HTMLElement;
 }
+
+/** obj[key] only when key is obj's own property: lookups keyed by server or browser strings
+ * must not reach Object.prototype ("constructor", "__proto__", ...). */
+export function own<V>(obj: Record<string, V>, key: string): V | undefined {
+  return Object.hasOwn(obj, key) ? obj[key] : undefined;
+}

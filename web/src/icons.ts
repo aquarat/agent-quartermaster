@@ -3,6 +3,7 @@
 // every one comes with text next to it.
 
 import type { EventKind } from "./audit";
+import { own } from "./dom";
 
 const NS = "http://www.w3.org/2000/svg";
 
@@ -64,7 +65,7 @@ const PASSKEY_GLYPHS: Record<string, Shape[]> = {
 };
 
 export function passkeyIcon(icon: string): SVGSVGElement {
-  return draw(PASSKEY_GLYPHS[icon] ?? KEY, "glyph");
+  return draw(own(PASSKEY_GLYPHS, icon) ?? KEY, "glyph");
 }
 
 const EVENT_GLYPHS: Record<EventKind, Shape[]> = {

@@ -6,8 +6,8 @@
 
 import { ApiError, createApi, type Api } from "./api";
 import { FILTERS, actor, classify, detailUntrusted, groupByDay, matches, objectRef, rowKey, type Filter } from "./audit";
-import type { Part } from "./canonical";
-import { $, h, replace, type Child } from "./dom";
+import { shortId, type Part } from "./canonical";
+import { $, h, own, replace, type Child } from "./dom";
 import {
   FlowError,
   LOGIN_OPTIONS_MAX_AGE_MS,
@@ -604,6 +604,8 @@ export class App {
         fact("Added", h("time", { datetime: p.created_at, title: absoluteTime(p.created_at) }, shortDate(p.created_at))),
         fact("Last used", p.last_used_at ? since(p.last_used_at) : h("span", { class: "muted" }, "never")),
         transports.length ? fact("Connects by", transports.join(", ")) : null,
+        // The same short id the rename/remove confirmation shows (from the signed text).
+        fact("Id", h("span", { class: "mono" }, vt(shortId(p.id)))),
       ),
       h(
         "div",
@@ -800,7 +802,7 @@ const TRANSPORTS: Record<string, string> = {
 };
 
 function transportLabel(t: string): string {
-  return TRANSPORTS[t] ?? vt(t);
+  return own(TRANSPORTS, t) ?? vt(t);
 }
 
 function fact(label: string, ...value: Child[]): Child[] {
@@ -925,7 +927,6 @@ class Sheet {
   private target: ActionTarget | null = null;
   private prepared: PreparedAction | null = null;
   /** Nickname chosen for a passkey being added ("" = let the server name it). */
-  private addNickname = "";
   private goneNote: HTMLElement | null = null;
   private retry: (() => void) | null = null;
   /** Bumped whenever a flow starts or the sheet closes; async results for an older flow are
@@ -1077,7 +1078,6 @@ class Sheet {
     const target: ActionTarget = { ...PASSKEY_TARGET };
     const seq = this.begin(target);
     this.step = "choose";
-    this.addNickname = "";
     const { input, error, field } = nicknameField("pk-new-name", "", "e.g. YubiKey on keyring");
     const go = h("button", { class: "btn approve", type: "button" }, "Continue");
     const submit = () => {
@@ -1088,8 +1088,7 @@ class Sheet {
         input.focus();
         return;
       }
-      this.addNickname = name;
-      void this.prepare(seq, target, { action: "add" }, () => this.openAddPasskey());
+      void this.prepare(seq, target, { action: "add", nickname: name }, () => this.openAddPasskey());
     };
     go.addEventListener("click", submit);
     input.addEventListener("keydown", (e) => {
@@ -1239,7 +1238,8 @@ class Sheet {
     create.addEventListener("click", () => {
       if (!this.current(seq)) return;
       create.disabled = true;
-      completeRegistration(this.app.api, this.app.auth, reg, this.addNickname).then(
+      // The nickname was signed with the add action; the server uses exactly that.
+      completeRegistration(this.app.api, this.app.auth, reg).then(
         (res) => {
           this.app.changed();
           if (!this.current(seq)) return;

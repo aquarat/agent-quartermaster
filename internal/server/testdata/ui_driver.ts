@@ -108,7 +108,7 @@ const secondPk = pks.find((x: any) => x.current);
 if (pks.length !== 2 || !firstPk || !secondPk || firstPk.nickname !== "Passkey 1") throw new Error("passkey list " + JSON.stringify(pks));
 p = await flows.prepareAction(api, flows.targetForPasskey(firstPk), { action: "rename", nickname: "Old laptop" });
 step("rename canonical: " + p.canonicalText);
-if (p.description.headline !== "Rename the passkey Passkey 1 to Old laptop.") throw new Error("rename headline " + p.description.headline);
+if (p.description.headline !== `Rename the passkey Passkey 1 (id ${firstPk.id.slice(-6).toUpperCase()}) to Old laptop.`) throw new Error("rename headline " + p.description.headline);
 await flows.completeAction(api, second, p);
 pks = (await api.state()).passkeys;
 const renamed = pks.find((x: any) => x.id === firstPk.id);

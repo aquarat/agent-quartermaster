@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
+	"github.com/aquarat/agent-quartermaster/internal/server/nickname"
 	_ "modernc.org/sqlite"
 )
 
@@ -89,12 +90,82 @@ func (s *Store) migrate(ctx context.Context) error {
 			tx.Rollback()
 			return fmt.Errorf("store: migration %d: %w", i+1, err)
 		}
+		if i+1 == 3 {
+			if err := fixPasskeyNames(ctx, tx); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: migration 3: %w", err)
+			}
+		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", i+1)); err != nil {
 			tx.Rollback()
 			return err
 		}
 		if err := tx.Commit(); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// fixPasskeyNames (migration 3) gives every passkey a nickname that passes nickname.Normalize
+// and is unique ignoring case: a valid existing name is kept (normalised) unless an earlier
+// passkey already has it; otherwise the row becomes "Passkey N" (N = its position in
+// registration order, or the next free number).
+func fixPasskeyNames(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, "SELECT id, name FROM passkeys ORDER BY id")
+	if err != nil {
+		return err
+	}
+	type row struct {
+		id   int64
+		name string
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.name); err != nil {
+			rows.Close()
+			return err
+		}
+		all = append(all, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var kept []string
+	taken := func(c string) bool {
+		for _, k := range kept {
+			if nickname.Same(k, c) {
+				return true
+			}
+		}
+		return false
+	}
+	// Valid names first (in order), so a later "Passkey N" never collides with them.
+	want := make([]string, len(all))
+	for i, r := range all {
+		if n, err := nickname.Normalize(r.name); err == nil && !taken(n) {
+			want[i] = n
+			kept = append(kept, n)
+		}
+	}
+	for i := range all {
+		if want[i] == "" {
+			for n := i + 1; ; n++ {
+				if c := fmt.Sprintf("Passkey %d", n); !taken(c) {
+					want[i] = c
+					break
+				}
+			}
+			kept = append(kept, want[i])
+		}
+	}
+	for i, r := range all {
+		if want[i] != r.name {
+			if _, err := tx.ExecContext(ctx, "UPDATE passkeys SET name = ? WHERE id = ?", want[i], r.id); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

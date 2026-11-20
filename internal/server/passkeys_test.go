@@ -23,11 +23,18 @@ func mustHex(s string) []byte {
 	return b
 }
 
-// addPasskey signs "passkey add" with the current e.auth, registers a, and returns the result.
+// addPasskey signs "passkey add" (with nickname name, "" = server's choice) with the current
+// e.auth, registers a with that name, and returns the result.
 func (e *env) addPasskey(a *vauth.Authenticator, name string) api.RegisterResult {
 	e.t.Helper()
-	cr, st := e.challenge("/api/ui/passkeys", api.ChallengeRequest{Action: "add"})
+	cr, st := e.challenge("/api/ui/passkeys", api.ChallengeRequest{Action: "add", Nickname: name})
 	mustStatus(e.t, "passkey add challenge", st, 200)
+	return e.finishAdd(cr, a, name, 200)
+}
+
+// finishAdd signs an add challenge, creates a's credential and sends register/finish with name.
+func (e *env) finishAdd(cr challengeResp, a *vauth.Authenticator, name string, want int) api.RegisterResult {
+	e.t.Helper()
 	as, err := e.auth.AssertOptions(cr.PublicKey)
 	if err != nil {
 		e.t.Fatal(err)
@@ -42,8 +49,8 @@ func (e *env) addPasskey(a *vauth.Authenticator, name string) api.RegisterResult
 		e.t.Fatal(err)
 	}
 	var res api.RegisterResult
-	mustStatus(e.t, "register finish", e.webDo("POST", "/api/ui/passkeys/register/finish", api.RegisterFinish{ChallengeID: begin.ChallengeID, Credential: cred, Name: name}, &res), 200)
-	if !res.OK || res.Passkey == nil {
+	mustStatus(e.t, "register finish", e.webDo("POST", "/api/ui/passkeys/register/finish", api.RegisterFinish{ChallengeID: begin.ChallengeID, Credential: cred, Name: name}, &res), want)
+	if want == 200 && (!res.OK || res.Passkey == nil) {
 		e.t.Fatalf("register result %+v", res)
 	}
 	return res
@@ -116,11 +123,23 @@ func TestPasskeyListAddRenameRemove(t *testing.T) {
 	if r := e.addPasskey(bw2, ""); r.Passkey.Nickname != "Bitwarden 2" {
 		t.Fatalf("duplicate default name %q", r.Passkey.Nickname)
 	}
+	// A chosen nickname is signed with the add action: a taken one is refused up front, one
+	// differing at register/finish is refused, the signed one is stored exactly.
+	if _, st := e.challenge("/api/ui/passkeys", api.ChallengeRequest{Action: "add", Nickname: "  BITWARDEN  "}); st != 409 {
+		t.Fatalf("add with a taken nickname: %d, want 409", st)
+	}
+	cr, st := e.challenge("/api/ui/passkeys", api.ChallengeRequest{Action: "add", Nickname: "Key\u00a0on  keyring"})
+	mustStatus(t, "add challenge", st, 200)
+	if c := uiCheck(t, cr); c["new_nickname"] != "Key on keyring" || c["nickname"] != "" {
+		t.Fatalf("add canonical %s", cr.Canonical)
+	}
+	e.finishAdd(cr, vauth.New(testBase), "Something else", 400)
 	yk := vauth.New(testBase)
-	yk.AAGUID, yk.Transports = aaguidYubiKey, []string{"nfc", "usb"}
-	if r := e.addPasskey(yk, "  BITWARDEN  "); r.Passkey.Nickname != "BITWARDEN 3" || r.Passkey.Authenticator != "Security Key NFC by Yubico" ||
-		r.Passkey.BackupEligible || r.Passkey.Icon != "yubikey" {
-		t.Fatalf("chosen duplicate name / yubikey: %+v", r.Passkey)
+	yk.AAGUID, yk.Transports = aaguidYubiKey, []string{"nfc", "usb", "constructor-Is-Not-A-Transport!"}
+	cr, _ = e.challenge("/api/ui/passkeys", api.ChallengeRequest{Action: "add", Nickname: "Key on keyring"})
+	if r := e.finishAdd(cr, yk, "", 200); r.Passkey.Nickname != "Key on keyring" || r.Passkey.Authenticator != "Security Key NFC by Yubico" ||
+		r.Passkey.BackupEligible || r.Passkey.Icon != "yubikey" || len(r.Passkey.Transports) != 2 {
+		t.Fatalf("signed name / yubikey: %+v", r.Passkey)
 	}
 	s = e.state()
 	if len(s.Passkeys) != 4 || s.Owner.Passkeys != 4 {
@@ -135,7 +154,7 @@ func TestPasskeyListAddRenameRemove(t *testing.T) {
 
 	// Rename: the canonical names the passkey by its current nickname and the new one.
 	bwInfo := passkeyByName(t, s, "Bitwarden")
-	cr, st := e.challenge("/api/ui/passkeys/"+bwInfo.ID, api.ChallengeRequest{Action: "rename", Nickname: "  Phone <img src=x onerror=alert(1)>  "})
+	cr, st = e.challenge("/api/ui/passkeys/"+bwInfo.ID, api.ChallengeRequest{Action: "rename", Nickname: "  Phone <img src=x onerror=alert(1)>  "})
 	mustStatus(t, "rename challenge", st, 200)
 	c := uiCheck(t, cr)
 	if c["object"] != "passkey" || c["action"] != "rename" || c["id"] != bwInfo.ID || c["nickname"] != "Bitwarden" ||
@@ -251,7 +270,9 @@ func TestPasskeyCanonicalBinding(t *testing.T) {
 		name string
 		want int
 	}{
-		{"", 400}, {"   ", 400}, {"a‮b", 400}, {"zero​width", 400}, {"tab\tname", 400},
+		{"", 400}, {"   ", 400}, {"a\u202eb", 400}, {"zero\u200bwidth", 400}, {"tab\tname", 400}, {"Cafe\u0301", 400},
+		{"b\u00a0", 409}, {"\u3000B", 409}, {"Cafe\u0301", 400},
+		{"b\u00a0", 409}, {"\u3000B", 409},
 		{strings.Repeat("x", 65), 400}, {"A-renamed", 400}, {"b", 409}, {"TEST", 409},
 	} {
 		if _, st := e.challenge("/api/ui/passkeys/"+pa.ID, api.ChallengeRequest{Action: "rename", Nickname: c.name}); st != c.want {

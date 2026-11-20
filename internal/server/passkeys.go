@@ -8,15 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/server/aaguid"
+	"github.com/aquarat/agent-quartermaster/internal/server/nickname"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
 )
 
@@ -160,10 +158,7 @@ func findPasskey(ctx context.Context, q *store.Q, id string) (*storedPasskey, []
 
 func (p *storedPasskey) info(currentRowID int64) api.PasskeyInfo {
 	u, a := aaguid.Lookup(p.cred.Authenticator.AAGUID)
-	tr := make([]string, 0, len(p.cred.Transport))
-	for _, t := range p.cred.Transport {
-		tr = append(tr, string(t))
-	}
+	tr := cleanTransports(p.cred.Transport)
 	return api.PasskeyInfo{
 		ID: p.id, Nickname: p.Name, Authenticator: a.Name, Icon: a.Icon, AAGUID: u, Transports: tr,
 		BackupEligible: p.cred.Flags.BackupEligible, BackupState: p.cred.Flags.BackupState,
@@ -185,32 +180,19 @@ func (s *Server) passkeyRef(ctx context.Context, q *store.Q, rowID int64) string
 	return fmt.Sprintf("passkey:#%d", rowID)
 }
 
-// normalizeNickname trims a nickname and checks it: 1..api.MaxNicknameBytes UTF-8 bytes, no
-// control, format (bidi, zero-width), private-use or line/paragraph separator characters. The
-// nickname appears in signed canonical text, so it must read the same everywhere.
+// normalizeNickname applies nickname.Normalize (see that package for the rules).
 func normalizeNickname(n string) (string, error) {
-	n = strings.TrimSpace(n)
-	if n == "" {
-		return "", errBad("nickname is empty")
+	out, err := nickname.Normalize(n)
+	if err != nil {
+		return "", errBad(err.Error())
 	}
-	if len(n) > api.MaxNicknameBytes {
-		return "", errBad(fmt.Sprintf("nickname is longer than %d bytes", api.MaxNicknameBytes))
-	}
-	if !utf8.ValidString(n) {
-		return "", errBad("nickname is not valid UTF-8")
-	}
-	for _, r := range n {
-		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Co, unicode.Cs, unicode.Zl, unicode.Zp) {
-			return "", errBad("nickname contains control or invisible characters")
-		}
-	}
-	return n, nil
+	return out, nil
 }
 
 // nicknameTaken reports whether another passkey (not exceptRowID) has this nickname, ignoring case.
 func nicknameTaken(all []storedPasskey, name string, exceptRowID int64) bool {
 	for _, p := range all {
-		if p.ID != exceptRowID && strings.EqualFold(p.Name, name) {
+		if p.ID != exceptRowID && nickname.Same(p.Name, name) {
 			return true
 		}
 	}
@@ -219,18 +201,24 @@ func nicknameTaken(all []storedPasskey, name string, exceptRowID int64) bool {
 
 // uniqueNickname returns name, or name plus " 2", " 3", ... when another passkey has it.
 func uniqueNickname(all []storedPasskey, name string) string {
-	if !nicknameTaken(all, name, 0) {
-		return name
-	}
-	for i := 2; ; i++ {
-		suffix := fmt.Sprintf(" %d", i)
-		base := name
-		for len(base)+len(suffix) > api.MaxNicknameBytes {
-			_, size := utf8.DecodeLastRuneInString(base)
-			base = base[:len(base)-size]
+	return nickname.Unique(name, func(c string) bool { return nicknameTaken(all, c, 0) })
+}
+
+// cleanTransports keeps the browser-reported transports that look like transport names (at
+// most 8 of [a-z0-9-]{1,32}); they are self-reported strings, shown in the UI.
+func cleanTransports(in []protocol.AuthenticatorTransport) []string {
+	out := []string{}
+	for _, t := range in {
+		v := string(t)
+		ok := len(v) >= 1 && len(v) <= 32
+		for _, r := range v {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+				ok = false
+			}
 		}
-		if c := strings.TrimSpace(base) + suffix; !nicknameTaken(all, c, 0) {
-			return c
+		if ok && len(out) < 8 {
+			out = append(out, v)
 		}
 	}
+	return out
 }

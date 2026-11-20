@@ -65,20 +65,27 @@ export async function prepareRegistrationWithCode(api: Api, enrollCode: string):
   return toRegistration(await api.registerBegin({ enroll_code: code }));
 }
 
-/** Create the passkey and register it. `nickname` "" lets the server name it after the
- * authenticator. Resolves to the server's RegisterResult (passkey info when it sends one). */
+/** Create the passkey and register it. `nickname`: only for the first passkey (enroll code);
+ * later passkeys get the nickname signed with the add action, so leave it "". "" lets the
+ * server name it after the authenticator. Resolves to the server's RegisterResult. */
 export async function completeRegistration(api: Api, auth: Authenticator, p: PreparedRegistration, nickname = ""): Promise<unknown> {
   const cred = await auth.create(p.options);
   return api.registerFinish(p.challengeId, encodeAttestation(cred), nickname.trim() || undefined);
 }
 
+/** A nickname as the server stores it (internal/server/nickname.Normalize): runs of any
+ * Unicode space become one plain space, trimmed. */
+export function normalizeNickname(name: string): string {
+  return name.replace(/\p{Zs}+/gu, " ").trim();
+}
+
 /** Client-side check of a nickname before asking for a challenge (the server checks again):
  * returns an error message or null. Mirrors api.MaxNicknameBytes and the server's character rules. */
 export function nicknameProblem(name: string): string | null {
-  const n = name.trim();
+  const n = normalizeNickname(name);
   if (!n) return "Enter a name.";
   if (new TextEncoder().encode(n).length > 64) return "That name is too long (64 bytes at most).";
-  if (/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/u.test(n)) return "That name contains invisible or control characters.";
+  if (/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}\p{Mn}\p{Me}]/u.test(n)) return "That name contains invisible, control or combining characters.";
   return null;
 }
 
@@ -144,7 +151,8 @@ export interface ActionChoice {
   action: "approve" | "deny" | "revoke" | "add" | "rename" | "remove";
   ttl_seconds?: number;
   standing_hours?: number;
-  /** rename: the new nickname (sent trimmed; the canonical must carry exactly it). */
+  /** rename: the new nickname; add: an optional nickname for the new passkey. Sent
+   * normalised (normalizeNickname); the canonical must carry exactly it as new_nickname. */
   nickname?: string;
 }
 
@@ -169,12 +177,15 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
     if (choice.ttl_seconds !== undefined) body.ttl_seconds = choice.ttl_seconds;
     if (choice.standing_hours) body.standing_hours = choice.standing_hours;
   }
-  const newNickname = choice.action === "rename" ? (choice.nickname ?? "").trim() : undefined;
-  if (choice.action === "rename") {
-    if (target.object !== "passkey") throw new FlowError("Only passkeys can be renamed.");
-    const problem = nicknameProblem(newNickname!);
-    if (problem) throw new FlowError(problem);
-    body.nickname = newNickname;
+  let newNickname: string | undefined;
+  if (choice.action === "rename" || choice.action === "add") {
+    if (target.object !== "passkey") throw new FlowError("Only passkeys have nicknames.");
+    newNickname = normalizeNickname(choice.nickname ?? "");
+    if (choice.action === "rename" || newNickname !== "") {
+      const problem = nicknameProblem(newNickname);
+      if (problem) throw new FlowError(problem);
+      body.nickname = newNickname;
+    }
   }
   const r = await api.challenge(target.object, target.id, body);
   if (!r || typeof r.challenge_id !== "string" || !r.challenge_id) throw new FlowError("The server sent no challenge id.");

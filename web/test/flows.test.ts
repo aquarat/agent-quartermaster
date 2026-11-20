@@ -166,10 +166,15 @@ describe("seeded mock", () => {
     const { api, auth } = await signedIn(m);
     const before = (await api.state()).owner.passkeys;
     const prep = await prepareAction(api, PASSKEY_TARGET, { action: "add" });
-    expect(prep.description.headline).toBe("Allow adding a new passkey to aqmas.");
+    expect(prep.description.headline).toBe("Allow adding a new passkey to aqmas (named after its authenticator).");
     const reg = await authorizeAddPasskey(api, auth, prep);
     await completeRegistration(api, auth, reg);
     expect((await api.state()).owner.passkeys).toBe(before + 1);
+    // A chosen nickname is part of the signed add text (normalised like the server does).
+    const named = await prepareAction(api, PASSKEY_TARGET, { action: "add", nickname: " Desk\u00a0 key " });
+    expect(named.canonical).toMatchObject({ action: "add", nickname: "", new_nickname: "Desk key" });
+    expect(named.description.headline).toBe("Allow adding a new passkey named Desk key to aqmas.");
+    await expect(prepareAction(api, PASSKEY_TARGET, { action: "add", nickname: "Cafe\u0301" })).rejects.toThrow(FlowError);
     // register/begin without an enroll code or a signed challenge is refused.
     const e = await api.registerBegin({}).catch((x) => x);
     expect(e).toBeInstanceOf(ApiError);
@@ -199,6 +204,17 @@ describe("a lying or buggy server is caught before anything is signed", () => {
     const pk = (r.public_key as { publicKey: Record<string, unknown> }).publicKey;
     return { ...r, canonical: text, public_key: { publicKey: { ...pk, challenge: await sha(text) } } };
   };
+
+  test("passkey add: a dropped or swapped nickname is refused before signing", async () => {
+    const { api, auth } = await signedIn(m);
+    const swap = (nn: string): Api => ({ ...api, challenge: async (o, id, b) => rewrite(await api.challenge(o, id, b), { new_nickname: nn }) });
+    for (const [chosen, served] of [["Desk key", ""], ["Desk key", "Attacker key"], ["", "Desk key"]] as const) {
+      const e = await prepareAction(swap(served), PASSKEY_TARGET, { action: "add", nickname: chosen }).catch((x) => x);
+      expect(e).toBeInstanceOf(FlowError);
+      expect((e as FlowError).message).toMatch(/new_nickname/);
+    }
+    expect(auth.gets.length).toBe(1); // only the login
+  });
 
   test("longer TTL than chosen (consistent canonical + challenge)", async () => {
     const e = await tampered((r) => rewrite(r, { ttl_seconds: 28800 }));
@@ -336,7 +352,7 @@ describe("passkey management", () => {
     const yk = await byName(api, "YubiKey on keyring");
     const prep = await prepareAction(api, targetForPasskey(yk), { action: "rename", nickname: "  YubiKey C (desk) " });
     expect(prep.canonical).toMatchObject({ object: "passkey", action: "rename", id: yk.id, nickname: "YubiKey on keyring", new_nickname: "YubiKey C (desk)" });
-    expect(prep.description.headline).toBe("Rename the passkey YubiKey on keyring to YubiKey C (desk).");
+    expect(prep.description.headline).toBe(`Rename the passkey YubiKey on keyring (id ${yk.id.slice(-6).toUpperCase()}) to YubiKey C (desk).`);
     const res = (await completeAction(api, auth, prep)) as PasskeyChange;
     expect(f.log.at(-1)!.url).toEndWith(`/api/ui/passkeys/${yk.id}/rename`);
     expect(res).toMatchObject({ ok: true, action: "rename", nickname: "YubiKey C (desk)", signed_out: false });
@@ -396,7 +412,7 @@ describe("passkey management", () => {
     const bw = await byName(api, "Bitwarden");
     let prep = await prepareAction(api, targetForPasskey(bw), { action: "remove" });
     expect(prep.canonical).toMatchObject({ action: "remove", nickname: "Bitwarden", new_nickname: "" });
-    expect(prep.description.headline).toBe("Remove the passkey Bitwarden. It can no longer sign in or approve anything.");
+    expect(prep.description.headline).toBe(`Remove the passkey Bitwarden (id ${bw.id.slice(-6).toUpperCase()}). It can no longer sign in or approve anything.`);
     let res = (await completeAction(api, auth, prep)) as PasskeyChange;
     expect(res).toMatchObject({ action: "remove", signed_out: false });
 
@@ -413,12 +429,18 @@ describe("passkey management", () => {
     expect(e.code).toBe("conflict");
   });
 
-  test("adding with a nickname: the server's name comes back", async () => {
+  test("adding with a nickname: it is signed, and register/finish can't change it", async () => {
     const { api, auth } = await signedIn(m);
-    const prep = await prepareAction(api, PASSKEY_TARGET, { action: "add" });
-    expect(prep.canonical).toMatchObject({ nickname: "", new_nickname: "" });
-    const reg = await authorizeAddPasskey(api, auth, prep);
-    const res = (await completeRegistration(api, auth, reg, " Work laptop ")) as { passkey: PasskeyInfo };
+    let prep = await prepareAction(api, PASSKEY_TARGET, { action: "add", nickname: " Work laptop " });
+    expect(prep.canonical).toMatchObject({ nickname: "", new_nickname: "Work laptop" });
+    let reg = await authorizeAddPasskey(api, auth, prep);
+    const e = (await completeRegistration(api, auth, reg, "Something else").catch((x) => x)) as ApiError;
+    expect(e.status).toBe(400);
+    prep = await prepareAction(api, PASSKEY_TARGET, { action: "add", nickname: " Work laptop " });
+    reg = await authorizeAddPasskey(api, auth, prep);
+    const res = (await completeRegistration(api, auth, reg)) as { passkey: PasskeyInfo };
     expect(res.passkey.nickname).toBe("Work laptop");
+    // A server that drops or swaps the chosen name is refused before signing.
+    await expect(prepareAction(api, PASSKEY_TARGET, { action: "add", nickname: "Work laptop" })).rejects.toThrow(); // now taken: 409
   });
 });

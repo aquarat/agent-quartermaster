@@ -27,7 +27,7 @@ func TestMigration3NamesExistingPasskeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UnixMilli()
-	for i, name := range []string{"", "Laptop", " ", ""} {
+	for i, name := range []string{"", "Laptop", " ", "", "Passkey 1", "laptop", "\u200bPhone", "Work\u00a0 Key"} {
 		if _, err := db.ExecContext(ctx, "INSERT INTO passkeys(credential_id, credential_json, name, created_at) VALUES (?, '{}', ?, ?)",
 			[]byte(fmt.Sprint("cred", i)), name, now+int64(i)); err != nil {
 			t.Fatal(err)
@@ -52,7 +52,9 @@ func TestMigration3NamesExistingPasskeys(t *testing.T) {
 	for _, p := range pks {
 		names = append(names, p.Name)
 	}
-	if fmt.Sprint(names) != "[Passkey 1 Laptop Passkey 3 Passkey 4]" {
+	// Valid names are kept (normalised), duplicates ignoring case and invalid ones renamed,
+	// and no generated name collides with a kept one.
+	if fmt.Sprintf("%q", names) != `["Passkey 2" "Laptop" "Passkey 3" "Passkey 4" "Passkey 1" "Passkey 6" "Passkey 7" "Work Key"]` {
 		t.Fatalf("names after migration: %q", names)
 	}
 	if id, err := s.Q().SessionPasskeyID(ctx, "h"); err != nil || id != 1 {

@@ -158,7 +158,7 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
   if (e.object === "passkey") {
     // Every passkey action carries both nicknames; add and remove must not rename anything.
     cmp("nickname", c.nickname, e.nickname ?? "");
-    cmp("new_nickname", c.new_nickname, e.action === "rename" ? e.new_nickname : "");
+    cmp("new_nickname", c.new_nickname, e.action === "rename" || e.action === "add" ? (e.new_nickname ?? "") : "");
   }
   if (e.action === "approve") {
     cmp("ttl_seconds", c.ttl_seconds ?? 0, e.ttl_seconds);
@@ -233,6 +233,11 @@ export function partsText(parts: Part[]): string {
   return parts.map((p) => (typeof p === "string" ? p : p.value)).join("");
 }
 
+/** Short id of a passkey as the UI shows it on the tile: the last 6 hex digits, upper case. */
+export function shortId(id: string): string {
+  return id.slice(-6).toUpperCase();
+}
+
 function who(c: Canonical): Part[] {
   return [{ value: c.login_user ?? "?" }, "@", { value: c.target ?? "?" }];
 }
@@ -268,16 +273,22 @@ export function describe(c: Canonical): Description {
       headline = t`Revoke ${host}'s ${kind} access as ${who(c)}.`;
       break;
     case "passkey:add":
-      headline = ["Allow adding a new passkey to aqmas."];
+      headline = c.new_nickname ? t`Allow adding a new passkey named ${c.new_nickname} to aqmas.` : ["Allow adding a new passkey to aqmas (named after its authenticator)."];
       break;
     case "passkey:rename":
-      headline = t`Rename the passkey ${c.nickname ?? "?"} to ${c.new_nickname ?? "?"}.`;
+      headline = t`Rename the passkey ${c.nickname ?? "?"} (id ${shortId(c.id)}) to ${c.new_nickname ?? "?"}.`;
       break;
     case "passkey:remove":
-      headline = t`Remove the passkey ${c.nickname ?? "?"}. It can no longer sign in or approve anything.`;
+      headline = t`Remove the passkey ${c.nickname ?? "?"} (id ${shortId(c.id)}). It can no longer sign in or approve anything.`;
       break;
     default:
       headline = t`${c.action} ${c.object} ${c.id}.`;
+  }
+  for (const k of ["nickname", "new_nickname"] as const) {
+    const v = c[k];
+    if (typeof v === "string" && v !== "" && !/^[\x20-\x7e]+$/.test(v)) {
+      warnings.push(`The passkey name ${JSON.stringify(v)} has characters outside plain ASCII, which can look like other letters: go by the id.`);
+    }
   }
   for (const [k, label] of [
     ["requesting_host", "requesting host"],

@@ -4,6 +4,7 @@
 // builds DOM.
 
 import type { AuditEntry } from "./types";
+import { own } from "./dom";
 import { dayKey } from "./format";
 
 /** Event kinds: each has a colour, a glyph and a text label in the UI (colour is never alone). */
@@ -50,20 +51,8 @@ const KNOWN: Record<string, EventInfo> = {
   passkey_clone_warning: { kind: "warning", label: "Clone warning", groups: ["passkeys"] },
 };
 
-/** Words for each kind, for screen readers and the legend. */
-export const KIND_WORDS: Record<EventKind, string> = {
-  approve: "approval",
-  deny: "refusal",
-  revoke: "revocation or expiry",
-  request: "new request",
-  auto: "auto-approval",
-  passkey: "passkey",
-  system: "system",
-  warning: "warning",
-};
-
 export function classify(e: AuditEntry): EventInfo {
-  const known = KNOWN[e.action];
+  const known = own(KNOWN, e.action);
   const info: EventInfo = known
     ? { ...known, groups: [...known.groups] }
     : { kind: /error|fail|warn/i.test(e.action) ? "warning" : "system", label: humanize(e.action), groups: [] };
@@ -114,10 +103,10 @@ const TYPE_WORDS: Record<string, string> = {
 
 export function objectRef(o: string): ObjectRef {
   const i = o.indexOf(":");
-  if (i < 0) return { type: o, id: "", short: TYPE_WORDS[o] ?? o };
+  if (i < 0) return { type: o, id: "", short: own(TYPE_WORDS, o) ?? o };
   const type = o.slice(0, i);
   const id = o.slice(i + 1);
-  const words = TYPE_WORDS[type] ?? type;
+  const words = own(TYPE_WORDS, type) ?? type;
   // Hosts are named; everything else gets the same short Ref the cards show.
   const short = type === "host" || id.length <= 8 ? `${words} ${id}` : `${words} ${id.slice(-6).toUpperCase()}`;
   return { type, id, short };
