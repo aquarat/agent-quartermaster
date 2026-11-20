@@ -34,7 +34,9 @@ func (s *Server) AgentHandler() http.Handler {
 	mux.HandleFunc("GET /v1/enroll/{id}", s.handleEnrollStatus)
 	mux.Handle("POST /v1/requests", s.requireHost(s.handleCreateRequest))
 	mux.Handle("GET /v1/requests/{id}", s.requireHost(s.handleRequestStatus))
+	mux.Handle("POST /v1/requests/{id}/cancel", s.requireHost(s.handleCancel))
 	mux.Handle("GET /v1/grants", s.requireHost(s.handleGrants))
+	mux.Handle("GET /v1/ssh-ca", s.requireHost(s.handleSSHCA))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -88,8 +90,9 @@ func (s *Server) hostFromTLS(r *http.Request) (*store.Host, error) {
 	return h, nil
 }
 
-func (s *Server) approveURL(object, id string) string {
-	return s.cfg.PublicBaseURL + "/" + object + "/" + id
+// approveURL links to the UI with the item highlighted (fragment: no server routing needed).
+func (s *Server) approveURL(id string) string {
+	return s.cfg.PublicBaseURL + "/#r=" + id
 }
 
 // ---- enrollment ----
@@ -101,7 +104,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !config.ValidName(in.Hostname) {
-		s.writeErr(w, r, errBad("hostname must match [a-z0-9][a-z0-9.-]{0,62}"))
+		s.writeErr(w, r, errBad("hostname must match [a-z0-9][a-z0-9-]{0,62}"))
 		return
 	}
 	if len(in.Note) > MaxReasonLen || !utf8.ValidString(in.Note) || hasControl(in.Note, true) {
@@ -158,7 +161,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.bcast.notify()
-	url := s.approveURL("enrollments", e.ID)
+	url := s.approveURL(e.ID)
 	s.notify.Send("aqmas: enrollment", fmt.Sprintf("aqmas: %s wants to enroll as %s", e.PeerAddress, e.Hostname), url)
 	writeJSON(w, http.StatusCreated, api.EnrollResponse{ID: e.ID, Status: api.StatusPending, ApproveURL: url, PollAfterMS: PollAfterMS})
 }
@@ -249,6 +252,9 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 	}
 	now := s.now()
 	ttl := policy.ClampTTL(in.TTLSeconds, s.cfg.TTL)
+	if tgt.MaxTTLSeconds > 0 && ttl > tgt.MaxTTLSeconds {
+		ttl = max(tgt.MaxTTLSeconds, s.cfg.TTL.MinSeconds)
+	}
 	req := &store.Request{
 		ID:             ids.New(),
 		HostID:         h.ID,
@@ -311,7 +317,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		return
 	}
 	s.bcast.notify()
-	url := s.approveURL("requests", req.ID)
+	url := s.approveURL(req.ID)
 	if req.Status == api.StatusPending {
 		s.notify.Send("aqmas: "+h.Name, fmt.Sprintf("aqmas: %s wants ssh %s@%s", h.Name, req.LoginUser, req.TargetHost), url)
 	}
@@ -378,6 +384,46 @@ func (s *Server) requestStatus(ctx context.Context, q *store.Q, req *store.Reque
 		},
 	}
 	return out, nil
+}
+
+// StatusCancelled is the status of a request its host withdrew (proposed for internal/api).
+const StatusCancelled = "cancelled"
+
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request, h *store.Host) {
+	id := r.PathValue("id")
+	ctx := r.Context()
+	now := s.now()
+	var req *store.Request
+	err := s.store.Tx(ctx, func(q *store.Q) error {
+		if _, err := q.ExpireStale(ctx, now); err != nil {
+			return err
+		}
+		var err error
+		if req, err = q.GetRequest(ctx, id); err != nil || req.HostID != h.ID {
+			return errNotFound() // another host's request is indistinguishable from a missing one
+		}
+		if err := q.CancelRequest(ctx, id, h.ID, now); err != nil {
+			return statusErr(req.Status)
+		}
+		if req, err = q.GetRequest(ctx, id); err != nil {
+			return err
+		}
+		return q.Audit(ctx, now, "host:"+h.Name, "request_cancel", "request:"+id, "")
+	})
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	s.bcast.notify()
+	writeJSON(w, http.StatusOK, api.RequestStatus{ID: req.ID, Kind: req.Kind, Status: req.Status, DecidedAt: req.DecidedAt, DecisionNote: req.DecisionNote})
+}
+
+// handleSSHCA publishes the SSH user CA public key (proposed: GET /v1/ssh-ca).
+func (s *Server) handleSSHCA(w http.ResponseWriter, r *http.Request, _ *store.Host) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"public_key":  s.pki.SSHCAPublicLine(),
+		"fingerprint": ssh.FingerprintSHA256(s.pki.SSHSigner.PublicKey()),
+	})
 }
 
 func (s *Server) handleGrants(w http.ResponseWriter, r *http.Request, h *store.Host) {

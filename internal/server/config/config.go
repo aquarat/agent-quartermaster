@@ -59,13 +59,19 @@ func (a Access) Enabled() bool { return a.TeamDomain != "" && a.AUD != "" }
 
 // Target is a host (or service) aqmasd may issue SSH certificates for.
 type Target struct {
-	Name        string   `toml:"name"`
-	Address     string   `toml:"address"`
-	Port        int      `toml:"port"`
-	Users       []string `toml:"users"`
-	HostKey     string   `toml:"host_key"`     // pinned host key, emitted as a known_hosts line
-	ForgejoUser string   `toml:"forgejo_user"` // Forgejo targets: certificate principal is this username
-	HighRisk    bool     `toml:"high_risk"`    // shown as risk "high" in the UI
+	Name    string   `toml:"name"`
+	Address string   `toml:"address"`
+	Port    int      `toml:"port"`
+	Users   []string `toml:"users"`
+	HostKey string   `toml:"host_key"` // pinned host key, emitted as a known_hosts line
+	// PrincipalOverride replaces the "<login_user>@<name>" principal, e.g. for Forgejo, which
+	// maps a principal registered on a user account ("Manage SSH Certificate Principals").
+	PrincipalOverride string `toml:"principal"`
+	ForgejoUser       string `toml:"forgejo_user"` // deprecated alias of principal (docs/HOSTS.md)
+	// MaxTTLSeconds caps grants for this target below the global max (0: no extra cap). Useful
+	// where source-address is not enforced (Forgejo's built-in SSH server).
+	MaxTTLSeconds int  `toml:"max_ttl_seconds"`
+	HighRisk      bool `toml:"high_risk"` // shown as risk "high" in the UI
 }
 
 // AllowsUser reports whether login user u is configured for t.
@@ -80,6 +86,9 @@ func (t Target) AllowsUser(u string) bool {
 
 // Principal returns the certificate principal for login user u on this target.
 func (t Target) Principal(u string) string {
+	if t.PrincipalOverride != "" {
+		return t.PrincipalOverride
+	}
 	if t.ForgejoUser != "" {
 		return t.ForgejoUser
 	}
@@ -96,7 +105,9 @@ func (c *Config) Target(name string) (Target, bool) {
 	return Target{}, false
 }
 
-var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,62}$`)
+var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+var principalRE = regexp.MustCompile(`^[A-Za-z0-9._@-]{1,64}$`)
+var sanRE = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,252}$`)
 var userRE = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 
 // ValidName reports whether s is acceptable as a host or target name.
@@ -182,7 +193,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: access.team_domain is a bare host name, e.g. example.cloudflareaccess.com")
 	}
 	for _, san := range c.TLSSANs {
-		if net.ParseIP(san) == nil && !ValidName(san) {
+		if net.ParseIP(san) == nil && !sanRE.MatchString(san) {
 			return fmt.Errorf("config: tls_sans entry %q is neither an IP nor a host name", san)
 		}
 	}
@@ -212,6 +223,15 @@ func (c *Config) Validate() error {
 			if !ValidUser(u) {
 				return fmt.Errorf("config: target %q user %q invalid", tg.Name, u)
 			}
+		}
+		if tg.MaxTTLSeconds < 0 {
+			return fmt.Errorf("config: target %q max_ttl_seconds negative", tg.Name)
+		}
+		if tg.PrincipalOverride != "" && tg.ForgejoUser != "" && tg.PrincipalOverride != tg.ForgejoUser {
+			return fmt.Errorf("config: target %q sets both principal and forgejo_user", tg.Name)
+		}
+		if p := tg.PrincipalOverride; p != "" && !principalRE.MatchString(p) {
+			return fmt.Errorf("config: target %q principal invalid", tg.Name)
 		}
 		if tg.ForgejoUser != "" && !ValidUser(tg.ForgejoUser) {
 			return fmt.Errorf("config: target %q forgejo_user invalid", tg.Name)

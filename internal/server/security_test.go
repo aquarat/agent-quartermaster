@@ -434,7 +434,7 @@ func TestEnrollmentAndPasskeyBootstrap(t *testing.T) {
 	e.sess = saved
 	mustStatus(t, "session without assertion", e.webDo("POST", "/api/ui/passkeys/register/begin", map[string]any{}, nil), 400)
 	// With an assertion over a passkey/register challenge it works.
-	cr, st := e.challenge("/api/ui/passkeys", api.ChallengeRequest{Action: "register"})
+	cr, st := e.challenge("/api/ui/passkeys", api.ChallengeRequest{Action: "add"})
 	mustStatus(t, "passkey challenge", st, 200)
 	as, _ := e.auth.AssertOptions(cr.PublicKey)
 	var begin struct {
@@ -500,4 +500,28 @@ func TestLongPollWakesOnDecision(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("long poll did not wake")
 	}
+}
+
+// The owner signs whether an enrollment replaces an existing host; if that changes between
+// challenge and decide, nothing is applied.
+func TestEnrollmentReplacesBinding(t *testing.T) {
+	e := newEnv(t)
+	e.setupOwner()
+	anon := e.agentClient(nil)
+	_, csr1 := newCSR(t, "x")
+	_, csr2 := newCSR(t, "x")
+	var a, b api.EnrollResponse
+	agentDo(t, anon, "POST", e.agent.URL+"/v1/enroll", api.EnrollRequest{Hostname: "dup", CSRPEM: csr1}, &a)
+	agentDo(t, anon, "POST", e.agent.URL+"/v1/enroll", api.EnrollRequest{Hostname: "dup", CSRPEM: csr2}, &b)
+	cb, _ := e.challenge("/api/ui/enrollments/"+b.ID, api.ChallengeRequest{Action: "approve"})
+	if c := uiCheck(t, cb); c["replaces"] != false {
+		t.Fatal("first host of that name marked as replacing")
+	}
+	mustStatus(t, "approve a", e.approve("/api/ui/enrollments/"+a.ID, "decide", api.ChallengeRequest{Action: "approve"}), 200)
+	mustStatus(t, "approve b signed as non-replacing", e.decide("/api/ui/enrollments/"+b.ID, "decide", cb, nil), 409)
+	cb2, _ := e.challenge("/api/ui/enrollments/"+b.ID, api.ChallengeRequest{Action: "approve"})
+	if c := uiCheck(t, cb2); c["replaces"] != true {
+		t.Fatal("replacement not flagged")
+	}
+	mustStatus(t, "approve b as replacement", e.decide("/api/ui/enrollments/"+b.ID, "decide", cb2, nil), 200)
 }

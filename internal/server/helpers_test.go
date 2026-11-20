@@ -189,6 +189,9 @@ func (e *env) login() {
 func (e *env) challenge(path string, req api.ChallengeRequest) (challengeResp, int) {
 	var cr challengeResp
 	st := e.webDo("POST", path+"/challenge", req, &cr)
+	if st == 200 {
+		uiCheck(e.t, cr)
+	}
 	return cr, st
 }
 
@@ -273,10 +276,41 @@ func (e *env) enrollHost(name string) tls.Certificate {
 	if err != nil || st != 201 {
 		e.t.Fatalf("enroll: %d %v", st, err)
 	}
-	if !strings.HasPrefix(er.ApproveURL, testBase+"/enrollments/") {
+	if er.ApproveURL != testBase+"/#r="+er.ID {
 		e.t.Fatalf("approve url %q", er.ApproveURL)
 	}
-	if st := e.approve("/api/ui/enrollments/"+er.ID, "decide", api.ChallengeRequest{Action: "approve"}); st != 200 {
+	// As the UI does: the card's enrollment.replaces_existing must equal canonical "replaces".
+	var state struct {
+		Pending []struct {
+			ID         string `json:"id"`
+			Enrollment *struct {
+				CSRFingerprint   string `json:"csr_fingerprint"`
+				ReplacesExisting bool   `json:"replaces_existing"`
+			} `json:"enrollment"`
+		} `json:"pending"`
+	}
+	e.webDo("GET", "/api/ui/state", nil, &state)
+	var card *struct {
+		CSRFingerprint   string `json:"csr_fingerprint"`
+		ReplacesExisting bool   `json:"replaces_existing"`
+	}
+	for _, p := range state.Pending {
+		if p.ID == er.ID {
+			card = p.Enrollment
+		}
+	}
+	if card == nil {
+		e.t.Fatal("enrollment card missing from state")
+	}
+	cr, st := e.challenge("/api/ui/enrollments/"+er.ID, api.ChallengeRequest{Action: "approve"})
+	if st != 200 {
+		e.t.Fatalf("enrollment challenge: %d", st)
+	}
+	c := uiCheck(e.t, cr)
+	if c["replaces"] != card.ReplacesExisting || c["key_fingerprint"] != card.CSRFingerprint || c["requesting_host"] != name || c["kind"] != "enrollment" {
+		e.t.Fatalf("enrollment canonical %v vs card %+v", c, card)
+	}
+	if st := e.decide("/api/ui/enrollments/"+er.ID, "decide", cr, nil); st != 200 {
 		e.t.Fatalf("approve enrollment: %d", st)
 	}
 	var es api.EnrollStatus
@@ -286,7 +320,17 @@ func (e *env) enrollHost(name string) tls.Certificate {
 	if es.Status != "approved" || es.ClientCertPEM == "" || es.CACertPEM == "" {
 		e.t.Fatalf("enroll status %+v", es)
 	}
-	blk, _ := pem.Decode([]byte(es.ClientCertPEM))
+	return certFromPEM(e.t, es.ClientCertPEM, key)
+}
+
+type tlsCert = tls.Certificate
+
+func certFromPEM(t *testing.T, certPEM string, key *ecdsa.PrivateKey) tls.Certificate {
+	t.Helper()
+	blk, _ := pem.Decode([]byte(certPEM))
+	if blk == nil {
+		t.Fatal("bad cert PEM")
+	}
 	return tls.Certificate{Certificate: [][]byte{blk.Bytes}, PrivateKey: key}
 }
 

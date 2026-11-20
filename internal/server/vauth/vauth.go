@@ -114,7 +114,7 @@ func (a *Authenticator) Register(optionsJSON []byte) (json.RawMessage, error) {
 			"attestationObject": b64.EncodeToString(att),
 			"transports":        []string{"internal"},
 		},
-		"clientExtensionResults":  map[string]any{},
+		"clientExtensionResults":  map[string]any{"credProps": map[string]any{"rk": true}},
 		"authenticatorAttachment": "platform",
 	})
 }

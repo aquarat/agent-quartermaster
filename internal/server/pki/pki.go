@@ -375,6 +375,8 @@ func (p *PKI) loadServer(sans []string, create bool) error {
 	if err != nil {
 		return err
 	}
+	// Send leaf + CA: clients pin the CA, so a reissued leaf needs no re-enrollment.
+	tc.Certificate = append(tc.Certificate[:1], p.CACert.Raw)
 	p.ServerCert = tc
 	p.ServerLeaf, err = x509.ParseCertificate(tc.Certificate[0])
 	return err
@@ -432,6 +434,9 @@ func PublicKeyFingerprint(pub crypto.PublicKey) string {
 	h := sha256.Sum256(der)
 	return "SHA256:" + hex.EncodeToString(h[:])
 }
+
+// CAPin returns the client CA pin in the CLI's form: "sha256:<hex of SHA-256 over the DER>".
+func (p *PKI) CAPin() string { return "sha256:" + CertFingerprint(p.CACert.Raw) }
 
 // CertFingerprint returns the hex SHA-256 of a certificate's DER encoding.
 func CertFingerprint(der []byte) string {

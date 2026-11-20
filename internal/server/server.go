@@ -138,6 +138,11 @@ func New(o Options) (*Server, error) {
 		cfg: cfg, log: o.Logger, now: o.Now, store: st, pki: p, wa: wa, rpID: rpID, ownerID: ownerID,
 		notify: &notify.Notifier{TopicURL: cfg.Ntfy.TopicURL, Client: o.HTTPClient, Log: o.Logger},
 	}
+	for _, t := range cfg.Targets {
+		if t.HostKey == "" {
+			o.Logger.Warn("target has no host_key: grants carry no known_hosts line", "target", t.Name)
+		}
+	}
 	if cfg.Access.Enabled() {
 		s.access = cfaccess.New(cfg.Access.TeamDomain, cfg.Access.AUD)
 		if o.AccessCertsURL != "" {

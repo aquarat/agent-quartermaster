@@ -27,7 +27,8 @@ commands:
   serve                 run the agent API and the approval web UI
   passkey-enroll-code   print a one-time code (15 min, single use) to register the first passkey
   print-ssh-ca          print the SSH user CA public key (for TrustedUserCAKeys)
-  print-client-ca       print the internal client CA certificate (PEM, for --ca-pin)
+  print-client-ca       print the internal CA certificate (PEM; signs the agent-API server cert too)
+  tls-fingerprint       print the CA pin for ` + "`aqmas enroll --ca-pin`" + ` (sha256:<hex>)
   version               print the version
 
 Run every command as the aqmas user (sudo -u aqmas aqmasd ...).
@@ -99,6 +100,13 @@ func run(cmd, cfgPath string, out io.Writer) error {
 			return err
 		}
 		fmt.Fprintln(out, p.SSHCAPublicLine())
+		return nil
+	case "tls-fingerprint":
+		p, err := pki.LoadCAs(server.CADir(cfg.DataDir))
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(out, p.CAPin())
 		return nil
 	case "print-client-ca":
 		p, err := pki.LoadCAs(server.CADir(cfg.DataDir))

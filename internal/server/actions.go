@@ -115,6 +115,11 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 			return a, statusErr(e.Status)
 		}
 		a.RequestingHost, a.Kind, a.KeyFingerprint = e.Hostname, "enrollment", e.KeyFingerprint
+		if _, err := q.ActiveHostByName(ctx, e.Hostname); err == nil {
+			a.Replaces = true // approving revokes the current host of that name
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return a, err
+		}
 	case canon.ObjectStanding:
 		if in.Action != canon.ActionRevoke || in.TTLSeconds != 0 || in.StandingHours != 0 {
 			return a, errBad("standing approvals can only be revoked")
@@ -140,10 +145,9 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 		}
 		a.RequestingHost, a.Kind, a.Target, a.LoginUser = g.HostName, g.Kind, g.TargetHost, g.LoginUser
 	case canon.ObjectPasskey:
-		if in.Action != canon.ActionRegister || in.TTLSeconds != 0 || in.StandingHours != 0 {
-			return a, errBad("action must be register")
+		if in.Action != canon.ActionAdd || in.TTLSeconds != 0 || in.StandingHours != 0 {
+			return a, errBad(`action must be "add"`)
 		}
-		a.Kind = "passkey"
 	default:
 		return a, errBad("unknown object")
 	}
@@ -240,7 +244,15 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				return errConflict("stored CSR invalid")
 			}
 			replaced := ""
-			if old, err := q.ActiveHostByName(ctx, e.Hostname); err == nil {
+			old, err := q.ActiveHostByName(ctx, e.Hostname)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+			// The owner signed whether this replaces an existing host; the state must still agree.
+			if (old != nil) != a.Replaces {
+				return errConflict("host list changed since the challenge was issued; start again")
+			}
+			if old != nil {
 				if err := q.RevokeHost(ctx, old.ID, now); err != nil {
 					return err
 				}
@@ -248,8 +260,6 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				if err := q.Audit(ctx, now, "owner", "host_revoke", "host:"+old.Name, fmt.Sprintf("host_id=%d replaced by enrollment %s", old.ID, e.ID)); err != nil {
 					return err
 				}
-			} else if !errors.Is(err, store.ErrNotFound) {
-				return err
 			}
 			der, err := s.pki.IssueClientCert(csr, e.Hostname, now, s.cfg.ClientCertDays)
 			if err != nil {

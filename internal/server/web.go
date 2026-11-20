@@ -321,7 +321,7 @@ func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
 			s.writeErr(w, r, err)
 			return
 		}
-		if sg.Action.Action != canon.ActionRegister {
+		if sg.Action.Action != canon.ActionAdd {
 			s.writeErr(w, r, errBad("challenge is not for registering a passkey"))
 			return
 		}
@@ -334,6 +334,8 @@ func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
 	cc, sd, err := s.wa.BeginRegistration(o,
 		webauthn.WithExclusions(excl),
 		webauthn.WithConveyancePreference(protocol.PreferNoAttestation),
+		// The web UI always asks for credProps; requesting it here makes that output solicited.
+		webauthn.WithExtensions(webauthn.WithExtensionCredProps()),
 		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
 			ResidentKey:        protocol.ResidentKeyRequirementRequired,
 			RequireResidentKey: protocol.ResidentKeyRequired(),
@@ -452,6 +454,33 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 
 // ---- state ----
 
+// uiItem is api.PendingItem plus the fields the web UI uses that internal/api lacks yet
+// (docs/CONTRACT-NOTES-server.md).
+type uiItem struct {
+	api.PendingItem
+	Status     string             `json:"status,omitempty"`
+	Enrollment *pendingEnrollment `json:"enrollment,omitempty"`
+}
+
+type pendingEnrollment struct {
+	CSRFingerprint         string   `json:"csr_fingerprint"`
+	SSHHostKeyFingerprints []string `json:"ssh_host_key_fingerprints"`
+	ReplacesExisting       bool     `json:"replaces_existing"`
+}
+
+type uiGrant struct {
+	api.GrantSummary
+	RequestingHost string `json:"requesting_host"`
+}
+
+type uiState struct {
+	Owner    api.UIOwner            `json:"owner"`
+	Pending  []uiItem               `json:"pending"`
+	Standing []api.StandingApproval `json:"standing"`
+	Grants   []uiGrant              `json:"grants"`
+	Recent   []api.AuditEntry       `json:"recent"`
+}
+
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 	ctx := r.Context()
 	now := s.now()
@@ -465,7 +494,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 		s.writeErr(w, r, err)
 		return
 	}
-	out := api.UIState{Owner: api.UIOwner{Name: s.cfg.OwnerName, Passkeys: n}, Pending: []api.PendingItem{}, Standing: []api.StandingApproval{}}
+	out := uiState{Owner: api.UIOwner{Name: s.cfg.OwnerName, Passkeys: n}, Pending: []uiItem{}, Standing: []api.StandingApproval{}, Grants: []uiGrant{}}
 	reqs, err := q.PendingRequests(ctx, now)
 	if err != nil {
 		s.writeErr(w, r, err)
@@ -477,7 +506,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 			s.writeErr(w, r, err)
 			return
 		}
-		out.Pending = append(out.Pending, *it)
+		out.Pending = append(out.Pending, uiItem{PendingItem: *it})
 	}
 	ens, err := q.PendingEnrollments(ctx, now)
 	if err != nil {
@@ -485,7 +514,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	for _, e := range ens {
-		out.Pending = append(out.Pending, *s.enrollmentItem(ctx, e))
+		out.Pending = append(out.Pending, s.enrollmentItem(ctx, e))
 	}
 	sts, err := q.ActiveStanding(ctx, 0, now)
 	if err != nil {
@@ -495,6 +524,15 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 	for _, st := range sts {
 		out.Standing = append(out.Standing, api.StandingApproval{ID: st.ID, RequestingHost: st.HostName, Kind: st.Kind,
 			TargetHost: st.TargetHost, LoginUser: st.LoginUser, MaxTTLSeconds: st.MaxTTL, ExpiresAt: st.ExpiresAt, Uses: st.Uses})
+	}
+	gs, err := q.ActiveGrants(ctx, now)
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	for _, g := range gs {
+		out.Grants = append(out.Grants, uiGrant{GrantSummary: api.GrantSummary{ID: g.ID, Kind: g.Kind, Status: g.Status(now),
+			TargetHost: g.TargetHost, LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter}, RequestingHost: g.HostName})
 	}
 	if out.Recent, err = q.RecentAudit(ctx, 50); err != nil {
 		s.writeErr(w, r, err)
@@ -520,14 +558,21 @@ func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.Pendi
 	}, nil
 }
 
-func (s *Server) enrollmentItem(ctx context.Context, e *store.Enrollment) *api.PendingItem {
-	risk := "normal"
+func (s *Server) enrollmentItem(ctx context.Context, e *store.Enrollment) uiItem {
+	risk, replaces := "normal", false
 	if _, err := s.store.Q().ActiveHostByName(ctx, e.Hostname); err == nil {
-		risk = "high" // replaces an existing host identity
+		risk, replaces = "high", true // replaces an existing host identity
 	}
-	return &api.PendingItem{
-		ID: e.ID, Kind: "enrollment", CreatedAt: e.CreatedAt, ExpiresAt: e.ExpiresAt,
-		RequestingHost: e.Hostname, RequestingAddress: e.PeerAddress, Reason: e.Note, Risk: risk,
+	fps := e.SSHHostKeyFPs
+	if fps == nil {
+		fps = []string{}
+	}
+	return uiItem{
+		PendingItem: api.PendingItem{
+			ID: e.ID, Kind: "enrollment", CreatedAt: e.CreatedAt, ExpiresAt: e.ExpiresAt,
+			RequestingHost: e.Hostname, RequestingAddress: e.PeerAddress, Reason: e.Note, Risk: risk,
+		},
+		Enrollment: &pendingEnrollment{CSRFingerprint: e.KeyFingerprint, SSHHostKeyFingerprints: fps, ReplacesExisting: replaces},
 	}
 }
 
@@ -542,10 +587,7 @@ func (s *Server) handleRequestItem(w http.ResponseWriter, r *http.Request, _ str
 		s.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, struct {
-		*api.PendingItem
-		Status string `json:"status"`
-	}{it, rq.Status})
+	writeJSON(w, http.StatusOK, uiItem{PendingItem: *it, Status: rq.Status})
 }
 
 func (s *Server) handleEnrollmentItem(w http.ResponseWriter, r *http.Request, _ string) {
@@ -554,12 +596,9 @@ func (s *Server) handleEnrollmentItem(w http.ResponseWriter, r *http.Request, _ 
 		s.writeErr(w, r, mapNotFound(err))
 		return
 	}
-	writeJSON(w, http.StatusOK, struct {
-		*api.PendingItem
-		Status         string   `json:"status"`
-		KeyFingerprint string   `json:"key_fingerprint"`
-		SSHHostKeyFPs  []string `json:"ssh_host_key_fingerprints"`
-	}{s.enrollmentItem(r.Context(), e), e.Status, e.KeyFingerprint, e.SSHHostKeyFPs})
+	it := s.enrollmentItem(r.Context(), e)
+	it.Status = e.Status
+	writeJSON(w, http.StatusOK, it)
 }
 
 // ---- per-action challenge / decide ----

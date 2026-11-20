@@ -32,7 +32,7 @@ func TestEndToEnd(t *testing.T) {
 
 	rc, pub, st := e.request(host, "db-1", "alice", 600)
 	mustStatus(t, "create request", st, 201)
-	if rc.Status != "pending" || rc.ApproveURL != testBase+"/requests/"+rc.ID {
+	if rc.Status != "pending" || rc.ApproveURL != testBase+"/#r="+rc.ID {
 		t.Fatalf("created %+v", rc)
 	}
 

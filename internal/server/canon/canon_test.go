@@ -66,3 +66,42 @@ func TestParseRoundTripAndTamper(t *testing.T) {
 		t.Fatal("built without object/id")
 	}
 }
+
+func TestPerObjectKeySets(t *testing.T) {
+	at := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	en, err := Build(Action{Action: "approve", Object: "enrollment", ID: "E", RequestingHost: "h", Kind: "enrollment", KeyFingerprint: "SHA256:x", Replaces: true}, "N", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if en != `{"action":"approve","id":"E","issued_at":"2026-11-20T12:00:00Z","key_fingerprint":"SHA256:x","kind":"enrollment","nonce":"N","object":"enrollment","replaces":true,"requesting_host":"h","standing_hours":0,"ttl_seconds":0,"v":1}` {
+		t.Fatal(en)
+	}
+	pk, _ := Build(Action{Action: "add", Object: "passkey", ID: "new"}, "N", at)
+	if pk != `{"action":"add","id":"new","issued_at":"2026-11-20T12:00:00Z","nonce":"N","object":"passkey","v":1}` {
+		t.Fatal(pk)
+	}
+	if s, err := Parse(en); err != nil || !s.Replaces {
+		t.Fatalf("parse enrollment: %v", err)
+	}
+	// Fields an object doesn't carry can't be set (they would be acted on but not signed).
+	for _, a := range []Action{
+		{Action: "approve", Object: "enrollment", ID: "E", Target: "db-1"},
+		{Action: "revoke", Object: "grant", ID: "G", KeyFingerprint: "x"},
+		{Action: "add", Object: "passkey", ID: "new", Kind: "passkey"},
+		{Action: "approve", Object: "request", ID: "R", Replaces: true},
+		{Action: "approve", Object: "grant", ID: "G"},
+		{Action: "register", Object: "passkey", ID: "new"},
+	} {
+		if _, err := Build(a, "N", at); err == nil {
+			t.Errorf("built %+v", a)
+		}
+	}
+	// A request text with an enrollment-only key, or missing one, is refused.
+	req, _ := Build(Action{Action: "deny", Object: "request", ID: "R"}, "N", at)
+	if _, err := Parse(strings.Replace(req, `"requesting_host":""`, `"replaces":false,"requesting_host":""`, 1)); err == nil {
+		t.Fatal("extra key accepted")
+	}
+	if _, err := Parse(strings.Replace(pk, `"object":"passkey"`, `"object":"passkey","object":"request"`, 1)); err == nil {
+		t.Fatal("duplicate key accepted")
+	}
+}

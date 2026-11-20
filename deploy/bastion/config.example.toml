@@ -41,10 +41,13 @@ name     = "dev-1"
 address  = "192.0.2.62"
 users    = ["alice"]
 
-# Forgejo's built-in SSH server: the certificate principal is the Forgejo user name.
+# Forgejo's built-in SSH server maps a certificate principal to the user account that registered
+# it ("Manage SSH Certificate Principals"), so the principal is set explicitly. It probably does
+# not enforce source-address, so keep Forgejo grants short.
 [[targets]]
-name         = "forgejo"
-address      = "192.0.2.50"
-port         = 2222
-users        = ["git"]
-forgejo_user = "alice"
+name            = "forgejo"
+address         = "192.0.2.50"
+port            = 2222
+users           = ["git"]
+principal       = "alice"
+max_ttl_seconds = 3600

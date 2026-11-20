@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"path"
+	"regexp"
 	"strings"
 )
 
@@ -35,6 +36,9 @@ func IsFallback() bool {
 	_, err := fs.Stat(distFS, "dist/index.html")
 	return err != nil
 }
+
+// hashedName matches bundler output like index-3f9a1c2b.js or icon-AbCdEf12.svg.
+var hashedName = regexp.MustCompile(`^[A-Za-z0-9_.]+-[A-Za-z0-9_]{8,}\.[a-z0-9]+$`)
 
 var types = map[string]string{
 	".html":        "text/html; charset=utf-8",
@@ -92,7 +96,7 @@ func Handler() http.Handler {
 				return
 			}
 			w.Header().Set("Content-Type", contentType(p))
-			if strings.HasPrefix(p, "assets/") {
+			if strings.HasPrefix(p, "assets/") || hashedName.MatchString(path.Base(p)) {
 				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			} else {
 				w.Header().Set("Cache-Control", "no-cache")

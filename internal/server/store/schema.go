@@ -68,7 +68,7 @@ CREATE TABLE requests (
 	reason          TEXT NOT NULL,
 	requester_json  TEXT NOT NULL,
 	ttl_requested   INTEGER NOT NULL,
-	status          TEXT NOT NULL CHECK (status IN ('pending','approved','denied','expired','revoked')),
+	status          TEXT NOT NULL CHECK (status IN ('pending','approved','denied','expired','revoked','cancelled')),
 	created_at      INTEGER NOT NULL,
 	expires_at      INTEGER NOT NULL,
 	decided_at      INTEGER,

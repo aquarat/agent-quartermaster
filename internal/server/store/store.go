@@ -469,6 +469,12 @@ func (q *Q) DecideRequest(ctx context.Context, id, status, note string, now time
 		WHERE id = ? AND status = 'pending' AND expires_at > ?`, status, note, ms(now), id, ms(now)))
 }
 
+// CancelRequest moves a pending request of hostID to cancelled.
+func (q *Q) CancelRequest(ctx context.Context, id string, hostID int64, now time.Time) error {
+	return one(q.q.ExecContext(ctx, `UPDATE requests SET status = 'cancelled', decision_note = 'cancelled by requester', decided_at = ?
+		WHERE id = ? AND host_id = ? AND status = 'pending'`, ms(now), id, hostID))
+}
+
 // MarkRequestRevoked marks an approved request revoked (its grant was revoked).
 func (q *Q) MarkRequestRevoked(ctx context.Context, id string) error {
 	_, err := q.q.ExecContext(ctx, "UPDATE requests SET status = 'revoked' WHERE id = ? AND status = 'approved'", id)
@@ -566,6 +572,24 @@ func (q *Q) HostGrants(ctx context.Context, hostID int64, activeOnly bool, now t
 	}
 	query += " ORDER BY serial DESC LIMIT 200"
 	rows, err := q.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Grant
+	for rows.Next() {
+		g, err := scanGrant(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// ActiveGrants lists unexpired, unrevoked grants of all hosts, newest first.
+func (q *Q) ActiveGrants(ctx context.Context, now time.Time) ([]*Grant, error) {
+	rows, err := q.q.QueryContext(ctx, "SELECT "+grantCols+" FROM grants WHERE revoked_at IS NULL AND not_after > ? ORDER BY serial DESC LIMIT 200", ms(now))
 	if err != nil {
 		return nil, err
 	}
