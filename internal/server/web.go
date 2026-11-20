@@ -10,12 +10,12 @@ import (
 	"net/http"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
+	"github.com/aquarat/agent-quartermaster/internal/server/aaguid"
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
 	"github.com/aquarat/agent-quartermaster/internal/server/cfaccess"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
@@ -52,6 +52,9 @@ func (s *Server) WebHandler() http.Handler {
 		api.Handle("POST /api/ui/"+o.path+"/{id}/"+o.verb, s.requireSession(s.decideHandler(o.object)))
 	}
 	api.Handle("POST /api/ui/passkeys/challenge", s.requireSession(s.challengeHandler(canon.ObjectPasskey)))
+	api.Handle("POST /api/ui/passkeys/{id}/challenge", s.requireSession(s.challengeHandler(canon.ObjectPasskey)))
+	api.Handle("POST /api/ui/passkeys/{id}/rename", s.requireSession(s.passkeyChangeHandler(canon.ActionRename)))
+	api.Handle("POST /api/ui/passkeys/{id}/remove", s.requireSession(s.passkeyChangeHandler(canon.ActionRemove)))
 
 	static := webui.Handler()
 	root := http.NewServeMux()
@@ -227,7 +230,7 @@ func (s *Server) handleLoginFinish(w http.ResponseWriter, r *http.Request) {
 		if err := q.InsertSession(ctx, ids.Hash(cookie), pkID, accessSub(ctx), now, now.Add(SessionTTL)); err != nil {
 			return err
 		}
-		return q.Audit(ctx, now, "owner", "login", fmt.Sprintf("passkey:%d", pkID), "")
+		return q.Audit(ctx, now, "owner", "login", s.passkeyRef(ctx, q, pkID), "")
 	})
 	if err != nil {
 		s.writeErr(w, r, err)
@@ -304,7 +307,10 @@ func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
 			s.writeErr(w, r, errBad("challenge is not for registering a passkey"))
 			return
 		}
-		c.ObjectType, c.ObjectID, c.SessionHash = "session", fmt.Sprintf("passkey:%d", pkID), sess
+		c.ObjectType, c.ObjectID, c.SessionHash = "session", s.passkeyRef(ctx, s.store.Q(), pkID), sess
+		// The nickname the owner signed for the new passkey ("" = name it after the
+		// authenticator); register/finish uses exactly this.
+		c.Canonical = sg.NewNickname
 	}
 	var excl []protocol.CredentialDescriptor
 	for _, cr := range o.creds {
@@ -344,9 +350,14 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
-	if len(in.Name) > 64 || !utf8.ValidString(in.Name) || hasControl(in.Name, false) {
-		s.writeErr(w, r, errBad("name too long"))
-		return
+	nickname := ""
+	if strings.TrimSpace(in.Name) != "" {
+		n, err := normalizeNickname(in.Name)
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		nickname = n
 	}
 	now := s.now()
 	c, err := s.consume(ctx, in.ChallengeID, "register", now)
@@ -395,11 +406,13 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
+	var info api.PasskeyInfo
 	err = s.store.Tx(ctx, func(q *store.Q) error {
-		n, err := q.CountPasskeys(ctx)
+		all, err := loadPasskeys(ctx, q)
 		if err != nil {
 			return err
 		}
+		n := len(all)
 		detail := ""
 		switch c.ObjectType {
 		case "enroll_code":
@@ -414,26 +427,53 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 			if n == 0 {
 				return errConflict("no existing passkey")
 			}
+			// Only the signed nickname counts (see register/begin); a different name sent
+			// here is refused rather than silently dropped.
+			if nickname != "" && nickname != c.Canonical {
+				return errBad("name differs from the nickname signed with the add action")
+			}
+			nickname = c.Canonical
+			if nickname != "" && nicknameTaken(all, nickname, 0) {
+				return errConflict("another passkey took that name meanwhile; remove or rename it, then add again")
+			}
 			detail = "approved by " + c.ObjectID
 		default:
 			return errBad("bad registration challenge")
 		}
-		id, err := q.InsertPasskey(ctx, &store.Passkey{CredentialID: cred.ID, CredentialJSON: string(cj), Name: in.Name, CreatedAt: now})
+		// Nickname: the owner's choice, else the authenticator's name (else "Passkey N"), made
+		// unique so the nickname in a signed rename/remove names exactly one passkey.
+		name := nickname
+		if name == "" {
+			if _, a := aaguid.Lookup(cred.Authenticator.AAGUID); a != aaguid.Unknown {
+				name = a.Name
+			} else {
+				name = fmt.Sprintf("Passkey %d", n+1)
+			}
+		}
+		name = uniqueNickname(all, name)
+		p := &store.Passkey{CredentialID: cred.ID, CredentialJSON: string(cj), Name: name, CreatedAt: now}
+		id, err := q.InsertPasskey(ctx, p)
 		if err != nil {
 			return err
 		}
-		return q.Audit(ctx, now, "owner", "passkey_register", fmt.Sprintf("passkey:%d", id), detail)
+		p.ID = id
+		sp := storedPasskey{Passkey: p, cred: *cred, id: passkeyID(cred.ID)}
+		info = sp.info(0)
+		return q.Audit(ctx, now, "owner", "passkey_register", "passkey:"+sp.id,
+			fmt.Sprintf("nickname=%q authenticator=%q synced=%t %s", name, info.Authenticator, info.BackupEligible, detail))
 	})
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, api.OK{OK: true})
+	s.bcast.notify()
+	s.notify.Send("aqmas: passkey added", fmt.Sprintf("aqmas: passkey %q (%s) added [id %s]", info.Nickname, info.Authenticator, ref(info.ID)), s.cfg.PublicBaseURL+"/")
+	writeJSON(w, http.StatusOK, api.RegisterResult{OK: true, Passkey: &info})
 }
 
 // ---- state ----
 
-func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string) {
 	ctx := r.Context()
 	now := s.now()
 	q := s.store.Q()
@@ -489,6 +529,20 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 	if out.Recent, err = q.RecentAudit(ctx, 50); err != nil {
 		s.writeErr(w, r, err)
 		return
+	}
+	pks, err := loadPasskeys(ctx, q)
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	cur, err := q.SessionPasskeyID(ctx, sess)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.writeErr(w, r, err)
+		return
+	}
+	out.Passkeys = make([]api.PasskeyInfo, 0, len(pks))
+	for i := range pks {
+		out.Passkeys = append(out.Passkeys, pks[i].info(cur))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -571,6 +625,12 @@ func (s *Server) notifyDecision(sg canon.Signed) {
 		text = fmt.Sprintf("aqmas: %s enrollment of %s (replaces existing: %t)", a.Action, a.RequestingHost, a.Replaces)
 	case canon.ObjectStanding, canon.ObjectGrant:
 		text = fmt.Sprintf("aqmas: %s %s %s@%s for %s", a.Action, a.Object, a.LoginUser, a.Target, a.RequestingHost)
+	case canon.ObjectPasskey:
+		if a.Action == canon.ActionRename {
+			text = fmt.Sprintf("aqmas: rename passkey %q to %q", a.Nickname, a.NewNickname)
+		} else {
+			text = fmt.Sprintf("aqmas: %s passkey %q", a.Action, a.Nickname)
+		}
 	}
 	text += fmt.Sprintf(" [ref %s]", ref(a.ID))
 	s.notify.Send("aqmas: decision", text, s.cfg.PublicBaseURL+"/")
@@ -595,8 +655,8 @@ func (s *Server) challengeHandler(object string) func(http.ResponseWriter, *http
 			return
 		}
 		id := r.PathValue("id")
-		if object == canon.ObjectPasskey {
-			id = "new"
+		if object == canon.ObjectPasskey && id == "" {
+			id = "new" // POST /api/ui/passkeys/challenge: adding a passkey
 		}
 		a, err := s.buildAction(ctx, object, id, in)
 		if err != nil {
@@ -695,5 +755,45 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 		default:
 			writeJSON(w, http.StatusOK, api.RevokeResult{OK: true, ID: id, Status: api.StatusRevoked})
 		}
+	}
+}
+
+// passkeyChangeHandler applies a signed passkey rename or remove. The endpoint's verb must be
+// the signed action, so an assertion for "rename A" can be used neither to remove A nor to
+// touch any other passkey (verifyAction binds it to A's id).
+func (s *Server) passkeyChangeHandler(verb string) func(http.ResponseWriter, *http.Request, string) {
+	return func(w http.ResponseWriter, r *http.Request, sess string) {
+		ctx := r.Context()
+		var in api.DecideRequest
+		if err := decode(r, &in); err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		id := r.PathValue("id")
+		sg, pkID, err := s.verifyAction(ctx, sess, canon.ObjectPasskey, id, in.ChallengeID, in.Assertion)
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		if sg.Action.Action != verb {
+			s.writeErr(w, r, errBad("the signed action is "+sg.Action.Action+", not "+verb))
+			return
+		}
+		if err := s.apply(ctx, sg, pkID); err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		s.bcast.notify()
+		s.notifyDecision(sg)
+		out := api.PasskeyChange{OK: true, ID: id, Action: verb, Nickname: sg.Nickname}
+		if verb == canon.ActionRename {
+			out.Nickname = sg.NewNickname
+		}
+		if _, ok := s.sessionHash(r); !ok {
+			// The removed passkey was this session's: the session ended with it.
+			out.SignedOut = true
+			http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
+		}
+		writeJSON(w, http.StatusOK, out)
 	}
 }

@@ -7,7 +7,7 @@
 
 import { ApiError, type Api, type ObjectKind } from "./api";
 import { challengeCommitsTo, describe, mismatches, parseCanonical, type Canonical, type Description, type Expectation } from "./canonical";
-import type { BeginResponse, PendingItem, StandingApproval, GrantSummary } from "./types";
+import type { BeginResponse, GrantSummary, PasskeyInfo, PendingItem, StandingApproval } from "./types";
 import {
   decodeCreationOptions,
   decodeRequestOptions,
@@ -65,9 +65,28 @@ export async function prepareRegistrationWithCode(api: Api, enrollCode: string):
   return toRegistration(await api.registerBegin({ enroll_code: code }));
 }
 
-export async function completeRegistration(api: Api, auth: Authenticator, p: PreparedRegistration): Promise<void> {
+/** Create the passkey and register it. `nickname`: only for the first passkey (enroll code);
+ * later passkeys get the nickname signed with the add action, so leave it "". "" lets the
+ * server name it after the authenticator. Resolves to the server's RegisterResult. */
+export async function completeRegistration(api: Api, auth: Authenticator, p: PreparedRegistration, nickname = ""): Promise<unknown> {
   const cred = await auth.create(p.options);
-  await api.registerFinish(p.challengeId, encodeAttestation(cred));
+  return api.registerFinish(p.challengeId, encodeAttestation(cred), nickname.trim() || undefined);
+}
+
+/** A nickname as the server stores it (internal/server/nickname.Normalize): runs of any
+ * Unicode space become one plain space, trimmed. */
+export function normalizeNickname(name: string): string {
+  return name.replace(/\p{Zs}+/gu, " ").trim();
+}
+
+/** Client-side check of a nickname before asking for a challenge (the server checks again):
+ * returns an error message or null. Mirrors api.MaxNicknameBytes and the server's character rules. */
+export function nicknameProblem(name: string): string | null {
+  const n = normalizeNickname(name);
+  if (!n) return "Enter a name.";
+  if (new TextEncoder().encode(n).length > 64) return "That name is too long (64 bytes at most).";
+  if (/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}\p{Mn}\p{Me}]/u.test(n)) return "That name contains invisible, control or combining characters.";
+  return null;
 }
 
 // ---- signed actions ----
@@ -121,12 +140,20 @@ export function targetForGrant(g: GrantSummary): ActionTarget {
   };
 }
 
-export const PASSKEY_TARGET: ActionTarget = { object: "passkey", id: "new", facts: {} };
+export const PASSKEY_TARGET: ActionTarget = { object: "passkey", id: "new", facts: { nickname: "" } };
+
+/** Rename or remove an existing passkey: the canonical must name it by its current nickname. */
+export function targetForPasskey(p: PasskeyInfo): ActionTarget {
+  return { object: "passkey", id: p.id, facts: { nickname: p.nickname } };
+}
 
 export interface ActionChoice {
-  action: "approve" | "deny" | "revoke" | "add";
+  action: "approve" | "deny" | "revoke" | "add" | "rename" | "remove";
   ttl_seconds?: number;
   standing_hours?: number;
+  /** rename: the new nickname; add: an optional nickname for the new passkey. Sent
+   * normalised (normalizeNickname); the canonical must carry exactly it as new_nickname. */
+  nickname?: string;
 }
 
 export interface PreparedAction {
@@ -145,10 +172,20 @@ export const CHALLENGE_LIFETIME_MS = 120_000;
 
 /** Ask the server for a challenge and verify it commits to exactly the chosen action. */
 export async function prepareAction(api: Api, target: ActionTarget, choice: ActionChoice, now = Date.now()): Promise<PreparedAction> {
-  const body: { action: ActionChoice["action"]; ttl_seconds?: number; standing_hours?: number } = { action: choice.action };
+  const body: { action: ActionChoice["action"]; ttl_seconds?: number; standing_hours?: number; nickname?: string } = { action: choice.action };
   if (choice.action === "approve") {
     if (choice.ttl_seconds !== undefined) body.ttl_seconds = choice.ttl_seconds;
     if (choice.standing_hours) body.standing_hours = choice.standing_hours;
+  }
+  let newNickname: string | undefined;
+  if (choice.action === "rename" || choice.action === "add") {
+    if (target.object !== "passkey") throw new FlowError("Only passkeys have nicknames.");
+    newNickname = normalizeNickname(choice.nickname ?? "");
+    if (choice.action === "rename" || newNickname !== "") {
+      const problem = nicknameProblem(newNickname);
+      if (problem) throw new FlowError(problem);
+      body.nickname = newNickname;
+    }
   }
   const r = await api.challenge(target.object, target.id, body);
   if (!r || typeof r.challenge_id !== "string" || !r.challenge_id) throw new FlowError("The server sent no challenge id.");
@@ -167,6 +204,7 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
     ttl_seconds: choice.action === "approve" && target.object === "request" ? choice.ttl_seconds : undefined,
     standing_hours: choice.action === "approve" ? (choice.standing_hours ?? 0) : 0,
     ...target.facts,
+    new_nickname: newNickname,
   });
   if (problems.length > 0) {
     throw new FlowError(`Not signing: the server's action differs from what you chose (${problems.join("; ")}).`);
@@ -200,14 +238,17 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
 
 /** Passkey prompt + apply. Call straight from the owner's tap on "Confirm with passkey". */
 export async function completeAction(api: Api, auth: Authenticator, p: PreparedAction): Promise<unknown> {
-  if (p.target.object === "passkey") throw new FlowError("Use authorizeAddPasskey for passkey actions.");
+  if (p.target.object === "passkey" && p.choice.action === "add") throw new FlowError("Use authorizeAddPasskey to add a passkey.");
   const cred = await auth.get(p.options);
-  return api.apply(p.target.object, p.target.id, p.challengeId, encodeAssertion(cred));
+  // Passkey rename/remove: the endpoint is named after the SIGNED action (canonical), so a
+  // page bug can't send a rename assertion to the remove endpoint (the server refuses it anyway).
+  const action = p.target.object === "passkey" ? p.canonical.action : undefined;
+  return api.apply(p.target.object, p.target.id, p.challengeId, encodeAssertion(cred), action);
 }
 
 /** Adding a passkey: sign the "passkey:add" action, which unlocks register/begin. */
 export async function authorizeAddPasskey(api: Api, auth: Authenticator, p: PreparedAction): Promise<PreparedRegistration> {
-  if (p.target.object !== "passkey") throw new FlowError("not a passkey action");
+  if (p.target.object !== "passkey" || p.canonical.action !== "add") throw new FlowError("not a passkey add action");
   const cred = await auth.get(p.options);
   return toRegistration(await api.registerBegin({ challenge_id: p.challengeId, assertion: encodeAssertion(cred) }));
 }

@@ -69,13 +69,13 @@ describe("App in a DOM", () => {
     expect(agent.textContent).toContain("<b>not-bold</b>");
     expect(agent.textContent).toContain("⟨U+202E⟩"); // bidi override made visible
     // The trusted facts are outside it.
-    expect(card.querySelector(".target")!.textContent).toBe("root@ci-1");
+    expect(card.querySelector(".target")!.textContent).toBe("root@laptop-2");
     expect(agent.contains(card.querySelector(".target"))).toBe(false);
   });
 
   test("approve: canonical shown, then the passkey prompt starts inside the tap, no Cancel while signing", async () => {
     const doc = win.document as unknown as Document;
-    const card = root.querySelector<HTMLElement>('[data-id="01JDEMO0SSH0DBHOST0000001"]')!;
+    const card = root.querySelector<HTMLElement>('[data-id="01JDEMO0SSH0DB1XXX0000001"]')!;
     card.querySelector<HTMLButtonElement>("button.approve")!.click();
     const dlg = doc.querySelector("dialog")!;
     await until(() => !!dlg.querySelector("button.approve"));
@@ -83,7 +83,7 @@ describe("App in a DOM", () => {
     ttl15.checked = true;
     [...dlg.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent === "Continue")!.click();
     await until(() => !!dlg.querySelector("button.confirm"));
-    expect(dlg.querySelector(".headline")!.textContent).toBe("Approve SSH as alice@db-1 for 15 min, requested by build-box.");
+    expect(dlg.querySelector(".headline")!.textContent).toBe("Approve SSH as alice@db-1 for 15 min, requested by web-1.");
     expect(dlg.querySelectorAll(".headline bdi").length).toBe(5); // kind, user, target, duration, host: each isolated
 
     const before = auth.gets.length;
@@ -106,5 +106,83 @@ describe("App in a DOM", () => {
     const dlg = doc.querySelector("dialog")!;
     await until(() => !!dlg.querySelector('input[name="ttl"]'));
     expect(dlg.querySelectorAll('input[name="standing"]').length).toBe(0);
+  });
+
+  test("passkeys: listed with authenticator, sync state and this-device; hostile nicknames stay text", async () => {
+    const evil = '<img src=x onerror="alert(3)">\u202Ekey';
+    m.store.passkeys[1]!.info.nickname = evil;
+    m.store.audit("owner", "passkey_rename", "passkey:" + m.store.passkeys[1]!.info.id, `to=${JSON.stringify(evil)}`);
+    await until(() => !!root.querySelector("#sec-passkeys article") && [...root.querySelectorAll("#sec-passkeys .pk-name")].some((n) => n.textContent!.includes("onerror")), 8000);
+    const tiles = [...root.querySelectorAll<HTMLElement>("#sec-passkeys article.pk")];
+    expect(tiles.length).toBe(3);
+    expect(root.querySelectorAll("img, script, iframe").length).toBe(0);
+    expect(tiles[1]!.querySelector(".pk-name")!.textContent).toBe('<img src=x onerror="alert(3)">⟨U+202E⟩key');
+    expect(tiles[0]!.textContent).toContain("This device");
+    expect(tiles[0]!.textContent).toContain("Synced");
+    expect(tiles[2]!.textContent).toContain("Device-bound");
+    expect(tiles[2]!.textContent).toContain("Security Key NFC by Yubico");
+  });
+
+  test("rename sheet: confirmation text comes from the canonical", async () => {
+    const doc = win.document as unknown as Document;
+    doc.querySelector("dialog")?.close();
+    const tile = [...root.querySelectorAll<HTMLElement>("#sec-passkeys article.pk")][2]!;
+    [...tile.querySelectorAll("button")].find((b) => b.textContent === "Rename…")!.click();
+    const dlg = doc.querySelector("dialog")!;
+    await until(() => !!dlg.querySelector("input#pk-rename"));
+    const input = dlg.querySelector<HTMLInputElement>("input#pk-rename")!;
+    expect(input.value).toBe("YubiKey on keyring");
+    input.value = "Desk key";
+    [...dlg.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent === "Continue")!.click();
+    await until(() => !!dlg.querySelector("button.confirm"));
+    expect(dlg.querySelector(".headline")!.textContent).toMatch(/^Rename the passkey YubiKey on keyring \(id [0-9A-F]{6}\) to Desk key\.$/);
+    dlg.close();
+  });
+
+  test("activity: day groups, kinds as text + icon, filters, untrusted detail as text", async () => {
+    const sec = root.querySelector<HTMLElement>("#sec-recent")!;
+    await until(() => !!sec.querySelector(".ev-day"));
+    const days = [...sec.querySelectorAll(".ev-day-h")].map((x) => x.textContent);
+    expect(days[0]).toBe("Today");
+    expect(days).toContain("Yesterday");
+    // Every row has a glyph (aria-hidden) and words; colour is never alone.
+    for (const row of sec.querySelectorAll(".ev")) {
+      expect(row.querySelector(".ev-glyph svg")!.getAttribute("aria-hidden")).toBe("true");
+      expect(row.querySelector(".ev-label")!.textContent!.length).toBeGreaterThan(0);
+    }
+    // The hostile detail in the seed is text inside the unverified fence, once expanded.
+    const hostile = [...sec.querySelectorAll<HTMLElement>(".ev")].find((r) => r.classList.contains("ev-request") && r.querySelector(".ev-more")!.textContent!.includes("onerror"))!;
+    expect(hostile).toBeTruthy();
+    const toggle = hostile.querySelector<HTMLButtonElement>(".ev-toggle")!;
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    toggle.click();
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(hostile.querySelector<HTMLElement>(".ev-more")!.hidden).toBe(false);
+    expect(hostile.querySelector(".ev-detail .agent-label")!.textContent).toContain("unverified");
+    expect(sec.querySelectorAll("img, script, b").length).toBe(0);
+    // The owner's own rename row (nickname with markup) is plain text too, not fenced.
+    const own = [...sec.querySelectorAll<HTMLElement>(".ev-passkey")].find((r) => r.querySelector(".ev-more")!.textContent!.includes("onerror"))!;
+    expect(own.querySelector(".ev-detail-plain")!.textContent).toContain('<img src=x onerror=\\"alert(3)\\">');
+
+    // Filters: pressed state and rows.
+    const btn = (id: string) => root.querySelector<HTMLButtonElement>(`.filters [data-filter="${id}"]`)!;
+    btn("passkeys").click();
+    expect(btn("passkeys").getAttribute("aria-pressed")).toBe("true");
+    expect(btn("all").getAttribute("aria-pressed")).toBe("false");
+    const labels = [...sec.querySelectorAll(".ev-label")].map((x) => x.textContent);
+    expect(labels.length).toBeGreaterThan(0);
+    for (const l of labels) expect(["Signed in", "Signed out", "Passkey added", "Passkey renamed", "Passkey removed", "Enroll code made", "Clone warning"]).toContain(l!);
+    btn("hosts").click();
+    expect([...sec.querySelectorAll(".actor")].some((a) => a.classList.contains("actor-host"))).toBe(true);
+    btn("all").click();
+  });
+
+  test("activity rows link to cards that are on the page", async () => {
+    const sec = root.querySelector<HTMLElement>("#sec-recent")!;
+    const jump = sec.querySelector<HTMLButtonElement>(".ev-jump");
+    expect(jump).toBeTruthy();
+    expect(jump!.getAttribute("aria-label")).toMatch(/^Show the .+ card$/);
+    jump!.click();
+    expect(root.querySelectorAll(".focus").length).toBe(1);
   });
 });

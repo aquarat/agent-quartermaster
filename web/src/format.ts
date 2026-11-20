@@ -38,7 +38,8 @@ export function ago(at: string | number | Date, now = Date.now()): string {
   if (s < 60) return `${s} s ago`;
   if (s < 3600) return `${Math.floor(s / 60)} min ago`;
   if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
-  return new Date(t).toLocaleString();
+  if (s < 7 * 86400) return Math.floor(s / 86400) === 1 ? "1 day ago" : `${Math.floor(s / 86400)} days ago`;
+  return new Date(t).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
 }
 
 export function kindLabel(kind: string): string {
@@ -83,4 +84,62 @@ export function visibleText(s: unknown): string {
  * Anything else (look-alike letters, RTL text) gets a visible warning. */
 export function isPlainName(s: unknown): boolean {
   return typeof s === "string" && /^[A-Za-z0-9._-]{1,253}$/.test(s);
+}
+
+// ---- dates for the activity log ----
+
+const DAY_MS = 86_400_000;
+
+function localMidnight(t: number): number {
+  const d = new Date(t);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+/** Local calendar day of `t` as "YYYY-MM-DD" (group key). */
+export function dayKey(at: string | number | Date): string {
+  const d = new Date(typeof at === "number" ? at : new Date(at).getTime());
+  if (!Number.isFinite(d.getTime())) return "?";
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** "Today", "Yesterday", "Monday 18 November" (this year) or "18 November 2025". */
+export function dayLabel(at: string | number | Date, now = Date.now()): string {
+  const t = typeof at === "number" ? at : new Date(at).getTime();
+  if (!Number.isFinite(t)) return "Unknown date";
+  const days = Math.round((localMidnight(now) - localMidnight(t)) / DAY_MS);
+  if (days === 0) return "Today";
+  if (days === 1) return "Yesterday";
+  const d = new Date(t);
+  const sameYear = d.getFullYear() === new Date(now).getFullYear();
+  return d.toLocaleDateString("en-GB", sameYear && days > 0 && days < 7 ? { weekday: "long", day: "numeric", month: "long" } : sameYear ? { day: "numeric", month: "long" } : { day: "numeric", month: "long", year: "numeric" });
+}
+
+/** "14:05" in local time. */
+export function clockTime(at: string | number | Date): string {
+  const t = typeof at === "number" ? at : new Date(at).getTime();
+  if (!Number.isFinite(t)) return "?";
+  return new Date(t).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+}
+
+/** Full local date and time, for hover titles: "Wed 20 Nov 2026, 14:05:09". */
+export function absoluteTime(at: string | number | Date): string {
+  const t = typeof at === "number" ? at : new Date(at).getTime();
+  if (!Number.isFinite(t)) return "?";
+  return new Date(t).toLocaleString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+/** Activity row time: relative within the last 12 hours, else the clock time (the day
+ * header carries the date). */
+export function eventTime(at: string | number | Date, now = Date.now()): string {
+  const t = typeof at === "number" ? at : new Date(at).getTime();
+  if (!Number.isFinite(t)) return "?";
+  return now - t < 12 * 3600_000 ? ago(t, now) : clockTime(t);
+}
+
+/** "1 Nov 2026" style short date. */
+export function shortDate(at: string | number | Date): string {
+  const t = typeof at === "number" ? at : new Date(at).getTime();
+  if (!Number.isFinite(t)) return "?";
+  return new Date(t).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
+	"github.com/aquarat/agent-quartermaster/internal/server/nickname"
 	_ "modernc.org/sqlite"
 )
 
@@ -89,12 +90,82 @@ func (s *Store) migrate(ctx context.Context) error {
 			tx.Rollback()
 			return fmt.Errorf("store: migration %d: %w", i+1, err)
 		}
+		if i+1 == 3 {
+			if err := fixPasskeyNames(ctx, tx); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: migration 3: %w", err)
+			}
+		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", i+1)); err != nil {
 			tx.Rollback()
 			return err
 		}
 		if err := tx.Commit(); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// fixPasskeyNames (migration 3) gives every passkey a nickname that passes nickname.Normalize
+// and is unique ignoring case: a valid existing name is kept (normalised) unless an earlier
+// passkey already has it; otherwise the row becomes "Passkey N" (N = its position in
+// registration order, or the next free number).
+func fixPasskeyNames(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, "SELECT id, name FROM passkeys ORDER BY id")
+	if err != nil {
+		return err
+	}
+	type row struct {
+		id   int64
+		name string
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.name); err != nil {
+			rows.Close()
+			return err
+		}
+		all = append(all, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var kept []string
+	taken := func(c string) bool {
+		for _, k := range kept {
+			if nickname.Same(k, c) {
+				return true
+			}
+		}
+		return false
+	}
+	// Valid names first (in order), so a later "Passkey N" never collides with them.
+	want := make([]string, len(all))
+	for i, r := range all {
+		if n, err := nickname.Normalize(r.name); err == nil && !taken(n) {
+			want[i] = n
+			kept = append(kept, n)
+		}
+	}
+	for i := range all {
+		if want[i] == "" {
+			for n := i + 1; ; n++ {
+				if c := fmt.Sprintf("Passkey %d", n); !taken(c) {
+					want[i] = c
+					break
+				}
+			}
+			kept = append(kept, want[i])
+		}
+	}
+	for i, r := range all {
+		if want[i] != r.name {
+			if _, err := tx.ExecContext(ctx, "UPDATE passkeys SET name = ? WHERE id = ?", want[i], r.id); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -777,6 +848,38 @@ func (q *Q) UpdatePasskeyAfterUse(ctx context.Context, credID []byte, oldJSON, n
 		return 0, ErrConflict
 	}
 	return id, err
+}
+
+// SessionPasskeyID returns the passkey row id a web session signed in with.
+func (q *Q) SessionPasskeyID(ctx context.Context, sessionHash string) (int64, error) {
+	var id int64
+	err := q.q.QueryRowContext(ctx, "SELECT passkey_id FROM web_sessions WHERE hash = ?", sessionHash).Scan(&id)
+	return id, notFound(err)
+}
+
+// RenamePasskey sets a passkey's nickname if it is still oldName (ErrConflict otherwise).
+func (q *Q) RenamePasskey(ctx context.Context, id int64, oldName, newName string) error {
+	return one(q.q.ExecContext(ctx, "UPDATE passkeys SET name = ? WHERE id = ? AND name = ?", newName, id, oldName))
+}
+
+// DeletePasskey removes a passkey and ends every web session that signed in with it. It
+// returns how many sessions ended. ErrNotFound if the passkey does not exist.
+func (q *Q) DeletePasskey(ctx context.Context, id int64) (int64, error) {
+	res, err := q.q.ExecContext(ctx, "DELETE FROM web_sessions WHERE passkey_id = ?", id)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := one(q.q.ExecContext(ctx, "DELETE FROM passkeys WHERE id = ?", id)); err != nil {
+		if errors.Is(err, ErrConflict) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return n, nil
 }
 
 // ---- challenges ----

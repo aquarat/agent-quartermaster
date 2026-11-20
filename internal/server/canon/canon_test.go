@@ -77,8 +77,21 @@ func TestPerObjectKeySets(t *testing.T) {
 		t.Fatal(en)
 	}
 	pk, _ := Build(Action{Action: "add", Object: "passkey", ID: "new"}, "N", at)
-	if pk != `{"action":"add","id":"new","issued_at":"2026-11-20T12:00:00Z","nonce":"N","object":"passkey","v":1}` {
+	if pk != `{"action":"add","id":"new","issued_at":"2026-11-20T12:00:00Z","new_nickname":"","nickname":"","nonce":"N","object":"passkey","v":1}` {
 		t.Fatal(pk)
+	}
+	rn, err := Build(Action{Action: "rename", Object: "passkey", ID: "0123abcd", Nickname: "Bitwarden", NewNickname: "Phone <&>"}, "N", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rn != `{"action":"rename","id":"0123abcd","issued_at":"2026-11-20T12:00:00Z","new_nickname":"Phone <&>","nickname":"Bitwarden","nonce":"N","object":"passkey","v":1}` {
+		t.Fatal(rn)
+	}
+	if s, err := Parse(rn); err != nil || s.NewNickname != "Phone <&>" || s.Nickname != "Bitwarden" || s.Action.Action != ActionRename {
+		t.Fatalf("parse rename: %+v %v", s, err)
+	}
+	if _, err := Build(Action{Action: "remove", Object: "passkey", ID: "0123abcd", Nickname: "Bitwarden"}, "N", at); err != nil {
+		t.Fatal(err)
 	}
 	if s, err := Parse(en); err != nil || !s.Replaces {
 		t.Fatalf("parse enrollment: %v", err)
@@ -91,6 +104,8 @@ func TestPerObjectKeySets(t *testing.T) {
 		{Action: "approve", Object: "request", ID: "R", Replaces: true},
 		{Action: "approve", Object: "grant", ID: "G"},
 		{Action: "register", Object: "passkey", ID: "new"},
+		{Action: "approve", Object: "request", ID: "R", Nickname: "x"},
+		{Action: "revoke", Object: "grant", ID: "G", NewNickname: "x"},
 	} {
 		if _, err := Build(a, "N", at); err == nil {
 			t.Errorf("built %+v", a)

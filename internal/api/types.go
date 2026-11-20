@@ -229,7 +229,48 @@ type UIState struct {
 	Standing []StandingApproval `json:"standing"`
 	Grants   []GrantSummary     `json:"grants"` // active grants, newest first, with requesting_host
 	Recent   []AuditEntry       `json:"recent"`
+	Passkeys []PasskeyInfo      `json:"passkeys"` // the owner's passkeys, oldest first
 }
+
+// Passkey icon keys (PasskeyInfo.Icon); the web UI draws one glyph per key.
+const (
+	PasskeyIconApple       = "apple"
+	PasskeyIconBitwarden   = "bitwarden"
+	PasskeyIconOnePassword = "onepassword"
+	PasskeyIconGoogle      = "google"
+	PasskeyIconChrome      = "chrome"
+	PasskeyIconWindows     = "windows"
+	PasskeyIconMicrosoft   = "microsoft"
+	PasskeyIconSamsung     = "samsung"
+	PasskeyIconYubiKey     = "yubikey"
+	PasskeyIconManager     = "manager" // another password manager
+	PasskeyIconUnknown     = "unknown"
+)
+
+// PasskeyInfo is one registered owner passkey as the web UI lists it (public data only).
+type PasskeyInfo struct {
+	// ID is the hex of the first 16 bytes of SHA-256(credential ID): the passkey's id in
+	// /api/ui/passkeys/{id}/... and in the canonical "passkey" object.
+	ID            string `json:"id"`
+	Nickname      string `json:"nickname"`
+	Authenticator string `json:"authenticator"` // friendly name from the AAGUID, or "Unknown authenticator"
+	Icon          string `json:"icon"`          // PasskeyIcon* key
+	// AAGUID as a UUID string; "" when the authenticator reported none (all zeros).
+	AAGUID     string   `json:"aaguid"`
+	Transports []string `json:"transports"` // as the browser reported them at registration
+	// BackupEligible: a synced (multi-device) passkey; false means device-bound (e.g. a
+	// hardware security key). BackupState: currently backed up.
+	BackupEligible bool       `json:"backup_eligible"`
+	BackupState    bool       `json:"backup_state"`
+	SignCount      uint32     `json:"sign_count"`
+	CreatedAt      time.Time  `json:"created_at"`
+	LastUsedAt     *time.Time `json:"last_used_at,omitempty"`
+	// Current: the passkey this web session signed in with.
+	Current bool `json:"current"`
+}
+
+// MaxNicknameBytes limits a passkey nickname (UTF-8 bytes, no control or format characters).
+const MaxNicknameBytes = 64
 
 // UISession is the body of GET /api/ui/session (works without a session).
 type UISession struct {
@@ -273,18 +314,37 @@ type RegisterBegin struct {
 	Assertion   json.RawMessage `json:"assertion,omitempty"`
 }
 
-// RegisterFinish is the body of POST /api/ui/passkeys/register/finish.
+// RegisterFinish is the body of POST /api/ui/passkeys/register/finish. Name is the nickname;
+// empty means "name it after the authenticator" (made unique with a " 2", " 3"... suffix).
 type RegisterFinish struct {
 	ChallengeID string          `json:"challenge_id"`
 	Credential  json.RawMessage `json:"credential"` // PublicKeyCredential JSON from the browser
 	Name        string          `json:"name,omitempty"`
 }
 
+// RegisterResult is the response of POST /api/ui/passkeys/register/finish.
+type RegisterResult struct {
+	OK      bool         `json:"ok"`
+	Passkey *PasskeyInfo `json:"passkey,omitempty"`
+}
+
+// PasskeyChange is the response of POST /api/ui/passkeys/{id}/rename and /remove.
+// SignedOut is true when the removed passkey was the one this session signed in with: the
+// session has ended and the UI must sign in again.
+type PasskeyChange struct {
+	OK        bool   `json:"ok"`
+	ID        string `json:"id"`
+	Action    string `json:"action"`   // rename, remove
+	Nickname  string `json:"nickname"` // the nickname after the change (rename) or of the removed passkey
+	SignedOut bool   `json:"signed_out"`
+}
+
 // ChallengeRequest asks for a WebAuthn challenge that commits to one exact action.
 type ChallengeRequest struct {
-	Action        string `json:"action"` // approve, deny (requests, enrollments); revoke (standing, grants); add (passkeys)
+	Action        string `json:"action"` // approve, deny (requests, enrollments); revoke (standing, grants); add, rename, remove (passkeys)
 	TTLSeconds    int    `json:"ttl_seconds,omitempty"`
 	StandingHours int    `json:"standing_hours,omitempty"`
+	Nickname      string `json:"nickname,omitempty"` // passkey rename: the new nickname
 }
 
 // ChallengeResponse carries the WebAuthn PublicKeyCredentialRequestOptions as raw JSON so the

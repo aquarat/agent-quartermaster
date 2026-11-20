@@ -5,8 +5,9 @@
 // through text nodes only, with invisible/bidi characters made visible (visibleText).
 
 import { ApiError, createApi, type Api } from "./api";
-import type { Part } from "./canonical";
-import { $, h, replace, type Child } from "./dom";
+import { FILTERS, actor, classify, detailUntrusted, groupByDay, matches, objectRef, rowKey, type Filter } from "./audit";
+import { shortId, type Part } from "./canonical";
+import { $, h, own, replace, type Child } from "./dom";
 import {
   FlowError,
   LOGIN_OPTIONS_MAX_AGE_MS,
@@ -16,11 +17,13 @@ import {
   completeLogin,
   completeRegistration,
   explainError,
+  nicknameProblem,
   nothingChanged,
   prepareAction,
   prepareLogin,
   prepareRegistrationWithCode,
   targetForGrant,
+  targetForPasskey,
   targetForPending,
   targetForStanding,
   type ActionChoice,
@@ -29,8 +32,23 @@ import {
   type PreparedLogin,
   type PreparedRegistration,
 } from "./flows";
-import { STANDING_PRESETS, ago, countdown, duration, hours, isPlainName, kindLabel, ttlChoices, visibleText as vt } from "./format";
-import type { AuditEntry, GrantSummary, PendingItem, StandingApproval, UIState } from "./types";
+import {
+  STANDING_PRESETS,
+  absoluteTime,
+  ago,
+  countdown,
+  dayLabel,
+  duration,
+  eventTime,
+  hours,
+  isPlainName,
+  kindLabel,
+  shortDate,
+  ttlChoices,
+  visibleText as vt,
+} from "./format";
+import { chevronIcon, eventIcon, passkeyIcon, syncIcon } from "./icons";
+import type { AuditEntry, GrantSummary, PasskeyChange, PasskeyInfo, PendingItem, RegisterResult, StandingApproval, UIState } from "./types";
 import { browserAuthenticator, type Authenticator } from "./webauthn";
 
 const POLL_MS = 5000;
@@ -62,6 +80,10 @@ export class App {
   private focusId: string | null = null;
   private pointerDown = false;
   private lastTouch = 0;
+  /** Activity filter and which rows are expanded (kept across re-renders). */
+  private filter: Filter = "all";
+  private expanded = new Set<string>();
+  private evSeq = 0;
 
   constructor(root: HTMLElement, api: Api = createApi(), auth: Authenticator = browserAuthenticator()) {
     this.root = root;
@@ -144,6 +166,8 @@ export class App {
         return (s.standing ?? []).some((a) => a.id === t.id);
       case "grant":
         return s.grants === undefined ? undefined : (s.grants ?? []).some((g) => g.id === t.id && g.status === "approved");
+      case "passkey":
+        return t.id === "new" || s.passkeys === undefined ? undefined : (s.passkeys ?? []).some((p) => p.id === t.id);
       default:
         return undefined;
     }
@@ -188,6 +212,16 @@ export class App {
         }
       },
     );
+  }
+
+  isCurrentPasskey(id: string): boolean {
+    return (this.state?.passkeys ?? []).some((p) => p.id === id && p.current);
+  }
+
+  /** The session ended because its passkey was removed: back to sign-in with a message. */
+  signedOut(message: string): void {
+    this.sheet.close(true);
+    this.showSignin(message);
   }
 
   private showSignin(message?: string): void {
@@ -259,7 +293,7 @@ export class App {
     const go = h("button", { class: "btn", type: "button" }, "Continue");
     replace(
       body,
-      h("p", null, "Register this device's passkey with a one-time code. On the bastion (bastion), as root or the aqmas user, run:"),
+      h("p", null, "Register this device's passkey with a one-time code. On the aqmasd host, as root or the aqmas user, run:"),
       h("pre", { class: "cmd" }, "aqmasd passkey-enroll-code"),
       h("label", { for: "enroll-code" }, "Enroll code"),
       input,
@@ -304,18 +338,38 @@ export class App {
     this.view = "main";
     this.rendered.clear();
     this.loginStatus = this.signBtn = this.loginDetails = null;
+    const filters = h(
+      "div",
+      { class: "filters", role: "group", "aria-label": "Show activity" },
+      FILTERS.map((f) =>
+        h(
+          "button",
+          {
+            class: "filter",
+            type: "button",
+            "data-filter": f.id,
+            "aria-pressed": String(f.id === this.filter),
+            on: { click: () => this.setFilter(f.id) },
+          },
+          f.label,
+        ),
+      ),
+    );
     replace(
       this.root,
       h("header", { class: "topbar" }, h("h1", { class: "brand" }, "aqmas"), h("p", { class: "status", id: "status" })),
       h(
         "main",
         { class: "sections" },
-        section("pending", "Waiting for you"),
-        section("enroll", "Hosts asking to join"),
-        section("grants", "Active access"),
-        section("standing", "Auto-approvals"),
-        section("recent", "Recent activity"),
-        section("passkeys", "Passkeys"),
+        h("div", { class: "col col-queue" }, section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
+        h(
+          "div",
+          { class: "col col-access" },
+          section("grants", "Active access", "tiles"),
+          section("standing", "Auto-approvals", "tiles"),
+          section("passkeys", "Passkeys"),
+        ),
+        h("aside", { class: "col col-activity", "aria-labelledby": "sec-recent-h" }, section("recent", "Recent activity", "", filters)),
       ),
     );
     this.renderSections();
@@ -360,18 +414,9 @@ export class App {
       false,
       touching,
     );
-    this.section("recent", s.recent, () =>
-      s.recent!.length ? [h("ol", { class: "audit" }, s.recent!.map((e) => auditRow(e)))] : [h("p", { class: "empty" }, "No activity yet.")],
-    );
-    this.section("passkeys", s.owner, () => [
-      h(
-        "p",
-        null,
-        `Signed in as ${vt(s.owner.name)}. `,
-        s.owner.passkeys === 1 ? "1 passkey is registered." : `${s.owner.passkeys} passkeys are registered.`,
-      ),
-      h("button", { class: "btn", type: "button", on: { click: () => this.sheet.openAddPasskey() } }, "Add a passkey"),
-    ]);
+    const shown = this.shownIds();
+    this.section("recent", [s.recent, this.filter, [...shown].sort()], () => this.activity(s.recent!, shown), false, false, 0);
+    this.section("passkeys", [s.owner, s.passkeys], () => this.passkeys(s), false, touching, 0);
     this.updateStatus();
     this.tick();
     if (this.focusId) {
@@ -384,8 +429,206 @@ export class App {
     }
   }
 
+  /** Ids of every card on the page (activity rows link to these). */
+  private shownIds(): Set<string> {
+    const s = this.state;
+    const out = new Set<string>();
+    if (!s) return out;
+    for (const p of s.pending ?? []) out.add(p.id);
+    for (const a of s.standing ?? []) out.add(a.id);
+    for (const g of s.grants ?? []) if (g.status === "approved") out.add(g.id);
+    for (const p of s.passkeys ?? []) out.add(p.id);
+    return out;
+  }
+
+  private setFilter(f: Filter): void {
+    this.filter = f;
+    for (const b of this.root.querySelectorAll<HTMLElement>(".filters .filter")) b.setAttribute("aria-pressed", String(b.dataset["filter"] === f));
+    this.renderSections();
+  }
+
+  /** Scroll to a card and highlight it for a moment. */
+  private jumpTo(id: string): void {
+    const el = this.root.querySelector<HTMLElement>(`[data-id="${CSS.escape(id)}"]`);
+    if (!el) return;
+    for (const f of this.root.querySelectorAll(".focus")) f.classList.remove("focus");
+    el.classList.add("focus");
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    const btn = el.querySelector<HTMLElement>("button");
+    btn?.focus({ preventScroll: true });
+    window.setTimeout(() => el.classList.remove("focus"), 2500);
+  }
+
+  // ---- activity ----
+
+  private activity(entries: AuditEntry[], shown: Set<string>): Child[] {
+    if (!entries.length) return [h("p", { class: "empty" }, "No activity yet.")];
+    const list = entries.filter((e) => matches(e, this.filter));
+    if (!list.length) return [h("p", { class: "empty" }, "Nothing of this kind in the recent activity.")];
+    const now = Date.now();
+    return groupByDay(list).map((g) => {
+      const label = dayLabel(g.at, now);
+      return h(
+        "section",
+        { class: "ev-day", "aria-label": label },
+        h("h3", { class: "ev-day-h" }, h("time", { datetime: g.key }, label)),
+        h("ol", { class: "ev-list" }, g.entries.map((e) => this.eventRow(e, shown, now))),
+      );
+    });
+  }
+
+  private eventRow(e: AuditEntry, shown: Set<string>, now: number): HTMLElement {
+    const info = classify(e);
+    const who = actor(e.actor);
+    const obj = objectRef(e.object);
+    const key = rowKey(e);
+    const open = this.expanded.has(key);
+    const at = new Date(e.at).getTime();
+    const moreId = `ev-${++this.evSeq}`;
+    const linkable = obj.id !== "" && shown.has(obj.id);
+
+    const untrusted = detailUntrusted(e);
+    const more = h(
+      "div",
+      { class: "ev-more", id: moreId, hidden: !open },
+      h(
+        "dl",
+        { class: "facts" },
+        fact("When", absoluteTime(at)),
+        fact("By", h("bdi", { class: "mono" }, vt(e.actor))),
+        e.object ? fact("About", h("span", { class: "mono" }, vt(e.object))) : null,
+      ),
+      e.detail
+        ? untrusted
+          ? h(
+              "div",
+              { class: "agent ev-detail", role: "group", "aria-label": "Details, may include text a host sent (unverified)" },
+              h("p", { class: "agent-label" }, "Details", h("span", { class: "muted" }, ", may include text a host sent (unverified)")),
+              h("p", { class: "mono", dir: "ltr" }, vt(e.detail)),
+            )
+          : h("p", { class: "ev-detail-plain mono" }, vt(e.detail))
+        : null,
+      linkable ? h("button", { class: "btn small", type: "button", on: { click: () => this.jumpTo(obj.id) } }, `Show the ${vt(obj.short)} card`) : null,
+    );
+    const toggle = h(
+      "button",
+      { class: "ev-toggle", type: "button", "aria-expanded": String(open), "aria-controls": moreId },
+      h("span", { class: "ev-glyph" }, eventIcon(info.kind)),
+      h("span", { class: "ev-label" }, vt(info.label)),
+      h("span", { class: `actor actor-${who.kind}` }, who.kind === "host" ? [h("span", { class: "sr" }, "host "), h("bdi", null, vt(who.name))] : vt(who.name)),
+      obj.short ? h("span", { class: "ev-obj" }, vt(obj.short)) : null,
+      h("time", { class: "ev-time", datetime: e.at, title: absoluteTime(at), "data-ev-at": String(at) }, eventTime(at, now)),
+      chevronIcon(),
+    );
+    toggle.addEventListener("click", () => {
+      const nowOpen = toggle.getAttribute("aria-expanded") !== "true";
+      toggle.setAttribute("aria-expanded", String(nowOpen));
+      more.hidden = !nowOpen;
+      if (nowOpen) this.expanded.add(key);
+      else this.expanded.delete(key);
+    });
+    return h(
+      "li",
+      { class: `ev ev-${info.kind}` },
+      h(
+        "div",
+        { class: "ev-line" },
+        toggle,
+        linkable
+          ? h(
+              "button",
+              { class: "ev-jump", type: "button", "aria-label": `Show the ${vt(obj.short)} card`, on: { click: () => this.jumpTo(obj.id) } },
+              "Show",
+            )
+          : null,
+      ),
+      more,
+    );
+  }
+
+  // ---- passkeys ----
+
+  private passkeys(s: UIState): Child[] {
+    const list = s.passkeys;
+    const add = h("button", { class: "btn", type: "button", on: { click: () => this.sheet.openAddPasskey() } }, "Add a passkey");
+    const signedIn = h("p", { class: "muted" }, "Signed in as ", h("bdi", null, vt(s.owner.name)), ".");
+    if (list === undefined || list === null) {
+      // Older server: only the count.
+      return [
+        h("p", null, `Signed in as ${vt(s.owner.name)}. `, s.owner.passkeys === 1 ? "1 passkey is registered." : `${s.owner.passkeys} passkeys are registered.`),
+        add,
+      ];
+    }
+    const only = list.length <= 1;
+    return [
+      h("div", { class: "tiles" }, list.map((p) => this.passkeyTile(p, only))),
+      only ? h("p", { class: "muted" }, "Add a second passkey (another password manager or a hardware key) so you can still get in if you lose this one.") : null,
+      h("div", { class: "pk-foot" }, add, signedIn),
+    ];
+  }
+
+  private passkeyTile(p: PasskeyInfo, only: boolean): HTMLElement {
+    const synced = p.backup_eligible === true;
+    const transports = (p.transports ?? []).map(transportLabel).filter((t) => t !== "");
+    return h(
+      "article",
+      { class: `row pk${p.current ? " current" : ""}`, "data-id": p.id, "aria-label": `Passkey ${vt(p.nickname)}` },
+      h(
+        "div",
+        { class: "pk-head" },
+        h("span", { class: "pk-icon" }, passkeyIcon(p.icon)),
+        h(
+          "div",
+          { class: "pk-names" },
+          h("h3", { class: "pk-name" }, h("bdi", null, vt(p.nickname))),
+          h("p", { class: "pk-auth" }, vt(p.authenticator || "Unknown authenticator")),
+        ),
+      ),
+      h(
+        "div",
+        { class: "badges" },
+        h(
+          "span",
+          {
+            class: `badge ${synced ? "synced" : "bound"}`,
+            title: synced ? "Synced: the password manager copies it to your other devices" : "Device-bound: it never leaves this authenticator",
+          },
+          syncIcon(synced),
+          synced ? "Synced" : "Device-bound",
+        ),
+        p.current ? h("span", { class: "badge this", title: "You signed in with this passkey" }, "This device") : null,
+      ),
+      h(
+        "dl",
+        { class: "facts" },
+        fact("Added", h("time", { datetime: p.created_at, title: absoluteTime(p.created_at) }, shortDate(p.created_at))),
+        fact("Last used", p.last_used_at ? since(p.last_used_at) : h("span", { class: "muted" }, "never")),
+        transports.length ? fact("Connects by", transports.join(", ")) : null,
+        // The same short id the rename/remove confirmation shows (from the signed text).
+        fact("Id", h("span", { class: "mono" }, vt(shortId(p.id)))),
+      ),
+      h(
+        "div",
+        { class: "actions" },
+        h("button", { class: "btn", type: "button", on: { click: () => this.sheet.openRename(p) } }, "Rename…"),
+        h(
+          "button",
+          {
+            class: "btn deny",
+            type: "button",
+            disabled: only,
+            title: only ? "Your only passkey can't be removed" : undefined,
+            on: { click: () => this.sheet.openRemove(p) },
+          },
+          "Remove…",
+        ),
+      ),
+      only ? h("p", { class: "muted small" }, "Your only passkey can't be removed. Add another first.") : null,
+    );
+  }
+
   /** Re-render a section only when its data changed (keeps scroll/focus stable while polling). */
-  private section(name: string, data: unknown, build: () => Child[], hidden = false, defer = false): void {
+  private section(name: string, data: unknown, build: () => Child[], hidden = false, defer = false, count?: number): void {
     const key = JSON.stringify(data) ?? "undefined";
     const sec = $(`#sec-${name}`, this.root);
     if (this.rendered.get(name) === key) return;
@@ -394,8 +637,9 @@ export class App {
     this.rendered.set(name, key);
     const list = $(".list", sec);
     replace(list, build());
-    const count = sec.querySelector(".count");
-    if (count) count.textContent = Array.isArray(data) && data.length > 0 ? String(data.length) : "";
+    const countEl = sec.querySelector(".count");
+    const n = count ?? (Array.isArray(data) ? data.length : 0);
+    if (countEl) countEl.textContent = n > 0 ? String(n) : "";
   }
 
   private updateStatus(err?: unknown): void {
@@ -417,6 +661,7 @@ export class App {
     for (const t of this.root.querySelectorAll<HTMLElement>("[data-until]")) updateCountdown(t, now);
     for (const t of document.querySelectorAll<HTMLElement>("dialog [data-until]")) updateCountdown(t, now);
     for (const t of this.root.querySelectorAll<HTMLElement>("[data-since]")) t.textContent = ago(Number(t.dataset["since"]), now);
+    for (const t of this.root.querySelectorAll<HTMLElement>("[data-ev-at]")) t.textContent = eventTime(Number(t.dataset["evAt"]), now);
     if (this.view === "main" && !this.offline) this.updateStatus();
     if (this.view === "main" && this.rendered.size > 0 && !this.pointerDown && now - this.lastTouch >= TOUCH_SETTLE_MS) {
       // Catch up on a render that was deferred during a touch.
@@ -434,7 +679,8 @@ export class App {
       this.rendered.get("pending") !== JSON.stringify(req) ||
       this.rendered.get("enroll") !== JSON.stringify(enr) ||
       this.rendered.get("standing") !== JSON.stringify(s.standing) ||
-      this.rendered.get("grants") !== (JSON.stringify(s.grants) ?? "undefined");
+      this.rendered.get("grants") !== (JSON.stringify(s.grants) ?? "undefined") ||
+      this.rendered.get("passkeys") !== JSON.stringify([s.owner, s.passkeys]);
     if (stale) this.renderSections();
   }
 
@@ -537,13 +783,26 @@ function normalise(s: UIState): UIState {
   return { ...s, pending, standing: s.standing ?? [], recent: s.recent ?? [], grants: s.grants === undefined ? undefined : (s.grants ?? []) };
 }
 
-function section(name: string, title: string): HTMLElement {
+function section(name: string, title: string, listClass = "", extra?: Child): HTMLElement {
   return h(
     "section",
     { id: `sec-${name}`, class: "section", "aria-labelledby": `sec-${name}-h` },
-    h("h2", { id: `sec-${name}-h` }, title, " ", h("span", { class: "count" })),
-    h("div", { class: "list" }),
+    h("div", { class: "section-head" }, h("h2", { id: `sec-${name}-h` }, title, " ", h("span", { class: "count" })), extra),
+    h("div", { class: listClass ? `list ${listClass}` : "list" }),
   );
+}
+
+const TRANSPORTS: Record<string, string> = {
+  usb: "USB",
+  nfc: "NFC",
+  ble: "Bluetooth",
+  internal: "built in",
+  hybrid: "phone (QR code)",
+  "smart-card": "smart card",
+};
+
+function transportLabel(t: string): string {
+  return own(TRANSPORTS, t) ?? vt(t);
 }
 
 function fact(label: string, ...value: Child[]): Child[] {
@@ -622,19 +881,39 @@ function agentSays(p: PendingItem): HTMLElement {
   );
 }
 
-function auditRow(e: AuditEntry): HTMLElement {
+function isNegative(action: string): boolean {
+  return action === "deny" || action === "revoke" || action === "remove";
+}
+
+function passkeySummary(p: PasskeyInfo): HTMLElement {
   return h(
-    "li",
-    null,
-    h("time", { datetime: e.at }, ago(e.at)),
-    " ",
-    h("bdi", { class: "actor" }, vt(e.actor)),
-    " ",
-    h("strong", null, vt(e.action)),
-    " ",
-    h("span", { class: "mono" }, vt(e.object)),
-    e.detail ? h("span", { class: "detail" }, vt(e.detail)) : null,
+    "div",
+    { class: "summary pk-head" },
+    h("span", { class: "pk-icon" }, passkeyIcon(p.icon)),
+    h("div", { class: "pk-names" }, h("p", { class: "pk-name" }, h("bdi", null, vt(p.nickname))), h("p", { class: "pk-auth" }, vt(p.authenticator))),
   );
+}
+
+/** A labelled nickname input with a hint and an error line. */
+function nicknameField(id: string, value: string, placeholder: string) {
+  const input = h("input", {
+    id,
+    type: "text",
+    class: "text",
+    value,
+    autocomplete: "off",
+    spellcheck: "false",
+    maxlength: "64",
+    enterkeyhint: "go",
+    placeholder: placeholder || undefined,
+    "data-autofocus": "",
+    "aria-describedby": `${id}-hint ${id}-err`,
+  });
+  const error = h("p", { class: "error", id: `${id}-err`, role: "alert" });
+  input.addEventListener("input", () => (error.textContent = ""));
+  const field = (label: string, hint: string) =>
+    h("div", { class: "field" }, h("label", { for: id }, label), input, h("p", { class: "hint muted", id: `${id}-hint` }, hint));
+  return { input, error, field };
 }
 
 // ---- the decision sheet ----
@@ -647,6 +926,7 @@ class Sheet {
   private step: Step | null = null;
   private target: ActionTarget | null = null;
   private prepared: PreparedAction | null = null;
+  /** Nickname chosen for a passkey being added ("" = let the server name it). */
   private goneNote: HTMLElement | null = null;
   private retry: (() => void) | null = null;
   /** Bumped whenever a flow starts or the sheet closes; async results for an older flow are
@@ -796,7 +1076,79 @@ class Sheet {
 
   openAddPasskey(): void {
     const target: ActionTarget = { ...PASSKEY_TARGET };
-    void this.prepare(this.begin(target), target, { action: "add" });
+    const seq = this.begin(target);
+    this.step = "choose";
+    const { input, error, field } = nicknameField("pk-new-name", "", "e.g. YubiKey on keyring");
+    const go = h("button", { class: "btn approve", type: "button" }, "Continue");
+    const submit = () => {
+      const name = input.value.trim();
+      const problem = name ? nicknameProblem(name) : null;
+      if (problem) {
+        error.textContent = problem;
+        input.focus();
+        return;
+      }
+      void this.prepare(seq, target, { action: "add", nickname: name }, () => this.openAddPasskey());
+    };
+    go.addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submit();
+    });
+    this.render(
+      h("h2", { id: "sheet-title" }, "Add a passkey"),
+      h("p", null, "First confirm with a passkey you already have. Then create the new one, on this device or another (the browser offers a QR code or a security key)."),
+      field("Name (optional)", "Leave it empty to name it after its password manager or key, like “Bitwarden”."),
+      error,
+      h("div", { class: "actions" }, this.cancelButton(), go),
+    );
+  }
+
+  openRename(p: PasskeyInfo): void {
+    const target = targetForPasskey(p);
+    const seq = this.begin(target);
+    this.step = "choose";
+    const { input, error, field } = nicknameField("pk-rename", p.nickname, "");
+    const go = h("button", { class: "btn approve", type: "button" }, "Continue");
+    const submit = () => {
+      const name = input.value.trim();
+      const problem = nicknameProblem(name) ?? (name === p.nickname ? "That is already its name." : null);
+      if (problem) {
+        error.textContent = problem;
+        input.focus();
+        return;
+      }
+      void this.prepare(seq, target, { action: "rename", nickname: name }, () => this.openRename(p));
+    };
+    go.addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submit();
+    });
+    this.render(
+      h("h2", { id: "sheet-title" }, "Rename passkey"),
+      passkeySummary(p),
+      field("New name", "Names are unique. Pick one that tells you where the passkey lives."),
+      error,
+      h("div", { class: "actions" }, this.cancelButton(), go),
+    );
+    input.select();
+  }
+
+  openRemove(p: PasskeyInfo): void {
+    const target = targetForPasskey(p);
+    const seq = this.begin(target);
+    if (!p.current) {
+      void this.prepare(seq, target, { action: "remove" }, () => this.openRemove(p));
+      return;
+    }
+    this.step = "choose";
+    const go = h("button", { class: "btn deny", type: "button" }, "Continue");
+    go.addEventListener("click", () => void this.prepare(seq, target, { action: "remove" }, () => this.openRemove(p)));
+    this.render(
+      h("h2", { id: "sheet-title" }, "Remove the passkey you signed in with?"),
+      passkeySummary(p),
+      h("p", { class: "warn" }, "You signed in with this passkey. Removing it signs you out here; sign in again with another passkey."),
+      h("div", { class: "actions" }, this.cancelButton(), go),
+    );
   }
 
   private working(text: string): void {
@@ -822,7 +1174,8 @@ class Sheet {
   private showConfirm(seq: number, p: PreparedAction): void {
     this.step = "confirm";
     const d = p.description;
-    const negative = p.choice.action !== "approve" && p.choice.action !== "add";
+    const negative = isNegative(p.choice.action);
+    const removingCurrent = p.canonical.object === "passkey" && p.canonical.action === "remove" && this.app.isCurrentPasskey(p.target.id);
     const confirm = h("button", { class: `btn confirm big ${negative ? "deny" : "approve"}`, type: "button", "data-autofocus": "" }, "Confirm with passkey");
     confirm.addEventListener("click", () => this.confirm(seq, p, confirm));
     this.render(
@@ -830,6 +1183,7 @@ class Sheet {
       h("p", { class: `headline ${negative ? "neg" : "pos"}` }, renderParts(d.headlineParts)),
       d.standingParts ? h("p", { class: "warn" }, renderParts(d.standingParts)) : null,
       d.warnings.map((w) => h("p", { class: "warn" }, vt(w))),
+      removingCurrent ? h("p", { class: "warn" }, "This is the passkey you signed in with: you will be signed out here.") : null,
       h(
         "details",
         { class: "signed" },
@@ -845,22 +1199,28 @@ class Sheet {
   private confirm(seq: number, p: PreparedAction, btn: HTMLButtonElement): void {
     if (!this.current(seq) || this.step !== "confirm" || Date.now() > p.validUntil) return;
     btn.disabled = true;
-    const isPasskey = p.target.object === "passkey";
+    const isAdd = p.target.object === "passkey" && p.canonical.action === "add";
     // Both start with auth.get(...) synchronously, i.e. still inside the user gesture.
-    const run = isPasskey ? authorizeAddPasskey(this.app.api, this.app.auth, p) : completeAction(this.app.api, this.app.auth, p);
+    const run = isAdd ? authorizeAddPasskey(this.app.api, this.app.auth, p) : completeAction(this.app.api, this.app.auth, p);
     // From here the signed action may reach the server: no Cancel, no Escape, until it settles.
     this.step = "signing";
     this.render(
       h("h2", { id: "sheet-title" }, "Waiting for your passkey"),
-      h("p", { class: `headline ${p.choice.action === "approve" || p.choice.action === "add" ? "pos" : "neg"}` }, renderParts(p.description.headlineParts)),
+      h("p", { class: `headline ${isNegative(p.choice.action) ? "neg" : "pos"}` }, renderParts(p.description.headlineParts)),
       h("p", { class: "spinner", role: "status" }, "Confirm on your device. This closes by itself."),
     );
     run.then(
       (res) => {
-        this.app.changed();
         if (this.step === "signing") this.step = "done";
+        const change = res as Partial<PasskeyChange> | null;
+        if (p.target.object === "passkey" && change && change.signed_out === true) {
+          // The removed passkey was this session's: the server ended the session.
+          this.app.signedOut(`Removed the passkey “${vt(p.canonical.nickname ?? "")}”. You signed in with it, so sign in again with another passkey.`);
+          return;
+        }
+        this.app.changed();
         if (!this.current(seq)) return;
-        if (isPasskey) this.showCreatePasskey(seq, res as PreparedRegistration);
+        if (isAdd) this.showCreatePasskey(seq, res as PreparedRegistration);
         else this.showDone(p, res);
       },
       (e) => {
@@ -878,12 +1238,21 @@ class Sheet {
     create.addEventListener("click", () => {
       if (!this.current(seq)) return;
       create.disabled = true;
+      // The nickname was signed with the add action; the server uses exactly that.
       completeRegistration(this.app.api, this.app.auth, reg).then(
-        () => {
+        (res) => {
           this.app.changed();
           if (!this.current(seq)) return;
           this.step = "done";
-          this.render(h("h2", { id: "sheet-title", class: "ok" }, "Passkey added"), h("p", null, "You can now sign in and approve with it."), h("div", { class: "actions" }, h("button", { class: "btn", type: "button", on: { click: () => this.close() } }, "Done")));
+          const pk = (res && typeof res === "object" ? (res as RegisterResult).passkey : undefined) ?? undefined;
+          this.render(
+            h("h2", { id: "sheet-title", class: "ok" }, "Passkey added"),
+            pk && typeof pk.nickname === "string"
+              ? h("p", null, "It's called ", h("bdi", { class: "val" }, vt(pk.nickname)), " (", vt(pk.authenticator || "Unknown authenticator"), "). You can rename it in the Passkeys list.")
+              : null,
+            h("p", null, "You can now sign in and approve with it."),
+            h("div", { class: "actions" }, h("button", { class: "btn", type: "button", "data-autofocus": "", on: { click: () => this.close() } }, "Done")),
+          );
         },
         (e) => {
           if (this.current(seq)) this.showError(e);
@@ -914,11 +1283,12 @@ class Sheet {
       );
       return;
     }
-    const words: Record<string, string> = { approve: "Approved", deny: "Denied", revoke: "Revoked" };
+    const words: Record<string, string> = { approve: "Approved", deny: "Denied", revoke: "Revoked", rename: "Renamed", remove: "Removed" };
     const lines: Child[] = [];
     if (c.object === "grant")
       lines.push("Marked revoked, with any auto-approval that issued it or came with it. aqmas on the host stops reusing it; the certificate itself stays valid until it expires (no revocation list yet).");
     else if (c.object === "standing") lines.push("Matching requests need your approval again.");
+    else if (c.object === "passkey" && c.action === "remove") lines.push("It can no longer sign in or approve anything here. Delete it from its password manager or key too if you no longer need it.");
     else if (c.object === "enrollment" && c.action === "approve") lines.push(h("span", null, h("bdi", null, vt(c.requesting_host ?? "The host")), " can now ask for access."));
     else if (c.object === "request" && c.action === "approve") {
       const notAfter = typeof r.grant?.not_after === "string" ? new Date(r.grant.not_after) : null;
@@ -936,7 +1306,7 @@ class Sheet {
       );
     }
     this.render(
-      h("h2", { id: "sheet-title", class: c.action === "approve" ? "ok" : "neg" }, words[c.action] ?? "Done"),
+      h("h2", { id: "sheet-title", class: c.action === "approve" || c.action === "rename" ? "ok" : "neg" }, words[c.action] ?? "Done"),
       h("p", { class: "headline" }, renderParts(p.description.headlineParts)),
       lines.map((l) => h("p", null, l)),
       h("div", { class: "actions" }, done),
