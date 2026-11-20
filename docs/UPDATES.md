@@ -36,13 +36,13 @@ Not built yet. Scheduled after milestone 2 (Cloudflare) and the UI round have la
 - The same workflow pushes `main` and tags to the GitHub mirror (Forgejo push mirror or a
   deploy-key push), and attaches the same `SHA256SUMS` to a GitHub release if wanted.
 
-### CLI self-update (`aqmas update`, plus an occasional background check)
+### CLI self-update (`aqmas upgrade`, plus an occasional background check)
 - At most once a day, when run interactively, the CLI checks the latest release; if newer it
   prints a one-line notice (never auto-installs, never prompts in non-TTY/agent use).
-- `aqmas update` downloads the binary for its OS/arch, verifies it against the release's
+- `aqmas upgrade` (owner's preferred name; `aqmas update` as an alias) downloads the binary for its OS/arch, verifies it against the release's
   `SHA256SUMS`, **shows the hash and version and asks for confirmation**, then replaces itself
   atomically (keeping `aqmas.prev` for rollback). Root-owned installs (`/usr/local/bin`) need
-  `sudo aqmas update`.
+  `sudo aqmas upgrade`.
 - **Cheap extra assurance (recommended):** also fetch `SHA256SUMS` from a second source and
   refuse on mismatch: the GitHub mirror's release, and/or aqmasd, which can build the same
   commit reproducibly on the bastion (see below) and publish its own hashes over the agent API.
