@@ -364,7 +364,8 @@ func TestBodiesAndUploads(t *testing.T) {
 	mp, ct := multipartBody(`{"main_module":"w.js","bindings":[]}`, strings.Repeat("y", 400))
 	r := h.call("PUT", s+"?excludeScript=true&bindings_inherit=strict", mp, gh("W", "Content-Type", ct))
 	expect(t, r, 200, "")
-	if u := h.cf.requests(); len(u) != 1 || len(u[0].Body) != len(mp) || u[0].Auth != "Bearer "+fakeParent || u[0].CT != ct {
+	// The upload is re-encoded from the parts aqmasd checked (same parts, new boundary).
+	if u := h.cf.requests(); len(u) != 1 || !strings.Contains(string(u[0].Body), strings.Repeat("y", 400)) || u[0].Auth != "Bearer "+fakeParent || !strings.HasPrefix(u[0].CT, "multipart/form-data; boundary=") {
 		t.Fatalf("upload %+v", len(u))
 	}
 	expect(t, h.call("PUT", s, strings.Repeat("y", 2000), g("W")), 413, api.CFErrBadRequest)

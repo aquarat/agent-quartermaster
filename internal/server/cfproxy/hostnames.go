@@ -68,6 +68,22 @@ func guardTunnelProtected(after, before any, protected []string) *finding {
 	if !reflect.DeepEqual(a, b) {
 		return refuseG(GProtectedHost, "ingress rules for protected hostnames may not be added, removed, reordered or changed")
 	}
+	// Order: a rule without a hostname (it matches every host, e.g. a path-only rule) may not
+	// come before a protected hostname's rule, except as the last (catch-all) rule.
+	if aHas {
+		ing := arr(obj(after)["ingress"])
+		lastProt := -1
+		for i, r := range ing {
+			if _, hit := protectedHit(str(obj(r)["hostname"]), protected); str(obj(r)["hostname"]) != "" && hit {
+				lastProt = i
+			}
+		}
+		for i, r := range ing[:lastProt+1] {
+			if strings.TrimSpace(str(obj(r)["hostname"])) == "" && i != len(ing)-1 {
+				return refuseG(GProtectedHost, "an ingress rule without a hostname (it matches every host) may not come before a protected hostname's rule")
+			}
+		}
+	}
 	if (aHas || bHas) && !reflect.DeepEqual(obj(after)["originRequest"], obj(before)["originRequest"]) {
 		return refuseG(GProtectedHost, "the config-wide originRequest applies to a protected hostname's rule and may not change")
 	}

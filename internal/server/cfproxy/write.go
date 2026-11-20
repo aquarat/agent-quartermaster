@@ -138,9 +138,9 @@ func (p *Proxy) serveWrite(w http.ResponseWriter, r *http.Request, c Caller, cal
 		scanner *markerScanner
 		fwdHdr  = r.Header
 	)
-	bindingsCheck := !admin && (route.Guard == cfscope.GuardWorkersBindings || route.Guard == cfscope.GuardPagesBindings)
+	bindingsCheck := !admin && (route.Guard == cfscope.GuardWorkersBindings || route.Guard == cfscope.GuardPagesBindings || route.Guard == cfscope.GuardPagesDeploy)
 	// Routes whose JSON body a guard rail or scope check reads: strict JSON (jsoncheck.go).
-	strict := (route.Guard != "" && route.Guard != cfscope.GuardWorkersBindings) || route.Snapshot == cfscope.SnapDNSName || bindingsCheck
+	strict := (route.Guard != "" && route.Guard != cfscope.GuardWorkersBindings && route.Guard != cfscope.GuardPagesDeploy) || route.Snapshot == cfscope.SnapDNSName || bindingsCheck
 	if route.Upload && !bindingsCheck {
 		if r.ContentLength > p.uploadMax {
 			refuseW(refuse(http.StatusRequestEntityTooLarge, api.CFErrBadRequest, "upload too large"), false)
@@ -175,7 +175,11 @@ func (p *Proxy) serveWrite(w http.ResponseWriter, r *http.Request, c Caller, cal
 			if !route.Upload {
 				names = []string{"settings", "metadata"}
 			}
-			ps, err := workerParts(ct, raw, names...)
+			mps, err := parseMultipartStrict(ct, raw)
+			var ps map[string]map[string]any
+			if err == nil {
+				ps, err = jsonParts(mps, names...)
+			}
 			if err == nil && len(ps) != 1 {
 				err = fmt.Errorf("the upload needs exactly one %s part", strings.Join(names, " or "))
 			}
@@ -184,6 +188,23 @@ func (p *Proxy) serveWrite(w http.ResponseWriter, r *http.Request, c Caller, cal
 				return
 			}
 			parts = ps
+			// Upstream gets exactly the parts aqmasd checked.
+			raw, ct = encodeMultipart(mps)
+			fwdHdr = r.Header.Clone()
+			fwdHdr.Set("Content-Type", ct)
+		case bindingsCheck && route.Guard == cfscope.GuardPagesDeploy:
+			mps, err := parseMultipartStrict(ct, raw)
+			if err != nil {
+				refuseW(refuse(http.StatusBadRequest, api.CFErrBadRequest, err.Error()), true)
+				return
+			}
+			if mps, err = checkPagesDeployment(mps, cd.res.Params[api.CFParamProject], p.cfg); err != nil {
+				refuseW(refuse(http.StatusForbidden, api.CFErrNoGrant, err.Error()), true)
+				return
+			}
+			raw, ct = encodeMultipart(mps)
+			fwdHdr = r.Header.Clone()
+			fwdHdr.Set("Content-Type", ct)
 		case strict && len(bytes.TrimSpace(b)) > 0:
 			if !requestIsJSON(ct) {
 				refuseW(refuse(http.StatusBadRequest, api.CFErrBadRequest, "the body must be application/json on this route"), false)

@@ -23,6 +23,10 @@ func TestExprCovers(t *testing.T) {
 		`lower(http.host) eq "app.example.com"`,
 		`http.host eq "app.example.com`, // unterminated
 		`http.host in {"app.example.com" "*.example.com"}`,
+		`http.host eq r#"app.example.com"#`,
+		`http.host eq r"app.example.com"`,
+		`http.host eq "\x69d.example.com"`,
+		`http.host eq "app.example.com" and http.request.uri.path eq "\u{2f}"`,
 	}
 	for _, e := range covers {
 		if c := exprCovers(e, prot); !c["id.example.com"] {
@@ -35,7 +39,6 @@ func TestExprCovers(t *testing.T) {
 		`(http.host eq "app.example.com" and ssl) and http.request.method eq "POST"`,
 		`http.request.uri.path eq "/" && http.host in {"a.example.com", "b.example.com"}`,
 		`http.host in {"app.example.com" "id.example.com"} and http.host eq "app.example.com"`,
-		`http.host eq r#"app.example.com"#`,
 	}
 	for _, e := range safe {
 		if c := exprCovers(e, prot); len(c) != 0 {

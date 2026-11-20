@@ -352,7 +352,7 @@ naming the guard; warnings answer normally with `X-Aqmas-Warning`. Each guard ha
 | `tunnel-access-aud` | tunnel PUT | removing or changing `originRequest.access` of a hostname that had it (e.g. a rule whose origin checks the Access aud) | yes |
 | `tunnel-version` | tunnel PUT | live config `version` differs from the version this host last read through the proxy (or the host never read it): 409, "GET the config again and re-apply your change" | yes |
 | `access-protected-hostname` | Access app POST/PUT | `domain`, any `self_hosted_domains[]`, or any `destinations[].uri`/`hostname` touching a protected hostname (below) | **never** |
-| `protected-hostname` | Workers custom domains (`PUT W/domains`, `S/domains/records`, `POST S/domains/changeset`; DELETE of one by id), Workers routes (`pattern`, also of the existing route on PUT/DELETE by id), Pages domains, R2 custom domains, DNS records (body, merged PATCH, before-snapshot), tunnel PUT | a hostname touching a protected hostname. Tunnel: the ingress rules for protected hostnames must stay byte-identical and in the same order (none added, removed or changed, no wildcard rule covering one added), and the config-wide `originRequest` must not change while such a rule exists | **never** |
+| `protected-hostname` | Workers custom domains (`PUT W/domains`, `S/domains/records`, `POST S/domains/changeset`; DELETE of one by id), Workers routes (`pattern`, also of the existing route on PUT/DELETE by id), Pages domains, R2 custom domains, DNS records (body, merged PATCH, before-snapshot), tunnel PUT | a hostname touching a protected hostname. Tunnel: the ingress rules for protected hostnames must stay byte-identical and in the same order (none added, removed or changed, no wildcard rule covering one added), no rule without a hostname (it matches every host) may come before one of them (except the last, catch-all rule), and the config-wide `originRequest` must not change while such a rule exists | **never** |
 | `access-patch` | Access app PATCH | always: "PATCH on Access apps fails with 10405: GET it, change it, PUT the whole object" | **never** |
 | `access-policy-shared` | policy/group PUT/DELETE | a `reusable` policy (or a group) referenced by more than one app (aqmasd counts via GET apps): "change which policy the app references instead" | yes |
 | `idp-delete` | IdP DELETE | always | yes |
@@ -363,7 +363,7 @@ naming the guard; warnings answer normally with `X-Aqmas-Warning`. Each guard ha
 | `workers-domain-remove` | Workers custom-domain DELETE | always (dropping a custom domain deletes its DNS record) | yes |
 | `redacted-write` | any write | body contains `[redacted by aqmas]` | **never** |
 | `ruleset-protected-hostname` | ruleset writes (entrypoint PUT, ruleset PUT by id, rule POST/PATCH), all phases but logging and managed-ruleset ones | a new rule that could match a protected hostname; a changed rule that newly could; a rule that could match one changing its `action`, `action_parameters` or becoming enabled. Unchanged rules (same id, expression, action, parameters, enabled) are not re-checked | **never** |
-| `ruleset-protected-removal` | the same writes and rule DELETE in `http_request_late_transform` / `http_request_firewall_custom` | a rule that could match a protected hostname stops matching it or is removed (such rules usually protect it, e.g. dropping a spoofable header) | yes |
+| `ruleset-protected-removal` | the same writes and rule DELETE in `http_request_late_transform` / `http_request_firewall_custom` | a rule that could match a protected hostname stops matching it, is disabled (`enabled` true → false) or is removed (such rules usually protect it, e.g. dropping a spoofable header) | yes |
 | `email-forward` | email routing rule POST/PUT, catch-all PUT, destination address POST | a `forward` action to an address not in `email_forward_allow`, a `worker` (or any other non-`drop`) action, a destination address not in the list | yes |
 
 **Protected hostnames** = `protected_access_hostnames` ∪ `protected_dns_names` (both empty by
@@ -375,7 +375,9 @@ it equals it, or a `*` wildcard in either covers the other (`*.example.com`, `*e
 **Ruleset expressions** "could match" a protected hostname unless the expression is a
 top-level conjunction (`and`/`&&` only, parentheses allowed) containing `http.host eq "x"`,
 `http.host == "x"` or `http.host in {"x" "y"}` conjuncts whose names all avoid it (every such
-conjunct must exclude it). Anything else (`true`, a path test, `or`, `not`, `ne`, `lower(…)`,
+conjunct must exclude it). Strings may use only the `\"` and `\\` escapes; any other escape
+(`\x69`, …) or a raw string (`r"…"`, `r#"…"#`) makes the expression unjudgeable, which counts
+as matching every protected hostname. Anything else (`true`, a path test, `or`, `not`, `ne`, `lower(…)`,
 `ends_with`/`contains`/`wildcard`/`matches` on `http.host` or the URI) could. Adding or removing
 unprotected names in an `http.host in {…}` set of a rule that already covers a protected
 hostname is allowed when its action and parameters stay the same. A new
@@ -386,8 +388,13 @@ body must be `application/json` (aqmasd forwards it as exactly that), valid UTF-
 object may have two keys that are equal ignoring case (Unicode simple folding, exact
 duplicates included) or a key that folds to a field aqmasd reads without being spelled exactly
 so (`Domain`, `OriginRequest`, `ſql`, …): 400 `bad_request`. Workers uploads (`PUT S`, `POST
-S/versions`, multipart `PATCH S/settings`) must be `multipart/form-data` with exactly one
-`metadata` (`settings`) part, spelled exactly, without a transfer encoding, holding such JSON.
+S/versions`, multipart `PATCH S/settings`, Pages `POST …/deployments`) must be
+`multipart/form-data` where every part has exactly one parseable `Content-Disposition`
+(`form-data`, a unique printable-ASCII `name`, optionally `filename`, no other or RFC 2231
+parameters), at most one `Content-Type` and no other header; Workers uploads have exactly one
+`metadata` (`settings`) part, spelled exactly, holding such JSON. aqmasd re-encodes the body
+from the parts it checked (new boundary, no preamble/epilogue), so Cloudflare receives exactly
+what was checked.
 
 Warnings (never refuse): tunnel PUT adds a hostname with no proxied DNS record in a configured
 zone or no Access app (best effort, from GETs aqmasd makes after the PUT); DNS write of a
@@ -407,8 +414,11 @@ access=migrate;db=…`, `cf.admin` for purge-everything).
 never-overridable one answers 400 `bad_request` before anything is read or written.
 **Data bindings** (cf.workers.deploy, cf.pages): the `bindings[]` of a Workers upload's
 `metadata` part or settings PATCH, its `tail_consumers[]` (a tail consumer receives the
-script's logs), and the `deployment_configs.{production,preview}` bindings of a Pages project
-PATCH may only name data listed for that script / project in `[[cloudflare.worker_bindings]]`
+script's logs), its Durable Object `migrations` (every `from_script`, also inside `steps[]`,
+must be the script itself or allowed as `durable_object:<from_script>`: a transfer takes over
+the other script's objects), the `deployment_configs.{production,preview}` bindings of a Pages
+project PATCH, and the `metadata` of the `_worker.bundle` part of a Pages deployment (the
+bundle carries the bindings of the project's wrangler config) may only name data listed for that script / project in `[[cloudflare.worker_bindings]]`
 (`d1:<configured db name>`, `r2:<bucket>`, `kv:<namespace-id>`, `service:<script>`,
 `queue:<name>`, `durable_object:<script or namespace id>`, `hyperdrive:<id>`,
 `vectorize:<index>`, `analytics_engine:<dataset>`, `secrets_store:<store>/<secret>`,
@@ -416,9 +426,12 @@ PATCH may only name data listed for that script / project in `[[cloudflare.worke
 `send_email:<binding name>`). Free: `plain_text`, `secret_text`, `json`, `assets`,
 `version_metadata`, `ai`, `browser`, `inherit`, `wasm_module`, `text_blob`, `data_blob`,
 `images`, `ratelimit`, `media`, `secret_key`, a service binding to itself, Durable Objects and
-workflows of the script itself. Unknown binding types and unknown Pages config keys are
-refused. No entry = no data bindings. (Pages deployments carry no bindings: `wrangler pages
-deploy` uploads only `_worker.bundle`, `_routes.json` and the manifest.) Child tokens cannot
+workflows of the script itself. Unknown binding types, unknown Pages config keys and alias fields
+(`database_name`, a D1 `id` and `database_id` that differ, `id` on KV/R2/queue bindings, …)
+are refused. A Pages deployment may only have the parts `wrangler pages deploy` sends
+(`manifest`, `branch`, `commit_*`, `_headers`, `_redirects`, `_routes.json`, `_worker.bundle`,
+`functions-filepath-routing-config.json`, `wrangler_config_hash`, `pages_build_output_dir`).
+No entry = no data bindings. Child tokens cannot
 enforce any of this (noted on the card).
 
 **D1 bodies**: exactly `{"sql", "params"?}`, `{"batch": [{"sql", "params"?}…]}` or

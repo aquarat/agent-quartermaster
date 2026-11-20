@@ -40,9 +40,10 @@ type exprTok struct {
 	str bool // a string literal (s is its value)
 }
 
-// exprTokens tokenises a Cloudflare rules expression (wirefilter): strings ("..." with
-// escapes, r"..." / r#"..."#), punctuation and operators, words. ok=false when a string is
-// not terminated.
+// exprTokens tokenises a Cloudflare rules expression (wirefilter): strings ("..." with only
+// \" and \\ escapes), punctuation and operators, words. ok=false (unjudgeable: the rule
+// counts as covering every protected hostname) for an unterminated string, any other escape,
+// or a raw string.
 func exprTokens(e string) ([]exprTok, bool) {
 	var out []exprTok
 	for i := 0; i < len(e); {
@@ -54,7 +55,12 @@ func exprTokens(e string) ([]exprTok, bool) {
 			var b strings.Builder
 			j := i + 1
 			for ; j < len(e) && e[j] != '"'; j++ {
-				if e[j] == '\\' && j+1 < len(e) {
+				if e[j] == '\\' {
+					// Only \" and \\ can be judged; any other escape (\x69 = "i", ...)
+					// makes the whole expression unjudgeable.
+					if j+1 >= len(e) || (e[j+1] != '"' && e[j+1] != '\\') {
+						return nil, false
+					}
 					j++
 				}
 				b.WriteByte(e[j])
@@ -64,22 +70,8 @@ func exprTokens(e string) ([]exprTok, bool) {
 			}
 			out = append(out, exprTok{s: b.String(), str: true})
 			i = j + 1
-		case c == 'r' && i+1 < len(e) && (e[i+1] == '"' || e[i+1] == '#'):
-			j := i + 1
-			hashes := 0
-			for j < len(e) && e[j] == '#' {
-				hashes++
-				j++
-			}
-			if j >= len(e) || e[j] != '"' {
-				goto word
-			}
-			end := strings.Index(e[j+1:], "\""+strings.Repeat("#", hashes))
-			if end < 0 {
-				return nil, false
-			}
-			out = append(out, exprTok{s: e[j+1 : j+1+end], str: true})
-			i = j + 1 + end + 1 + hashes
+		case c == 'r' && i+1 < len(e) && (e[i+1] == '"' || e[i+1] == '#') && (i == 0 || strings.IndexByte(" \t\n\r(){}[],=!<>&|^~", e[i-1]) >= 0):
+			return nil, false // raw strings (r"…", r#"…"#): judged conservatively as unjudgeable
 		case strings.IndexByte("(){}[],", c) >= 0:
 			out = append(out, exprTok{s: string(c)})
 			i++
@@ -281,6 +273,9 @@ func guardRulesetProtected(phase string, written []map[string]any, prior map[str
 			fs = append(fs, refuseG(GRulesetProtected, "the changed rule %s would newly match the protected hostname %s", asciiOnly(str(r["id"])), sortedKeys(newly)))
 		case len(kept) > 0 && (str(r["action"]) != str(old["action"]) || !reflect.DeepEqual(r["action_parameters"], old["action_parameters"]) || (ruleEnabled(r) && !ruleEnabled(old))):
 			fs = append(fs, refuseG(GRulesetProtected, "rule %s matches the protected hostname %s: its action, action_parameters and enabled state may not change", asciiOnly(str(r["id"])), sortedKeys(kept)))
+		}
+		if protectivePhases[phase] && len(pc) > 0 && ruleEnabled(old) && !ruleEnabled(r) {
+			fs = append(fs, refuseG(GRulesetProtectedRemoval, "disabling rule %s drops coverage of the protected hostname %s (it likely protects it)", asciiOnly(str(r["id"])), sortedKeys(pc)))
 		}
 		if len(dropped) > 0 && protectivePhases[phase] {
 			fs = append(fs, refuseG(GRulesetProtectedRemoval, "rule %s would stop covering the protected hostname %s (it likely protects it)", asciiOnly(str(r["id"])), sortedKeys(dropped)))
