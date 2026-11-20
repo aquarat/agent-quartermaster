@@ -97,18 +97,6 @@ type Route struct {
 	Redact []string
 }
 
-// Denied reports whether the call is on the deny-list (section 3), which no scope, not even
-// cf.admin, can pass. The reason is safe to show.
-func (c *Catalogue) Denied(call Call) (bool, string) { return true, "not implemented" }
-
-// Match returns the first route of the grant's scope (with its resolved parameters) that
-// allows the call, or ok=false.
-func (c *Catalogue) Match(r *Resolved, call Call) (Route, bool) { return Route{}, false }
-
-// NeedsScope returns the narrowest scope (and canonical params) that would allow the call,
-// for the X-Aqmas-Needs-Scope hint: "" when none but cf.admin does.
-func (c *Catalogue) NeedsScope(call Call) string { return "" }
-
 // IsWrite reports whether method m changes state.
 func IsWrite(m string) bool {
 	return m != http.MethodGet && m != http.MethodHead
