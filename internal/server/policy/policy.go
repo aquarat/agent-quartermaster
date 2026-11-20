@@ -55,6 +55,10 @@ type Rule struct {
 	MaxTTL      int
 	ExpiresAt   time.Time
 	Revoked     bool
+	// Kind "cloudflare": the exact scope, canonical scope_params and mode ("proxy").
+	Scope       string
+	ScopeParams string
+	Mode        string
 }
 
 // Candidate is a new request that might be auto-approved.
@@ -65,12 +69,22 @@ type Candidate struct {
 	Target      string
 	LoginUser   string
 	TTL         int // after clamping
+	Scope       string
+	ScopeParams string
+	Mode        string
 }
+
+// KindCloudflare mirrors api.KindCloudflare; ModeProxy mirrors api.CFModeProxy.
+const (
+	KindCloudflare = "cloudflare"
+	ModeProxy      = "proxy"
+)
 
 // Matches reports whether rule auto-approves c at now: same enrolled host connecting from the
 // same address as the request the owner approved, kind, target and login user, TTL within the
 // rule's maximum, rule neither expired nor revoked. Binding the address means a host's stolen
-// client key used from another machine gets no silent approvals.
+// client key used from another machine gets no silent approvals. Cloudflare rules also need the
+// identical scope and scope_params, and match proxy-mode requests only (never child tokens).
 func Matches(r Rule, c Candidate, now time.Time) bool {
 	return !r.Revoked &&
 		now.Before(r.ExpiresAt) &&
@@ -79,5 +93,9 @@ func Matches(r Rule, c Candidate, now time.Time) bool {
 		r.Kind == c.Kind &&
 		r.Target == c.Target &&
 		r.LoginUser == c.LoginUser &&
+		r.Scope == c.Scope &&
+		r.ScopeParams == c.ScopeParams &&
+		r.Mode == c.Mode &&
+		(c.Kind != KindCloudflare || (c.Mode == ModeProxy && c.Scope != "")) &&
 		c.TTL > 0 && c.TTL <= r.MaxTTL
 }

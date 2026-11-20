@@ -18,6 +18,7 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
 	"github.com/aquarat/agent-quartermaster/internal/server/cfaccess"
+	"github.com/aquarat/agent-quartermaster/internal/server/cfscope"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
 	"github.com/aquarat/agent-quartermaster/internal/webui"
@@ -475,7 +476,8 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 	}
 	for _, st := range sts {
 		out.Standing = append(out.Standing, api.StandingApproval{ID: st.ID, RequestingHost: st.HostName, Kind: st.Kind,
-			TargetHost: st.TargetHost, LoginUser: st.LoginUser, MaxTTLSeconds: st.MaxTTL, ExpiresAt: st.ExpiresAt, Uses: st.Uses})
+			TargetHost: st.TargetHost, LoginUser: st.LoginUser, MaxTTLSeconds: st.MaxTTL, ExpiresAt: st.ExpiresAt, Uses: st.Uses,
+			Scope: st.Scope, ScopeParams: st.ScopeParams, Mode: st.Mode})
 	}
 	gs, err := q.ActiveGrants(ctx, now)
 	if err != nil {
@@ -484,7 +486,8 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 	}
 	for _, g := range gs {
 		out.Grants = append(out.Grants, api.GrantSummary{ID: g.ID, Kind: g.Kind, Status: g.Status(now),
-			TargetHost: g.TargetHost, LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter, RequestingHost: g.HostName})
+			TargetHost: g.TargetHost, LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter, RequestingHost: g.HostName,
+			Scope: g.Scope, ScopeParams: g.ScopeParams, Mode: g.Mode})
 	}
 	if out.Recent, err = q.RecentAudit(ctx, 50); err != nil {
 		s.writeErr(w, r, err)
@@ -501,6 +504,9 @@ func (s *Server) highRisk(rq *store.Request) bool {
 }
 
 func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.PendingItem, error) {
+	if rq.Kind == api.KindCloudflare {
+		return s.cfRequestItem(ctx, rq)
+	}
 	similar, err := s.store.Q().CountSimilar(ctx, rq.HostID, rq.TargetHost, rq.LoginUser, s.now().Add(-7*24*time.Hour))
 	if err != nil {
 		return nil, err
@@ -514,6 +520,42 @@ func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.Pendi
 		RequestingHost: rq.HostName, RequestingAddress: rq.PeerAddress, Requester: rq.Requester, Reason: rq.Reason,
 		SSH:          &api.PendingSSH{TargetHost: rq.TargetHost, LoginUser: rq.LoginUser, KeyFingerprint: rq.KeyFingerprint},
 		TTLRequested: rq.TTLRequested, TTLMax: rq.TTLRequested, Risk: risk, SimilarRecent: similar,
+	}, nil
+}
+
+// cfRequestItem is the approval card of a Cloudflare request (docs/API.md 5.7).
+func (s *Server) cfRequestItem(ctx context.Context, rq *store.Request) (*api.PendingItem, error) {
+	similar, err := s.store.Q().CountSimilarScope(ctx, rq.HostID, rq.Scope, s.now().Add(-7*24*time.Hour))
+	if err != nil {
+		return nil, err
+	}
+	pc := &api.PendingCloudflare{Scope: rq.Scope, Params: map[string]string{}, ScopeParams: rq.ScopeParams, Mode: rq.Mode,
+		IPCondition: rq.IPCondition, Title: rq.Scope, Risk: api.CFRiskHigh}
+	if p, err := cfscope.ParseParams(rq.ScopeParams); err == nil {
+		pc.Params = p
+	}
+	if s.cf.cat != nil {
+		if sc, ok := s.cf.cat.Lookup(rq.Scope); ok {
+			pc.Title, pc.Description, pc.Risk = sc.Title, sc.Description, sc.Risk
+			pc.StandingAllowed = sc.StandingAllowed && rq.Mode == api.CFModeProxy
+		}
+		if res, err := s.cf.cat.Reparse(rq.Scope, rq.ScopeParams, rq.Mode); err == nil {
+			pc.Permissions, pc.Notes = res.Permissions, res.Notes
+		} else if rq.Status == api.StatusPending {
+			pc.StandingAllowed = false
+			pc.Notes = append(pc.Notes, "This request can no longer be approved: "+err.Error())
+		}
+	} else if rq.Status == api.StatusPending {
+		pc.Notes = []string{"Cloudflare is not enabled on this aqmasd: this request cannot be approved."}
+	}
+	risk := "normal"
+	if pc.Risk == api.CFRiskHigh || pc.Risk == api.CFRiskAdmin {
+		risk = "high"
+	}
+	return &api.PendingItem{
+		ID: rq.ID, Kind: rq.Kind, CreatedAt: rq.CreatedAt, ExpiresAt: rq.ExpiresAt,
+		RequestingHost: rq.HostName, RequestingAddress: rq.PeerAddress, Requester: rq.Requester, Reason: rq.Reason,
+		Cloudflare: pc, TTLRequested: rq.TTLRequested, TTLMax: rq.TTLRequested, Risk: risk, SimilarRecent: similar,
 	}, nil
 }
 
@@ -567,10 +609,16 @@ func (s *Server) notifyDecision(sg canon.Signed) {
 	switch a.Object {
 	case canon.ObjectRequest:
 		text = fmt.Sprintf("aqmas: %s %s %s@%s for %s, ttl %ds, standing %dh", a.Action, a.Kind, a.LoginUser, a.Target, a.RequestingHost, a.TTLSeconds, a.StandingHours)
+		if a.Kind == api.KindCloudflare {
+			text = fmt.Sprintf("aqmas: %s cloudflare %s (%s) for %s, ttl %ds, standing %dh", a.Action, cfDesc(a.Scope, a.ScopeParams), a.Mode, a.RequestingHost, a.TTLSeconds, a.StandingHours)
+		}
 	case canon.ObjectEnrollment:
 		text = fmt.Sprintf("aqmas: %s enrollment of %s (replaces existing: %t)", a.Action, a.RequestingHost, a.Replaces)
 	case canon.ObjectStanding, canon.ObjectGrant:
 		text = fmt.Sprintf("aqmas: %s %s %s@%s for %s", a.Action, a.Object, a.LoginUser, a.Target, a.RequestingHost)
+		if a.Kind == api.KindCloudflare {
+			text = fmt.Sprintf("aqmas: %s %s cloudflare %s (%s) for %s", a.Action, a.Object, cfDesc(a.Scope, a.ScopeParams), a.Mode, a.RequestingHost)
+		}
 	}
 	text += fmt.Sprintf(" [ref %s]", ref(a.ID))
 	s.notify.Send("aqmas: decision", text, s.cfg.PublicBaseURL+"/")
@@ -673,6 +721,9 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 		if err := s.apply(ctx, sg, pkID); err != nil {
 			s.writeErr(w, r, err)
 			return
+		}
+		if object == canon.ObjectGrant {
+			s.afterGrantRevoke(ctx, id) // token grants: delete the child token upstream now
 		}
 		s.bcast.notify()
 		s.notifyDecision(sg)

@@ -90,6 +90,9 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 		if h, err := q.GetHost(ctx, r.HostID); err != nil || h.RevokedAt != nil {
 			return a, errConflict("the requesting host's identity was revoked")
 		}
+		if r.Kind == api.KindCloudflare {
+			return s.buildCFRequestAction(a, r, in)
+		}
 		a.RequestingHost, a.Kind, a.Target, a.LoginUser, a.KeyFingerprint = r.HostName, r.Kind, r.TargetHost, r.LoginUser, r.KeyFingerprint
 		if in.Action == canon.ActionApprove {
 			ttl, err := policy.ApproverTTL(r.TTLRequested, in.TTLSeconds, s.cfg.TTL)
@@ -138,6 +141,7 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 			return a, errConflict("already revoked")
 		}
 		a.RequestingHost, a.Kind, a.Target, a.LoginUser, a.TTLSeconds = st.HostName, st.Kind, st.TargetHost, st.LoginUser, st.MaxTTL
+		a.Scope, a.ScopeParams, a.Mode = st.Scope, st.ScopeParams, st.Mode // kind "cloudflare"; empty for ssh
 	case canon.ObjectGrant:
 		if in.Action != canon.ActionRevoke || in.TTLSeconds != 0 || in.StandingHours != 0 {
 			return a, errBad("grants can only be revoked")
@@ -150,6 +154,7 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 			return a, errConflict("already revoked")
 		}
 		a.RequestingHost, a.Kind, a.Target, a.LoginUser = g.HostName, g.Kind, g.TargetHost, g.LoginUser
+		a.Scope, a.ScopeParams, a.Mode = g.Scope, g.ScopeParams, g.Mode // kind "cloudflare"; empty for ssh
 	case canon.ObjectPasskey:
 		if in.Action != canon.ActionAdd || in.TTLSeconds != 0 || in.StandingHours != 0 {
 			return a, errBad(`action must be "add"`)
@@ -158,6 +163,73 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 		return a, errBad("unknown object")
 	}
 	return a, nil
+}
+
+// buildCFRequestAction is buildAction for a pending Cloudflare request (docs/API.md 5.4).
+func (s *Server) buildCFRequestAction(a canon.Action, r *store.Request, in api.ChallengeRequest) (canon.Action, error) {
+	a.RequestingHost, a.Kind, a.Scope, a.ScopeParams, a.Mode, a.IPCondition = r.HostName, r.Kind, r.Scope, r.ScopeParams, r.Mode, r.IPCondition
+	if in.Action != canon.ActionApprove {
+		if in.TTLSeconds != 0 || in.StandingHours != 0 {
+			return a, errBad("deny takes no ttl_seconds or standing_hours")
+		}
+		return a, nil
+	}
+	res, err := s.cfCheckApprovable(r)
+	if err != nil {
+		return a, err
+	}
+	ttl, err := policy.ApproverTTL(r.TTLRequested, in.TTLSeconds, s.cfg.TTL)
+	if err != nil {
+		return a, errBad(err.Error())
+	}
+	if err := policy.StandingHours(in.StandingHours, s.cfg.TTL); err != nil {
+		return a, errBad(err.Error())
+	}
+	if in.StandingHours > 0 && !(res.Scope.StandingAllowed && r.Mode == api.CFModeProxy) {
+		return a, errBad("no standing approvals for this scope or for child tokens")
+	}
+	a.TTLSeconds, a.StandingHours = ttl, in.StandingHours
+	return a, nil
+}
+
+// applyCFApprove approves a Cloudflare request inside apply's transaction, re-checking the
+// signed values against the current config and policy.
+func (s *Server) applyCFApprove(ctx context.Context, q *store.Q, r *store.Request, a canon.Action, detail string, now time.Time) error {
+	res, err := s.cfCheckApprovable(r)
+	if err != nil {
+		return err
+	}
+	if a.TTLSeconds <= 0 || a.TTLSeconds > r.TTLRequested || a.TTLSeconds > res.Scope.MaxTTL || a.TTLSeconds > s.cfg.TTL.MaxSeconds {
+		return errConflict("signed ttl outside policy")
+	}
+	if a.StandingHours > 0 && (a.StandingHours > s.cfg.TTL.MaxStandingHours || !res.Scope.StandingAllowed || r.Mode != api.CFModeProxy) {
+		return errConflict("signed standing_hours outside policy")
+	}
+	if err := q.DecideRequest(ctx, r.ID, api.StatusApproved, "approved by owner", now); err != nil {
+		return decideErr(err)
+	}
+	g, err := s.issueCFGrant(ctx, q, r, a.TTLSeconds, now)
+	if err != nil {
+		return err
+	}
+	what := cfDesc(r.Scope, r.ScopeParams)
+	if err := q.Audit(ctx, now, "owner", "approve", "request:"+r.ID,
+		fmt.Sprintf("grant=%s cloudflare %s mode=%s for %s ttl=%d ip=%s src=%s %s", g.ID, what, r.Mode, r.HostName, a.TTLSeconds, r.IPCondition, r.PeerAddress, detail)); err != nil {
+		return err
+	}
+	if a.StandingHours == 0 {
+		return nil
+	}
+	st := &store.Standing{
+		ID: ids.New(), HostID: r.HostID, HostName: r.HostName, Kind: r.Kind, MaxTTL: a.TTLSeconds, CreatedAt: now,
+		ExpiresAt: now.Add(time.Duration(a.StandingHours) * time.Hour), SourceRequestID: r.ID, PeerAddress: r.PeerAddress,
+		Scope: r.Scope, ScopeParams: r.ScopeParams, Mode: r.Mode,
+	}
+	if err := q.InsertStanding(ctx, st); err != nil {
+		return err
+	}
+	return q.Audit(ctx, now, "owner", "standing_create", "standing:"+st.ID,
+		fmt.Sprintf("host=%s cloudflare %s mode=%s max_ttl=%d hours=%d %s", r.HostName, what, r.Mode, a.TTLSeconds, a.StandingHours, detail))
 }
 
 func mapNotFound(err error) error {
@@ -191,7 +263,8 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 			}
 			// The stored request must still be the one that was signed.
 			if r.HostName != a.RequestingHost || r.Kind != a.Kind || r.TargetHost != a.Target ||
-				r.LoginUser != a.LoginUser || r.KeyFingerprint != a.KeyFingerprint {
+				r.LoginUser != a.LoginUser || r.KeyFingerprint != a.KeyFingerprint ||
+				r.Scope != a.Scope || r.ScopeParams != a.ScopeParams || r.Mode != a.Mode || r.IPCondition != a.IPCondition {
 				return errConflict("request changed since the challenge was issued")
 			}
 			if h, err := q.GetHost(ctx, r.HostID); err != nil || h.RevokedAt != nil {
@@ -202,6 +275,9 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 					return decideErr(err)
 				}
 				return q.Audit(ctx, now, "owner", "deny", "request:"+r.ID, detail)
+			}
+			if r.Kind == api.KindCloudflare {
+				return s.applyCFApprove(ctx, q, r, a, detail, now)
 			}
 			if a.TTLSeconds <= 0 || a.TTLSeconds > r.TTLRequested || a.TTLSeconds > s.cfg.TTL.MaxSeconds {
 				return errConflict("signed ttl outside policy")
@@ -285,6 +361,14 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 			return q.Audit(ctx, now, "owner", "enroll_approve", "enrollment:"+e.ID, "hostname="+e.Hostname+" key="+e.KeyFingerprint+replaced+" "+detail)
 
 		case canon.ObjectStanding:
+			st, err := q.GetStanding(ctx, a.ID)
+			if err != nil {
+				return mapNotFound(err)
+			}
+			if st.HostName != a.RequestingHost || st.Kind != a.Kind || st.TargetHost != a.Target || st.LoginUser != a.LoginUser ||
+				st.Scope != a.Scope || st.ScopeParams != a.ScopeParams || st.Mode != a.Mode {
+				return errConflict("standing approval changed since the challenge was issued")
+			}
 			if err := q.RevokeStanding(ctx, a.ID, now); err != nil {
 				return decideErr(err)
 			}
@@ -294,6 +378,10 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 			g, err := q.GetGrant(ctx, a.ID)
 			if err != nil {
 				return mapNotFound(err)
+			}
+			if g.HostName != a.RequestingHost || g.Kind != a.Kind || g.TargetHost != a.Target || g.LoginUser != a.LoginUser ||
+				g.Scope != a.Scope || g.ScopeParams != a.ScopeParams || g.Mode != a.Mode {
+				return errConflict("grant changed since the challenge was issued")
 			}
 			if err := q.RevokeGrant(ctx, a.ID, now); err != nil {
 				return decideErr(err)
@@ -317,6 +405,13 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				} else if !errors.Is(err, store.ErrConflict) {
 					return err
 				}
+			}
+			if g.Kind == api.KindCloudflare {
+				what := "proxy access ends now"
+				if g.Mode == api.CFModeToken {
+					what = "child token deleted upstream"
+				}
+				return q.Audit(ctx, now, "owner", "grant_revoke", "grant:"+a.ID, "cloudflare "+cfDesc(g.Scope, g.ScopeParams)+": "+what+" "+detail)
 			}
 			return q.Audit(ctx, now, "owner", "grant_revoke", "grant:"+a.ID, "certificate stays valid until "+g.NotAfter.Format(time.RFC3339)+" "+detail)
 		}

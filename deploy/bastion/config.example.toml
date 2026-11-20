@@ -29,6 +29,46 @@ team_domain = ""  # e.g. "<team>.cloudflareaccess.com"
 aud         = ""  # the Access application's AUD tag
 owner_email = ""  # if set, the Access identity's email must match; sessions are bound to its sub
 
+# Cloudflare API access through aqmasd (milestone 2, docs/CLOUDFLARE.md). Off unless enabled.
+# The parent tokens are NOT in this file: they are root-owned files in /etc/aqmas handed over by
+# systemd LoadCredential= (see aqmasd.service), referred to here by credential name.
+# [cloudflare]
+# enabled    = true
+# account_id = "<32 lowercase hex>"
+# proxy_token_credential  = "cf-proxy-token"    # LoadCredential=cf-proxy-token:/etc/aqmas/cf-proxy-token
+# minter_token_credential = "cf-minter-token"   # optional: without it token mode is off
+# # proxy_token_file = "/etc/aqmas/cf-proxy-token"  # alternative: owned by user aqmas, mode 0600/0400
+# token_ip_condition = ["<static home IPv4>/32"] # child tokens only work from here; empty = token mode off
+# # snapshot_dir = "/var/lib/aqmas/cf-snapshots"   # default <data_dir>/cf-snapshots
+# # snapshot_retention_days = 7                    # 1..7; newest per object always kept
+# # rate_per_minute = 600
+# # write_rate_per_minute = 60
+# # protected_access_hostnames = ["id.example.com"]
+# # traefik_origin = "https://192.0.2.50:9443"
+# # traefik_plain_origins = ["http://192.0.2.50", "http://192.0.2.50:80"]
+# # protected_dns_names = ["id.example.com"]
+#
+# # Names agents use in scope parameters; aqmasd maps them to ids. Anything not listed here can
+# # only be reached with cf.admin.
+# [[cloudflare.zones]]
+# name = "example.com"
+# id   = "<32 hex zone id>"
+# [[cloudflare.tunnels]]
+# name = "home"
+# id   = "<tunnel uuid>"
+# [[cloudflare.d1_databases]]
+# name = "app-db"
+# id   = "<database uuid>"
+#
+# # Built-in scopes can only be narrowed:
+# [cloudflare.scopes."cf.read"]
+# no_auto_approve = true
+# [cloudflare.scopes."cf.email"]
+# disabled = true
+# [cloudflare.scopes."cf.workers.deploy"]
+# max_ttl_seconds = 3600
+# no_token_mode   = true
+
 # Hosts aqmas may issue SSH certificates for. Principal: "<login_user>@<name>" (see docs/HOSTS.md).
 [[targets]]
 name     = "db-1"

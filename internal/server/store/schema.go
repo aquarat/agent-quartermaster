@@ -151,4 +151,31 @@ BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 ALTER TABLE standing ADD COLUMN peer_address TEXT NOT NULL DEFAULT '';
 ALTER TABLE enrollments ADD COLUMN poll_token_hash TEXT NOT NULL DEFAULT '';
 `,
+	// 3 (milestone 2): Cloudflare requests, grants and standing approvals. SSH rows keep these
+	// empty; Cloudflare rows keep the SSH columns (target_host, login_user, public_key,
+	// key_fingerprint, principals, certificate) empty. grants.peer_address is the address of the
+	// request that created the grant (the proxy only serves calls from it). Child-token values
+	// are never stored, only their upstream id.
+	`
+ALTER TABLE requests ADD COLUMN scope        TEXT NOT NULL DEFAULT '';
+ALTER TABLE requests ADD COLUMN scope_params TEXT NOT NULL DEFAULT '';
+ALTER TABLE requests ADD COLUMN mode         TEXT NOT NULL DEFAULT '';
+ALTER TABLE requests ADD COLUMN ip_condition TEXT NOT NULL DEFAULT '';
+CREATE INDEX requests_similar_scope ON requests(host_id, scope, created_at);
+
+ALTER TABLE grants ADD COLUMN scope            TEXT NOT NULL DEFAULT '';
+ALTER TABLE grants ADD COLUMN scope_params     TEXT NOT NULL DEFAULT '';
+ALTER TABLE grants ADD COLUMN mode             TEXT NOT NULL DEFAULT '';
+ALTER TABLE grants ADD COLUMN ip_condition     TEXT NOT NULL DEFAULT '';
+ALTER TABLE grants ADD COLUMN peer_address     TEXT NOT NULL DEFAULT '';
+ALTER TABLE grants ADD COLUMN token_id         TEXT NOT NULL DEFAULT '';
+ALTER TABLE grants ADD COLUMN token_delivered  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE grants ADD COLUMN token_deleted_at INTEGER;
+CREATE INDEX grants_kind_host ON grants(kind, host_id, not_after);
+CREATE INDEX grants_token ON grants(token_id) WHERE token_id != '';
+
+ALTER TABLE standing ADD COLUMN scope        TEXT NOT NULL DEFAULT '';
+ALTER TABLE standing ADD COLUMN scope_params TEXT NOT NULL DEFAULT '';
+ALTER TABLE standing ADD COLUMN mode         TEXT NOT NULL DEFAULT '';
+`,
 }

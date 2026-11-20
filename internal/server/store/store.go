@@ -391,12 +391,21 @@ func (q *Q) InsertHost(ctx context.Context, h *Host) (int64, error) {
 	return res.LastInsertId()
 }
 
-// RevokeHost marks a host identity revoked and revokes its standing approvals.
+// RevokeHost marks a host identity revoked and revokes its standing approvals and its
+// Cloudflare grants (the sweeper then deletes their child tokens upstream; SSH certificates
+// cannot be recalled and stay as they are).
 func (q *Q) RevokeHost(ctx context.Context, id int64, now time.Time) error {
 	if err := one(q.q.ExecContext(ctx, "UPDATE hosts SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", ms(now), id)); err != nil {
 		return err
 	}
 	if _, err := q.q.ExecContext(ctx, "UPDATE standing SET revoked_at = ? WHERE host_id = ? AND revoked_at IS NULL", ms(now), id); err != nil {
+		return err
+	}
+	if _, err := q.q.ExecContext(ctx, `UPDATE requests SET status = 'revoked' WHERE status = 'approved' AND id IN
+		(SELECT request_id FROM grants WHERE host_id = ? AND kind = 'cloudflare' AND revoked_at IS NULL)`, id); err != nil {
+		return err
+	}
+	if _, err := q.q.ExecContext(ctx, "UPDATE grants SET revoked_at = ? WHERE host_id = ? AND kind = 'cloudflare' AND revoked_at IS NULL", ms(now), id); err != nil {
 		return err
 	}
 	_, err := q.q.ExecContext(ctx, "UPDATE requests SET status = 'expired', decision_note = 'host identity revoked', decided_at = ? WHERE host_id = ? AND status = 'pending'", ms(now), id)
@@ -425,9 +434,15 @@ type Request struct {
 	DecidedAt      *time.Time
 	DecisionNote   string
 	StandingID     string
+	// Kind "cloudflare" (milestone 2): scope, canonical scope_params, mode and, in token mode,
+	// the child token's IP condition (sorted CIDRs joined by ",") as it will be signed.
+	Scope       string
+	ScopeParams string
+	Mode        string
+	IPCondition string
 }
 
-const reqCols = "id, host_id, host_name, peer_address, kind, target_host, login_user, public_key, key_fingerprint, reason, requester_json, ttl_requested, status, created_at, expires_at, decided_at, decision_note, standing_id"
+const reqCols = "id, host_id, host_name, peer_address, kind, target_host, login_user, public_key, key_fingerprint, reason, requester_json, ttl_requested, status, created_at, expires_at, decided_at, decision_note, standing_id, scope, scope_params, mode, ip_condition"
 
 func scanRequest(sc interface{ Scan(...any) error }) (*Request, error) {
 	var r Request
@@ -436,7 +451,8 @@ func scanRequest(sc interface{ Scan(...any) error }) (*Request, error) {
 	var decided sql.NullInt64
 	var standing sql.NullString
 	if err := sc.Scan(&r.ID, &r.HostID, &r.HostName, &r.PeerAddress, &r.Kind, &r.TargetHost, &r.LoginUser, &r.PublicKey,
-		&r.KeyFingerprint, &r.Reason, &reqJSON, &r.TTLRequested, &r.Status, &created, &expires, &decided, &r.DecisionNote, &standing); err != nil {
+		&r.KeyFingerprint, &r.Reason, &reqJSON, &r.TTLRequested, &r.Status, &created, &expires, &decided, &r.DecisionNote, &standing,
+		&r.Scope, &r.ScopeParams, &r.Mode, &r.IPCondition); err != nil {
 		return nil, notFound(err)
 	}
 	_ = json.Unmarshal([]byte(reqJSON), &r.Requester)
@@ -452,9 +468,10 @@ func (q *Q) InsertRequest(ctx context.Context, r *Request) error {
 	if r.StandingID != "" {
 		standing = r.StandingID
 	}
-	_, err := q.q.ExecContext(ctx, `INSERT INTO requests(`+reqCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err := q.q.ExecContext(ctx, `INSERT INTO requests(`+reqCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.HostID, r.HostName, r.PeerAddress, r.Kind, r.TargetHost, r.LoginUser, r.PublicKey, r.KeyFingerprint, r.Reason,
-		string(rj), r.TTLRequested, r.Status, ms(r.CreatedAt), ms(r.ExpiresAt), nullMS(r.DecidedAt), r.DecisionNote, standing)
+		string(rj), r.TTLRequested, r.Status, ms(r.CreatedAt), ms(r.ExpiresAt), nullMS(r.DecidedAt), r.DecisionNote, standing,
+		r.Scope, r.ScopeParams, r.Mode, r.IPCondition)
 	return err
 }
 
@@ -507,6 +524,15 @@ func (q *Q) CountSimilar(ctx context.Context, hostID int64, target, user string,
 	return n, err
 }
 
+// CountSimilarScope counts approved Cloudflare requests from the same host for the same scope
+// since t (similar_recent on a Cloudflare card).
+func (q *Q) CountSimilarScope(ctx context.Context, hostID int64, scope string, since time.Time) (int, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE host_id = ? AND kind = 'cloudflare' AND scope = ?
+		AND status IN ('approved','revoked') AND created_at >= ?`, hostID, scope, ms(since)).Scan(&n)
+	return n, err
+}
+
 // ---- grants ----
 
 // Grant is an issued credential.
@@ -524,6 +550,23 @@ type Grant struct {
 	NotBefore   time.Time
 	NotAfter    time.Time
 	RevokedAt   *time.Time
+	// PeerAddress is the address of the request that created the grant.
+	PeerAddress string
+	// Kind "cloudflare" (milestone 2).
+	Scope       string
+	ScopeParams string
+	Mode        string
+	IPCondition string // token mode: sorted CIDRs joined by ","
+	// Token mode: the child token's upstream id (never its value), whether it was handed out,
+	// and when aqmasd deleted it upstream.
+	TokenID        string
+	TokenDelivered bool
+	TokenDeletedAt *time.Time
+}
+
+// Active reports whether the grant is usable at now (not revoked, inside its validity).
+func (g *Grant) Active(now time.Time) bool {
+	return g.RevokedAt == nil && !now.Before(g.NotBefore) && now.Before(g.NotAfter)
 }
 
 // Status derives the grant status at now.
@@ -537,28 +580,37 @@ func (g *Grant) Status(now time.Time) string {
 	return api.StatusApproved
 }
 
-const grantCols = "serial, id, request_id, host_id, host_name, kind, target_host, login_user, principals, certificate, not_before, not_after, revoked_at"
+const grantCols = "serial, id, request_id, host_id, host_name, kind, target_host, login_user, principals, certificate, not_before, not_after, revoked_at, " +
+	"peer_address, scope, scope_params, mode, ip_condition, token_id, token_delivered, token_deleted_at"
 
 func scanGrant(sc interface{ Scan(...any) error }) (*Grant, error) {
 	var g Grant
 	var principals string
 	var nb, na int64
-	var revoked sql.NullInt64
+	var revoked, tokenDeleted sql.NullInt64
+	var delivered int
 	if err := sc.Scan(&g.Serial, &g.ID, &g.RequestID, &g.HostID, &g.HostName, &g.Kind, &g.TargetHost, &g.LoginUser,
-		&principals, &g.Certificate, &nb, &na, &revoked); err != nil {
+		&principals, &g.Certificate, &nb, &na, &revoked,
+		&g.PeerAddress, &g.Scope, &g.ScopeParams, &g.Mode, &g.IPCondition, &g.TokenID, &delivered, &tokenDeleted); err != nil {
 		return nil, notFound(err)
 	}
 	_ = json.Unmarshal([]byte(principals), &g.Principals)
 	g.NotBefore, g.NotAfter, g.RevokedAt = fromMS(nb), fromMS(na), fromNullMS(revoked)
+	g.TokenDelivered, g.TokenDeletedAt = delivered != 0, fromNullMS(tokenDeleted)
 	return &g, nil
 }
 
 // InsertGrant reserves a grant row and returns its serial; fill the certificate with SetGrantCert.
 func (q *Q) InsertGrant(ctx context.Context, g *Grant) (int64, error) {
 	pj, _ := json.Marshal(g.Principals)
-	res, err := q.q.ExecContext(ctx, `INSERT INTO grants(id, request_id, host_id, host_name, kind, target_host, login_user, principals, certificate, not_before, not_after)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		g.ID, g.RequestID, g.HostID, g.HostName, g.Kind, g.TargetHost, g.LoginUser, string(pj), g.Certificate, ms(g.NotBefore), ms(g.NotAfter))
+	if g.Principals == nil {
+		pj = []byte("[]")
+	}
+	res, err := q.q.ExecContext(ctx, `INSERT INTO grants(id, request_id, host_id, host_name, kind, target_host, login_user, principals, certificate, not_before, not_after,
+			peer_address, scope, scope_params, mode, ip_condition)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		g.ID, g.RequestID, g.HostID, g.HostName, g.Kind, g.TargetHost, g.LoginUser, string(pj), g.Certificate, ms(g.NotBefore), ms(g.NotAfter),
+		g.PeerAddress, g.Scope, g.ScopeParams, g.Mode, g.IPCondition)
 	if err != nil {
 		return 0, err
 	}
@@ -628,6 +680,91 @@ func (q *Q) RevokeGrant(ctx context.Context, id string, now time.Time) error {
 	return one(q.q.ExecContext(ctx, "UPDATE grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", ms(now), id))
 }
 
+func (q *Q) grants(ctx context.Context, where string, args ...any) ([]*Grant, error) {
+	rows, err := q.q.QueryContext(ctx, "SELECT "+grantCols+" FROM grants WHERE "+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Grant
+	for rows.Next() {
+		g, err := scanGrant(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// activeCF is the condition for a usable Cloudflare grant at now (args: now, now).
+const activeCF = "kind = 'cloudflare' AND revoked_at IS NULL AND not_before <= ? AND not_after > ?"
+
+// ActiveProxyGrants returns those of ids that are hostID's active proxy-mode Cloudflare grants,
+// in the order of ids (unknown, foreign, inactive and duplicate ids are skipped).
+func (q *Q) ActiveProxyGrants(ctx context.Context, hostID int64, ids []string, now time.Time) ([]*Grant, error) {
+	var out []*Grant
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		g, err := scanGrant(q.q.QueryRowContext(ctx, "SELECT "+grantCols+" FROM grants WHERE id = ? AND host_id = ? AND mode = 'proxy' AND "+activeCF,
+			id, hostID, ms(now), ms(now)))
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+// HasActiveCFGrant reports whether hostID holds any active Cloudflare grant (either mode).
+func (q *Q) HasActiveCFGrant(ctx context.Context, hostID int64, now time.Time) (bool, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, "SELECT count(*) FROM grants WHERE host_id = ? AND "+activeCF, hostID, ms(now), ms(now)).Scan(&n)
+	return n > 0, err
+}
+
+// MarkTokenDelivering claims the first delivery of an active token-mode grant's child token:
+// it sets token_delivered and reports whether this caller won (exactly one caller does).
+func (q *Q) MarkTokenDelivering(ctx context.Context, id string, now time.Time) (bool, error) {
+	res, err := q.q.ExecContext(ctx, "UPDATE grants SET token_delivered = 1 WHERE id = ? AND mode = 'token' AND token_delivered = 0 AND token_id = '' AND "+activeCF,
+		id, ms(now), ms(now))
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// UnmarkTokenDelivered undoes MarkTokenDelivering after a failed mint (the next poll retries).
+func (q *Q) UnmarkTokenDelivered(ctx context.Context, id string) error {
+	_, err := q.q.ExecContext(ctx, "UPDATE grants SET token_delivered = 0 WHERE id = ? AND token_id = ''", id)
+	return err
+}
+
+// SetTokenID records the minted child token's upstream id.
+func (q *Q) SetTokenID(ctx context.Context, id, tokenID string) error {
+	return one(q.q.ExecContext(ctx, "UPDATE grants SET token_id = ? WHERE id = ? AND mode = 'token' AND token_id = ''", tokenID, id))
+}
+
+// TokenGrantsToDelete lists token-mode grants whose child token exists upstream (as far as
+// aqmasd knows) but must not any more: revoked, or past not_after.
+func (q *Q) TokenGrantsToDelete(ctx context.Context, now time.Time) ([]*Grant, error) {
+	return q.grants(ctx, "kind = 'cloudflare' AND mode = 'token' AND token_id != '' AND token_deleted_at IS NULL AND (revoked_at IS NOT NULL OR not_after <= ?) ORDER BY serial LIMIT 500", ms(now))
+}
+
+// MarkTokenDeleted records that a grant's child token was deleted upstream.
+func (q *Q) MarkTokenDeleted(ctx context.Context, id string, now time.Time) error {
+	_, err := q.q.ExecContext(ctx, "UPDATE grants SET token_deleted_at = ? WHERE id = ? AND token_deleted_at IS NULL", ms(now), id)
+	return err
+}
+
 // ---- standing approvals ----
 
 // Standing is a standing approval ("approve similar requests for N hours").
@@ -645,15 +782,20 @@ type Standing struct {
 	Uses            int
 	SourceRequestID string
 	PeerAddress     string // address of the source request; later requests must come from it
+	// Kind "cloudflare" (milestone 2): the exact scope, scope_params and mode it approves.
+	Scope       string
+	ScopeParams string
+	Mode        string
 }
 
-const standingCols = "id, host_id, host_name, kind, target_host, login_user, max_ttl, created_at, expires_at, revoked_at, uses, source_request_id, peer_address"
+const standingCols = "id, host_id, host_name, kind, target_host, login_user, max_ttl, created_at, expires_at, revoked_at, uses, source_request_id, peer_address, scope, scope_params, mode"
 
 func scanStanding(sc interface{ Scan(...any) error }) (*Standing, error) {
 	var s Standing
 	var created, expires int64
 	var revoked sql.NullInt64
-	if err := sc.Scan(&s.ID, &s.HostID, &s.HostName, &s.Kind, &s.TargetHost, &s.LoginUser, &s.MaxTTL, &created, &expires, &revoked, &s.Uses, &s.SourceRequestID, &s.PeerAddress); err != nil {
+	if err := sc.Scan(&s.ID, &s.HostID, &s.HostName, &s.Kind, &s.TargetHost, &s.LoginUser, &s.MaxTTL, &created, &expires, &revoked, &s.Uses, &s.SourceRequestID, &s.PeerAddress,
+		&s.Scope, &s.ScopeParams, &s.Mode); err != nil {
 		return nil, notFound(err)
 	}
 	s.CreatedAt, s.ExpiresAt, s.RevokedAt = fromMS(created), fromMS(expires), fromNullMS(revoked)
@@ -662,9 +804,11 @@ func scanStanding(sc interface{ Scan(...any) error }) (*Standing, error) {
 
 // InsertStanding stores a standing approval.
 func (q *Q) InsertStanding(ctx context.Context, s *Standing) error {
-	_, err := q.q.ExecContext(ctx, `INSERT INTO standing(id, host_id, host_name, kind, target_host, login_user, max_ttl, created_at, expires_at, source_request_id, peer_address)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.ID, s.HostID, s.HostName, s.Kind, s.TargetHost, s.LoginUser, s.MaxTTL, ms(s.CreatedAt), ms(s.ExpiresAt), s.SourceRequestID, s.PeerAddress)
+	_, err := q.q.ExecContext(ctx, `INSERT INTO standing(id, host_id, host_name, kind, target_host, login_user, max_ttl, created_at, expires_at, source_request_id, peer_address,
+			scope, scope_params, mode)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.ID, s.HostID, s.HostName, s.Kind, s.TargetHost, s.LoginUser, s.MaxTTL, ms(s.CreatedAt), ms(s.ExpiresAt), s.SourceRequestID, s.PeerAddress,
+		s.Scope, s.ScopeParams, s.Mode)
 	return err
 }
 

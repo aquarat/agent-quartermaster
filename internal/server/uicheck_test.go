@@ -62,8 +62,21 @@ func uiCheck(t *testing.T, cr challengeResp) map[string]any {
 		"passkey":    common,
 	}
 	actions := map[string][]string{"request": {"approve", "deny"}, "enrollment": {"approve", "deny"}, "standing": {"revoke"}, "grant": {"revoke"}, "passkey": {"add"}}
+	cfAllowed := map[string][]string{
+		"request":  append(slices.Clone(common), "requesting_host", "kind", "scope", "scope_params", "mode", "ip_condition", "ttl_seconds", "standing_hours"),
+		"standing": append(slices.Clone(common), "requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"),
+		"grant":    append(slices.Clone(common), "requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"),
+	}
 	obj, _ := v["object"].(string)
 	al, ok := allowed[obj]
+	if kind, _ := v["kind"].(string); kind == "cloudflare" {
+		if al, ok = cfAllowed[obj]; !ok {
+			t.Fatalf("ui: object %q has no cloudflare key set", obj)
+		}
+		if len(keys) != len(al) {
+			t.Fatalf("ui: cloudflare %s has keys %v, want %v", obj, keys, al)
+		}
+	}
 	if !ok {
 		t.Fatalf("ui: unknown object %q", obj)
 	}

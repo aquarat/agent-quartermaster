@@ -75,13 +75,22 @@ func testConfig(dir string) *config.Config {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	cfg := testConfig(t.TempDir())
+	return newEnvWith(t, testConfig(t.TempDir()), nil)
+}
+
+// newEnvWith starts an env with cfg; opt may adjust the server options (fake proxy, ...).
+func newEnvWith(t *testing.T, cfg *config.Config, opt func(*Options)) *env {
+	t.Helper()
 	clk := &fakeClock{t: time.Now().UTC().Truncate(time.Second)}
 	var logOut io.Writer = io.Discard
 	if testing.Verbose() {
 		logOut = os.Stderr
 	}
-	s, err := New(Options{Config: cfg, Now: clk.Now, Logger: slog.New(slog.NewTextHandler(logOut, nil))})
+	o := Options{Config: cfg, Now: clk.Now, Logger: slog.New(slog.NewTextHandler(logOut, nil))}
+	if opt != nil {
+		opt(&o)
+	}
+	s, err := New(o)
 	if err != nil {
 		t.Fatal(err)
 	}
