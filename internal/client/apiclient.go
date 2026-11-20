@@ -77,7 +77,16 @@ func ExitCode(err error) int {
 	var ue *UnreachableError
 	var ae *APIError
 	var uerr *UsageError
+	var cfr *CFRefusalError
+	var cfs *CFStatusError
 	switch {
+	case errors.As(err, &cfr):
+		return ExitDenied
+	case errors.As(err, &cfs):
+		if cfs.Status == http.StatusBadGateway || cfs.Status == http.StatusServiceUnavailable || cfs.Status == http.StatusGatewayTimeout {
+			return ExitUnreachable
+		}
+		return ExitError
 	case errors.Is(err, ErrCancelled), errors.Is(err, context.Canceled):
 		return ExitCancelled
 	case errors.As(err, &de):
@@ -114,9 +123,12 @@ func (e *UsageError) Error() string { return e.Msg }
 
 // APIClient talks to the agent API.
 type APIClient struct {
-	base   string
-	http   *http.Client
-	maxRsp int64
+	base string
+	http *http.Client
+	// proxyHTTP shares the transport but has no overall timeout: proxied uploads stream up
+	// to 100 MiB and are bounded by the caller's context.
+	proxyHTTP *http.Client
+	maxRsp    int64
 }
 
 // NewAPIClient builds a client that verifies the server with trust and presents clientCert
@@ -134,9 +146,10 @@ func NewAPIClient(server string, trust *Trust, clientCert *tls.Certificate, now 
 		IdleConnTimeout:     60 * time.Second,
 	}
 	return &APIClient{
-		base:   strings.TrimRight(server, "/"),
-		http:   &http.Client{Transport: tr, Timeout: 60 * time.Second, CheckRedirect: noRedirects},
-		maxRsp: 1 << 20,
+		base:      strings.TrimRight(server, "/"),
+		http:      &http.Client{Transport: tr, Timeout: 60 * time.Second, CheckRedirect: noRedirects},
+		proxyHTTP: &http.Client{Transport: tr, CheckRedirect: noRedirects},
+		maxRsp:    1 << 20,
 	}, nil
 }
 

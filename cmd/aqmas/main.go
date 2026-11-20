@@ -1,5 +1,6 @@
 // Command aqmas is the agent-quartermaster CLI: it enrolls a fleet host with aqmasd and asks
-// the owner for short-lived SSH certificates (docs/API.md section 3).
+// the owner for short-lived SSH certificates (docs/API.md section 3) and Cloudflare API grants
+// (section 5.6).
 package main
 
 import (
@@ -35,6 +36,8 @@ Usage:
   aqmas status [REQUEST-ID]   enrollment + cached certificates, or one request
   aqmas list [--json]         this host's active grants on the server
   aqmas ssh-config [USER@]HOST...  print an opt-in ~/.ssh/config snippet (read its notes)
+  aqmas cf scopes|request|api|env|curl|token|snapshot ...
+      Cloudflare API access through aqmasd (aqmas cf help).
   aqmas version | help
 
 Exit codes: 0 ok (or ssh's own), 1 error, 2 usage, 3 denied, 4 expired,
@@ -55,6 +58,7 @@ func run(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	env.StdoutIsTTY = term.IsTerminal(int(os.Stdout.Fd()))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -147,6 +151,8 @@ func run(args []string) int {
 			return fail(&client.UsageError{Msg: "usage: aqmas list [--json]"})
 		}
 		return fail(env.List(ctx, f.bool["json"]))
+	case "cf":
+		return runCF(ctx, env, rest)
 	case "ssh-config":
 		self, err := os.Executable()
 		if err != nil {

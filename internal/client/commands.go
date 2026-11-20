@@ -12,6 +12,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/aquarat/agent-quartermaster/internal/api"
 )
 
 // Status runs `aqmas status [id]`: with an id, the server's view of that request; without,
@@ -43,6 +45,19 @@ func (e *Env) Status(ctx context.Context, id string) error {
 			if g.SSH != nil {
 				fmt.Fprintf(w, "ssh      %s@%s (%s port %d)\n", sanitize(g.SSH.LoginUser), sanitize(g.SSH.TargetHost),
 					sanitize(g.SSH.TargetAddress), g.SSH.TargetPort)
+			}
+			if cf := g.Cloudflare; cf != nil {
+				// Never the token value: a token-mode grant's value is only in the local cache.
+				fmt.Fprintf(w, "scope    %s\nmode     %s\naccount  %s\n", describeCFGrant(cf.Scope, cf.ScopeParams, ""), sanitize(cf.Mode), sanitize(cf.AccountID))
+				if cf.TokenID != "" {
+					fmt.Fprintf(w, "token id %s (delivered: %v)\n", sanitize(cf.TokenID), cf.TokenDelivered || cf.Token != "")
+				}
+				if len(cf.IPCondition) > 0 {
+					fmt.Fprintf(w, "token ip %s\n", sanitize(strings.Join(cf.IPCondition, ",")))
+				}
+				for _, p := range cf.Permissions {
+					fmt.Fprintf(w, "permits  %s\n", sanitize(p))
+				}
 			}
 		}
 		return nil
@@ -93,6 +108,22 @@ func (e *Env) Status(ctx context.Context, id string) error {
 	if n == 0 {
 		fmt.Fprintln(tw, "no cached certificates")
 	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	toks, err := e.loadCFTokens()
+	if err != nil {
+		fmt.Fprintf(w, "cf tokens    unreadable: %s\n", sanitize(err.Error()))
+		return nil
+	}
+	if len(toks) == 0 {
+		return nil
+	}
+	tw = tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "\nCF TOKEN GRANT\tSCOPE\tVALID UNTIL")
+	for _, t := range toks {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", sanitize(t.GrantID), describeCFGrant(t.Scope, t.ScopeParams, ""), t.NotAfter.Local().Format(time.RFC3339))
+	}
 	return tw.Flush()
 }
 
@@ -122,6 +153,13 @@ func (e *Env) List(ctx context.Context, asJSON bool) error {
 		target := sanitize(g.TargetHost)
 		if g.LoginUser != "" {
 			target = sanitize(g.LoginUser) + "@" + target
+		}
+		if g.Kind == api.KindCloudflare {
+			mode := g.Mode
+			if mode == "" {
+				mode = api.CFModeProxy
+			}
+			target = describeCFGrant(g.Scope, g.ScopeParams, "") + " (" + sanitize(mode) + ")"
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", sanitize(g.ID), sanitize(g.Kind), sanitize(g.Status), target,
 			g.NotAfter.Local().Format(time.RFC3339))
