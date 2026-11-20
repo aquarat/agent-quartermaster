@@ -49,7 +49,7 @@ describe("format", () => {
   });
 
   test("isPlainName", () => {
-    expect(isPlainName("bastion")).toBe(true);
+    expect(isPlainName("gw-host-2")).toBe(true);
     expect(isPlainName("alice")).toBe(true);
     expect(isPlainName("b" + String.fromCharCode(0x430) + "ckup")).toBe(false);
     expect(isPlainName("a b")).toBe(false);

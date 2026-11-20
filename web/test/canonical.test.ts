@@ -8,7 +8,7 @@ const base = {
   action: "approve",
   object: "request",
   id: "01JX",
-  requesting_host: "build-box",
+  requesting_host: "web-1",
   kind: "ssh",
   target: "db-1",
   login_user: "alice",
@@ -59,7 +59,7 @@ describe("canonical", () => {
 
   test("mismatches catch every field the owner relies on", () => {
     const c = parseCanonical(canonicalJSON(base));
-    const want = { action: "approve", object: "request", id: "01JX", ttl_seconds: 1800, standing_hours: 0, requesting_host: "build-box", kind: "ssh", target: "db-1", login_user: "alice", key_fingerprint: "SHA256:abc" };
+    const want = { action: "approve", object: "request", id: "01JX", ttl_seconds: 1800, standing_hours: 0, requesting_host: "web-1", kind: "ssh", target: "db-1", login_user: "alice", key_fingerprint: "SHA256:abc" };
     expect(mismatches(c, want)).toEqual([]);
     for (const [k, v] of Object.entries({ action: "deny", id: "other", ttl_seconds: 3600, standing_hours: 4, requesting_host: "x", target: "y", login_user: "root", key_fingerprint: "SHA256:zzz" })) {
       expect(mismatches(c, { ...want, [k]: v }).length).toBeGreaterThan(0);
@@ -71,13 +71,13 @@ describe("canonical", () => {
 
   test("describe reads only canonical fields", () => {
     const d = describeAction(parseCanonical(canonicalJSON(base)));
-    expect(d.headline).toBe("Approve SSH as alice@db-1 for 30 min, requested by build-box.");
+    expect(d.headline).toBe("Approve SSH as alice@db-1 for 30 min, requested by web-1.");
     expect(d.standing).toBeUndefined();
     const s = describeAction(parseCanonical(canonicalJSON({ ...base, standing_hours: 4 })));
-    expect(s.standing).toBe("Also auto-approve the same request (build-box to alice@db-1) for the next 4 hours.");
-    expect(describeAction(parseCanonical(canonicalJSON({ ...base, action: "deny", ttl_seconds: 0 }))).headline).toBe("Deny SSH as alice@db-1, requested by build-box.");
-    expect(describeAction(parseCanonical(canonicalJSON({ v: 1, action: "revoke", object: "grant", id: "g", requesting_host: "ci-1", kind: "ssh", target: "db-1", login_user: "alice" }))).headline).toBe(
-      "Revoke ci-1's SSH access as alice@db-1.",
+    expect(s.standing).toBe("Also auto-approve the same request (web-1 to alice@db-1) for the next 4 hours.");
+    expect(describeAction(parseCanonical(canonicalJSON({ ...base, action: "deny", ttl_seconds: 0 }))).headline).toBe("Deny SSH as alice@db-1, requested by web-1.");
+    expect(describeAction(parseCanonical(canonicalJSON({ v: 1, action: "revoke", object: "grant", id: "g", requesting_host: "laptop-2", kind: "ssh", target: "db-1", login_user: "alice" }))).headline).toBe(
+      "Revoke laptop-2's SSH access as alice@db-1.",
     );
     // Every field is listed, including the nonce.
     expect(d.fields.map(([k]) => k)).toContain("Nonce");
@@ -106,7 +106,7 @@ describe("canonical", () => {
   test("values are separate parts (rendered isolated) and odd names are flagged", () => {
     const cyrillicA = String.fromCharCode(0x430);
     const d = describeAction(parseCanonical(canonicalJSON({ ...base, target: "b" + cyrillicA + "ckup" })));
-    expect(d.headlineParts.filter((p) => typeof p !== "string").map((p) => (p as { value: string }).value)).toEqual(["SSH", "alice", "b" + cyrillicA + "ckup", "30 min", "build-box"]);
+    expect(d.headlineParts.filter((p) => typeof p !== "string").map((p) => (p as { value: string }).value)).toEqual(["SSH", "alice", "b" + cyrillicA + "ckup", "30 min", "web-1"]);
     expect(d.warnings.join(" ")).toMatch(/target host name contains unusual characters/);
     expect(describeAction(parseCanonical(canonicalJSON(base))).warnings).toEqual([]);
   });

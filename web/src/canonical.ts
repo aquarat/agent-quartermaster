@@ -175,7 +175,7 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
 export type Part = string | { value: string };
 
 export interface Description {
-  /** One sentence, e.g. "Approve SSH as alice@db-1 for 30 min, requested by build-box." */
+  /** One sentence, e.g. "Approve SSH as alice@db-1 for 30 min, requested by web-1." */
   headline: string;
   headlineParts: Part[];
   /** Extra sentence for a standing approval, shown as a warning. */

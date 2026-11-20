@@ -24,6 +24,8 @@ export interface Attrs {
   dir?: string;
   datetime?: string;
   open?: boolean;
+  placeholder?: string;
+  maxlength?: string;
   [aria: `aria-${string}`]: string | undefined;
   [data: `data-${string}`]: string | undefined;
   on?: { [K in keyof HTMLElementEventMap]?: (ev: HTMLElementEventMap[K]) => void };
@@ -32,7 +34,7 @@ export interface Attrs {
 const BOOL = new Set(["hidden", "disabled", "checked", "open"]);
 const ALLOWED = new Set([
   "class", "id", "role", "type", "name", "value", "for", "title", "autocomplete", "inputmode",
-  "enterkeyhint", "spellcheck", "tabindex", "dir", "datetime",
+  "enterkeyhint", "spellcheck", "tabindex", "dir", "datetime", "placeholder", "maxlength",
 ]);
 
 export function append(parent: Node, children: Child[]): void {
