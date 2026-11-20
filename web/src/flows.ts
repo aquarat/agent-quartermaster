@@ -77,6 +77,15 @@ export interface ActionTarget {
   object: ObjectKind;
   id: string;
   facts: Omit<Expectation, "action" | "object" | "id" | "ttl_seconds" | "standing_hours">;
+  /** For a revoke: the ttl_seconds its canonical must carry (Cloudflare standing: the rule's
+   * max TTL; Cloudflare grant: 0). Unset = not checked (M1 SSH). */
+  revokeTTL?: number;
+}
+
+/** Cloudflare facts from a card. Missing fields become "" so they are still compared: the
+ * page never signs a Cloudflare action whose scope it did not show. */
+function cfFacts(scope: string | undefined, scopeParams: string | undefined, mode: string | undefined) {
+  return { scope: scope ?? "", scope_params: scopeParams ?? "", mode: mode ?? "" };
 }
 
 export function targetForPending(item: PendingItem): ActionTarget {
@@ -89,6 +98,19 @@ export function targetForPending(item: PendingItem): ActionTarget {
         kind: "enrollment",
         key_fingerprint: item.enrollment?.csr_fingerprint,
         replaces: item.enrollment?.replaces_existing ?? false,
+      },
+    };
+  }
+  if (item.kind === "cloudflare") {
+    const cf = item.cloudflare;
+    return {
+      object: "request",
+      id: item.id,
+      facts: {
+        requesting_host: item.requesting_host,
+        kind: "cloudflare",
+        ...cfFacts(cf?.scope, cf?.scope_params, cf?.mode),
+        ip_condition: cf?.ip_condition ?? "",
       },
     };
   }
@@ -106,6 +128,14 @@ export function targetForPending(item: PendingItem): ActionTarget {
 }
 
 export function targetForStanding(s: StandingApproval): ActionTarget {
+  if (s.kind === "cloudflare") {
+    return {
+      object: "standing",
+      id: s.id,
+      facts: { requesting_host: s.requesting_host, kind: "cloudflare", ...cfFacts(s.scope, s.scope_params, s.mode) },
+      revokeTTL: s.max_ttl_seconds,
+    };
+  }
   return {
     object: "standing",
     id: s.id,
@@ -114,6 +144,14 @@ export function targetForStanding(s: StandingApproval): ActionTarget {
 }
 
 export function targetForGrant(g: GrantSummary): ActionTarget {
+  if (g.kind === "cloudflare") {
+    return {
+      object: "grant",
+      id: g.id,
+      facts: { requesting_host: g.requesting_host, kind: "cloudflare", ...cfFacts(g.scope, g.scope_params, g.mode) },
+      revokeTTL: 0,
+    };
+  }
   return {
     object: "grant",
     id: g.id,
@@ -164,7 +202,7 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
     action: choice.action,
     object: target.object,
     id: target.id,
-    ttl_seconds: choice.action === "approve" && target.object === "request" ? choice.ttl_seconds : undefined,
+    ttl_seconds: choice.action === "approve" ? (target.object === "request" ? choice.ttl_seconds : undefined) : target.revokeTTL,
     standing_hours: choice.action === "approve" ? (choice.standing_hours ?? 0) : 0,
     ...target.facts,
   });

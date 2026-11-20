@@ -23,9 +23,24 @@ export interface PendingEnrollment {
   replaces_existing?: boolean;
 }
 
+/** Cloudflare detail for kind "cloudflare" (api.PendingCloudflare, API.md 5.7). */
+export interface PendingCloudflare {
+  scope: string;
+  params: Record<string, string> | null;
+  scope_params: string; // exactly as it will be signed
+  mode: string; // "proxy" | "token"
+  ip_condition: string; // "" in proxy mode; sorted CIDRs joined by ","
+  title: string; // the server catalogue's words (supplement only)
+  description: string;
+  risk: string; // "low" | "medium" | "high" | "admin"
+  standing_allowed: boolean;
+  permissions?: string[]; // token mode: the child token's policy in plain words
+  notes?: string[];
+}
+
 export interface PendingItem {
   id: string;
-  kind: string; // "ssh" | "enrollment"
+  kind: string; // "ssh" | "enrollment" | "cloudflare"
   created_at: string;
   expires_at: string;
   requesting_host: string;
@@ -34,9 +49,10 @@ export interface PendingItem {
   reason: string; // untrusted
   ssh?: PendingSSH;
   enrollment?: PendingEnrollment;
+  cloudflare?: PendingCloudflare;
   ttl_requested: number;
   ttl_max: number;
-  risk: string; // "normal" | "high"
+  risk: string; // "normal" | "high" (Cloudflare: low/medium -> normal, high/admin -> high)
   similar_recent: number;
   status?: string; // only on GET /api/ui/requests/{id} and /api/ui/enrollments/{id}
 }
@@ -50,6 +66,10 @@ export interface StandingApproval {
   max_ttl_seconds: number;
   expires_at: string;
   uses: number;
+  // kind "cloudflare" (target_host/login_user empty then)
+  scope?: string;
+  scope_params?: string;
+  mode?: string;
 }
 
 export interface GrantSummary {
@@ -61,6 +81,10 @@ export interface GrantSummary {
   requesting_host?: string; // set in UIState.grants
   not_before: string;
   not_after: string;
+  // kind "cloudflare"
+  scope?: string;
+  scope_params?: string;
+  mode?: string;
 }
 
 export interface AuditEntry {

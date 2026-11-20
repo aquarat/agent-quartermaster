@@ -8,6 +8,17 @@
 // So what is shown is exactly what is signed, and what is signed is what was asked for.
 
 import { bytesEqual, decode } from "./b64url";
+import {
+  ScopeParamsError,
+  cfScope,
+  paramPairs,
+  paramProblems,
+  parseIPCondition,
+  parseScopeParams,
+  unusualParams,
+  wideCIDRs,
+  type CFRisk,
+} from "./cfscopes";
 import { duration, hours, isPlainName, kindLabel } from "./format";
 
 export interface Canonical {
@@ -23,6 +34,11 @@ export interface Canonical {
   ttl_seconds?: number;
   standing_hours?: number;
   replaces?: boolean;
+  // kind "cloudflare" (API.md 5.4)
+  scope?: string;
+  scope_params?: string;
+  mode?: string;
+  ip_condition?: string;
   nonce?: string;
   issued_at?: string;
   [k: string]: unknown;
@@ -38,6 +54,13 @@ const ALLOWED_KEYS: Record<string, string[]> = {
   grant: [...COMMON_KEYS, "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"],
   passkey: COMMON_KEYS,
 };
+// kind "cloudflare" (API.md 5.4): a different, exact key set for request/standing/grant.
+const CF_KEYS: Record<string, string[]> = {
+  request: [...COMMON_KEYS, "requesting_host", "kind", "scope", "scope_params", "mode", "ip_condition", "ttl_seconds", "standing_hours"],
+  standing: [...COMMON_KEYS, "requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"],
+  grant: [...COMMON_KEYS, "requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"],
+};
+const STRING_KEYS = ["requesting_host", "kind", "target", "login_user", "key_fingerprint", "scope", "scope_params", "mode", "ip_condition", "nonce", "issued_at"] as const;
 const ALLOWED_ACTIONS: Record<string, string[]> = {
   request: ["approve", "deny"],
   enrollment: ["approve", "deny"],
@@ -90,12 +113,15 @@ export function parseCanonical(text: string): Canonical {
   for (const k of ["action", "object", "id"] as const) {
     if (typeof c[k] !== "string" || c[k] === "") throw new CanonicalError(`canonical action has no ${k}`);
   }
-  const allowed = ALLOWED_KEYS[c.object];
-  if (!allowed) throw new CanonicalError(`unknown object ${JSON.stringify(c.object)}`);
+  if (!ALLOWED_KEYS[c.object]) throw new CanonicalError(`unknown object ${JSON.stringify(c.object)}`);
+  // The key set depends on (object, kind): a Cloudflare request carries scope/params/mode
+  // instead of target/user/key.
+  const cf = c.kind === "cloudflare" && CF_KEYS[c.object] !== undefined;
+  const allowed = cf ? CF_KEYS[c.object]! : ALLOWED_KEYS[c.object]!;
   if (!ALLOWED_ACTIONS[c.object]!.includes(c.action)) throw new CanonicalError(`unknown action ${JSON.stringify(c.action)} for ${c.object}`);
   const extra = Object.keys(c).filter((k) => !allowed.includes(k));
   if (extra.length) throw new CanonicalError(`canonical action has fields this page can't show (${extra.join(", ")})`);
-  for (const k of ["requesting_host", "kind", "target", "login_user", "key_fingerprint", "nonce", "issued_at"] as const) {
+  for (const k of STRING_KEYS) {
     if (c[k] !== undefined && typeof c[k] !== "string") throw new CanonicalError(`canonical ${k} is not a string`);
   }
   if (c.replaces !== undefined && typeof c.replaces !== "boolean") throw new CanonicalError("canonical replaces is not a boolean");
@@ -104,7 +130,56 @@ export function parseCanonical(text: string): Canonical {
       throw new CanonicalError(`canonical ${k} is not a whole number`);
     }
   }
+  if (cf) checkCloudflare(c, allowed);
   return c;
+}
+
+/** Kind "cloudflare": every key present, a scope this page can describe, well-formed
+ * parameters for it, a consistent mode/ip_condition, and no standing approval where none can
+ * exist. Throws CanonicalError. */
+function checkCloudflare(c: Canonical, keys: string[]): void {
+  const missing = keys.filter((k) => !(k in c));
+  if (missing.length) throw new CanonicalError(`canonical action lacks ${missing.join(", ")}`);
+  const scope = cfScope(c.scope);
+  if (!scope) throw new CanonicalError(`this page has no description of Cloudflare scope ${JSON.stringify(c.scope)}, so it won't sign it`);
+  let params: Record<string, string>;
+  try {
+    params = parseScopeParams(c.scope_params!);
+  } catch (e) {
+    throw new CanonicalError((e as Error).message);
+  }
+  const problems = paramProblems(scope, params);
+  if (problems.length) throw new CanonicalError(`scope_params: ${problems.join("; ")}`);
+  if (c.mode !== "proxy" && c.mode !== "token") throw new CanonicalError(`unknown Cloudflare mode ${JSON.stringify(c.mode)}`);
+  if (c.mode === "token" && !scope.token) throw new CanonicalError(`${scope.name} has no token mode`);
+  if (c.object === "request") {
+    let cidrs: string[];
+    try {
+      cidrs = parseIPCondition(c.ip_condition!);
+    } catch (e) {
+      throw new CanonicalError((e as Error).message);
+    }
+    if (c.mode === "proxy" && cidrs.length) throw new CanonicalError("ip_condition must be empty in proxy mode");
+    if (c.mode === "token" && !cidrs.length) throw new CanonicalError("a token must carry an ip_condition");
+  }
+  if ((c.standing_hours ?? 0) > 0) {
+    if (c.object !== "request" || c.action !== "approve") throw new CanonicalError("only an approval can carry standing_hours");
+    if (!scope.standing) throw new CanonicalError(`${scope.name} never allows auto-approval (standing_hours must be 0)`);
+    if (c.mode !== "proxy") throw new CanonicalError("token grants are never auto-approved (standing_hours must be 0)");
+  }
+  if (c.object === "request" && c.action === "approve" && (c.ttl_seconds ?? 0) > scope.maxTTL) {
+    throw new CanonicalError(`${scope.name} lasts at most ${duration(scope.maxTTL)}`);
+  }
+}
+
+/** Parsed Cloudflare parameters of a (validated) canonical action; {} if absent or bad. */
+export function canonicalParams(c: Canonical): Record<string, string> {
+  try {
+    return parseScopeParams(c.scope_params ?? "");
+  } catch (e) {
+    if (e instanceof ScopeParamsError) return {};
+    throw e;
+  }
 }
 
 export async function sha256(text: string): Promise<ArrayBuffer> {
@@ -131,6 +206,10 @@ export interface Expectation {
   login_user?: string;
   key_fingerprint?: string;
   replaces?: boolean;
+  scope?: string;
+  scope_params?: string;
+  mode?: string;
+  ip_condition?: string;
 }
 
 /** List of human-readable mismatches between canonical and the expectation (empty = ok). */
@@ -148,11 +227,17 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
   cmp("target", c.target, e.target);
   cmp("login_user", c.login_user, e.login_user);
   cmp("key_fingerprint", c.key_fingerprint, e.key_fingerprint);
+  cmp("scope", c.scope, e.scope);
+  cmp("scope_params", c.scope_params, e.scope_params);
+  cmp("mode", c.mode, e.mode);
+  cmp("ip_condition", c.ip_condition, e.ip_condition);
   if (e.object === "enrollment") cmp("replaces", c.replaces ?? false, e.replaces ?? false);
   if (e.action === "approve") {
     cmp("ttl_seconds", c.ttl_seconds ?? 0, e.ttl_seconds);
     cmp("standing_hours", c.standing_hours ?? 0, e.standing_hours ?? 0);
   } else {
+    // Revoking a Cloudflare standing approval names the rule's max TTL; a grant revoke 0.
+    cmp("ttl_seconds", c.ttl_seconds ?? 0, e.ttl_seconds);
     // Deny/revoke must not carry a standing approval.
     cmp("standing_hours", c.standing_hours ?? 0, 0);
   }
@@ -174,12 +259,22 @@ export interface Description {
   warnings: string[];
   /** Every canonical field, in the order the owner should read them. */
   fields: Array<[string, string]>;
+  /** Kind "cloudflare": one line per parameter, then the mode, each from canonical. */
+  details?: Part[][];
+  /** Kind "cloudflare": the scope's risk (this page's own table). */
+  risk?: CFRisk;
+  /** cf.admin: show the confirmation as break-glass. */
+  breakGlass?: boolean;
 }
 
 const FIELD_LABELS: Record<string, string> = {
   action: "Action",
   object: "Applies to",
   kind: "Kind",
+  scope: "Cloudflare scope",
+  scope_params: "Parameters",
+  mode: "Mode",
+  ip_condition: "Token usable from",
   login_user: "Log in as",
   target: "On host",
   requesting_host: "Requested by",
@@ -198,6 +293,8 @@ function fieldValue(k: string, v: unknown): string {
   if (k === "ttl_seconds" && typeof v === "number") return v > 0 ? duration(v) : "n/a";
   if (k === "standing_hours" && typeof v === "number") return v > 0 ? `for ${hours(v)}` : "no";
   if (k === "replaces" && typeof v === "boolean") return v ? "yes" : "no";
+  if (k === "scope_params" && v === "") return "none";
+  if (k === "ip_condition" && v === "") return "n/a (proxy)";
   if (typeof v === "string") return v;
   return JSON.stringify(v);
 }
@@ -225,6 +322,7 @@ function who(c: Canonical): Part[] {
 
 /** Describe the canonical action in plain words. Built only from canonical's own fields. */
 export function describe(c: Canonical): Description {
+  if (c.kind === "cloudflare" && CF_KEYS[c.object]) return describeCloudflare(c);
   const kind = kindLabel(c.kind ?? "ssh");
   const host = c.requesting_host ?? "?";
   let headline: Part[];
@@ -266,18 +364,95 @@ export function describe(c: Canonical): Description {
   ] as const) {
     if (c[k] !== undefined && !isPlainName(c[k])) warnings.push(`The ${label} name contains unusual characters: check it letter by letter.`);
   }
-  const keys = Object.keys(c).sort((a, b) => {
-    const ia = FIELD_ORDER.indexOf(a);
-    const ib = FIELD_ORDER.indexOf(b);
-    return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib) || a.localeCompare(b);
-  });
-  const fields: Array<[string, string]> = keys.map((k) => [FIELD_LABELS[k] ?? k, fieldValue(k, c[k])]);
   return {
     headline: partsText(headline),
     headlineParts: headline,
     standing: standing ? partsText(standing) : undefined,
     standingParts: standing,
     warnings,
-    fields,
+    fields: fieldList(c),
+  };
+}
+
+function fieldList(c: Canonical): Array<[string, string]> {
+  const keys = Object.keys(c).sort((a, b) => {
+    const ia = FIELD_ORDER.indexOf(a);
+    const ib = FIELD_ORDER.indexOf(b);
+    return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib) || a.localeCompare(b);
+  });
+  return keys.map((k) => [FIELD_LABELS[k] ?? k, fieldValue(k, c[k])]);
+}
+
+/** Plain words for a Cloudflare action, from canonical and this page's scope table only.
+ * parseCanonical has already refused unknown scopes and malformed parameters. */
+function describeCloudflare(c: Canonical): Description {
+  const scope = cfScope(c.scope);
+  const params = canonicalParams(c);
+  const host = c.requesting_host ?? "?";
+  const what: Part[] = scope ? scope.phrase(params) : [{ value: c.scope ?? "?" }];
+  const token = c.mode === "token";
+  const cidrs = token ? (c.ip_condition ?? "").split(",").filter(Boolean) : [];
+  const modeWords: Part[] = token
+    ? ["as a real API token that leaves aqmas, limited to ", { value: cidrs.join(", ") || "?" }]
+    : ["through the aqmas proxy (no secret leaves aqmas)"];
+  let headline: Part[];
+  let standing: Part[] | undefined;
+  const warnings: string[] = [];
+  const breakGlass = c.scope === "cf.admin";
+  switch (`${c.object}:${c.action}`) {
+    case "request:approve":
+      headline = t`Approve Cloudflare for ${host}: ${what} for ${duration(c.ttl_seconds ?? 0)}, ${modeWords}.`;
+      if ((c.standing_hours ?? 0) > 0) {
+        standing = t`Also auto-approve the same Cloudflare request from ${host} (${c.scope ?? "?"} ${c.scope_params || "without parameters"}, proxy) for the next ${hours(c.standing_hours!)}.`;
+      }
+      break;
+    case "request:deny":
+      headline = t`Deny Cloudflare for ${host}: ${what}.`;
+      break;
+    case "standing:revoke":
+      headline =
+        (c.ttl_seconds ?? 0) > 0
+          ? t`Stop auto-approving Cloudflare for ${host}: ${what} (each grant up to ${duration(c.ttl_seconds!)}).`
+          : t`Stop auto-approving Cloudflare for ${host}: ${what}.`;
+      break;
+    case "grant:revoke":
+      headline = token ? t`Revoke ${host}'s Cloudflare token (deleted at Cloudflare at once): ${what}.` : t`Revoke ${host}'s Cloudflare access: ${what}.`;
+      break;
+    default:
+      headline = t`${c.action} ${c.object} ${c.id}.`;
+  }
+  if (breakGlass && c.action === "approve") {
+    warnings.push(
+      "BREAK-GLASS: full Cloudflare access for up to 1 hour. Every API call on every zone, tunnel and app except the deny-list (API tokens, members, tunnel run tokens), and guard rails can be overridden per call. Approve only if you asked for this yourself.",
+    );
+  }
+  if (token && c.action === "approve") {
+    warnings.push(
+      "A real Cloudflare API token leaves aqmas. aqmas's guard rails and snapshots do not apply to calls made with it; it expires with the grant and revoking deletes it.",
+    );
+    const note = scope?.tokenNote?.(params);
+    if (note) warnings.push(note);
+    const wide = wideCIDRs(cidrs);
+    if (wide.length) warnings.push(`The token works from whole networks, not one address: ${wide.join(", ")}.`);
+  }
+  if (!isPlainName(host)) warnings.push("The requesting host name contains unusual characters: check it letter by letter.");
+  if (scope) {
+    for (const label of unusualParams(scope, params)) warnings.push(`The ${label} value contains unusual characters: check it letter by letter.`);
+  }
+  for (const cidr of cidrs) {
+    if (!/^[0-9a-f.:/]+$/.test(cidr)) warnings.push("The token's IP condition contains unusual characters: check it letter by letter.");
+  }
+  const details: Part[][] = paramPairs(scope, params).map(([label, val]) => [`${label}: `, { value: val }]);
+  details.push(token ? ["Mode: real API token, usable only from ", { value: cidrs.join(", ") || "?" }] : ["Mode: through the aqmas proxy"]);
+  return {
+    headline: partsText(headline),
+    headlineParts: headline,
+    standing: standing ? partsText(standing) : undefined,
+    standingParts: standing,
+    warnings,
+    fields: fieldList(c),
+    details,
+    risk: scope?.risk,
+    breakGlass,
   };
 }

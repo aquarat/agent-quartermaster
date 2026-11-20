@@ -29,8 +29,9 @@ import {
   type PreparedLogin,
   type PreparedRegistration,
 } from "./flows";
-import { STANDING_PRESETS, ago, countdown, duration, hours, isPlainName, kindLabel, ttlChoices, visibleText as vt } from "./format";
-import type { AuditEntry, GrantSummary, PendingItem, StandingApproval, UIState } from "./types";
+import { CF_RISKS, cfScope, paramPairs, parseScopeParams, riskLabel, sentenceCase, unusualParams, type CFScopeDesc } from "./cfscopes";
+import { STANDING_PRESETS, ago, auditLabel, countdown, duration, hours, isPlainName, kindLabel, ttlChoices, visibleText as vt } from "./format";
+import type { AuditEntry, GrantSummary, PendingCloudflare, PendingItem, StandingApproval, UIState } from "./types";
 import { browserAuthenticator, type Authenticator } from "./webauthn";
 
 const POLL_MS = 5000;
@@ -441,6 +442,7 @@ export class App {
   // ---- cards ----
 
   private requestCard(p: PendingItem): HTMLElement {
+    if (p.kind === "cloudflare") return this.cfRequestCard(p);
     const ssh = p.ssh;
     const high = p.risk === "high";
     const odd = !isPlainName(p.requesting_host) || (ssh && (!isPlainName(ssh.login_user) || !isPlainName(ssh.target_host)));
@@ -476,6 +478,60 @@ export class App {
     );
   }
 
+  /** A Cloudflare request: scope in this page's own words, each parameter, mode, TTL, risk. */
+  private cfRequestCard(p: PendingItem): HTMLElement {
+    const cf = p.cloudflare;
+    const v = cfView(cf?.scope, cf?.scope_params, cf?.mode);
+    const risk = v.scope?.risk ?? cfRisk(cf?.risk);
+    const admin = cf?.scope === "cf.admin";
+    const token = cf?.mode === "token";
+    const odd = !isPlainName(p.requesting_host) || v.unusual.length > 0;
+    return h(
+      "article",
+      {
+        class: `card request cloudflare${risk === "high" || risk === "admin" ? " high" : ""}${admin ? " cf-admin" : ""}`,
+        "data-id": p.id,
+        "aria-label": `${admin ? "Break-glass " : ""}Cloudflare request from ${vt(p.requesting_host)}`,
+      },
+      h(
+        "div",
+        { class: "card-top" },
+        h("span", { class: "kind" }, "Cloudflare"),
+        riskBadge(risk),
+        h("span", { class: "expires" }, "Expires in ", until(p.expires_at)),
+      ),
+      admin ? h("p", { class: "breakglass", role: "note" }, "BREAK-GLASS: full Cloudflare access for 1 hour, everything except the deny-list. Approve only if you asked for it yourself.") : null,
+      v.heading,
+      v.problem ? h("p", { class: "warn" }, vt(v.problem)) : null,
+      odd ? h("p", { class: "warn" }, "A name here contains unusual characters. Check it letter by letter.") : null,
+      h(
+        "dl",
+        { class: "facts" },
+        fact("Scope", h("span", { class: "mono" }, vt(cf?.scope ?? "?"))),
+        v.pairs.map(([label, val]) => fact(label, h("bdi", { class: "param" }, vt(val)))),
+        fact("Mode", token ? ["Real API token, usable only from ", h("span", { class: "mono" }, vt(cf?.ip_condition || "?"))] : "Through the aqmas proxy (no secret leaves aqmas)"),
+        fact("From", h("bdi", { class: "host-name" }, vt(p.requesting_host)), " ", h("span", { class: "addr" }, vt(p.requesting_address))),
+        fact("Asks for", duration(p.ttl_requested), p.ttl_max > 0 ? h("span", { class: "muted" }, ` (up to ${duration(p.ttl_max)} allowed)`) : null),
+        p.similar_recent > 0 ? fact("Similar", p.similar_recent === 1 ? "1 similar request recently" : `${p.similar_recent} similar requests recently`) : null,
+        fact("Asked", since(p.created_at)),
+        fact("Ref", h("span", { class: "mono" }, vt(refCode(p.id)))),
+      ),
+      token ? tokenBox(cf!, v.scope) : null,
+      scopeDetails(v.scope, cf),
+      agentSays(p),
+      h(
+        "div",
+        { class: "actions" },
+        h("button", { class: "btn deny", type: "button", on: { click: () => this.sheet.openDeny(p) } }, "Deny…"),
+        h(
+          "button",
+          { class: "btn approve", type: "button", disabled: !!v.problem, title: v.problem ? "This page can't describe this scope, so it won't sign an approval" : undefined, on: { click: () => this.sheet.openApprove(p) } },
+          admin ? "Approve break-glass…" : "Approve…",
+        ),
+      ),
+    );
+  }
+
   private enrollCard(p: PendingItem): HTMLElement {
     const e = p.enrollment;
     return h(
@@ -497,6 +553,27 @@ export class App {
   }
 
   private standingRow(a: StandingApproval): HTMLElement {
+    if (a.kind === "cloudflare") {
+      const v = cfView(a.scope, a.scope_params, a.mode, true);
+      return h(
+        "article",
+        { class: "row cloudflare", "data-id": a.id },
+        v.heading,
+        v.problem ? h("p", { class: "warn" }, vt(v.problem)) : null,
+        h(
+          "dl",
+          { class: "facts" },
+          fact("Scope", h("span", { class: "mono" }, vt(a.scope ?? "?"))),
+          v.pairs.map(([label, val]) => fact(label, h("bdi", { class: "param" }, vt(val)))),
+          fact("Mode", vt(modeWords(a.mode))),
+          fact("For host", h("bdi", { class: "host-name" }, vt(a.requesting_host))),
+          fact("Each grant", `up to ${duration(a.max_ttl_seconds)}`),
+          fact("Ends in", until(a.expires_at)),
+          fact("Used", a.uses === 1 ? "once" : `${a.uses} times`),
+        ),
+        h("div", { class: "actions" }, h("button", { class: "btn deny", type: "button", on: { click: () => this.sheet.openRevoke(targetForStanding(a)) } }, "Revoke…")),
+      );
+    }
     return h(
       "article",
       { class: "row", "data-id": a.id },
@@ -514,6 +591,27 @@ export class App {
   }
 
   private grantRow(g: GrantSummary): HTMLElement {
+    if (g.kind === "cloudflare") {
+      const v = cfView(g.scope, g.scope_params, g.mode, true);
+      const admin = g.scope === "cf.admin";
+      return h(
+        "article",
+        { class: `row cloudflare${admin ? " cf-admin" : ""}`, "data-id": g.id },
+        admin ? h("p", { class: "breakglass", role: "note" }, "BREAK-GLASS access is active.") : null,
+        v.heading,
+        v.problem ? h("p", { class: "warn" }, vt(v.problem)) : null,
+        h(
+          "dl",
+          { class: "facts" },
+          g.requesting_host ? fact("Held by", h("bdi", { class: "host-name" }, vt(g.requesting_host))) : null,
+          fact("Kind", "Cloudflare ", h("span", { class: "mono" }, vt(g.scope ?? "?"))),
+          v.pairs.map(([label, val]) => fact(label, h("bdi", { class: "param" }, vt(val)))),
+          fact("Mode", vt(modeWords(g.mode))),
+          fact("Ends in", until(g.not_after)),
+        ),
+        h("div", { class: "actions" }, h("button", { class: "btn deny", type: "button", on: { click: () => this.sheet.openRevoke(targetForGrant(g)) } }, "Revoke…")),
+      );
+    }
     return h(
       "article",
       { class: "row", "data-id": g.id },
@@ -557,6 +655,73 @@ function targetLine(user: string, host: string, small = false): HTMLElement {
     h("bdi", { class: "user" }, vt(user)),
     h("span", { class: "at" }, "@"),
     h("bdi", { class: "host" }, vt(host)),
+  );
+}
+
+interface CFView {
+  scope: CFScopeDesc | undefined;
+  pairs: Array<[string, string]>;
+  unusual: string[];
+  heading: HTMLElement;
+  /** Why this page won't sign an approval for it (unknown scope, bad parameters). */
+  problem?: string;
+}
+
+/** A Cloudflare scope + canonical parameters as a heading in this page's own words. */
+function cfView(scopeName: string | undefined, scopeParams: string | undefined, mode: string | undefined, small = false): CFView {
+  const scope = cfScope(scopeName);
+  let params: Record<string, string> = {};
+  let problem: string | undefined;
+  try {
+    params = parseScopeParams(scopeParams ?? "");
+  } catch (e) {
+    problem = `${(e as Error).message}: this page won't sign it.`;
+  }
+  if (!scope) problem = `This page has no description of the Cloudflare scope "${scopeName ?? ""}", so it won't sign it.`;
+  const cls = small ? "target cf small" : "target cf";
+  const heading = scope
+    ? h("h3", { class: cls }, renderParts(sentenceCase(scope.phrase(params))), mode === "token" ? h("span", { class: "muted mode-tag" }, " (API token)") : null)
+    : h("h3", { class: cls }, "Unknown Cloudflare scope ", h("bdi", { class: "val" }, vt(scopeName ?? "?")));
+  return { scope, pairs: paramPairs(scope, params), unusual: scope ? unusualParams(scope, params) : [], heading, problem };
+}
+
+function cfRisk(r: string | undefined): string {
+  return r && (CF_RISKS as readonly string[]).includes(r) ? r : "high";
+}
+
+function riskBadge(risk: string): HTMLElement {
+  return h("span", { class: `badge risk-${cfRisk(risk)}` }, riskLabel(cfRisk(risk)));
+}
+
+function modeWords(mode: string | undefined): string {
+  if (mode === "token") return "Real API token";
+  if (mode === "proxy") return "Through the aqmas proxy";
+  return mode ?? "?";
+}
+
+/** Token mode: what the minted token can do (server's words) and this page's own warning. */
+function tokenBox(cf: PendingCloudflare, scope: CFScopeDesc | undefined): HTMLElement {
+  const own = scope?.tokenNote?.(cf.params ?? {});
+  return h(
+    "div",
+    { class: "token-box", role: "group", "aria-label": "API token details" },
+    h("p", { class: "token-label" }, "A real API token leaves aqmas"),
+    h("p", null, "Guard rails and snapshots don't apply to it. It expires with the grant and is deleted at Cloudflare on revoke."),
+    own ? h("p", { class: "warn" }, own) : null,
+    cf.permissions?.length ? [h("p", { class: "muted" }, "Token permissions (from aqmas):"), h("ul", { class: "perms" }, cf.permissions.map((x) => h("li", null, vt(x))))] : null,
+    cf.notes?.length ? h("ul", { class: "notes" }, cf.notes.map((x) => h("li", null, vt(x)))) : null,
+  );
+}
+
+/** What the scope allows and doesn't (this page's words), plus the server's own description. */
+function scopeDetails(scope: CFScopeDesc | undefined, cf: PendingCloudflare | undefined): HTMLElement | null {
+  if (!scope && !cf?.description) return null;
+  return h(
+    "details",
+    { class: "scope-details" },
+    h("summary", null, "What this allows"),
+    scope ? [h("p", { class: "muted" }, "Can:"), h("ul", null, scope.can.map((x) => h("li", null, x))), h("p", { class: "muted" }, "Cannot:"), h("ul", null, scope.cannot.map((x) => h("li", null, x)))] : null,
+    cf?.title || cf?.description ? h("p", { class: "server-says" }, h("span", { class: "muted" }, "aqmas catalogue: "), vt(cf.title), cf.title && cf.description ? ". " : "", vt(cf.description)) : null,
   );
 }
 
@@ -630,7 +795,7 @@ function auditRow(e: AuditEntry): HTMLElement {
     " ",
     h("bdi", { class: "actor" }, vt(e.actor)),
     " ",
-    h("strong", null, vt(e.action)),
+    h("strong", { title: e.action }, vt(auditLabel(e.action))),
     " ",
     h("span", { class: "mono" }, vt(e.object)),
     e.detail ? h("span", { class: "detail" }, vt(e.detail)) : null,
@@ -734,6 +899,18 @@ class Sheet {
         enrollFacts(p),
       );
     }
+    if (p.kind === "cloudflare") {
+      const cf = p.cloudflare;
+      const v = cfView(cf?.scope, cf?.scope_params, cf?.mode);
+      return h(
+        "div",
+        { class: "summary" },
+        cf?.scope === "cf.admin" ? h("p", { class: "breakglass", role: "note" }, "BREAK-GLASS: full Cloudflare access, everything except the deny-list.") : null,
+        v.heading,
+        h("dl", { class: "facts" }, v.pairs.map(([label, val]) => fact(label, h("bdi", { class: "param" }, vt(val)))), fact("Mode", vt(modeWords(cf?.mode)))),
+        h("p", null, "Cloudflare requested by ", h("bdi", { class: "host-name" }, vt(p.requesting_host)), " ", h("span", { class: "addr" }, vt(p.requesting_address))),
+      );
+    }
     return h(
       "div",
       { class: "summary" },
@@ -758,7 +935,11 @@ class Sheet {
       );
       return;
     }
-    const { options, def } = ttlChoices(p.ttl_requested, p.ttl_max);
+    const cf = p.kind === "cloudflare" ? p.cloudflare : undefined;
+    const cfDesc = cf ? cfScope(cf.scope) : undefined;
+    // Never offer more than the card's ttl_max, nor (Cloudflare) the scope's built-in maximum.
+    const maxTTL = cfDesc ? Math.min(p.ttl_max > 0 ? p.ttl_max : cfDesc.maxTTL, cfDesc.maxTTL) : p.ttl_max;
+    const { options, def } = ttlChoices(p.ttl_requested, maxTTL);
     const ttlSet = h(
       "fieldset",
       { class: "chips" },
@@ -767,11 +948,17 @@ class Sheet {
         h("label", { class: "chip" }, h("input", { type: "radio", name: "ttl", value: String(t), checked: t === def }), h("span", null, duration(t), t === p.ttl_requested ? h("small", null, " requested") : null)),
       ),
     );
-    // aqmasd refuses standing approvals for high-risk requests (high_risk target, root, > 4 h).
-    const standSet = p.risk === "high" ? null : h(
+    // SSH: aqmasd refuses standing approvals for high-risk requests (high_risk target, root,
+    // > 4 h). Cloudflare: only when the server allows it for this scope AND this page's own
+    // table does, and only in proxy mode (never cf.admin, never a token).
+    const offerStanding = cf ? cf.standing_allowed === true && cf.mode === "proxy" && cfDesc?.standing === true : p.risk !== "high";
+    const standLegend: Child[] = cf
+      ? ["Also auto-approve the same Cloudflare request (", h("bdi", null, vt(p.requesting_host)), ", ", h("bdi", null, vt(cf.scope)), cf.scope_params ? [" ", h("bdi", null, vt(cf.scope_params))] : null, ")"]
+      : ["Also auto-approve the same request (", h("bdi", null, vt(p.requesting_host)), " to ", h("bdi", null, vt(p.ssh?.login_user ?? "?")), "@", h("bdi", null, vt(p.ssh?.target_host ?? "?")), ")"];
+    const standSet = !offerStanding ? null : h(
       "fieldset",
       { class: "chips" },
-      h("legend", null, "Also auto-approve the same request (", h("bdi", null, vt(p.requesting_host)), " to ", h("bdi", null, vt(p.ssh?.login_user ?? "?")), "@", h("bdi", null, vt(p.ssh?.target_host ?? "?")), ")"),
+      h("legend", null, standLegend),
       STANDING_PRESETS.map((n) =>
         h("label", { class: "chip" }, h("input", { type: "radio", name: "standing", value: String(n), checked: n === 0 }), h("span", null, n === 0 ? "No" : `for ${hours(n)}`)),
       ),
@@ -782,7 +969,7 @@ class Sheet {
       const standing = Number(standSet?.querySelector<HTMLInputElement>("input:checked")?.value ?? 0);
       void this.prepare(seq, target, { action: "approve", ttl_seconds: ttl, standing_hours: standing }, again);
     });
-    this.render(h("h2", { id: "sheet-title" }, "Approve access"), this.summary(p), ttlSet, standSet, h("div", { class: "actions" }, this.cancelButton(), go));
+    this.render(h("h2", { id: "sheet-title" }, cf?.scope === "cf.admin" ? "Approve break-glass access" : "Approve access"), this.summary(p), ttlSet, standSet, h("div", { class: "actions" }, this.cancelButton(), go));
   }
 
   openDeny(p: PendingItem): void {
@@ -825,11 +1012,14 @@ class Sheet {
     const negative = p.choice.action !== "approve" && p.choice.action !== "add";
     const confirm = h("button", { class: `btn confirm big ${negative ? "deny" : "approve"}`, type: "button", "data-autofocus": "" }, "Confirm with passkey");
     confirm.addEventListener("click", () => this.confirm(seq, p, confirm));
+    const loud = d.breakGlass && !negative;
     this.render(
-      h("h2", { id: "sheet-title" }, "Check, then confirm"),
-      h("p", { class: `headline ${negative ? "neg" : "pos"}` }, renderParts(d.headlineParts)),
+      h("h2", { id: "sheet-title" }, loud ? "Break-glass: check, then confirm" : "Check, then confirm"),
+      d.risk ? h("p", { class: "card-top" }, h("span", { class: "kind" }, "Cloudflare"), riskBadge(d.risk)) : null,
+      h("p", { class: `headline ${negative ? "neg" : "pos"}${loud ? " loud" : ""}` }, renderParts(d.headlineParts)),
+      d.details?.length ? h("ul", { class: "cf-details" }, d.details.map((line) => h("li", null, renderParts(line)))) : null,
       d.standingParts ? h("p", { class: "warn" }, renderParts(d.standingParts)) : null,
-      d.warnings.map((w) => h("p", { class: "warn" }, vt(w))),
+      d.warnings.map((w, i) => h("p", { class: loud && i === 0 ? "breakglass" : "warn" }, vt(w))),
       h(
         "details",
         { class: "signed" },
@@ -916,8 +1106,28 @@ class Sheet {
     }
     const words: Record<string, string> = { approve: "Approved", deny: "Denied", revoke: "Revoked" };
     const lines: Child[] = [];
-    if (c.object === "grant")
+    if (c.object === "grant" && c.kind === "cloudflare")
+      lines.push(
+        c.mode === "token"
+          ? "Revoked, with any auto-approval that issued it or came with it. aqmas deletes the API token at Cloudflare now."
+          : "Revoked, with any auto-approval that issued it or came with it. The aqmas proxy refuses it from the next call.",
+      );
+    else if (c.object === "grant")
       lines.push("Marked revoked, with any auto-approval that issued it or came with it. aqmas on the host stops reusing it; the certificate itself stays valid until it expires (no revocation list yet).");
+    else if (c.object === "request" && c.action === "approve" && c.kind === "cloudflare") {
+      const notAfter = typeof r.grant?.not_after === "string" ? new Date(r.grant.not_after) : null;
+      lines.push(
+        h(
+          "span",
+          null,
+          h("bdi", null, vt(c.requesting_host ?? "The host")),
+          " has the Cloudflare grant ",
+          h("span", { class: "mono" }, vt(c.scope ?? "?")),
+          notAfter && Number.isFinite(notAfter.getTime()) ? ` until ${notAfter.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.` : ` for ${duration(c.ttl_seconds ?? 0)}.`,
+        ),
+      );
+      if (c.mode === "token") lines.push("The API token is handed to the host once, on its next poll.");
+    }
     else if (c.object === "standing") lines.push("Matching requests need your approval again.");
     else if (c.object === "enrollment" && c.action === "approve") lines.push(h("span", null, h("bdi", null, vt(c.requesting_host ?? "The host")), " can now ask for access."));
     else if (c.object === "request" && c.action === "approve") {
