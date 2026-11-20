@@ -7,6 +7,7 @@ require (
 	github.com/go-webauthn/webauthn v0.18.2
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	golang.org/x/crypto v0.59.0
+	golang.org/x/term v0.48.0
 	modernc.org/sqlite v1.62.0
 )
 

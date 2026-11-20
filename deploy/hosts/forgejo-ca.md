@@ -1,0 +1,91 @@
+# Forgejo (built-in SSH server on :2222) trusting the aqmas SSH user CA
+
+Documentation only: nothing here has been applied. Changing the Forgejo stack is a swarm
+change on build-box (192.0.2.50): edit the Forgejo
+stack file, deploy it and keep a rollback ready.
+
+## Settings
+
+In the `environment:` list of the Forgejo service (same style as the existing
+`GITEA__server__START_SSH_SERVER=true` lines):
+
+```yaml
+      # aqmas: accept SSH user certificates signed by the aqmas CA (built-in SSH server)
+      - GITEA__server__SSH_TRUSTED_USER_CA_KEYS=ssh-ed25519 AAAA...the CA public key... aqmas-user-ca
+      - GITEA__server__SSH_AUTHORIZED_PRINCIPALS_ALLOW=username
+```
+
+| ini (`[server]`) | env var | meaning in Forgejo 17 |
+|---|---|---|
+| `SSH_TRUSTED_USER_CA_KEYS` | `GITEA__server__SSH_TRUSTED_USER_CA_KEYS` (or `FORGEJO__server__...`) | Comma-separated list of CA public keys in authorized_keys format. Each is parsed at startup with `ssh.ParseAuthorizedKey`; **a key that fails to parse is `log.Fatal`: Forgejo does not start.** No commas in the key comment (the value is split on commas). |
+| `SSH_AUTHORIZED_PRINCIPALS_ALLOW` | `GITEA__server__SSH_AUTHORIZED_PRINCIPALS_ALLOW` | Which principal strings a user may *register* on their account: `username`, `email`, `anything`, or `off`. Defaults to `username,email` when CA keys are set, `off` otherwise. It is checked only when a principal is added, not at login. |
+| `SSH_TRUSTED_USER_CA_KEYS_FILENAME` | (leave unset) | Only used when Forgejo writes a CA file for an *external* OpenSSH; irrelevant with `START_SSH_SERVER=true`. |
+
+`environment-to-ini` also supports a `__FILE` suffix
+(`GITEA__server__SSH_TRUSTED_USER_CA_KEYS__FILE=/run/secrets/aqmas_user_ca`), which would let
+the CA key come from a swarm config instead of the stack file. The public key is not a secret,
+so the plain variable is fine.
+
+## One manual step: register the principal
+
+Forgejo does **not** map a certificate principal to a user by name. After the settings above,
+the owner adds the principal `alice` (must equal the username, because of
+`ALLOW=username`) under *Settings → SSH / GPG keys → "Manage SSH Certificate Principals" →
+"Add principal"* (the section only appears when principals are enabled). Forgejo's own text:
+"These SSH certificate principals are associated with your account and allow full access to
+your repositories." Principals are unique across all users.
+
+aqmasd then issues Forgejo grants with principal `alice`, login user `git`, target
+`192.0.2.50` port `2222`, and a `known_hosts_line` with the Forgejo built-in server's host
+key (`ssh-keyscan -p 2222 192.0.2.50`). Client side: `aqmas ssh git@forgejo` or, for git,
+`aqmas cert git@forgejo` and a `GIT_SSH_COMMAND` using the printed paths (see
+CONTRACT-NOTES-client.md: a `git` helper is proposed).
+
+Because fleet hosts only accept `alice@<host>` (their `AuthorizedPrincipalsFile`) and Forgejo
+only accepts registered principals (`alice`), a host certificate does not open Forgejo and a
+Forgejo certificate does not open a host.
+
+## What was verified, and how
+
+Read in the Forgejo 17.0.2 source (2026-11-20):
+
+- `modules/setting/ssh.go` (`loadSSHFrom`, `parseAuthorizedPrincipalsAllow`): the settings,
+  their defaults, comma splitting and the `log.Fatal` on an unparsable CA key, as in the table.
+- `modules/ssh/ssh.go` (`publicKeyHandler`), the built-in server's certificate login:
+  1. the SSH user must be the built-in server user (`git`);
+  2. no CA keys configured → every certificate is rejected; the certificate must be a user
+     certificate;
+  3. for each principal in the certificate, it looks up a stored key whose content equals the
+     principal exactly (`SearchPublicKeyByContentExact`); unknown principals are skipped;
+  4. the signing key must be one of the configured CA keys;
+  5. `CertChecker.CheckCert(principal, cert)` checks the principal and the validity window
+     (expired or not-yet-valid certificates fail);
+  6. the login is authorised as that principal key's owner (`forgejo-key-id`).
+- `models/asymkey/ssh_key_principals.go`: principals are stored as keys of type principal,
+  unique across users, validated against `SSH_AUTHORIZED_PRINCIPALS_ALLOW` only when added;
+  `routers/web/user/setting/keys.go` shows the principals UI only when principals are enabled.
+- `modules/setting/config_env.go`: `GITEA__SECTION__KEY` / `FORGEJO__...` env vars and the
+  `__FILE` suffix; `docker/root/etc/s6/gitea/setup` runs `environment-to-ini` on the container's
+  `app.ini` at start.
+- The image is built from this branch: its head commit is "ci: build 17.0.2-patched.1 from
+  the v17.0.2-patched branch", and `git diff v17.0.2..HEAD` touches nothing in
+  `modules/ssh`, `modules/setting/ssh.go` or `models/asymkey`, so this is upstream 17.0.2's
+  SSH code.
+- `options/locale/locale_en-US.ini`: the principals UI strings quoted above.
+- the Forgejo stack file on .50: the running service uses the built-in server
+  (`GITEA__server__START_SSH_SERVER=true`, port 2222) and image
+  `codeberg.org/forgejo/forgejo:<version>`.
+
+**Inferred from the source, not tested:** the `source-address` critical option is probably
+**not enforced** by Forgejo's built-in server. `x/crypto/ssh`'s `CheckCert` deliberately skips
+`source-address` and leaves it to the server, which enforces it from the `Permissions` returned
+by the auth callback; Forgejo's handler never copies the certificate's critical options into
+those permissions. So a Forgejo certificate copied to another LAN host would work there until
+it expires. Keep Forgejo grants short, or test this (a cert with `source-address` set to an
+address you are not connecting from) before relying on it.
+
+**Assumed, not verified:**
+- that the image running on .50 was really built from that commit (inferred from the tag and the
+  commit message, not from the image's digest or build metadata);
+- nothing was run against a live Forgejo: the end-to-end certificate login, the principals UI
+  and the `source-address` behaviour are untested.
