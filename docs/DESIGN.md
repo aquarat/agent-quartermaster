@@ -36,6 +36,7 @@ Later milestones (design here only so M1 doesn't paint us into a corner): GitHub
 installation tokens; Forgejo API via Forgejo *authorized integrations* (aqmasd as JWT issuer);
 Cloudflare policy proxy + minted expiring child tokens; generic header-injecting HTTP proxy;
 SSH `ProxyJump` through aqmasd to cut sessions at expiry; KRL-based revocation.
+See [Organisations, services and credential sets](ORGANISATIONS.md) for organisation-scoped approvals and CLI delivery of application secrets.
 
 ## Key decisions
 
