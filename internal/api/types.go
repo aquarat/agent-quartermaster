@@ -3,11 +3,14 @@
 // docs/API.md in step.
 package api
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Error is the body of every non-2xx response.
 type Error struct {
-	Code    string `json:"error"`   // bad_request, unauthenticated, forbidden, not_found, conflict, expired, denied, internal
+	Code    string `json:"error"`   // see the Err* constants
 	Message string `json:"message"` // human text
 }
 
@@ -18,6 +21,21 @@ const (
 	StatusDenied   = "denied"
 	StatusExpired  = "expired"
 	StatusRevoked  = "revoked"
+	// StatusCancelled: the requesting host withdrew a pending request (POST /v1/requests/{id}/cancel).
+	StatusCancelled = "cancelled"
+)
+
+// Error codes (Error.Code).
+const (
+	ErrBadRequest      = "bad_request"
+	ErrUnauthenticated = "unauthenticated"
+	ErrForbidden       = "forbidden"
+	ErrNotFound        = "not_found"
+	ErrConflict        = "conflict"
+	ErrExpired         = "expired"
+	ErrDenied          = "denied"
+	ErrRateLimited     = "rate_limited" // HTTP 429: too many pending requests/enrollments
+	ErrInternal        = "internal"
 )
 
 // Request kinds. Only KindSSH exists in milestone 1.
@@ -115,6 +133,15 @@ type GrantSummary struct {
 	LoginUser  string    `json:"login_user,omitempty"`
 	NotBefore  time.Time `json:"not_before"`
 	NotAfter   time.Time `json:"not_after"`
+	// RequestingHost is set in the web UI's state (who holds the access); the agent API's
+	// GET /v1/grants omits it (always the calling host).
+	RequestingHost string `json:"requesting_host,omitempty"`
+}
+
+// SSHCA is the body of GET /v1/ssh-ca: the SSH user CA that signs every grant certificate.
+type SSHCA struct {
+	PublicKey   string `json:"public_key"`  // authorized_keys format
+	Fingerprint string `json:"fingerprint"` // SHA256:<base64>, as ssh-keygen -l prints it
 }
 
 type GrantList struct {
@@ -129,20 +156,34 @@ type PendingSSH struct {
 	KeyFingerprint string `json:"key_fingerprint"`
 }
 
+// PendingEnrollment is the enrollment detail of a PendingItem with kind "enrollment".
+type PendingEnrollment struct {
+	CSRFingerprint         string   `json:"csr_fingerprint"`           // SHA256:<hex> of the CSR's PKIX public key
+	SSHHostKeyFingerprints []string `json:"ssh_host_key_fingerprints"` // as reported by the host (untrusted)
+	ReplacesExisting       bool     `json:"replaces_existing"`         // approving revokes the current host of that name
+}
+
+// PendingItem is an SSH request (kind "ssh") or a host enrollment (kind "enrollment") in the
+// web UI. For enrollments requesting_host is the proposed name, reason the enroll note, and
+// ttl_requested/ttl_max are 0.
 type PendingItem struct {
-	ID                string      `json:"id"`
-	Kind              string      `json:"kind"` // ssh, enrollment
-	CreatedAt         time.Time   `json:"created_at"`
-	ExpiresAt         time.Time   `json:"expires_at"`
-	RequestingHost    string      `json:"requesting_host"`
-	RequestingAddress string      `json:"requesting_address"`
-	Requester         Requester   `json:"requester"`
-	Reason            string      `json:"reason"`
-	SSH               *PendingSSH `json:"ssh,omitempty"`
-	TTLRequested      int         `json:"ttl_requested"`
-	TTLMax            int         `json:"ttl_max"`
-	Risk              string      `json:"risk"` // normal, high
-	SimilarRecent     int         `json:"similar_recent"`
+	ID                string             `json:"id"`
+	Kind              string             `json:"kind"` // ssh, enrollment
+	CreatedAt         time.Time          `json:"created_at"`
+	ExpiresAt         time.Time          `json:"expires_at"`
+	RequestingHost    string             `json:"requesting_host"`
+	RequestingAddress string             `json:"requesting_address"`
+	Requester         Requester          `json:"requester"`
+	Reason            string             `json:"reason"`
+	SSH               *PendingSSH        `json:"ssh,omitempty"`
+	TTLRequested      int                `json:"ttl_requested"`
+	TTLMax            int                `json:"ttl_max"`
+	Risk              string             `json:"risk"` // normal, high
+	SimilarRecent     int                `json:"similar_recent"`
+	Enrollment        *PendingEnrollment `json:"enrollment,omitempty"`
+	// Status is set by GET /api/ui/requests/{id} and /api/ui/enrollments/{id} (the item may
+	// have been decided since); UIState.pending items are always pending and omit it.
+	Status string `json:"status,omitempty"`
 }
 
 type StandingApproval struct {
@@ -173,12 +214,62 @@ type UIState struct {
 	Owner    UIOwner            `json:"owner"`
 	Pending  []PendingItem      `json:"pending"`
 	Standing []StandingApproval `json:"standing"`
+	Grants   []GrantSummary     `json:"grants"` // active grants, newest first, with requesting_host
 	Recent   []AuditEntry       `json:"recent"`
+}
+
+// UISession is the body of GET /api/ui/session (works without a session).
+type UISession struct {
+	Authenticated bool    `json:"authenticated"`
+	Owner         UIOwner `json:"owner"`
+}
+
+// OK is the body of calls that only report success (login/finish, register/finish, logout).
+type OK struct {
+	OK bool `json:"ok"`
+}
+
+// RevokeResult is the body of /api/ui/standing/{id}/revoke and /api/ui/grants/{id}/revoke.
+type RevokeResult struct {
+	OK     bool   `json:"ok"`
+	ID     string `json:"id"`
+	Status string `json:"status"`
+}
+
+// CeremonyBegin is the response of login/begin and passkeys/register/begin. PublicKey is the
+// bare WebAuthn options object (PublicKeyCredentialRequestOptions for login,
+// PublicKeyCredentialCreationOptions for registration). The WebAuthn session state stays on
+// the server, keyed by ChallengeID, which the matching finish call must send back.
+type CeremonyBegin struct {
+	ChallengeID string `json:"challenge_id"`
+	PublicKey   any    `json:"public_key"`
+}
+
+// LoginFinish is the body of POST /api/ui/login/finish.
+type LoginFinish struct {
+	ChallengeID string          `json:"challenge_id"`
+	Assertion   json.RawMessage `json:"assertion"` // PublicKeyCredential JSON from the browser
+}
+
+// RegisterBegin is the body of POST /api/ui/passkeys/register/begin: EnrollCode for the first
+// passkey (from aqmasd passkey-enroll-code), otherwise a session plus ChallengeID/Assertion
+// for a {"action":"add","object":"passkey"} challenge from POST /api/ui/passkeys/challenge.
+type RegisterBegin struct {
+	EnrollCode  string          `json:"enroll_code,omitempty"`
+	ChallengeID string          `json:"challenge_id,omitempty"`
+	Assertion   json.RawMessage `json:"assertion,omitempty"`
+}
+
+// RegisterFinish is the body of POST /api/ui/passkeys/register/finish.
+type RegisterFinish struct {
+	ChallengeID string          `json:"challenge_id"`
+	Credential  json.RawMessage `json:"credential"` // PublicKeyCredential JSON from the browser
+	Name        string          `json:"name,omitempty"`
 }
 
 // ChallengeRequest asks for a WebAuthn challenge that commits to one exact action.
 type ChallengeRequest struct {
-	Action        string `json:"action"` // approve, deny, revoke
+	Action        string `json:"action"` // approve, deny (requests, enrollments); revoke (standing, grants); add (passkeys)
 	TTLSeconds    int    `json:"ttl_seconds,omitempty"`
 	StandingHours int    `json:"standing_hours,omitempty"`
 }
@@ -194,6 +285,6 @@ type ChallengeResponse struct {
 
 // DecideRequest carries the assertion for a previously issued challenge.
 type DecideRequest struct {
-	ChallengeID string `json:"challenge_id"`
-	Assertion   any    `json:"assertion"` // PublicKeyCredential JSON from the browser
+	ChallengeID string          `json:"challenge_id"`
+	Assertion   json.RawMessage `json:"assertion"` // PublicKeyCredential JSON from the browser
 }

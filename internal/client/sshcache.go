@@ -110,8 +110,8 @@ func (e *Env) targetDir(t Target) (string, error) {
 }
 
 // CertValidity checks an OpenSSH user certificate (authorized_keys format) for key pub and
-// returns its expiry. It checks type, key binding and time window; it cannot check the CA
-// signature because the client is not told the CA key.
+// returns its expiry. It checks type, key binding and time window; VerifyCertSigner checks
+// the CA signature.
 func CertValidity(certText []byte, pub ssh.PublicKey, now time.Time) (*ssh.Certificate, error) {
 	pk, _, _, rest, err := ssh.ParseAuthorizedKey(certText)
 	if err != nil {
@@ -143,6 +143,23 @@ func CertValidity(certText []byte, pub ssh.PublicKey, now time.Time) (*ssh.Certi
 		return nil, fmt.Errorf("certificate: expired at %s", certTime(cert.ValidBefore).Format(time.RFC3339))
 	}
 	return cert, nil
+}
+
+// VerifyCertSigner checks that cert was signed by caKey (the key GET /v1/ssh-ca publishes).
+func VerifyCertSigner(cert *ssh.Certificate, caKey ssh.PublicKey) error {
+	if !bytes.Equal(cert.SignatureKey.Marshal(), caKey.Marshal()) {
+		return fmt.Errorf("certificate is signed by %s, not the server's SSH CA %s; refusing",
+			ssh.FingerprintSHA256(cert.SignatureKey), ssh.FingerprintSHA256(caKey))
+	}
+	// Re-verify the signature over the certificate body: SignatureKey is only a claim.
+	c := *cert
+	c.Signature = nil
+	body := c.Marshal()
+	body = body[:len(body)-4] // Marshal ends with an empty signature string (uint32 length 0)
+	if err := caKey.Verify(body, cert.Signature); err != nil {
+		return fmt.Errorf("certificate signature does not verify against the server's SSH CA: %w", err)
+	}
+	return nil
 }
 
 func certTime(t uint64) time.Time {
@@ -219,7 +236,9 @@ func (e *Env) loadCached(tdir string, t Target) (*Prepared, error) {
 // storeGrant validates an approved grant against what was asked for, writes key, cert,
 // known_hosts and grant.json (all 0600) into a new directory tdir/g-<request id> (0700) and
 // then points tdir/current at it.
-func (e *Env) storeGrant(tdir string, t Target, requestID string, priv ed25519.PrivateKey, g *api.Grant) (*Prepared, error) {
+// storeGrant validates and caches an approved grant. caKey, when not nil, must have signed
+// the certificate.
+func (e *Env) storeGrant(tdir string, t Target, requestID string, priv ed25519.PrivateKey, g *api.Grant, caKey ssh.PublicKey) (*Prepared, error) {
 	if g == nil || g.SSH == nil {
 		return nil, errors.New("approved, but the server sent no SSH grant")
 	}
@@ -240,6 +259,11 @@ func (e *Env) storeGrant(tdir string, t Target, requestID string, priv ed25519.P
 	cert, err := CertValidity([]byte(sg.Certificate), sshPub, e.now())
 	if err != nil {
 		return nil, fmt.Errorf("server sent an unusable certificate: %w", err)
+	}
+	if caKey != nil {
+		if err := VerifyCertSigner(cert, caKey); err != nil {
+			return nil, err
+		}
 	}
 	var known []byte
 	if sg.KnownHostsLine != "" {

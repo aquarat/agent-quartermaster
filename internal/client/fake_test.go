@@ -89,10 +89,11 @@ func (ca *testCA) issue(t *testing.T, cn string, pub any, eku []x509.ExtKeyUsage
 }
 
 type fakeReq struct {
-	req     api.AccessRequest
-	host    string
-	polls   int
-	granted *api.Grant
+	req       api.AccessRequest
+	host      string
+	polls     int
+	granted   *api.Grant
+	cancelled bool
 }
 
 // fakeServer implements the agent API (docs/API.md section 1) from internal/api types.
@@ -102,6 +103,8 @@ type fakeServer struct {
 	serverCA *testCA
 	clientCA *testCA
 	sshCA    ssh.Signer
+	// publishedSSHCA, when set, is what GET /v1/ssh-ca returns instead of sshCA.
+	publishedSSHCA ssh.Signer
 
 	mu sync.Mutex
 	// enrollment behaviour
@@ -160,6 +163,8 @@ func newFakeServer(t *testing.T) *fakeServer {
 	mux.HandleFunc("POST /v1/requests", f.handleCreate)
 	mux.HandleFunc("GET /v1/requests/{id}", f.handleRequestStatus)
 	mux.HandleFunc("GET /v1/grants", f.handleGrants)
+	mux.HandleFunc("POST /v1/requests/{id}/cancel", f.handleCancel)
+	mux.HandleFunc("GET /v1/ssh-ca", f.handleSSHCA)
 	f.srv = httptest.NewUnstartedServer(mux)
 	f.srv.Config.ErrorLog = log.New(io.Discard, "", 0) // handshake failures are expected in some tests
 
@@ -296,6 +301,10 @@ func (f *fakeServer) handleRequestStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	fr.polls++
+	if fr.cancelled {
+		writeJSON(w, 200, api.RequestStatus{ID: id, Kind: api.KindSSH, Status: api.StatusCancelled})
+		return
+	}
 	if fr.polls <= f.requestPending {
 		writeJSON(w, 200, api.RequestStatus{ID: id, Kind: api.KindSSH, Status: api.StatusPending})
 		return
@@ -309,6 +318,38 @@ func (f *fakeServer) handleRequestStatus(w http.ResponseWriter, r *http.Request)
 		fr.granted = f.sign(id, fr)
 	}
 	writeJSON(w, 200, api.RequestStatus{ID: id, Kind: api.KindSSH, Status: api.StatusApproved, Grant: fr.granted})
+}
+
+func (f *fakeServer) handleCancel(w http.ResponseWriter, r *http.Request) {
+	host, ok := f.host(w, r)
+	if !ok {
+		return
+	}
+	id := r.PathValue("id")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fr, ok := f.requests[id]
+	if !ok || fr.host != host {
+		apiErr(w, 404, "not_found", "no such request")
+		return
+	}
+	if fr.granted != nil {
+		apiErr(w, 409, "conflict", "request is approved")
+		return
+	}
+	fr.cancelled = true
+	writeJSON(w, 200, api.RequestStatus{ID: id, Kind: api.KindSSH, Status: api.StatusCancelled})
+}
+
+func (f *fakeServer) handleSSHCA(w http.ResponseWriter, r *http.Request) {
+	if _, ok := f.host(w, r); !ok {
+		return
+	}
+	ca := f.sshCA
+	if f.publishedSSHCA != nil {
+		ca = f.publishedSSHCA
+	}
+	writeJSON(w, 200, api.SSHCA{PublicKey: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(ca.PublicKey()))), Fingerprint: ssh.FingerprintSHA256(ca.PublicKey())})
 }
 
 func (f *fakeServer) sign(id string, fr *fakeReq) *api.Grant {

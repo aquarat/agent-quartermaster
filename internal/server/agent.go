@@ -149,12 +149,12 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		if n >= MaxPendingEnrolls {
-			return &apiErr{http.StatusTooManyRequests, "conflict", "too many pending enrollments"}
+			return &apiErr{http.StatusTooManyRequests, api.ErrRateLimited, "too many pending enrollments"}
 		}
 		if n, err := q.CountPendingEnrollmentsFrom(ctx, e.PeerAddress, now); err != nil {
 			return err
 		} else if n >= MaxPendingEnrollsPerIP {
-			return &apiErr{http.StatusTooManyRequests, "conflict", "too many pending enrollments from this address"}
+			return &apiErr{http.StatusTooManyRequests, api.ErrRateLimited, "too many pending enrollments from this address"}
 		}
 		if err := q.InsertEnrollment(ctx, e); err != nil {
 			return err
@@ -316,7 +316,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		if n, err := q.CountPendingRequests(ctx, h.ID, now); err != nil {
 			return err
 		} else if n >= MaxPendingPerHost {
-			return &apiErr{http.StatusTooManyRequests, "conflict", "too many pending requests from this host"}
+			return &apiErr{http.StatusTooManyRequests, api.ErrRateLimited, "too many pending requests from this host"}
 		}
 		if err := q.InsertRequest(ctx, req); err != nil {
 			return err
@@ -398,9 +398,6 @@ func (s *Server) requestStatus(ctx context.Context, q *store.Q, req *store.Reque
 	return out, nil
 }
 
-// StatusCancelled is the status of a request its host withdrew (proposed for internal/api).
-const StatusCancelled = "cancelled"
-
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request, h *store.Host) {
 	id := r.PathValue("id")
 	ctx := r.Context()
@@ -430,11 +427,11 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request, h *store.H
 	writeJSON(w, http.StatusOK, api.RequestStatus{ID: req.ID, Kind: req.Kind, Status: req.Status, DecidedAt: req.DecidedAt, DecisionNote: req.DecisionNote})
 }
 
-// handleSSHCA publishes the SSH user CA public key (proposed: GET /v1/ssh-ca).
+// handleSSHCA publishes the SSH user CA public key (GET /v1/ssh-ca).
 func (s *Server) handleSSHCA(w http.ResponseWriter, r *http.Request, _ *store.Host) {
-	writeJSON(w, http.StatusOK, map[string]string{
-		"public_key":  s.pki.SSHCAPublicLine(),
-		"fingerprint": ssh.FingerprintSHA256(s.pki.SSHSigner.PublicKey()),
+	writeJSON(w, http.StatusOK, api.SSHCA{
+		PublicKey:   s.pki.SSHCAPublicLine(),
+		Fingerprint: ssh.FingerprintSHA256(s.pki.SSHSigner.PublicKey()),
 	})
 }
 

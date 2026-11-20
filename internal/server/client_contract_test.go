@@ -46,7 +46,7 @@ func TestCancelAndSSHCA(t *testing.T) {
 	var rs api.RequestStatus
 	st, _ = agentDo(t, a, "POST", e.agent.URL+"/v1/requests/"+rc.ID+"/cancel", map[string]any{}, &rs)
 	mustStatus(t, "cancel", st, 200)
-	if rs.Status != StatusCancelled {
+	if rs.Status != api.StatusCancelled {
 		t.Fatalf("status %q", rs.Status)
 	}
 	var state api.UIState

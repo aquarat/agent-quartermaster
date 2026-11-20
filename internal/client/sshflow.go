@@ -108,18 +108,42 @@ func (e *Env) EnsureSSHCert(ctx context.Context, o SSHOptions) (*Prepared, error
 
 	st, err := e.waitRequest(ctx, c, created)
 	if err != nil {
-		if errors.Is(err, ErrCancelled) {
-			e.logf("cancelled; request %s stays pending on the server until %s (the key was not saved)",
-				created.ID, created.ExpiresAt.Local().Format("15:04:05"))
+		if errors.Is(err, ErrCancelled) || errors.Is(err, context.Canceled) {
+			e.cancelRequest(c, created)
 		}
 		return nil, err
 	}
-	p, err := e.storeGrant(dir, o.Target, created.ID, priv, st.Grant)
+	// Check the certificate is signed by the SSH CA the server publishes (best effort: an
+	// unreachable endpoint only warns; a different CA is refused).
+	var caKey ssh.PublicKey
+	if ca, err := c.SSHCA(ctx); err != nil {
+		e.logf("warning: could not fetch the SSH CA to check the certificate's signer: %v", err)
+	} else if caKey, _, _, _, err = ssh.ParseAuthorizedKey([]byte(ca.PublicKey)); err != nil {
+		return nil, fmt.Errorf("server sent an unreadable SSH CA key: %w", err)
+	}
+	p, err := e.storeGrant(dir, o.Target, created.ID, priv, st.Grant, caKey)
 	if err != nil {
 		return nil, err
 	}
 	e.logf("approved: grant %s valid until %s", p.Grant.GrantID, p.ValidBefore.Local().Format("15:04:05"))
 	return p, nil
+}
+
+// cancelRequest withdraws a request after Ctrl-C so it leaves the owner's queue. It uses its
+// own short context: the command's context is already cancelled.
+func (e *Env) cancelRequest(c *APIClient, created *api.RequestCreated) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := c.CancelRequest(ctx, created.ID)
+	switch {
+	case err == nil && st.Status == api.StatusCancelled:
+		e.logf("cancelled request %s (the key was not saved)", created.ID)
+	case err == nil:
+		e.logf("request %s is already %s; nothing to cancel (the key was not saved)", created.ID, sanitize(st.Status))
+	default:
+		e.logf("could not cancel request %s (%v); it stays pending until %s (the key was not saved)",
+			created.ID, err, created.ExpiresAt.Local().Format("15:04:05"))
+	}
 }
 
 func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.RequestCreated) (*api.RequestStatus, error) {
@@ -156,7 +180,7 @@ func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.Reques
 		switch st.Status {
 		case api.StatusApproved:
 			return st, nil
-		case api.StatusDenied, api.StatusExpired, api.StatusRevoked:
+		case api.StatusDenied, api.StatusExpired, api.StatusRevoked, api.StatusCancelled:
 			return nil, &DecisionError{Status: st.Status, What: what, Note: st.DecisionNote}
 		case api.StatusPending:
 			if !deadline.IsZero() && time.Now().After(deadline) {

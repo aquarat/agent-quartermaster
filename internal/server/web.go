@@ -154,39 +154,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": ok, "owner": api.UIOwner{Name: s.cfg.OwnerName, Passkeys: n}})
+	writeJSON(w, http.StatusOK, api.UISession{Authenticated: ok, Owner: api.UIOwner{Name: s.cfg.OwnerName, Passkeys: n}})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess string) {
 	_ = s.store.Q().DeleteSession(r.Context(), sess)
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-// ceremonyBegin is the response to login/begin and passkeys/register/begin.
-type ceremonyBegin struct {
-	ChallengeID string `json:"challenge_id"`
-	PublicKey   any    `json:"public_key"`
-}
-
-// ceremonyFinish is the body of login/finish and passkeys/register/finish. The browser's
-// PublicKeyCredential JSON may be sent as "assertion" (login), "credential" (register), or
-// "attestation".
-type ceremonyFinish struct {
-	ChallengeID string          `json:"challenge_id"`
-	Assertion   json.RawMessage `json:"assertion"`
-	Credential  json.RawMessage `json:"credential"`
-	Attestation json.RawMessage `json:"attestation"`
-	Name        string          `json:"name"`
-}
-
-func (f ceremonyFinish) payload() json.RawMessage {
-	for _, p := range []json.RawMessage{f.Credential, f.Attestation, f.Assertion} {
-		if len(p) > 0 && string(p) != "null" {
-			return p
-		}
-	}
-	return nil
+	writeJSON(w, http.StatusOK, api.OK{OK: true})
 }
 
 func randomChallenge() []byte {
@@ -222,12 +196,12 @@ func (s *Server) handleLoginBegin(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, ceremonyBegin{ChallengeID: c.ID, PublicKey: as.Response})
+	writeJSON(w, http.StatusOK, api.CeremonyBegin{ChallengeID: c.ID, PublicKey: as.Response})
 }
 
 func (s *Server) handleLoginFinish(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	var in ceremonyFinish
+	var in api.LoginFinish
 	if err := decode(r, &in); err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -243,7 +217,7 @@ func (s *Server) handleLoginFinish(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
-	pkID, err := s.verifyAssertion(ctx, ch, in.payload())
+	pkID, err := s.verifyAssertion(ctx, ch, in.Assertion)
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -261,7 +235,7 @@ func (s *Server) handleLoginFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: cookie, Path: "/", MaxAge: int(SessionTTL / time.Second),
 		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusOK, api.OK{OK: true})
 }
 
 func (s *Server) consume(ctx context.Context, id, purpose string, now time.Time) (*store.Challenge, error) {
@@ -282,15 +256,9 @@ func (s *Server) consume(ctx context.Context, id, purpose string, now time.Time)
 
 // ---- passkey registration ----
 
-type registerBegin struct {
-	EnrollCode  string          `json:"enroll_code"`
-	ChallengeID string          `json:"challenge_id"`
-	Assertion   json.RawMessage `json:"assertion"`
-}
-
 func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	var in registerBegin
+	var in api.RegisterBegin
 	if err := decode(r, &in); err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -366,12 +334,12 @@ func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, ceremonyBegin{ChallengeID: c.ID, PublicKey: cc.Response})
+	writeJSON(w, http.StatusOK, api.CeremonyBegin{ChallengeID: c.ID, PublicKey: cc.Response})
 }
 
 func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	var in ceremonyFinish
+	var in api.RegisterFinish
 	if err := decode(r, &in); err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -397,8 +365,8 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
-	payload := in.payload()
-	if payload == nil {
+	payload := []byte(in.Credential)
+	if len(payload) == 0 || string(payload) == "null" {
 		s.writeErr(w, r, errBad("credential required"))
 		return
 	}
@@ -460,37 +428,10 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusOK, api.OK{OK: true})
 }
 
 // ---- state ----
-
-// uiItem is api.PendingItem plus the fields the web UI uses that internal/api lacks yet
-// (docs/CONTRACT-NOTES-server.md).
-type uiItem struct {
-	api.PendingItem
-	Status     string             `json:"status,omitempty"`
-	Enrollment *pendingEnrollment `json:"enrollment,omitempty"`
-}
-
-type pendingEnrollment struct {
-	CSRFingerprint         string   `json:"csr_fingerprint"`
-	SSHHostKeyFingerprints []string `json:"ssh_host_key_fingerprints"`
-	ReplacesExisting       bool     `json:"replaces_existing"`
-}
-
-type uiGrant struct {
-	api.GrantSummary
-	RequestingHost string `json:"requesting_host"`
-}
-
-type uiState struct {
-	Owner    api.UIOwner            `json:"owner"`
-	Pending  []uiItem               `json:"pending"`
-	Standing []api.StandingApproval `json:"standing"`
-	Grants   []uiGrant              `json:"grants"`
-	Recent   []api.AuditEntry       `json:"recent"`
-}
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 	ctx := r.Context()
@@ -505,7 +446,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 		s.writeErr(w, r, err)
 		return
 	}
-	out := uiState{Owner: api.UIOwner{Name: s.cfg.OwnerName, Passkeys: n}, Pending: []uiItem{}, Standing: []api.StandingApproval{}, Grants: []uiGrant{}}
+	out := api.UIState{Owner: api.UIOwner{Name: s.cfg.OwnerName, Passkeys: n}, Pending: []api.PendingItem{}, Standing: []api.StandingApproval{}, Grants: []api.GrantSummary{}}
 	reqs, err := q.PendingRequests(ctx, now)
 	if err != nil {
 		s.writeErr(w, r, err)
@@ -517,7 +458,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 			s.writeErr(w, r, err)
 			return
 		}
-		out.Pending = append(out.Pending, uiItem{PendingItem: *it})
+		out.Pending = append(out.Pending, *it)
 	}
 	ens, err := q.PendingEnrollments(ctx, now)
 	if err != nil {
@@ -542,8 +483,8 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	for _, g := range gs {
-		out.Grants = append(out.Grants, uiGrant{GrantSummary: api.GrantSummary{ID: g.ID, Kind: g.Kind, Status: g.Status(now),
-			TargetHost: g.TargetHost, LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter}, RequestingHost: g.HostName})
+		out.Grants = append(out.Grants, api.GrantSummary{ID: g.ID, Kind: g.Kind, Status: g.Status(now),
+			TargetHost: g.TargetHost, LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter, RequestingHost: g.HostName})
 	}
 	if out.Recent, err = q.RecentAudit(ctx, 50); err != nil {
 		s.writeErr(w, r, err)
@@ -569,7 +510,7 @@ func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.Pendi
 	}, nil
 }
 
-func (s *Server) enrollmentItem(ctx context.Context, e *store.Enrollment) uiItem {
+func (s *Server) enrollmentItem(ctx context.Context, e *store.Enrollment) api.PendingItem {
 	risk, replaces := "normal", false
 	if _, err := s.store.Q().ActiveHostByName(ctx, e.Hostname); err == nil {
 		risk, replaces = "high", true // replaces an existing host identity
@@ -578,12 +519,10 @@ func (s *Server) enrollmentItem(ctx context.Context, e *store.Enrollment) uiItem
 	if fps == nil {
 		fps = []string{}
 	}
-	return uiItem{
-		PendingItem: api.PendingItem{
-			ID: e.ID, Kind: "enrollment", CreatedAt: e.CreatedAt, ExpiresAt: e.ExpiresAt,
-			RequestingHost: e.Hostname, RequestingAddress: e.PeerAddress, Reason: e.Note, Risk: risk,
-		},
-		Enrollment: &pendingEnrollment{CSRFingerprint: e.KeyFingerprint, SSHHostKeyFingerprints: fps, ReplacesExisting: replaces},
+	return api.PendingItem{
+		ID: e.ID, Kind: "enrollment", CreatedAt: e.CreatedAt, ExpiresAt: e.ExpiresAt,
+		RequestingHost: e.Hostname, RequestingAddress: e.PeerAddress, Reason: e.Note, Risk: risk,
+		Enrollment: &api.PendingEnrollment{CSRFingerprint: e.KeyFingerprint, SSHHostKeyFingerprints: fps, ReplacesExisting: replaces},
 	}
 }
 
@@ -598,7 +537,8 @@ func (s *Server) handleRequestItem(w http.ResponseWriter, r *http.Request, _ str
 		s.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, uiItem{PendingItem: *it, Status: rq.Status})
+	it.Status = rq.Status
+	writeJSON(w, http.StatusOK, it)
 }
 
 func (s *Server) handleEnrollmentItem(w http.ResponseWriter, r *http.Request, _ string) {
@@ -712,10 +652,7 @@ func (s *Server) verifyAction(ctx context.Context, sess, object, id, challengeID
 func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Request, string) {
 	return func(w http.ResponseWriter, r *http.Request, sess string) {
 		ctx := r.Context()
-		var in struct {
-			ChallengeID string          `json:"challenge_id"`
-			Assertion   json.RawMessage `json:"assertion"`
-		}
+		var in api.DecideRequest
 		if err := decode(r, &in); err != nil {
 			s.writeErr(w, r, err)
 			return
@@ -749,7 +686,7 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 			}
 			writeJSON(w, http.StatusOK, api.EnrollStatus{ID: e.ID, Status: e.Status})
 		default:
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "status": api.StatusRevoked})
+			writeJSON(w, http.StatusOK, api.RevokeResult{OK: true, ID: id, Status: api.StatusRevoked})
 		}
 	}
 }

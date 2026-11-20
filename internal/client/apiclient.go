@@ -52,7 +52,7 @@ func (e *APIError) Error() string {
 
 // DecisionError is a request or enrollment that ended without approval.
 type DecisionError struct {
-	Status string // denied, expired, revoked
+	Status string // denied, expired, revoked, cancelled
 	What   string // "request 01J..." or "enrollment 01J..."
 	Note   string
 }
@@ -81,8 +81,11 @@ func ExitCode(err error) int {
 	case errors.Is(err, ErrCancelled), errors.Is(err, context.Canceled):
 		return ExitCancelled
 	case errors.As(err, &de):
-		if de.Status == api.StatusExpired {
+		switch de.Status {
+		case api.StatusExpired:
 			return ExitExpired
+		case api.StatusCancelled:
+			return ExitCancelled
 		}
 		return ExitDenied
 	case errors.As(err, &ue):
@@ -223,6 +226,24 @@ func (c *APIClient) CreateRequest(ctx context.Context, req *api.AccessRequest) (
 func (c *APIClient) RequestStatus(ctx context.Context, id string, wait time.Duration) (*api.RequestStatus, error) {
 	var out api.RequestStatus
 	if err := c.do(ctx, http.MethodGet, "/v1/requests/"+url.PathEscape(id)+waitQuery(wait), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CancelRequest withdraws a pending request (POST /v1/requests/{id}/cancel).
+func (c *APIClient) CancelRequest(ctx context.Context, id string) (*api.RequestStatus, error) {
+	var out api.RequestStatus
+	if err := c.do(ctx, http.MethodPost, "/v1/requests/"+url.PathEscape(id)+"/cancel", struct{}{}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SSHCA fetches the SSH user CA public key (GET /v1/ssh-ca).
+func (c *APIClient) SSHCA(ctx context.Context) (*api.SSHCA, error) {
+	var out api.SSHCA
+	if err := c.do(ctx, http.MethodGet, "/v1/ssh-ca", nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

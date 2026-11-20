@@ -344,8 +344,75 @@ func TestSSHCancel(t *testing.T) {
 	if ents, _ := os.ReadDir(filepath.Join(e.Paths.CacheDir, "alice@db-1")); len(ents) != 1 || ents[0].Name() != ".lock" {
 		t.Errorf("files saved after cancel: %v", ents)
 	}
-	if !strings.Contains(e.stderr.String(), "cancelled; request REQ0001 stays pending") {
+	if !strings.Contains(e.stderr.String(), "cancelled request REQ0001") {
 		t.Errorf("stderr: %s", e.stderr)
+	}
+	f.mu.Lock()
+	cancelled := f.requests["REQ0001"].cancelled
+	f.mu.Unlock()
+	if !cancelled {
+		t.Error("the request was not cancelled on the server")
+	}
+}
+
+func TestSSHCancelledElsewhere(t *testing.T) {
+	f := newFakeServer(t)
+	f.requestPending = 1 << 30
+	e := newTestEnv(t)
+	enroll(t, f, e)
+	go func() {
+		for {
+			time.Sleep(20 * time.Millisecond)
+			f.mu.Lock()
+			fr := f.requests["REQ0001"]
+			if fr != nil {
+				fr.cancelled = true
+				f.mu.Unlock()
+				return
+			}
+			f.mu.Unlock()
+		}
+	}()
+	_, err := e.EnsureSSHCert(context.Background(), sshOpts("x"))
+	if ExitCode(err) != ExitCancelled {
+		t.Fatalf("err=%v code=%d", err, ExitCode(err))
+	}
+}
+
+func TestSSHWrongCASigner(t *testing.T) {
+	f := newFakeServer(t)
+	_, other, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.publishedSSHCA, err = ssh.NewSignerFromKey(other); err != nil {
+		t.Fatal(err)
+	}
+	e := newTestEnv(t)
+	enroll(t, f, e)
+	_, err = e.EnsureSSHCert(context.Background(), sshOpts("x"))
+	if err == nil || !strings.Contains(err.Error(), "not the server's SSH CA") {
+		t.Fatalf("certificate from another CA accepted: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(e.Paths.CacheDir, "alice@db-1", "current")); !os.IsNotExist(err) {
+		t.Error("grant saved although its signer is not the published CA")
+	}
+}
+
+func TestVerifyCertSignerForged(t *testing.T) {
+	f := newFakeServer(t)
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	pk, _ := ssh.NewPublicKey(pub)
+	cert := &ssh.Certificate{Key: pk, CertType: ssh.UserCert, ValidPrincipals: []string{"a@b"}, ValidBefore: 1 << 40}
+	if err := cert.SignCert(rand.Reader, f.sshCA); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyCertSigner(cert, f.sshCA.PublicKey()); err != nil {
+		t.Fatalf("genuine certificate refused: %v", err)
+	}
+	cert.ValidPrincipals = []string{"root@b"} // tampered after signing
+	if err := VerifyCertSigner(cert, f.sshCA.PublicKey()); err == nil {
+		t.Fatal("tampered certificate accepted")
 	}
 }
 

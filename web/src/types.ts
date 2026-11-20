@@ -1,6 +1,6 @@
 // Wire types for the web UI API (docs/API.md section 2). Mirrors internal/api/types.go,
-// which is the source of truth. Fields marked "proposed" are in docs/CONTRACT-NOTES-web.md
-// and are optional here so the UI works whether or not the server sends them.
+// which is the source of truth. A few fields stay optional here so the UI degrades
+// gracefully against an older server.
 
 export interface Requester {
   tool: string; // self-reported, untrusted
@@ -16,7 +16,7 @@ export interface PendingSSH {
   key_fingerprint: string;
 }
 
-/** Proposed: enrollment detail for kind "enrollment". */
+/** Enrollment detail for kind "enrollment" (api.PendingEnrollment). */
 export interface PendingEnrollment {
   csr_fingerprint?: string;
   ssh_host_key_fingerprints?: string[];
@@ -33,11 +33,12 @@ export interface PendingItem {
   requester: Requester;
   reason: string; // untrusted
   ssh?: PendingSSH;
-  enrollment?: PendingEnrollment; // proposed
+  enrollment?: PendingEnrollment;
   ttl_requested: number;
   ttl_max: number;
   risk: string; // "normal" | "high"
   similar_recent: number;
+  status?: string; // only on GET /api/ui/requests/{id} and /api/ui/enrollments/{id}
 }
 
 export interface StandingApproval {
@@ -57,7 +58,7 @@ export interface GrantSummary {
   status: string;
   target_host?: string;
   login_user?: string;
-  requesting_host?: string; // proposed
+  requesting_host?: string; // set in UIState.grants
   not_before: string;
   not_after: string;
 }
@@ -80,7 +81,7 @@ export interface UIState {
   pending: PendingItem[] | null;
   standing: StandingApproval[] | null;
   recent: AuditEntry[] | null;
-  grants?: GrantSummary[] | null; // proposed
+  grants?: GrantSummary[] | null; // active grants (api.UIState.grants)
 }
 
 export type Action = "approve" | "deny" | "revoke" | "add";
@@ -99,7 +100,7 @@ export interface ChallengeResponse {
   public_key: unknown;
 }
 
-/** Response of login/begin and register/begin (proposed shape, see contract notes). */
+/** Response of login/begin and register/begin (api.CeremonyBegin). */
 export interface BeginResponse {
   challenge_id?: string;
   public_key?: unknown;

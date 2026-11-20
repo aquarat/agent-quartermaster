@@ -182,7 +182,7 @@ func TestCSRFAndHeaders(t *testing.T) {
 	req.Header.Set("X-Aqmas", "1")
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ = http.DefaultClient.Do(req)
-	var begin ceremonyBegin
+	var begin api.CeremonyBegin
 	json.NewDecoder(resp.Body).Decode(&begin)
 	resp.Body.Close()
 	pk, _ := json.Marshal(begin.PublicKey)
