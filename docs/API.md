@@ -274,7 +274,8 @@ reason, ttl_seconds, requester}`.
 - `ttl_seconds`: 0 = the scope's default; clamped into `[ttl.min_seconds, min(scope max, ttl.max_seconds)]`
   (`cf.admin` max 3600). The clamped value is the card's `ttl_max`.
 - **Auto-approval**: `cf.read` and `cf.cache.purge` in proxy mode are approved at once
-  (status `approved` in the 201), audited `cf_auto_approve`, no push. Otherwise a matching
+  (status `approved` in the 201), audited `cf_auto_approve`, no push; at most 4 such active
+  grants per host and scope+params (then 429 `rate_limited`: reuse one). Otherwise a matching
   standing approval (same host connecting from the same address, kind, scope, **identical**
   `scope_params`, mode `proxy`, TTL within the rule's max) approves it. Otherwise `pending`,
   pushed as `aqmas: <host> wants <scope> <scope_params> (<ttl>)` (token mode: `aqmas: <host>
