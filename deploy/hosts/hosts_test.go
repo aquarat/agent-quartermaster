@@ -137,7 +137,7 @@ func TestApplyIdempotentAndUninstall(t *testing.T) {
 	ca, _ := os.ReadFile(f.caKey)
 	for p, want := range map[string]string{
 		"etc/ssh/aqmas_user_ca.pub":           strings.TrimSpace(string(ca)) + "\n",
-		"etc/ssh/aqmas_principals/alice":    "alice@db-1\n",
+		"etc/ssh/aqmas_principals/alice":      "alice@db-1\n",
 		"etc/ssh/sshd_config.d/10-aqmas.conf": mustRead(t, "10-aqmas.conf"),
 	} {
 		got, err := os.ReadFile(f.path(p))
