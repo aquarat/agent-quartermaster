@@ -1,0 +1,13 @@
+[Unit]
+Description=aqmas agent API firewall (TCP 8443 from 192.0.2.0/24 only)
+Before=aqmasd.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/aqmas/aqmas-firewall.nft
+ExecStop=/usr/sbin/nft delete table inet aqmas_agent_api
+
+[Install]
+WantedBy=multi-user.target
