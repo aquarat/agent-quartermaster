@@ -39,6 +39,7 @@ NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 ProtectSystem=strict
+ReadWritePaths=-/var/spool/aqmas-update
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

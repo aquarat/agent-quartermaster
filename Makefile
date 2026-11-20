@@ -3,16 +3,33 @@
 
 GO      ?= $(shell command -v go 2>/dev/null || echo $(HOME)/.local/toolchains/go/bin/go)
 BUN     ?= bun
-VERSION ?= $(shell git describe --always --dirty --tags 2>/dev/null || echo dev)
+VERSION ?= $(shell cat VERSION)
+COMMIT  := $(shell git rev-parse --verify HEAD)
+SUMS    ?= SHA256SUMS
 MODULE  := github.com/aquarat/agent-quartermaster
 # aqmasd reads main.version; the aqmas CLI reads internal/client.Version (an -X for a symbol a
 # binary doesn't link is ignored, so both binaries get both).
-LDFLAGS := -s -w -X main.version=$(VERSION) -X $(MODULE)/internal/client.Version=$(VERSION)
-GOBUILD := CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)"
+LDFLAGS := -s -w -X main.version=$(VERSION) -X $(MODULE)/internal/client.Version=$(VERSION) -X $(MODULE)/internal/release.Version=$(VERSION) -X $(MODULE)/internal/release.Commit=$(COMMIT)
+GOBUILD := CGO_ENABLED=0 GOAMD64=v1 GOARM64=v8.0 GOTOOLCHAIN=local $(GO) build -mod=readonly -buildvcs=false -trimpath -ldflags "$(LDFLAGS)"
 
 .PHONY: all build aqmasd aqmas web webui test vet clean interop interop-cf
 
 all: build
+
+.PHONY: release verify-release pins
+pins:
+	@test "$$($(GO) env GOVERSION)" = go1.27.4 && test "$$($(BUN) --version)" = 1.4.4 || { echo 'need Go 1.27.4 and Bun 1.4.4'; exit 1; }
+	@test '$(VERSION)' = "$$(cat VERSION)" && grep -Exq '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)' VERSION
+	@test $$(wc -l < VERSION) -eq 1 && test $$(printf %s '$(COMMIT)' | wc -c) -eq 40
+
+release: pins
+	$(MAKE) build WEB_INSTALL='--production --offline --ignore-scripts'
+	mkdir -p dist
+	cp bin/aqmasd-linux-arm64 bin/aqmas-linux-arm64 bin/aqmas-linux-amd64 bin/aqmas-darwin-arm64 dist/
+	cd dist && sha256sum aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64 > SHA256SUMS
+
+verify-release:
+	@set -e; expected=$$(mktemp); trap 'rm -f "$$expected"' EXIT; cp '$(SUMS)' "$$expected"; $(MAKE) release; cmp "$$expected" dist/SHA256SUMS
 
 build: aqmasd aqmas
 
@@ -26,7 +43,7 @@ aqmas:
 
 # Build the TypeScript UI into web/dist (embedded into aqmasd by the webui target).
 web:
-	cd web && $(BUN) install --frozen-lockfile && $(BUN) run build
+	cd web && $(BUN) install --frozen-lockfile $(WEB_INSTALL) && $(BUN) run build
 
 # Copy web/dist into the embed directory (or leave it empty, which selects the placeholder).
 webui: web

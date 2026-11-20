@@ -26,6 +26,7 @@ export class ApiError extends Error {
 /** Objects with a challenge endpoint, and the verb that applies the signed action. */
 export const OBJECT_PATHS = {
   host: {path:'hosts', apply:'revoke'},
+  update: {path:'updates', apply:'decide'},
   request: { path: "requests", apply: "decide" },
   enrollment: { path: "enrollments", apply: "decide" },
   standing: { path: "standing", apply: "revoke" },
@@ -41,6 +42,7 @@ export interface ApiOptions {
 
 export interface Api {
   hosts(): Promise<HostInfo[]>;
+  updates(): Promise<import('./admin').UpdateView>;
   help(): Promise<HelpConfig>;
   state(): Promise<UIState>;
   request(id: string): Promise<PendingItem>;
@@ -105,6 +107,7 @@ export function createApi(opts: ApiOptions = {}): Api {
 
   return {
     hosts: () => call('GET','/api/ui/hosts'),
+    updates: () => call('GET','/api/ui/updates'),
     help: () => call('GET','/api/ui/help'),
     state: () => call<UIState>("GET", "/api/ui/state"),
     request: (id) => call<PendingItem>("GET", `/api/ui/requests/${seg(id)}`),

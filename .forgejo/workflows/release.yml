@@ -1,0 +1,76 @@
+name: Release from VERSION
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+jobs:
+  build:
+    runs-on: linux-arm64
+    container: node:24-bookworm
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: https://github.com/actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: version
+        run: |
+          set -eu
+          v=$(cat VERSION)
+          test "$(wc -l < VERSION)" = 1 && printf '%s\n' "$v" | grep -qxE '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          if ! git rev-parse --verify --quiet "refs/tags/v$v"; then echo "tag=v$v" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.version.outputs.tag != ''
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends unzip jq openssh-server
+          mkdir -p /run/sshd
+          bash ci/toolchains.sh /opt/aqmas-tools
+          echo /opt/aqmas-tools/bin >> "$GITHUB_PATH"
+          echo /opt/aqmas-tools/go/bin >> "$GITHUB_PATH"
+      - if: steps.version.outputs.tag != ''
+        run: |
+          set -eu
+          cd web && bun install --frozen-lockfile && bun test && bun run build && cd ..
+          make vet
+          go test -race ./...
+          make interop interop-cf
+          make release
+      - if: steps.version.outputs.tag != ''
+        uses: https://github.com/actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3, Forgejo compatible
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+  publish:
+    needs: build
+    if: needs.build.outputs.tag != ''
+    runs-on: linux-arm64
+    container: node:24-bookworm
+    permissions:
+      contents: write
+    steps:
+      - uses: https://github.com/actions/download-artifact@9bc31d5ccc31df68ecc42ccf4149144866c47d8a # v3
+        with:
+          name: dist
+          path: dist
+      - run: apt-get update && apt-get install -y --no-install-recommends jq
+      - env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ $TAG =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          cd dist
+          files=(aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64)
+          for f in "${files[@]}" SHA256SUMS; do [[ -f $f && ! -L $f ]]; done
+          sha256sum "${files[@]}" | cmp - SHA256SUMS
+          api() { curl --fail-with-body -sS -H "Authorization: token $RELEASE_TOKEN" "$@"; }
+          body=$(jq -nc --arg t "$TAG" --arg sha "$GITHUB_SHA" '{tag_name:$t,target_commitish:$sha,name:$t,draft:true}')
+          id=$(api -H 'Content-Type: application/json' -d "$body" "$API/releases" | jq -er '.id | numbers')
+          for f in "${files[@]}" SHA256SUMS; do api -F "attachment=@$f" "$API/releases/$id/assets?name=$f" >/dev/null; done
+          api -X PATCH -H 'Content-Type: application/json' -d '{"draft":false}' "$API/releases/$id" >/dev/null
+          api -X POST "$API/push_mirrors-sync" >/dev/null || echo 'Check push mirror status (sync-on-commit and interval still enabled).'

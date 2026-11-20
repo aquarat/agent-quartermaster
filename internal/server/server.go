@@ -63,6 +63,7 @@ type Options struct {
 
 // Server is a running aqmasd instance.
 type Server struct {
+	updates updateState
 	cfg     *config.Config
 	log     *slog.Logger
 	now     func() time.Time
@@ -216,6 +217,9 @@ func (s *Server) Run(ctx context.Context) error {
 	go func() { errc <- agentSrv.ServeTLS(agentLn, "", "") }()
 	go func() { errc <- webSrv.Serve(webLn) }()
 	go s.sweeper(ctx)
+	if s.cfg.Updates.Repo != "" {
+		go s.pollUpdates(ctx)
+	}
 	s.log.Info("aqmasd listening", "agent", agentLn.Addr().String(), "web", webLn.Addr().String())
 	select {
 	case <-ctx.Done():

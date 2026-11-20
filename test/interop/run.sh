@@ -55,6 +55,7 @@ trap 'echo "interop: failed at line $LINENO; logs in $T (KEEP=1 keeps them)" >&2
 
 free_port() { bun -e 'const s = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } }); console.log(s.port); s.stop(true);'; }
 PA=$(free_port) PW=$(free_port) PS=$(free_port)
+PF=$(free_port) PG=$(free_port)
 ME=$(id -un)
 ORIGIN=https://aqmas.interop.test
 mkdir -p "$T"/{data,sshd/principals,client/config,client/cache}
@@ -72,6 +73,13 @@ public_base_url = "$ORIGIN"
 owner_name      = "interop-owner"
 tls_sans        = ["127.0.0.1"]
 client_cert_days = 2
+
+[updates]
+cache_dir = "$T/releases"
+[updates.forgejo]
+api = "http://127.0.0.1:$PF/api/v1/repos/example/aqmas"
+[updates.github]
+api = "http://127.0.0.1:$PG"
 
 [ttl]
 pending_expiry_seconds = 120
@@ -161,6 +169,26 @@ owner approve "$EID" >/dev/null 2>"$T/owner-enroll.err"
 wait $EPID || { cat "$T/enroll.err"; fail "aqmas enroll exited $?"; }
 grep -q "Ref ${EID: -6}" "$T/enroll.err" || fail "enroll did not print the card's Ref"
 ok "enrolled interop-host (Ref ${EID: -6})"
+
+# An older, locally built CLI updates itself using the enrolled mTLS identity. Seed
+# the server's release cache from the same two-source bootstrap used by the owner.
+v=$(cat "$ROOT/VERSION")
+make -C "$ROOT" release >/dev/null
+mkdir -p "$T/releases/$v" "$T/upgrade"
+cp "$ROOT/dist/"aqmas-* "$ROOT/dist/SHA256SUMS" "$T/releases/$v/"
+for port in "$PF" "$PG"; do
+  bun "$ROOT/test/interop/release-source.ts" "$port" "$v" "$T/releases/$v/SHA256SUMS" & PIDS+=($!)
+  for _ in {1..50}; do curl -fsS "http://127.0.0.1:$port/releases/tags/v$v" >/dev/null 2>&1 && break; sleep 0.1; done
+done
+(cd "$ROOT" && go run ./cmd/aqmas-update-verify bootstrap "$v" "$(git rev-parse HEAD)" "$T/config.toml") > "$T/releases/latest.json"
+(cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags '-X github.com/aquarat/agent-quartermaster/internal/client.Version=0.0.0' -o "$T/upgrade/aqmas" ./cmd/aqmas)
+printf '\n[github]\napi = "http://127.0.0.1:%s"\n' "$PG" >> "$AQMAS_CONFIG_DIR/config.toml"
+want=$(awk -v n="aqmas-linux-$ARCH" '$2==n {print $1}' "$T/releases/$v/SHA256SUMS")
+"$T/upgrade/aqmas" update --check 2>&1 | grep -F "$want" >/dev/null
+"$T/upgrade/aqmas" upgrade --yes --expect-sha256 "$want" </dev/null
+"$T/upgrade/aqmas" version | grep -F "aqmas $v " >/dev/null
+"$T/upgrade/aqmas.prev" version | grep -F 'aqmas 0.0.0 ' >/dev/null
+ok 'old CLI verified both releases, replaced itself and retained runnable previous version'
 
 # --- ssh: first request, approved for 10 min ---
 "$AQMAS" ssh 127.0.0.1 --ttl 15m --why "interop first login" -- echo ok </dev/null >"$T/ssh1.out" 2>"$T/ssh1.err" &

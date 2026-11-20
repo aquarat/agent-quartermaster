@@ -1,0 +1,64 @@
+name: Independent release build
+on:
+  push:
+    tags: ['v*']
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - run: |
+          test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
+          bash ci/toolchains.sh "$RUNNER_TEMP/toolchains"
+          echo "$RUNNER_TEMP/toolchains/go/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/toolchains/bin" >> "$GITHUB_PATH"
+      - run: |
+          go test ./...
+          make release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          files=(aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64)
+          for f in "${files[@]}" SHA256SUMS; do [[ -f $f && ! -L $f ]]; done
+          sha256sum "${files[@]}" | cmp - SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" "${files[@]}" SHA256SUMS --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+  compare:
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -p SHA256SUMS
+          url="https://forge.example.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/SHA256SUMS"
+          code=$(curl --max-time 20 -sS -o forgejo.sums -w '%{http_code}' "$url") || code=000
+          case "$code" in
+            200) cmp SHA256SUMS forgejo.sums ;;
+            000|302|401|403|404) echo '::notice::Forgejo release inaccessible from this runner; installation still requires matching manifests.' ;;
+            *) echo "Unexpected Forgejo response $code"; exit 1 ;;
+          esac

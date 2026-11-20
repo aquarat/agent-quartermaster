@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/aquarat/agent-quartermaster/internal/release"
 )
 
 // DefaultTTL is used when neither --ttl nor default_ttl is given.
@@ -25,6 +26,7 @@ const MaxTTL = 8 * time.Hour
 
 // Config is ~/.config/aqmas/config.toml.
 type Config struct {
+	GitHub release.Source `toml:"github,omitempty"`
 	// Server is the agent API base URL.
 	Server string `toml:"server"`
 	// ServerCA is a PEM file holding the pinned server CA certificate (written by enroll).

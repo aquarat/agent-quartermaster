@@ -50,7 +50,7 @@ import {
 import { CF_RISKS, cfScope, paramPairs, parseScopeParams, riskLabel, sentenceCase, unusualParams, type CFScopeDesc } from "./cfscopes";
 import { chevronIcon, cloudIcon, eventIcon, passkeyIcon, syncIcon } from "./icons";
 import type { AuditEntry, GrantSummary, PasskeyChange, PasskeyInfo, PendingCloudflare, PendingItem, RegisterResult, StandingApproval, UIState } from "./types";
-import { hostCard, type HostInfo } from './admin';
+import { hostCard, updateCard, type UpdateView, type HostInfo } from './admin';
 import { helpPage, type HelpConfig } from './help';
 
 function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/help' ? 'help' : 'queue'; }
@@ -81,6 +81,7 @@ export class App {
   private refreshing = false;
   private page = route();
   private hosts: HostInfo[]=[];
+  private updates?: UpdateView;
   private help?: HelpConfig;
   private rendered = new Map<string, string>();
   private login: PreparedLogin | null = null;
@@ -136,7 +137,7 @@ export class App {
     const requested=route();
     try {
       const s = await this.api.state();
-      if(requested==='admin') this.hosts=await this.api.hosts();
+      if(requested==='admin') [this.hosts,this.updates]=await Promise.all([this.api.hosts(),this.api.updates()]);
       if(requested==='help') this.help=await this.api.help();
       if(requested!==route()) return;
       this.state = normalise(s);
@@ -378,7 +379,7 @@ export class App {
     replace(
       this.root,
       h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Request queue')), h("p", { class: "status", id: "status" }),h('nav',{'aria-label':'Pages'},nav('Help','#/help','Help'),nav('⚙','#/admin','Admin'))),
-      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('passkeys','Passkeys'),section('hosts','Enrolled hosts'),h('section',{class:'card'},h('h2',null,'Updates'),h('p',null,'Self-update is planned.'))) : h(
+      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('passkeys','Passkeys'),section('hosts','Enrolled hosts'),section('updates','Updates')) : h(
         "main",
         { class: "sections" },
         h("div", { class: "col col-queue" }, section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
@@ -400,7 +401,7 @@ export class App {
     if (!s || this.view !== "main") return;
     if(this.page!=='queue'){
       document.title=`${this.page==='admin'?'Admin':'Help'} · aqmas`;
-      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);}
+      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);if(this.updates)this.section('updates',this.updates,()=>[updateCard(this.updates!,t=>this.sheet.openUpdate(t))]);}
       else if(this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
       this.updateStatus();return;
     }
@@ -1286,6 +1287,10 @@ class Sheet {
 
   openRevoke(target: ActionTarget): void {
     void this.prepare(this.begin(target), target, { action: "revoke" });
+  }
+
+  openUpdate(target: ActionTarget): void {
+    void this.prepare(this.begin(target),target,{action:'approve'});
   }
 
   openAddPasskey(): void {

@@ -852,6 +852,7 @@ export function startMock(opts: MockOptions = {}) {
     const isPost = req.method === "POST";
     let m: RegExpMatchArray | null;
     if(p==='/api/ui/hosts' && !isPost){needSession();return json([]);}
+    if(p==='/api/ui/updates' && !isPost){needSession();return json({current:'dev',commit:'unknown',candidate:{},stat:'',diff:'',status:'',error:'Update discovery is disabled'});}
     if(p==='/api/ui/help' && !isPost){needSession();return json({agent_api_url:'https://agent.example.com:8443',cli_download_base_url:'',ca_pin:'sha256:'+ '0'.repeat(64),owner_max_seconds:86400});}
 
     if (p === "/api/ui/state" && !isPost) {

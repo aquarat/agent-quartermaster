@@ -12,7 +12,7 @@ and **Help** for enrollment and command examples using the running server’s UR
 - API contract: [docs/API.md](docs/API.md), shared types in `internal/api`
 - Host and Forgejo trust: [docs/HOSTS.md](docs/HOSTS.md)
 - Cloudflare (milestone 2): [docs/CLOUDFLARE.md](docs/CLOUDFLARE.md)
-- Releases and self-update (planned): [docs/UPDATES.md](docs/UPDATES.md)
+- Reproducible releases, `aqmas upgrade` and passkey-approved bastion updates: [docs/UPDATES.md](docs/UPDATES.md)
 
 Toolchain: Go 1.27, Bun 1.4.4 for `web/`. `make vet test build`, `cd web && bun test`,
 `make interop`, `make interop-cf`.
@@ -40,4 +40,3 @@ agent-quartermaster is free software: you can redistribute it and/or modify it u
 the GNU Affero General Public License, version 3 (AGPL-3.0-only), as published by the Free
 Software Foundation. See [LICENSE](LICENSE). If you run a modified version as a network service,
 the AGPL requires you to offer its source to the service's users.
-

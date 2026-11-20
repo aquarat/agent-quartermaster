@@ -22,6 +22,15 @@ const base = {
 };
 
 describe("canonical", () => {
+  test('bastion updates bind every displayed digest and both identities',()=>{
+    const fields={from_version:'0.1.0',from_commit:'a'.repeat(40),to_version:'0.1.1',to_commit:'b'.repeat(40),daemon_sha256:'1'.repeat(64),linux_arm64_sha256:'2'.repeat(64),linux_amd64_sha256:'3'.repeat(64),darwin_arm64_sha256:'4'.repeat(64)};
+    const choice={...fields,id:fields.to_commit,action:'approve',object:'update'};
+    const text=canonicalJSON({...choice,nonce:base.nonce,issued_at:base.issued_at,v:1});
+    const c=parseCanonical(text);
+    expect(mismatches(c,choice)).toEqual([]);
+    for(const k of Object.keys(fields)) expect(mismatches(c,{...choice,[k]:'different'})).not.toEqual([]);
+    expect(()=>parseCanonical(text.replace(/"daemon_sha256":"[^"]+",/,''))).toThrow();
+  });
   test("parses sorted, compact JSON", () => {
     const c = parseCanonical(canonicalJSON(base));
     expect(c.action).toBe("approve");

@@ -55,6 +55,7 @@ func uiCheck(t *testing.T, cr challengeResp) map[string]any {
 	}
 	common := []string{"v", "action", "object", "id", "nonce", "issued_at"}
 	allowed := map[string][]string{
+		"update":     append(slices.Clone(common), "from_version", "from_commit", "to_version", "to_commit", "daemon_sha256", "linux_arm64_sha256", "linux_amd64_sha256", "darwin_arm64_sha256"),
 		"request":    append(slices.Clone(common), "principal", "address", "target_address", "target_port", "requesting_host", "kind", "target", "login_user", "key_fingerprint", "ttl_seconds", "standing_hours"),
 		"enrollment": append(slices.Clone(common), "replaces_id", "address", "class", "requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"),
 		"host":       append(slices.Clone(common), "address", "class", "requesting_host"),
@@ -70,6 +71,7 @@ func uiCheck(t *testing.T, cr challengeResp) map[string]any {
 	}
 	obj, _ := v["object"].(string)
 	actions["host"] = []string{"revoke"}
+	actions["update"] = []string{"approve"}
 	al, ok := allowed[obj]
 	if kind, _ := v["kind"].(string); kind == "cloudflare" {
 		if al, ok = cfAllowed[obj]; !ok {

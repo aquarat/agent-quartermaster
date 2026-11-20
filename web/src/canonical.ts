@@ -51,7 +51,10 @@ export interface Canonical {
 // Keys allowed per object. Anything else is refused: the owner can only judge what the UI
 // knows how to describe, so an unknown field (say, a forced command) must not be signed blind.
 const COMMON_KEYS = ["v", "action", "object", "id", "nonce", "issued_at"];
+const UPDATE_KEYS = ['from_commit','to_commit','from_version','to_version','daemon_sha256','linux_arm64_sha256','linux_amd64_sha256','darwin_arm64_sha256'] as const;
+type UpdateFields = Partial<Record<typeof UPDATE_KEYS[number], string>>;
 const ALLOWED_KEYS: Record<string, string[]> = {
+  update: [...COMMON_KEYS,...UPDATE_KEYS],
   host: [...COMMON_KEYS, 'address','class','requesting_host'],
   request: [...COMMON_KEYS,'address','principal', 'target_address','target_port',"requesting_host", "kind", "target", "login_user", "key_fingerprint", "ttl_seconds", "standing_hours"],
   enrollment: [...COMMON_KEYS,'replaces_id','address','class', "requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"],
@@ -67,6 +70,7 @@ const CF_KEYS: Record<string, string[]> = {
 };
 const STRING_KEYS = ["requesting_host", "kind", "target", "login_user", "key_fingerprint", "nickname", "new_nickname", "scope", "scope_params", "mode", "ip_condition", "nonce", "issued_at"] as const;
 const ALLOWED_ACTIONS: Record<string, string[]> = {
+  update:['approve'],
   host:['revoke'],
   request: ["approve", "deny"],
   enrollment: ["approve", "deny"],
@@ -129,6 +133,13 @@ export function parseCanonical(text: string): Canonical {
   if (extra.length) throw new CanonicalError(`canonical action has fields this page can't show (${extra.join(", ")})`);
   const missing = allowed.filter(k => !Object.hasOwn(c,k));
   if (missing.length) throw new CanonicalError(`canonical action lacks ${missing.join(', ')}`);
+  if (c.object==='update') {
+    for (const k of UPDATE_KEYS) {
+      const re=k.endsWith('_commit')?/^[0-9a-f]{40}$/:k.endsWith('_version')?/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/:/^[0-9a-f]{64}$/;
+      const v=c[k]; if(typeof v!=='string'||!re.test(v)||v.trim()!==v) throw new CanonicalError(`invalid ${k}`);
+    }
+    if(c.to_commit!==c.id) throw new CanonicalError('update id differs from commit');
+  }
   if (c.object==='request' && !cf && (typeof c.principal!=='string'||!c.principal||typeof c.address!=='string'||!c.address)) throw new CanonicalError('invalid SSH source or principal');
   if (c.object==='enrollment' && (typeof c.replaces_id!=='string'||Boolean(c.replaces_id)!==c.replaces||c.ttl_seconds!==0||c.standing_hours!==0)) throw new CanonicalError('inconsistent enrollment');
   if ((c.object==='host'||c.object==='enrollment') && (typeof c.address!=='string'||!c.address||!['owner-device','agent'].includes(c.class ?? ''))) throw new CanonicalError('invalid host address or class');
@@ -206,7 +217,7 @@ export async function challengeCommitsTo(canonical: string, challengeB64url: str
 }
 
 /** What the owner chose plus the facts on the card. Unset fields are not checked. */
-export interface Expectation {
+export interface Expectation extends UpdateFields {
   principal?: string; replaces_id?: string;
   class?: string; address?: string; target_address?: string; target_port?: number;
   action: string;
@@ -240,6 +251,7 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
   cmp("action", c.action, e.action);
   cmp("object", c.object, e.object);
   cmp("id", c.id, e.id);
+  if (e.object==='update') for (const k of UPDATE_KEYS) cmp(k,c[k],e[k]??'');
   cmp("requesting_host", c.requesting_host, e.requesting_host);
   cmp("kind", c.kind, e.kind);
   cmp("target", c.target, e.target);
@@ -362,6 +374,10 @@ export function describe(c: Canonical): Description {
   let standing: Part[] | undefined;
   const warnings: string[] = [];
   switch (`${c.object}:${c.action}`) {
+    case 'update:approve':
+      headline=t`Install aqmasd ${String(c.to_version)} on the bastion, replacing ${String(c.from_version)}.`;
+      warnings.push('The updater will rebuild this commit, verify all four binaries, and restart the credential broker.');
+      break;
     case "request:approve":
       headline = t`Approve ${kind} as ${who(c)} for ${duration(c.ttl_seconds ?? 0)}, requested by ${host}.`;
       if ((c.standing_hours ?? 0) > 0) {

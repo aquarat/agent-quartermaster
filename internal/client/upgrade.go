@@ -1,0 +1,237 @@
+package client
+
+import (
+	"bufio"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/aquarat/agent-quartermaster/internal/release"
+	"golang.org/x/sys/unix"
+)
+
+func (e *Env) agentSession() bool {
+	for _, entry := range e.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if name == "CLAUDECODE" || strings.HasPrefix(name, "OPENCODE") {
+			return true
+		}
+	}
+	return false
+}
+func (e *Env) UpdateNotice(ctx context.Context) {
+	if !e.StdinIsTTY || e.agentSession() || !release.ValidVersion(Version) {
+		return
+	}
+	_, c, err := e.authedClient()
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(e.Paths.ConfigDir, "update-check"), os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil {
+		return
+	}
+	var last int64
+	fmt.Fscan(f, &last)
+	now := e.now()
+	if now.Unix()-last < 86400 {
+		return
+	}
+	if _, err = f.Seek(0, 0); err != nil {
+		return
+	}
+	if err = f.Truncate(0); err != nil {
+		return
+	}
+	if _, err = fmt.Fprintln(f, now.Unix()); err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 700*time.Millisecond)
+	defer cancel()
+	var m release.Metadata
+	if c.do(ctx, "GET", "/v1/releases/latest", nil, &m) == nil && m.Valid() && release.Newer(m.Version, Version) {
+		e.logf("version %s available; run aqmas upgrade", m.Version)
+	}
+}
+func (e *Env) Upgrade(ctx context.Context, check, yes, single bool, expect string, stderrTTY bool) error {
+	if yes && !release.ValidHash(expect) || expect != "" && !release.ValidHash(expect) {
+		return &UsageError{Msg: "--yes requires --expect-sha256 with a 64-character lowercase digest"}
+	}
+	cfg, c, err := e.authedClient()
+	if err != nil {
+		return err
+	}
+	path, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	return e.upgrade(ctx, c, cfg.GitHub, path, Version, check, yes, single, expect, stderrTTY)
+}
+func (e *Env) upgrade(ctx context.Context, c *APIClient, source release.Source, path, current string, check, yes, single bool, expect string, tty bool) error {
+	original, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	var m release.Metadata
+	if err = c.do(ctx, "GET", "/v1/releases/latest", nil, &m); err != nil {
+		return err
+	}
+	if !m.Valid() || !release.ValidVersion(current) {
+		return errors.New("invalid running version or unverified release metadata")
+	}
+	if !release.Newer(m.Version, current) {
+		e.logf("no newer verified release (running %s)", current)
+		return nil
+	}
+	gh, err := source.Hashes(ctx, m.Version, true)
+	switch {
+	case single && errors.Is(err, release.ErrOffline):
+		e.logf("WARNING: SINGLE SOURCE — GitHub unreachable; trusting only the bastion")
+	case err != nil:
+		return fmt.Errorf("GitHub verification: %w", err)
+	case !m.Forgejo.Agrees(gh):
+		return errors.New("Forgejo and GitHub SHA256SUMS disagree")
+	}
+	asset := "aqmas-" + runtime.GOOS + "-" + runtime.GOARCH
+	want := m.Forgejo[asset]
+	if want == "" {
+		return errors.New("unsupported platform")
+	}
+	e.logf("%s version %s SHA-256 %s", asset, m.Version, want)
+	if expect != "" && expect != want {
+		return errors.New("expected SHA-256 differs")
+	}
+	if check {
+		return nil
+	}
+	if !yes && (!e.StdinIsTTY || !tty || e.agentSession()) {
+		return errors.New("not prompting outside an interactive owner terminal; use --check or --yes --expect-sha256 HEX")
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", c.base+"/v1/releases/"+m.Version+"/"+asset, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("asset download: HTTP %d", resp.StatusCode)
+	}
+	confirm := func() bool {
+		if yes {
+			return true
+		}
+		fmt.Fprint(e.Stderr, "Install this verified binary? [y/N] ")
+		answer, _ := bufio.NewReader(e.Stdin).ReadString('\n')
+		return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes")
+	}
+	return replaceBinary(path, original, resp.Body, want, confirm)
+}
+func replaceBinary(path string, original os.FileInfo, body io.Reader, want string, confirm func() bool) error {
+	dir := filepath.Dir(path)
+	if os.Geteuid() == 0 {
+		for p := dir; ; p = filepath.Dir(p) {
+			st, e := os.Lstat(p)
+			if e != nil || !st.IsDir() || st.Sys().(*syscall.Stat_t).Uid != 0 || (st.Mode().Perm()&0022 != 0 && st.Mode()&os.ModeSticky == 0) {
+				return errors.New("privileged upgrade requires a root-controlled install directory and parents")
+			}
+			if p == filepath.Dir(p) {
+				break
+			}
+		}
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err = unix.Flock(int(d.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return fmt.Errorf("another upgrade in progress: %w", err)
+	}
+	current, err := os.Lstat(path)
+	if err != nil || !original.Mode().IsRegular() || !os.SameFile(current, original) {
+		return errors.New("installed executable changed; retry")
+	}
+	stage, err := os.MkdirTemp(dir, ".aqmas-upgrade-")
+	if err != nil {
+		return fmt.Errorf("cannot stage upgrade (system install: sudo aqmas upgrade): %w", err)
+	}
+	defer os.RemoveAll(stage)
+	tmp := filepath.Join(stage, "new")
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0700)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	hash := sha256.New()
+	const max = 128 << 20
+	n, err := io.Copy(io.MultiWriter(f, hash), io.LimitReader(body, max+1))
+	if err != nil {
+		return err
+	}
+	if n > max || fmt.Sprintf("%x", hash.Sum(nil)) != want {
+		return errors.New("downloaded executable SHA-256 mismatch")
+	}
+	if err = f.Chmod(0755); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if runtime.GOOS == "darwin" {
+		if exec.Command("/usr/bin/xattr", "-p", "com.apple.quarantine", tmp).Run() == nil {
+			if err = exec.Command("/usr/bin/xattr", "-d", "com.apple.quarantine", tmp).Run(); err != nil {
+				return err
+			}
+		}
+		if err = exec.Command("/usr/bin/codesign", "--verify", tmp).Run(); err != nil {
+			return errors.New("release lacks valid ad-hoc signature (re-signing would change the approved SHA-256)")
+		}
+	}
+	if !confirm() {
+		return ErrCancelled
+	}
+	fd := int(d.Fd())
+	base := filepath.Base(path)
+	backup := filepath.Join(filepath.Base(stage), "previous")
+	if err = unix.Linkat(fd, base, fd, backup, 0); err != nil {
+		return err
+	}
+	linked, err := os.Lstat(filepath.Join(dir, backup))
+	if err != nil || !os.SameFile(original, linked) || linked.Size() != original.Size() || !linked.ModTime().Equal(original.ModTime()) {
+		return errors.New("installed executable changed during confirmation; retry")
+	}
+	if err = unix.Renameat(fd, backup, fd, base+".prev"); err != nil {
+		return err
+	}
+	if err = d.Sync(); err != nil {
+		return err
+	}
+	if err = unix.Renameat(fd, filepath.Join(filepath.Base(stage), "new"), fd, base); err != nil {
+		return err
+	}
+	return d.Sync()
+}

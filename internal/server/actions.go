@@ -78,6 +78,11 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 	}
 	a := canon.Action{Action: in.Action, Object: object, ID: id}
 	switch object {
+	case "update":
+		if in.Action != "approve" || in.TTLSeconds != 0 || in.StandingHours != 0 || in.Nickname != "" {
+			return a, errBad("expected update approval")
+		}
+		return s.updateAction(id)
 	case canon.ObjectRequest:
 		if in.Action != canon.ActionApprove && in.Action != canon.ActionDeny {
 			return a, errBad("action must be approve or deny")

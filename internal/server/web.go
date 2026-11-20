@@ -42,11 +42,13 @@ func (s *Server) WebHandler() http.Handler {
 	api.Handle("POST /api/ui/logout", s.requireSession(s.handleLogout))
 	api.Handle("GET /api/ui/state", s.requireSession(s.handleState))
 	api.Handle("GET /api/ui/hosts", s.requireSession(s.handleHosts))
+	api.Handle("GET /api/ui/updates", s.requireSession(s.handleUpdates))
 	api.Handle("GET /api/ui/help", s.requireSession(s.handleHelp))
 	api.Handle("GET /api/ui/requests/{id}", s.requireSession(s.handleRequestItem))
 	api.Handle("GET /api/ui/enrollments/{id}", s.requireSession(s.handleEnrollmentItem))
 	for _, o := range []struct{ path, object, verb string }{
 		{"requests", canon.ObjectRequest, "decide"},
+		{"updates", "update", "decide"},
 		{"enrollments", canon.ObjectEnrollment, "decide"},
 		{"standing", canon.ObjectStanding, "revoke"},
 		{"grants", canon.ObjectGrant, "revoke"},
@@ -63,6 +65,10 @@ func (s *Server) WebHandler() http.Handler {
 	static := webui.Handler()
 	root := http.NewServeMux()
 	root.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.store.DB().PingContext(r.Context()); err != nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte("ok\n"))
 	})
@@ -793,6 +799,10 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 		sg, pkID, err := s.verifyAction(ctx, sess, object, id, in.ChallengeID, in.Assertion)
 		if err != nil {
 			s.writeErr(w, r, err)
+			return
+		}
+		if object == "update" {
+			s.queueUpdate(w, r, sg, in.Assertion, pkID)
 			return
 		}
 		if err := s.apply(ctx, sg, pkID); err != nil {

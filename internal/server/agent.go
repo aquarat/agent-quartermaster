@@ -32,6 +32,8 @@ const (
 // AgentHandler returns the agent API handler (serve it with PKI().TLSConfig()).
 func (s *Server) AgentHandler() http.Handler {
 	mux := http.NewServeMux()
+	mux.Handle("GET /v1/releases/latest", s.requireHost(s.latestRelease))
+	mux.Handle("GET /v1/releases/{version}/{asset}", s.requireHost(s.releaseAsset))
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
 	mux.HandleFunc("GET /v1/enroll/{id}", s.handleEnrollStatus)
 	mux.Handle("POST /v1/requests", s.requireHost(s.handleCreateRequest))

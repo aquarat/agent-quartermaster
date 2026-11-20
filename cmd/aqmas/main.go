@@ -42,6 +42,7 @@ Usage:
   aqmas cf scopes|request|api|env|curl|token|snapshot ...
       Cloudflare API access through aqmasd (aqmas cf help).
   aqmas version | help
+  aqmas upgrade | update [--check] [--yes --expect-sha256 HEX] [--allow-single-source]
 
 Exit codes: 0 ok (or ssh's own), 1 error, 2 usage, 3 denied, 4 expired,
 5 server unreachable / TLS failure, 130 cancelled.
@@ -66,7 +67,19 @@ func run(args []string) int {
 	defer stop()
 
 	cmd, rest := args[0], args[1:]
+	if cmd != "upgrade" && cmd != "update" && term.IsTerminal(int(os.Stderr.Fd())) {
+		env.UpdateNotice(ctx)
+	}
 	switch cmd {
+	case "upgrade", "update":
+		f, err := parseFlags(rest, map[string]bool{"check": false, "yes": false, "expect-sha256": true, "allow-single-source": false})
+		if err != nil {
+			return fail(err)
+		}
+		if len(f.pos) > 0 || f.cmd != nil {
+			return fail(&client.UsageError{Msg: "upgrade takes flags only"})
+		}
+		return fail(env.Upgrade(ctx, f.bool["check"], f.bool["yes"], f.bool["allow-single-source"], f.str["expect-sha256"], term.IsTerminal(int(os.Stderr.Fd()))))
 	case "help", "-h", "--help":
 		fmt.Fprint(os.Stdout, usage)
 		return 0

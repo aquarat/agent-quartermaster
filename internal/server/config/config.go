@@ -24,6 +24,7 @@ const DefaultPath = "/etc/aqmas/config.toml"
 
 // Config is the whole aqmasd configuration.
 type Config struct {
+	Updates            Updates  `toml:"updates"`
 	AgentAPIURL        string   `toml:"agent_api_url"`
 	CLIDownloadBaseURL string   `toml:"cli_download_base_url"`
 	ListenAgent        string   `toml:"listen_agent"`    // agent API (mTLS), default ":8443"

@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch the owner-approved aqmas update spool
+
+[Path]
+PathExists=/var/spool/aqmas-update/approved
+PathExists=/var/lib/aqmas-updater/pending-rollback.json
+Unit=aqmas-updater.service
+
+[Install]
+WantedBy=multi-user.target

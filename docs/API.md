@@ -234,6 +234,11 @@ object (a missing or extra key cannot be built by the server and is refused by t
 | `standing` | `revoke` | `requesting_host, kind, target, login_user, ttl_seconds` (the rule's max TTL), `standing_hours` |
 | `grant` | `revoke` | `requesting_host, kind, target, login_user, ttl_seconds` (0), `standing_hours` |
 | `passkey` | `add`, `rename`, `remove` | `nickname` (the passkey's current nickname; `""` for add), `new_nickname` (rename: the new one; add: the chosen nickname or `""`; remove: `""`). For add `id` is `"new"`, otherwise the passkey's id |
+| `update` | `approve` | `from_version, from_commit, to_version, to_commit, daemon_sha256, darwin_arm64_sha256, linux_amd64_sha256, linux_arm64_sha256`. `id` equals `to_commit`. Versions are stable numeric semver, Git IDs are full lowercase hex, hashes are SHA-256 in lowercase hex. |
+
+Updates: session-authenticated `GET /api/ui/updates` returns running `current`/`commit`, `candidate`, local `stat` and `diff`, `error` and updater `status`. `POST /api/ui/updates/{to_commit}/challenge` (`{"action":"approve"}`) and `.../decide` (standard assertion) use the ceremony below. A successful decision queues the proof (`{"ok":true}`); it does not mean installation succeeded.
+
+On the agent listener, enrolled hosts may `GET /v1/releases/latest` for the latest installed and verified `{version,commit,forgejo,github}`. Each source map keys the four fixed asset names to their hex digests. `GET /v1/releases/{version}/{asset}` serves only the three CLI binaries or `SHA256SUMS` from root-managed cache. Missing releases return 404. See [UPDATES.md](UPDATES.md) for trust and setup.
 
 The `passkey` object gained `nickname`/`new_nickname` (for `add` too) without a version bump:
 a page from before this change refuses the new add text (unknown keys), which fails safe.
