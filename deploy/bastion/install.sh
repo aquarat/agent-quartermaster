@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
-# Install aqmasd on the bastion (192.0.2.60).
+# Install aqmasd on the bastion host.
 #
 # By default this only PRINTS the steps. With --apply it runs them on the machine it is run on
 # (it never connects anywhere else), and every step is idempotent: existing config, keys and
 # data are never overwritten. Run it on the bastion as root, from a checkout or a copy of
 # deploy/bastion/ plus the aqmasd binary:
 #
-#   sudo ./install.sh --binary ./aqmasd-linux-arm64            # show the plan
-#   sudo ./install.sh --binary ./aqmasd-linux-arm64 --apply    # do it
+#   sudo ./install.sh --binary ./aqmasd-linux-arm64 --host bastion            # show the plan
+#   sudo ./install.sh --binary ./aqmasd-linux-arm64 --host bastion --apply    # do it
+#
+# --host NAME refuses to run unless `hostname -s` is NAME (guards against the wrong machine);
+# --any-host skips that check.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 binary=""
 apply=0
-expect_host="bastion"
+expect_host=""
+host_checked=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--binary) binary="$2"; shift 2 ;;
 	--apply) apply=1; shift ;;
-	--any-host) expect_host=""; shift ;;
+	--host) expect_host="$2"; host_checked=1; shift 2 ;;
+	--any-host) expect_host=""; host_checked=1; shift ;;
 	-h|--help) sed -n '2,13p' "$0"; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
@@ -36,6 +41,7 @@ run() {
 
 if [ "$apply" = 1 ]; then
 	[ "$(id -u)" = 0 ] || { echo "--apply needs root" >&2; exit 1; }
+	[ "$host_checked" = 1 ] || { echo "--apply needs --host NAME (the bastion's short host name) or --any-host" >&2; exit 1; }
 	if [ -n "$expect_host" ] && [ "$(hostname -s)" != "$expect_host" ]; then
 		echo "this is $(hostname -s), not $expect_host; refusing (use --any-host to override)" >&2
 		exit 1
@@ -70,7 +76,7 @@ cat <<'NEXT'
 Next steps (by hand, on the bastion):
   1. Edit /etc/aqmas/config.toml: targets (+ host_key pins), ntfy topic, access.team_domain/aud.
   2. Open the agent API to the LAN only:
-       firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=192.0.2.0/24 port port=8443 protocol=tcp accept'
+       firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=<LAN CIDR> port port=8443 protocol=tcp accept'
        firewall-cmd --reload
   3. systemctl enable --now aqmasd && journalctl -u aqmasd -n 20
      (first start generates /var/lib/aqmas/ca/*: SSH user CA, client CA, server cert)
@@ -78,8 +84,8 @@ Next steps (by hand, on the bastion):
      sudo -u aqmas aqmasd tls-fingerprint    -> the pin for `aqmas enroll --ca-pin` (sha256:<hex>)
   5. Tunnel: cloudflared-aqmas.yml.example -> /etc/cloudflared/aqmas.yml, cloudflared-aqmas.service
      -> /etc/systemd/system/, then systemctl enable --now cloudflared-aqmas. Put an Access app
-     (owner, OIDC IdP) on approvals.example.com.
-  6. sudo -u aqmas aqmasd passkey-enroll-code, open https://approvals.example.com within 15 minutes
+     (owner only) on the public_base_url host name.
+  6. sudo -u aqmas aqmasd passkey-enroll-code, open public_base_url within 15 minutes
      and register the owner passkey.
   7. Cloudflare (optional, milestone 2; docs/CLOUDFLARE.md section 8): put the parent tokens in
      /etc/aqmas/cf-proxy-token and /etc/aqmas/cf-minter-token (root:root 0600), add the

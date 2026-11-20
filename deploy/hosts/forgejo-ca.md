@@ -1,8 +1,9 @@
 # Forgejo (built-in SSH server on :2222) trusting the aqmas SSH user CA
 
-Documentation only: nothing here has been applied. Changing the Forgejo stack is a swarm
-change on build-box (192.0.2.50): edit the Forgejo
-stack file, deploy it and keep a rollback ready.
+How to make a Forgejo instance that uses its built-in SSH server accept aqmas certificates.
+The example below assumes Forgejo runs in a container configured through environment
+variables (e.g. a compose or swarm stack); keep a way to roll the change back ready, since an
+unparsable CA key stops Forgejo from starting.
 
 ## Settings
 
@@ -40,9 +41,9 @@ target in aqmasd's config) under *Settings → SSH / GPG keys → "Manage SSH Ce
 "These SSH certificate principals are associated with your account and allow full access to
 your repositories." Principals are unique across all users.
 
-aqmasd then issues Forgejo grants with principal `alice@forgejo`, login user `git`, target
-`192.0.2.50` port `2222`, and a `known_hosts_line` with the Forgejo built-in server's host
-key (`ssh-keyscan -p 2222 192.0.2.50`). Client side: `aqmas ssh git@forgejo` or, for git,
+aqmasd then issues Forgejo grants with principal `alice@forgejo`, login user `git`, the
+`forgejo` target's address (e.g. `192.0.2.50`) and port `2222`, and a `known_hosts_line` with
+the Forgejo built-in server's host key (`ssh-keyscan -p 2222 192.0.2.50`). Client side: `aqmas ssh git@forgejo` or, for git,
 `aqmas cert git@forgejo` and a `GIT_SSH_COMMAND` using the printed paths (a `git-ssh` helper
 is an open question in docs/DESIGN.md).
 
@@ -77,14 +78,9 @@ Read in the Forgejo 17.0.2 source (2026-11-20):
 - `modules/setting/config_env.go`: `GITEA__SECTION__KEY` / `FORGEJO__...` env vars and the
   `__FILE` suffix; `docker/root/etc/s6/gitea/setup` runs `environment-to-ini` on the container's
   `app.ini` at start.
-- The image is built from this branch: its head commit is "ci: build 17.0.2-patched.1 from
-  the v17.0.2-patched branch", and `git diff v17.0.2..HEAD` touches nothing in
-  `modules/ssh`, `modules/setting/ssh.go` or `models/asymkey`, so this is upstream 17.0.2's
-  SSH code.
 - `options/locale/locale_en-US.ini`: the principals UI strings quoted above.
-- the Forgejo stack file on .50: the running service uses the built-in server
-  (`GITEA__server__START_SSH_SERVER=true`, port 2222) and image
-  `codeberg.org/forgejo/forgejo:<version>`.
+- The setup assumed here uses the built-in server (`GITEA__server__START_SSH_SERVER=true`,
+  port 2222).
 
 **Inferred from the source, not tested:** the `source-address` critical option is probably
 **not enforced** by Forgejo's built-in server. `x/crypto/ssh`'s `CheckCert` deliberately skips
@@ -94,8 +90,5 @@ those permissions. So a Forgejo certificate copied to another LAN host would wor
 it expires. Keep Forgejo grants short, or test this (a cert with `source-address` set to an
 address you are not connecting from) before relying on it.
 
-**Assumed, not verified:**
-- that the image running on .50 was really built from that commit (inferred from the tag and the
-  commit message, not from the image's digest or build metadata);
-- nothing was run against a live Forgejo: the end-to-end certificate login, the principals UI
-  and the `source-address` behaviour are untested.
+**Not verified here:** nothing in this document was run against a live Forgejo: the end-to-end
+certificate login, the principals UI and the `source-address` behaviour are untested.

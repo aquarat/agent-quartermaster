@@ -1,5 +1,5 @@
 [Unit]
-Description=aqmas agent API firewall (TCP 8443 from 192.0.2.0/24 only)
+Description=aqmas agent API firewall (TCP 8443 from the LAN only)
 Before=aqmasd.service network-pre.target
 Wants=network-pre.target
 

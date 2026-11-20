@@ -1,8 +1,8 @@
-# Separate Cloudflare tunnel connector on the bastion (.60), NOT .50's tunnel.
+# Separate Cloudflare tunnel connector on the bastion, NOT a tunnel shared with other hosts.
 # Install as /etc/cloudflared/aqmas.yml (root:root 0600) for a locally-managed tunnel:
 #   cloudflared tunnel create aqmas            -> writes /etc/cloudflared/<TUNNEL-UUID>.json
 #   cloudflared tunnel route dns aqmas approvals.example.com
-# Put the hostname behind a Cloudflare Access app (owner, OIDC IdP). No LAN DNS override.
+# Put the hostname behind a Cloudflare Access app (owner only). No LAN DNS override.
 tunnel: <TUNNEL-UUID>
 credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
 no-autoupdate: true

@@ -2,13 +2,15 @@
 
 Status (2026-11-20): milestone 2 (Cloudflare API access through aqmasd: proxy with scoped,
 time-boxed grants, guard rails, snapshots, child tokens) is built and tested, not deployed:
-design and operator setup `docs/CLOUDFLARE.md`, wire contract `docs/API.md` section 5 (the
-site's deployment and migration plans live in the operator's private ops repository). Milestone 1 is built and tested (unit tests, `TestUIFlows`, and
-`test/interop/run.sh` with the real binaries), not deployed. Deployment plan:
-`docs/DEPLOY-M1.md`. Wire contract: `docs/API.md`; host and Forgejo trust: `docs/HOSTS.md`.
+design and operator setup `docs/CLOUDFLARE.md`, wire contract `docs/API.md` section 5.
+Milestone 1 is built and tested (unit tests, `TestUIFlows`, and `test/interop/run.sh` with the
+real binaries). Wire contract: `docs/API.md`; host and Forgejo trust: `docs/HOSTS.md`. A
+site's own deployment plan, real target list and progress notes belong in its private ops
+documentation, not in this repository.
 
-Owner's home-lab credential broker. Agents (Claude Code, OpenCode) and the owner ask it for
-short-lived, approved access to other machines and services instead of holding long-lived keys.
+A credential broker for a single owner's home lab or small fleet. Agents (Claude Code,
+OpenCode) and the owner ask it for short-lived, approved access to other machines and services
+instead of holding long-lived keys.
 
 ## Threat model
 
@@ -17,13 +19,13 @@ short-lived, approved access to other machines and services instead of holding l
   needs a grant the owner approves. The owner's own routine SSH also goes through aqmas.
 - Convenience matters: grants must be quick to request and approve, and things must keep
   working when aqmas is down (a separate owner emergency key covers that; not aqmas's job).
-- The bastion host **bastion (192.0.2.60)** runs aqmasd and nothing agents use. It must
+- A dedicated **bastion** host runs aqmasd and nothing agents use. It must
   only accept an owner key that agents never hold (prerequisite, done by the owner/operator,
   not by this code): otherwise an agent could SSH in, become root and approve itself.
 
 ## Milestone 1 scope
 
-1. **aqmasd** (Go, one binary) on .60: request/grant store, SSH user CA, agent API (mTLS),
+1. **aqmasd** (Go, one binary) on the bastion: request/grant store, SSH user CA, agent API (mTLS),
    approval web UI with a **passkey (WebAuthn) assertion per approval**, push notification.
 2. **aqmas** CLI (Go, same module) on fleet hosts: request SSH access, wait for approval, run
    `ssh` with the short-lived certificate. Also `enroll` (host identity), `status`, `list`.
@@ -37,23 +39,23 @@ SSH `ProxyJump` through aqmasd to cut sessions at expiry; KRL-based revocation.
 
 ## Key decisions
 
-- **Approval channel:** web UI served by aqmasd on 127.0.0.1 on .60, published through **its
-  own Cloudflare tunnel connector on .60** (not .50's tunnel) at `approvals.example.com`, behind
-  a Cloudflare Access app (owner, OIDC IdP). Access is convenience only; the security boundary
+- **Approval channel:** web UI served by aqmasd on 127.0.0.1 on the bastion, published through
+  **its own Cloudflare tunnel connector on the bastion** (not a tunnel shared with other hosts)
+  at e.g. `approvals.example.com`, behind a Cloudflare Access app (owner only). Access is convenience only; the security boundary
   is the **WebAuthn assertion per approval**, whose challenge commits to the exact request
   (see API.md "approval challenge"). No LAN DNS override for that name.
   **Accepted residual (wider than first thought):** whoever can change the Cloudflare zone
   (Workers, Snippets, DNS, the tunnel) controls the approval page's code and can show one action
-  while having the owner sign another. A Cloudflare token on another host
-  is readable by the agents' user there, not only by root. Mitigations in M1: the UI renders the
+  while having the owner sign another. In the reference deployment a Cloudflare token on
+  another host is readable by the agents' user there, not only by root. Mitigations in M1: the UI renders the
   confirmation from the signed canonical text only, the CLI prints the same **Ref** as the card,
   and after every decision aqmasd pushes what it **applied** to ntfy (a mismatch shows on the
-  phone). Real fix (owner's decision): narrow that token, or serve the UI from a zone it cannot
+  phone). Real fix: narrow that token, or serve the UI from a zone it cannot
   edit; a later milestone moves the Cloudflare token into aqmas.
 - **Owner passkey bootstrap:** the first passkey is registered with a one-time code that
-  `aqmasd passkey-enroll-code` prints on .60 (root/aqmas user only). Later passkeys need an
+  `aqmasd passkey-enroll-code` prints on the bastion (root/aqmas user only). Later passkeys need an
   existing passkey to approve them.
-- **Several passkeys (2026-11-20):** the owner keeps more than one (passkeys in password
+- **Several passkeys:** the owner keeps more than one (passkeys in password
   managers and platform keychains, and hardware security keys). The UI lists them (nickname,
   authenticator from the AAGUID, synced vs device-bound, created, last used, "this device")
   and can add, rename and remove them; rename and remove are passkey-signed actions with their
@@ -109,14 +111,14 @@ SSH `ProxyJump` through aqmasd to cut sessions at expiry; KRL-based revocation.
   request.
 - **Storage:** SQLite (pure Go driver `modernc.org/sqlite`), WAL, at `/var/lib/aqmas/aqmas.db`;
   CA keys under `/var/lib/aqmas/ca/` (mode 600, user `aqmas`). Audit log table, append-only.
-- **Runtime on .60:** system user `aqmas`, systemd unit with hardening
+- **Runtime on the bastion:** system user `aqmas`, systemd unit with hardening
   (`deploy/bastion/aqmasd.service`); agent API on `:8443` (TLS 1.3, client certs required except
   for enrollment; firewall it to the LAN), web UI on `127.0.0.1:8080` (its own cloudflared
   connector → it). Web API guards: `X-Aqmas` header, `Origin`/`Sec-Fetch-Site` checks, strict
   CSP, optional Cloudflare Access JWT validation bound to the owner's identity.
 - **Toolchain:** Go 1.27 (user-local install at `~/.local/toolchains/go`), web UI in TypeScript built with Bun 1.4.4 into
-  static files embedded in the aqmasd binary (`go:embed`). Target linux/arm64 (all fleet Linux
-  hosts are arm64 except db-1, amd64; build both CLI arches).
+  static files embedded in the aqmasd binary (`go:embed`). aqmasd is built for linux/arm64;
+  the CLI for linux/arm64, linux/amd64 and darwin/arm64.
 
 ## Repository layout (contract between parallel workstreams)
 
@@ -135,7 +137,7 @@ internal/testutil/fakecf/      M2: fake Cloudflare API for tests and interop (cl
 deploy/bastion/                aqmasd.service, install.sh, cloudflared unit + config template
 deploy/hosts/                  10-aqmas.conf, install-host-trust.sh, forgejo-ca.md
 test/interop/                  run.sh (real binaries end to end), owner.ts, softauthn.ts
-docs/                          DESIGN.md, API.md, HOSTS.md, DEPLOY-M1.md, CLOUDFLARE.md
+docs/                          DESIGN.md, API.md, HOSTS.md, CLOUDFLARE.md, UPDATES.md
 ```
 
 Build and test: `make vet test build` (aqmasd linux/arm64; aqmas linux/arm64 and amd64, with
@@ -167,7 +169,7 @@ Build and test: `make vet test build` (aqmasd linux/arm64; aqmas linux/arm64 and
 - **One CA for server and client certificates** (EKU split today); separate CAs later.
 - **`Requester.ppid`** (client proposal): the parent pid identifies the agent process better
   than aqmas's own pid. Not added; display only either way.
-- **`aqmas git-ssh`**: a `GIT_SSH_COMMAND` helper mapping `git@build-box:2222` to the
+- **`aqmas git-ssh`**: a `GIT_SSH_COMMAND` helper mapping `git@<forgejo host>:2222` to the
   `forgejo` target.
 - **Host revocation from the UI:** only `aqmasd revoke-host` on the bastion in M1; a web action
   needs a new canonical object (`host`, `revoke`) in both the server and `web/src/canonical.ts`.

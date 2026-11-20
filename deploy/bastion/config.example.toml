@@ -7,7 +7,7 @@ data_dir        = "/var/lib/aqmas"
 public_base_url = "https://approvals.example.com" # approve links, WebAuthn RP ID and origin
 owner_name      = "alice"
 # SANs of the agent-API server certificate (issued by the internal CA; clients pin that CA).
-tls_sans        = ["192.0.2.60", "bastion"]
+tls_sans        = ["192.0.2.10", "bastion"]
 client_cert_days = 730                          # host client certificates from enrollment
 
 [ttl]

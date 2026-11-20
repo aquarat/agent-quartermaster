@@ -12,7 +12,7 @@ Not built yet. Scheduled after milestone 2 (Cloudflare) and the UI round have la
 3. **Releases in the repository carry those hashes** (`SHA256SUMS` per release), so the trust
    sits with the repository host (Forgejo).
 4. **CI mirrors the repository to GitHub** as part of the release flow.
-5. Install location on a workstation: `~/.local/bin/aqmas` (Linux hosts: `/usr/local/bin/aqmas`).
+5. Install location: `~/.local/bin/aqmas` on a workstation, `/usr/local/bin/aqmas` on Linux hosts.
 
 ## Decisions
 
@@ -22,10 +22,9 @@ Not built yet. Scheduled after milestone 2 (Cloudflare) and the UI round have la
 - **Distribution:** aqmasd serves CLI releases (binaries + `SHA256SUMS`) over the mTLS agent API;
   a **public GitHub repository** may also be used as a download/verification source.
 - Consequence of a public mirror: the repository must not contain site-specific details (LAN
-  addresses, tunnel/Access IDs, host keys, deploy progress notes). Move those to the fleet's
-  private ops docs  and keep generic examples in the repo; because the mirror
-  pushes full history, scrub history once (e.g. `git filter-repo`) **before** the first public
-  push, at a point when no workstream branches are open.
+  addresses, tunnel/Access IDs, host keys, deploy progress notes). Those live in the
+  operator's private ops documentation; the repository keeps generic examples with
+  placeholders (RFC 5737 addresses, `example.com`).
 
 ## Proposed design (decisions above take precedence)
 
@@ -50,17 +49,17 @@ Not built yet. Scheduled after milestone 2 (Cloudflare) and the UI round have la
   Two hosts agreeing is much stronger than one.
 - Where the CLI fetches from: the private Forgejo repo needs credentials and Access off-LAN.
   Options: serve releases (binaries + `SHA256SUMS`) from aqmasd over the existing mTLS agent API
-  (no new credential on hosts), or make the repository public. Owner to choose.
+  (no new credential on hosts), or make the repository public.
 
 ### aqmasd self-update (bastion)
 - aqmasd polls the repository (read-only deploy key) for a new `VERSION` on `main`.
 - The UI shows "update available vX.Y.Z", the commit, and **the diff from the running commit,
-  computed on .60 from git objects it fetched and verified** (not Forgejo's web view, which a
-  compromised .50 could fake).
+  computed on the bastion from git objects it fetched and verified** (not the Forgejo web view,
+  which a compromised Forgejo host could fake).
 - The owner approves with a passkey; the canonical action commits to the exact commit hash and
   the expected binary hashes.
 - A separate root-only `aqmas-update.service` (triggered by a path unit) builds that exact commit
-  on .60 (Go toolchain + vendored modules; the web bundle via Bun with no network installs),
+  on the bastion (Go toolchain + vendored modules; the web bundle via Bun with no network installs),
   compares the hashes with the release's `SHA256SUMS`, runs the tests, installs with the previous
   binary kept, restarts aqmasd, health-checks, and rolls back automatically on failure. aqmasd
   itself never gets write access to its binary.

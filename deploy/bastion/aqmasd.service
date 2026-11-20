@@ -1,4 +1,4 @@
-# agent-quartermaster server on the bastion (192.0.2.60).
+# agent-quartermaster server on the bastion host.
 # Install: see install.sh (prints the steps; --apply runs them locally on the bastion).
 [Unit]
 Description=agent-quartermaster credential broker (aqmasd)

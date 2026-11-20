@@ -13,8 +13,8 @@ closes the socket; `--uninstall` reverses it):
   accepted; `--ca-fingerprint` refuses any other key than the one the owner read.
 - `/etc/ssh/aqmas_principals/alice` (root:root 0644, directory 0755): exactly one line,
   `alice@<name>`, where `<name>` is the host's name in aqmasd's `[[targets]]` (not
-  necessarily `hostname -s`). `--user` adds other login users; `root` is refused
-  (`PermitRootLogin no` fleet-wide).
+  necessarily `hostname -s`), for the login user from `--user` (repeatable) or `$SUDO_USER`;
+  `root` is refused (meant for fleets with `PermitRootLogin no`).
 - `/etc/ssh/sshd_config.d/10-aqmas.conf` (`deploy/hosts/10-aqmas.conf`):
 
 ```
@@ -31,26 +31,28 @@ sudo ./install-host-trust.sh --name dev-1 --ca-key aqmas_user_ca.pub --apply \
      --ca-fingerprint SHA256:<as read on the bastion>                              # do it
 ```
 
-The script refuses the bastion (bastion, 192.0.2.60) outright, and web-1 and
-hub-1 without `--i-have-owner-approval`.
+Site policy comes from `/etc/aqmas/host-trust.conf` (or `--policy FILE`; format in
+`deploy/hosts/host-trust.conf.example`) plus `--refuse NAME|ADDRESS` and
+`--needs-approval NAME`: refused hosts (always list the bastion, by name and address) are never
+configured, needs-approval hosts only with `--i-have-owner-approval`. The login user defaults to
+`$SUDO_USER`; pass `--user` otherwise.
 
 `AuthorizedPrincipalsFile` only affects **certificate** logins; existing `authorized_keys`
-logins keep working, so rollout is additive. Removing the owner's `id_rsa` from agent sockets
-and authorized_keys is a later, separate step the owner decides.
+logins keep working, so rollout is additive. Removing long-lived keys from agent sockets and
+`authorized_keys` is a later, separate step.
 
 The certificate carries `source-address <requesting host>/32`, which OpenSSH's sshd enforces,
 so a certificate copied off the requesting host is useless elsewhere.
 
-Rollout order: one canary host, verify cert login + plain key login + `sshd -t`,
-then the rest. Keep a second root session open while changing sshd on a host. Steps:
-`docs/DEPLOY-M1.md`.
+Rollout order: one canary host, verify cert login + plain key login + `sshd -t`, then the rest.
+Keep a second root session open while changing sshd on a host.
 
 ## Forgejo (built-in SSH server on :2222)
 
 Details and the source reading behind them: `deploy/hosts/forgejo-ca.md`. In short:
 
 - Forgejo checks certificates against `[server] SSH_TRUSTED_USER_CA_KEYS`
-  (`GITEA__server__SSH_TRUSTED_USER_CA_KEYS` in the Forgejo stack file on .50).
+  (`GITEA__server__SSH_TRUSTED_USER_CA_KEYS` in the container environment).
   An unparsable value is fatal at Forgejo startup, and the value is split on commas.
 - Forgejo does **not** map a principal to a user by name. It looks each certificate principal
   up as a *principal registered on a user account* (exact string match).
@@ -77,7 +79,7 @@ Details and the source reading behind them: `deploy/hosts/forgejo-ca.md`. In sho
 
 ```toml
 [[targets]]
-name = "db-1"          # [a-z0-9-]; used in principals and in `aqmas ssh db-1`
+name = "db-1"            # [a-z0-9-]; used in principals and in `aqmas ssh db-1`
 address = "192.0.2.61"
 port = 22
 users = ["alice"]
@@ -88,7 +90,7 @@ name = "forgejo"
 address = "192.0.2.50"
 port = 2222
 users = ["git"]
-principal = "alice@forgejo"      # registered on the Forgejo account; must contain "@"
+principal = "alice@forgejo"        # registered on the Forgejo account; must contain "@"
 max_ttl_seconds = 3600             # source-address probably not enforced by Forgejo
 host_key = "ssh-ed25519 AAAA..."   # the built-in server's key (ssh-keyscan -p 2222)
 ```

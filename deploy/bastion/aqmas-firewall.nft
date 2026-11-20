@@ -1,6 +1,6 @@
 #!/usr/sbin/nft -f
-# aqmas agent API (:8443): LAN (192.0.2.0/24) only. Its own table, like other_filter;
-# replaced atomically by aqmas-firewall.service. The web UI listens on 127.0.0.1:8080 only.
+# aqmas agent API (:8443): LAN only (replace 192.0.2.0/24 with your LAN). Its own table, so it
+# leaves other rulesets alone; replaced atomically by aqmas-firewall.service. The web UI listens on 127.0.0.1:8080 only.
 table inet aqmas_agent_api
 delete table inet aqmas_agent_api
 table inet aqmas_agent_api {
