@@ -130,7 +130,7 @@ const SCOPES: CFScopeDesc[] = [
     params: [],
     phrase: () => ["create, change and delete Cloudflare Access apps"],
     can: ["Create, change and delete Access applications (who may reach which hostname) and their app-level policies."],
-    cannot: ["Put an app on protected hostnames such as id.example.com.", "Change login methods or the Access organization."],
+    cannot: ["Put an app on aqmasd's protected hostnames.", "Change login methods or the Access organization."],
   },
   {
     name: "cf.access.policies",
@@ -270,14 +270,14 @@ const SCOPES: CFScopeDesc[] = [
   },
   {
     name: "cf.email",
-    risk: "medium",
+    risk: "high",
     maxTTL: 8 * HOUR,
-    standing: true,
+    standing: false,
     token: false,
     params: [zone],
     phrase: (p) => ["change email routing and sending for zone ", v(p["zone"])],
     can: ["Change email routing rules and their DNS in this zone, destination addresses, and email sending subdomains."],
-    cannot: ["Touch other zones' email routing."],
+    cannot: ["Touch other zones' email routing.", "Forward mail to an address not in aqmasd's email_forward_allow."],
   },
   {
     name: "cf.admin",

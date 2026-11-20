@@ -44,18 +44,28 @@ type Cloudflare struct {
 	MaxBodyBytes       int64 `toml:"max_body_bytes"`
 	UploadMaxBodyBytes int64 `toml:"upload_max_body_bytes"`
 
-	// Guard-rail facts (deployment policy).
-	// ProtectedAccessHostnames never get an Access app (default ["id.example.com"]).
+	// Guard-rail facts. All empty by default: a guard that needs one simply does not apply.
+	// ProtectedAccessHostnames never get an Access app (e.g. the identity provider's own
+	// hostname: an Access app on it breaks every login). Together with ProtectedDNSNames they
+	// form the protected-hostname set no grant (not even cf.admin) may route, re-route or
+	// re-point: Workers routes and custom domains, Pages and R2 custom domains, tunnel ingress
+	// rules (which must stay byte-identical), DNS records of exactly that name.
 	ProtectedAccessHostnames []string `toml:"protected_access_hostnames"`
-	// TraefikOrigin is the tunnel service that needs originServerName == hostname (default
-	// "https://192.0.2.50:9443"); TraefikPlainOrigins are refused as tunnel services
-	// (default ["http://192.0.2.50", "http://192.0.2.50:80"]).
+	// TraefikOrigin is a tunnel service that needs originServerName == hostname (e.g.
+	// "https://192.0.2.10:443"); TraefikPlainOrigins are refused as tunnel services (plain-HTTP
+	// origins of that proxy, which redirect-loop).
 	TraefikOrigin       string   `toml:"traefik_origin"`
 	TraefikPlainOrigins []string `toml:"traefik_plain_origins"`
 	// ProtectedDNSNames: names whose records a cf.dns.edit grant may not touch (apex and the
-	// mail/ACME/NS records are protected by type and prefix anyway; this adds names), default
-	// ["id.example.com"]. Overridable with a cf.admin grant.
+	// mail/ACME/NS records are protected by type and prefix anyway; this adds names).
 	ProtectedDNSNames []string `toml:"protected_dns_names"`
+	// EmailForwardAllow: the only addresses email routing may forward to (rules and catch-all)
+	// or register as destination addresses (cf.email). Empty: none.
+	EmailForwardAllow []string `toml:"email_forward_allow"`
+	// WorkerBindings lists the data bindings (D1, R2, KV, services, queues, ...) a Worker
+	// script or Pages project may have when deployed through a cf.workers.deploy / cf.pages
+	// grant. Without an entry: no data bindings at all.
+	WorkerBindings []CFBindings `toml:"worker_bindings"`
 
 	Zones       []CFObject `toml:"zones"`        // [[cloudflare.zones]] name, id
 	Tunnels     []CFObject `toml:"tunnels"`      // [[cloudflare.tunnels]] name, id (a second tunnel is deliberately absent)
@@ -64,6 +74,65 @@ type Cloudflare struct {
 	// Scopes narrows built-in scopes: [cloudflare.scopes."cf.read"] ... Unknown scope names
 	// are a config error. Nothing here can widen a scope (docs/CLOUDFLARE.md section 6).
 	Scopes map[string]CFScopeOverride `toml:"scopes"`
+}
+
+// CFBindings is one [[cloudflare.worker_bindings]] entry: exactly one of Script and
+// PagesProject, and the bindings allowed for it as "<kind>:<value>" (kinds in BindingKinds;
+// d1 values are configured D1 database names).
+type CFBindings struct {
+	Script       string   `toml:"script"`
+	PagesProject string   `toml:"pages_project"`
+	Allow        []string `toml:"allow"`
+}
+
+// BindingKinds are the "<kind>:" prefixes worker_bindings entries may use.
+var BindingKinds = map[string]bool{
+	"d1": true, "r2": true, "kv": true, "service": true, "queue": true, "durable_object": true,
+	"hyperdrive": true, "vectorize": true, "analytics_engine": true, "secrets_store": true,
+	"dispatch_namespace": true, "mtls": true, "workflow": true, "pipeline": true, "send_email": true,
+}
+
+// AllowedBindings returns the allow list for a Worker script (pages=false) or a Pages
+// project (pages=true).
+func (c *Cloudflare) AllowedBindings(name string, pages bool) []string {
+	var out []string
+	for _, b := range c.WorkerBindings {
+		if (!pages && b.Script == name && b.Script != "") || (pages && b.PagesProject == name && b.PagesProject != "") {
+			out = append(out, b.Allow...)
+		}
+	}
+	return out
+}
+
+// ProtectedHostnames is the union of protected_access_hostnames and protected_dns_names,
+// lower case, without a trailing dot.
+func (c *Cloudflare) ProtectedHostnames() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, h := range append(append([]string{}, c.ProtectedAccessHostnames...), c.ProtectedDNSNames...) {
+		h = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), ".")
+		if h != "" && !seen[h] {
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// Warnings lists Cloudflare settings that are valid but probably unintended (core logs them
+// at start).
+func (c *Cloudflare) Warnings() []string {
+	if !c.Enabled {
+		return nil
+	}
+	var w []string
+	if len(c.ProtectedAccessHostnames) == 0 {
+		w = append(w, "cloudflare.protected_access_hostnames is empty: no hostname (e.g. the identity provider's) is protected from Access apps, Workers routes, custom domains or tunnel changes")
+	}
+	if c.TraefikOrigin == "" {
+		w = append(w, "cloudflare.traefik_origin is empty: the tunnel-traefik-sni guard does not apply")
+	}
+	return w
 }
 
 // CFObject is a named Cloudflare object (zone, tunnel, D1 database).
@@ -88,6 +157,8 @@ var (
 	uuidRE   = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	cfNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,252}$`)
 	credRE   = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+	hostRE   = regexp.MustCompile(`^[a-z0-9*_]([a-z0-9*_-]{0,62})(\.[a-z0-9*_]([a-z0-9*_-]{0,62}))*$`)
+	emailRE  = regexp.MustCompile(`^[a-z0-9.!#$%&'*+/=?^_{|}~-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$`)
 )
 
 // CFDefaults fills unset Cloudflare values.
@@ -110,18 +181,6 @@ func (c *Cloudflare) applyDefaults() {
 	}
 	if c.UploadMaxBodyBytes == 0 {
 		c.UploadMaxBodyBytes = 100 << 20
-	}
-	if c.ProtectedAccessHostnames == nil {
-		c.ProtectedAccessHostnames = []string{"id.example.com"}
-	}
-	if c.TraefikOrigin == "" {
-		c.TraefikOrigin = "https://192.0.2.50:9443"
-	}
-	if c.TraefikPlainOrigins == nil {
-		c.TraefikPlainOrigins = []string{"http://192.0.2.50", "http://192.0.2.50:80"}
-	}
-	if c.ProtectedDNSNames == nil {
-		c.ProtectedDNSNames = []string{"id.example.com"}
 	}
 }
 
@@ -180,6 +239,32 @@ func (c *Cloudflare) validate() error {
 	}
 	if err := check("d1_databases", c.D1Databases, uuidRE); err != nil {
 		return err
+	}
+	for _, h := range c.ProtectedHostnames() {
+		if !hostRE.MatchString(h) {
+			return fmt.Errorf("config: cloudflare protected hostname %q invalid (plain DNS name, '*' wildcards allowed)", h)
+		}
+	}
+	for _, e := range c.EmailForwardAllow {
+		if !emailRE.MatchString(strings.ToLower(e)) {
+			return fmt.Errorf("config: cloudflare.email_forward_allow entry %q is not an email address", e)
+		}
+	}
+	for _, b := range c.WorkerBindings {
+		if (b.Script == "") == (b.PagesProject == "") {
+			return fmt.Errorf("config: each cloudflare.worker_bindings entry needs exactly one of script and pages_project")
+		}
+		for _, a := range b.Allow {
+			k, v, ok := strings.Cut(a, ":")
+			if !ok || v == "" || !BindingKinds[k] || strings.ContainsAny(v, " \t\n") {
+				return fmt.Errorf("config: cloudflare.worker_bindings allow entry %q: want \"<kind>:<value>\" (kinds: d1, r2, kv, service, queue, durable_object, ...)", a)
+			}
+			if k == "d1" {
+				if _, ok := c.D1(v); !ok {
+					return fmt.Errorf("config: cloudflare.worker_bindings allow entry %q: D1 database %q is not in cloudflare.d1_databases", a, v)
+				}
+			}
+		}
 	}
 	for name, o := range c.Scopes {
 		if o.MaxTTLSeconds < 0 || o.DefaultTTL < 0 {

@@ -189,7 +189,7 @@ func TestDenyListThroughProxy(t *testing.T) {
 		{"GET", "/accounts/" + acct + "/cfd_tunnel/" + tunHome + "/token", true},
 		{"DELETE", "/accounts/" + acct + "/cfd_tunnel/" + tunHome, true},
 		{"GET", "/accounts/ffffffffffffffffffffffffffffffff/cfd_tunnel", false},
-		{"GET", "/accounts/" + acct + "/workers/scripts/my-worker", false},
+		{"GET", "/accounts/" + acct + "/workers/scripts/hello", false},
 		{"POST", "/graphql", false},
 	} {
 		before := h.pushCount()
@@ -225,7 +225,7 @@ func TestSynthetic(t *testing.T) {
 		t.Fatalf("verify %v", res)
 	}
 	r = h.call("GET", "/user", nil, g("R"))
-	if r.doc["result"].(map[string]any)["email"] != "aqmas-proxy@build-box.invalid" {
+	if r.doc["result"].(map[string]any)["email"] != "aqmas-proxy@hosta.invalid" {
 		t.Fatalf("user %s", r.Body)
 	}
 	r = h.call("GET", "/memberships?page=1&per_page=50", nil, g("R"))
@@ -356,14 +356,15 @@ func TestRedaction(t *testing.T) {
 
 func TestBodiesAndUploads(t *testing.T) {
 	h := newHarness(t, func(c *config.Cloudflare) { c.MaxBodyBytes = 64; c.UploadMaxBodyBytes = 1024 })
-	h.grant("W", api.CFScopeWorkersDeploy, map[string]string{"script": "my-worker"})
+	h.grant("W", api.CFScopeWorkersDeploy, map[string]string{"script": "hello"})
 	h.grant("O", api.CFScopeR2Objects, map[string]string{"bucket": "photos", "access": "write"})
-	s := "/accounts/" + acct + "/workers/scripts/my-worker"
+	s := "/accounts/" + acct + "/workers/scripts/hello"
 	expect(t, h.call("PUT", s+"/secrets", strings.Repeat("x", 100), g("W")), 413, api.CFErrBadRequest)
 	// Uploads stream up to the upload limit.
-	r := h.call("PUT", s+"?excludeScript=true&bindings_inherit=strict", strings.Repeat("y", 900), g("W"))
+	mp, ct := multipartBody(`{"main_module":"w.js","bindings":[]}`, strings.Repeat("y", 400))
+	r := h.call("PUT", s+"?excludeScript=true&bindings_inherit=strict", mp, gh("W", "Content-Type", ct))
 	expect(t, r, 200, "")
-	if u := h.cf.requests(); len(u) != 1 || len(u[0].Body) != 900 || u[0].Auth != "Bearer "+fakeParent {
+	if u := h.cf.requests(); len(u) != 1 || len(u[0].Body) != len(mp) || u[0].Auth != "Bearer "+fakeParent || u[0].CT != ct {
 		t.Fatalf("upload %+v", len(u))
 	}
 	expect(t, h.call("PUT", s, strings.Repeat("y", 2000), g("W")), 413, api.CFErrBadRequest)
@@ -375,7 +376,7 @@ func TestBodiesAndUploads(t *testing.T) {
 
 func TestJWTPassthrough(t *testing.T) {
 	h := newHarness(t)
-	h.grant("W", api.CFScopeWorkersDeploy, map[string]string{"script": "my-worker"})
+	h.grant("W", api.CFScopeWorkersDeploy, map[string]string{"script": "hello"})
 	h.grant("P", api.CFScopePages, map[string]string{"project": "blog"})
 	r := h.call("POST", "/accounts/"+acct+"/workers/assets/upload?base64=true", "--multipart--", gh("W", "Authorization", "Bearer upload.jwt.value"))
 	expect(t, r, 200, "")
@@ -389,7 +390,7 @@ func TestJWTPassthrough(t *testing.T) {
 		t.Fatal("pages jwt")
 	}
 	// Non-J routes never forward the client's Authorization.
-	h.call("POST", "/accounts/"+acct+"/workers/scripts/my-worker/assets-upload-session", `{"manifest":{}}`, gh("W", "Authorization", "Bearer upload.jwt.value"))
+	h.call("POST", "/accounts/"+acct+"/workers/scripts/hello/assets-upload-session", `{"manifest":{}}`, gh("W", "Authorization", "Bearer upload.jwt.value"))
 	if a := h.cf.requests()[2].Auth; a != "Bearer "+fakeParent {
 		t.Fatalf("session auth %q", a)
 	}

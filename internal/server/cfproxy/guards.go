@@ -33,16 +33,18 @@ const (
 	GZoneSettingsPolicy = "zone-settings-policy"
 	GWorkersDomainRm    = "workers-domain-remove"
 	GRedactedWrite      = "redacted-write"
+	GEmailForward       = "email-forward"
 )
 
 // neverOverridable guards refuse even with a cf.admin override.
-var neverOverridable = map[string]bool{GAccessProtected: true, GAccessPatch: true, GRedactedWrite: true, GRulesetPhase: true}
+var neverOverridable = map[string]bool{GAccessProtected: true, GAccessPatch: true, GRedactedWrite: true, GRulesetPhase: true, GProtectedHost: true}
 
 // overridable lists the names X-Aqmas-Override accepts.
 var overridable = map[string]bool{
 	GTunnelWholeConfig: true, GTunnelCatchAll: true, GTunnelTraefikSNI: true, GTunnelPlainOrigin: true,
 	GTunnelNoTLSVerify: true, GTunnelAccessAud: true, GTunnelVersion: true, GAccessPolicyShared: true,
 	GIdPDelete: true, GDNSProtected: true, GRulesetKeepRules: true, GZoneSettingsPolicy: true, GWorkersDomainRm: true,
+	GEmailForward: true,
 }
 
 // finding is one guard-rail refusal.
@@ -158,7 +160,7 @@ func normOrigin(s string) string {
 func guardTunnelTraefikSNI(rules []ingressRule, traefik string) (*finding, []string) {
 	var warns []string
 	for _, r := range rules {
-		if normOrigin(r.service) != normOrigin(traefik) || traefik == "" {
+		if traefik == "" || !sameService(r.service, traefik) {
 			continue
 		}
 		if !strings.EqualFold(str(r.origin["originServerName"]), r.hostname) || r.hostname == "" {
@@ -175,7 +177,7 @@ func guardTunnelTraefikSNI(rules []ingressRule, traefik string) (*finding, []str
 func guardTunnelPlainOrigin(rules []ingressRule, plain []string) *finding {
 	for _, r := range rules {
 		for _, p := range plain {
-			if normOrigin(r.service) == normOrigin(p) {
+			if sameService(r.service, p) {
 				return refuseG(GTunnelPlainOrigin, "rule %q uses %s, which redirect-loops; use the Traefik https origin with originServerName", r.hostname, p)
 			}
 		}
@@ -337,7 +339,7 @@ func guardAccessProtected(body any, protected []string) *finding {
 			return refuseG(GAccessProtected, "cannot judge the domain %q; use plain host names", raw)
 		}
 		for _, p := range protected {
-			if coversHost(h, strings.ToLower(p)) {
+			if p = strings.ToLower(p); coversHost(h, p) || coversHost(p, h) {
 				return refuseG(GAccessProtected, "%s must never get an Access app (it would break every login)", p)
 			}
 		}
@@ -600,11 +602,55 @@ func zoneFor(cfg *config.Cloudflare, host string) (config.CFObject, bool) {
 
 // inZone: host is the zone or below it.
 func inZone(host, zone string) bool {
-	host, zone = strings.ToLower(host), strings.ToLower(zone)
+	host, zone = strings.TrimSuffix(strings.ToLower(host), "."), strings.ToLower(zone)
 	return zone != "" && (host == zone || strings.HasSuffix(host, "."+zone))
 }
 
 func uniq(s []string) []string {
 	slices.Sort(s)
 	return slices.Compact(s)
+}
+
+// ---- email routing ----
+
+func emailAllowed(addr string, allow []string) bool {
+	a := strings.ToLower(strings.TrimSpace(addr))
+	for _, x := range allow {
+		if a != "" && a == strings.ToLower(strings.TrimSpace(x)) {
+			return true
+		}
+	}
+	return false
+}
+
+// guardEmailActions: routing rules (and the catch-all) forward only to email_forward_allow;
+// "worker" actions (mail handed to a Worker) and unknown action types are refused too.
+func guardEmailActions(body any, allow []string) *finding {
+	for _, a := range arr(obj(body)["actions"]) {
+		m := obj(a)
+		switch t := str(m["type"]); t {
+		case "drop":
+		case "forward":
+			vals := arr(m["value"])
+			if len(vals) == 0 {
+				return refuseG(GEmailForward, "a forward action needs its addresses")
+			}
+			for _, v := range vals {
+				if !emailAllowed(str(v), allow) {
+					return refuseG(GEmailForward, "forwarding to %s: not in aqmasd's email_forward_allow", asciiOnly(str(v)))
+				}
+			}
+		default:
+			return refuseG(GEmailForward, "email routing action %q is not allowed (only forward to email_forward_allow, or drop)", asciiOnly(t))
+		}
+	}
+	return nil
+}
+
+// guardEmailAddress: destination addresses only from email_forward_allow.
+func guardEmailAddress(body any, allow []string) *finding {
+	if e := str(obj(body)["email"]); !emailAllowed(e, allow) {
+		return refuseG(GEmailForward, "destination address %s is not in aqmasd's email_forward_allow", asciiOnly(e))
+	}
+	return nil
 }

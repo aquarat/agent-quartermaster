@@ -105,8 +105,9 @@ type guardCtx struct {
 	host     Caller
 	admin    bool
 	res      *cfscope.Resolved
-	body     any // parsed request body (nil if none / not JSON)
-	before   any // before-snapshot result (nil when missing or none)
+	body     any                       // parsed request body (nil if none / not JSON)
+	parts    map[string]map[string]any // multipart JSON parts (Workers uploads)
+	before   any                       // before-snapshot result (nil when missing or none)
 	zoneName string
 }
 
@@ -133,9 +134,14 @@ func (p *Proxy) serveWrite(w http.ResponseWriter, r *http.Request, c Caller, cal
 		clen    int64
 		raw     []byte
 		parsed  any
+		parts   map[string]map[string]any
 		scanner *markerScanner
+		fwdHdr  = r.Header
 	)
-	if route.Upload {
+	bindingsCheck := !admin && (route.Guard == cfscope.GuardWorkersBindings || route.Guard == cfscope.GuardPagesBindings)
+	// Routes whose JSON body a guard rail or scope check reads: strict JSON (jsoncheck.go).
+	strict := (route.Guard != "" && route.Guard != cfscope.GuardWorkersBindings) || route.Snapshot == cfscope.SnapDNSName || bindingsCheck
+	if route.Upload && !bindingsCheck {
 		if r.ContentLength > p.uploadMax {
 			refuseW(refuse(http.StatusRequestEntityTooLarge, api.CFErrBadRequest, "upload too large"), false)
 			return
@@ -143,23 +149,61 @@ func (p *Proxy) serveWrite(w http.ResponseWriter, r *http.Request, c Caller, cal
 		scanner = &markerScanner{r: r.Body, limit: p.uploadMax}
 		body, clen = scanner, r.ContentLength
 	} else {
-		b, err := io.ReadAll(io.LimitReader(r.Body, p.maxBody+1))
+		limit := p.maxBody
+		if route.Upload {
+			limit = p.uploadMax // buffered: the metadata part is checked before anything is sent
+		}
+		if r.ContentLength > limit {
+			refuseW(refuse(http.StatusRequestEntityTooLarge, api.CFErrBadRequest, "body too large"), false)
+			return
+		}
+		b, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 		if err != nil {
 			refuseW(refuse(http.StatusBadRequest, api.CFErrBadRequest, "reading the body failed"), false)
 			return
 		}
-		if int64(len(b)) > p.maxBody {
+		if int64(len(b)) > limit {
 			refuseW(refuse(http.StatusRequestEntityTooLarge, api.CFErrBadRequest, "body too large"), false)
 			return
 		}
 		raw = b
-		if len(bytes.TrimSpace(b)) > 0 {
+		ct := r.Header.Get("Content-Type")
+		isMultipart := strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "multipart/")
+		switch {
+		case bindingsCheck && route.Guard == cfscope.GuardWorkersBindings && (route.Upload || isMultipart):
+			names := []string{"metadata"}
+			if !route.Upload {
+				names = []string{"settings", "metadata"}
+			}
+			ps, err := workerParts(ct, raw, names...)
+			if err == nil && len(ps) != 1 {
+				err = fmt.Errorf("the upload needs exactly one %s part", strings.Join(names, " or "))
+			}
+			if err != nil {
+				refuseW(refuse(http.StatusBadRequest, api.CFErrBadRequest, err.Error()), true)
+				return
+			}
+			parts = ps
+		case strict && len(bytes.TrimSpace(b)) > 0:
+			if !requestIsJSON(ct) {
+				refuseW(refuse(http.StatusBadRequest, api.CFErrBadRequest, "the body must be application/json on this route"), false)
+				return
+			}
+			if err := checkJSONKeys(b); err != nil {
+				refuseW(refuse(http.StatusBadRequest, api.CFErrBadRequest, err.Error()), true)
+				return
+			}
 			v, err := decodeJSON(b)
-			if err == nil {
-				parsed = v
-			} else if route.Guard != "" || route.Snapshot == cfscope.SnapDNSName {
+			if err != nil {
 				refuseW(refuse(http.StatusBadRequest, api.CFErrBadRequest, "the body must be JSON on this route"), false)
 				return
+			}
+			parsed = v
+			fwdHdr = r.Header.Clone()
+			fwdHdr.Set("Content-Type", "application/json")
+		case len(bytes.TrimSpace(b)) > 0:
+			if v, err := decodeJSON(b); err == nil {
+				parsed = v
 			}
 		}
 		if containsMarker(raw, parsed) {
@@ -202,7 +246,7 @@ func (p *Proxy) serveWrite(w http.ResponseWriter, r *http.Request, c Caller, cal
 			return
 		}
 	}
-	g := &guardCtx{call: call, route: route, host: c, admin: admin, res: cd.res, body: parsed, zoneName: zoneName}
+	g := &guardCtx{call: call, route: route, host: c, admin: admin, res: cd.res, body: parsed, parts: parts, zoneName: zoneName}
 	if before != nil {
 		g.before = before.result
 	}
@@ -270,7 +314,7 @@ func (p *Proxy) serveWrite(w http.ResponseWriter, r *http.Request, c Caller, cal
 	}
 
 	// 5. Forward.
-	resp, err := p.do(ctx, call.Method, call.Path, call.Query, body, clen, r.Header, auth)
+	resp, err := p.do(ctx, call.Method, call.Path, call.Query, body, clen, fwdHdr, auth)
 	if err != nil {
 		switch {
 		case scanner != nil && scanner.found:
@@ -382,6 +426,9 @@ func (p *Proxy) serveWrite(w http.ResponseWriter, r *http.Request, c Caller, cal
 	quiet := route.JWTPassthrough || readOnlyD1
 	if ok2xx && (!quiet || len(applied) > 0) {
 		text := fmt.Sprintf("aqmas: %s %s %s", c.HostName, call.Method, objName)
+		if hostDiff != "" {
+			text += " (" + hostDiff + ")"
+		}
 		if len(applied) > 0 {
 			text += " OVERRIDE " + strings.Join(applied, ",")
 		}
@@ -456,18 +503,19 @@ func (p *Proxy) enforce(g *guardCtx) (string, error) {
 			return api.CFScopeAdmin, err
 		}
 	case cfscope.GuardD1:
-		if res.Params[api.CFParamAccess] == "read" {
-			stmts, err := d1Statements(g.body)
-			if err == nil {
-				for _, s := range stmts {
-					if err = readOnlySQL(s); err != nil {
-						break
-					}
+		stmts, err := d1Statements(g.body)
+		if err == nil && res.Params[api.CFParamAccess] == "read" {
+			for _, s := range stmts {
+				if err = readOnlySQL(s); err != nil {
+					break
 				}
 			}
-			if err != nil {
+		}
+		if err != nil {
+			if res.Params[api.CFParamAccess] == "read" {
 				return api.CFScopeD1 + " " + cfscope.CanonicalParams(map[string]string{api.CFParamDB: res.Params[api.CFParamDB], api.CFParamAccess: "migrate"}), err
 			}
+			return "", err
 		}
 	case cfscope.GuardWorkersDomain:
 		if g.call.Method != http.MethodDelete {
@@ -477,6 +525,34 @@ func (p *Proxy) enforce(g *guardCtx) (string, error) {
 		}
 	case cfscope.GuardWorkersRoute:
 		if err := enforceWorkersRoute(rt, g.body, res.Params[api.CFParamScript], res.Params[api.CFParamZone], res.IDs[api.CFParamZone]); err != nil {
+			return "", err
+		}
+		if id := rt.Vars["id"]; id != "" { // PUT/DELETE of an existing zone route: it must be this script's
+			cur := findByID(g.before, id)
+			if cur == nil {
+				return "", fmt.Errorf("route %s not found in the zone", id)
+			}
+			if str(cur["script"]) != res.Params[api.CFParamScript] {
+				return "", fmt.Errorf("route %s belongs to another script", id)
+			}
+		}
+	case cfscope.GuardWorkersBindings:
+		script := res.Params[api.CFParamScript]
+		if g.parts != nil {
+			for _, part := range g.parts {
+				if err := checkWorkerSettings(part, script, p.cfg); err != nil {
+					return "", err
+				}
+			}
+		} else if err := checkWorkerSettings(obj(g.body), script, p.cfg); err != nil {
+			return "", err
+		}
+	case cfscope.GuardPagesBindings:
+		if err := checkPagesProject(g.body, res.Params[api.CFParamProject], p.cfg); err != nil {
+			return "", err
+		}
+	case cfscope.GuardR2Domain:
+		if err := p.enforceR2Domain(g); err != nil {
 			return "", err
 		}
 	case cfscope.GuardRuleset:
@@ -512,10 +588,11 @@ func (p *Proxy) guards(ctx context.Context, g *guardCtx) ([]*finding, []string, 
 		add(guardTunnelPlainOrigin(rules, p.cfg.TraefikPlainOrigins))
 		add(guardTunnelNoTLSVerify(after, beforeCfg))
 		add(guardTunnelAccessAud(after, beforeCfg))
+		add(guardTunnelProtected(after, beforeCfg, p.cfg.ProtectedHostnames()))
 		last, read := p.lastVersion(g.host.HostID, g.route.Vars["tunnel"])
 		add(guardTunnelVersion(num(obj(g.before)["version"]), last, read))
 	case cfscope.GuardAccessApp:
-		add(guardAccessProtected(g.body, p.cfg.ProtectedAccessHostnames))
+		add(guardAccessProtected(g.body, p.cfg.ProtectedHostnames()))
 		warns = append(warns, accessAppWarnings(g.body)...)
 	case cfscope.GuardAccessPatch:
 		add(guardAccessPatch())
@@ -551,6 +628,17 @@ func (p *Proxy) guards(ctx context.Context, g *guardCtx) ([]*finding, []string, 
 			before = nil // POST: the before is the list of same-name records
 		}
 		add(guardDNSProtected(m, obj(g.body), before, g.zoneName, p.cfg.ProtectedDNSNames))
+		var names []string
+		switch m {
+		case http.MethodPost, http.MethodPut:
+			names = append(names, fqdn(str(obj(g.body)["name"]), g.zoneName))
+		case http.MethodPatch:
+			names = append(names, fqdn(str(mergeRecord(before, obj(g.body))["name"]), g.zoneName))
+		}
+		if before != nil {
+			names = append(names, fqdn(str(before["name"]), g.zoneName))
+		}
+		add(guardProtectedHosts(nonEmpty(names), p.cfg.ProtectedHostnames(), "DNS record"))
 		switch m {
 		case http.MethodPost, http.MethodPut:
 			warns = append(warns, dnsWarnings(obj(g.body))...)
@@ -558,7 +646,7 @@ func (p *Proxy) guards(ctx context.Context, g *guardCtx) ([]*finding, []string, 
 			warns = append(warns, dnsWarnings(mergeRecord(before, obj(g.body)))...)
 		}
 	case cfscope.GuardRuleset:
-		if g.route.Snapshot == cfscope.SnapRulesetEntrypoint {
+		if g.route.Snapshot == cfscope.SnapRulesetEntrypoint || (g.route.Snapshot == cfscope.SnapRuleset && m == http.MethodPut) {
 			add(guardRulesetKeepRules(g.body, g.before))
 		}
 		if m == http.MethodDelete {
@@ -568,6 +656,42 @@ func (p *Proxy) guards(ctx context.Context, g *guardCtx) ([]*finding, []string, 
 		add(guardZoneSettingsPolicy(zoneSettingItems(g.route.Vars["name"], g.body)))
 	case cfscope.GuardWorkersDomRm:
 		add(guardWorkersDomainRemove())
+		if cur := findByID(g.before, g.route.Vars["id"]); cur != nil {
+			add(guardProtectedHosts(nonEmpty([]string{str(cur["hostname"])}), p.cfg.ProtectedHostnames(), "custom domain"))
+		}
+	case cfscope.GuardWorkersDomain:
+		k := map[string][]string{"hostname": nil}
+		collect(g.body, k)
+		add(guardProtectedHosts(k["hostname"], p.cfg.ProtectedHostnames(), "custom domain"))
+	case cfscope.GuardWorkersRoute:
+		var pats []string
+		if a := arr(g.body); a != nil {
+			for _, r := range a {
+				if s := str(r); s != "" {
+					pats = append(pats, s)
+				} else {
+					pats = append(pats, str(obj(r)["pattern"]))
+				}
+			}
+		} else if g.body != nil {
+			pats = append(pats, str(obj(g.body)["pattern"]))
+		}
+		if id := g.route.Vars["id"]; id != "" {
+			if cur := findByID(g.before, id); cur != nil {
+				pats = append(pats, str(cur["pattern"]))
+			}
+		}
+		add(guardProtectedHosts(nonEmpty(pats), p.cfg.ProtectedHostnames(), "Workers route"))
+	case cfscope.GuardPagesDomain:
+		add(guardProtectedHosts(nonEmpty([]string{str(obj(g.body)["name"]), g.route.Vars["name"]}), p.cfg.ProtectedHostnames(), "Pages domain"))
+	case cfscope.GuardR2Domain:
+		add(guardProtectedHosts(nonEmpty([]string{str(obj(g.body)["domain"]), g.route.Vars["name"]}), p.cfg.ProtectedHostnames(), "R2 custom domain"))
+	case cfscope.GuardEmailRules:
+		if m != http.MethodDelete {
+			add(guardEmailActions(g.body, p.cfg.EmailForwardAllow))
+		}
+	case cfscope.GuardEmailAddress:
+		add(guardEmailAddress(g.body, p.cfg.EmailForwardAllow))
 	}
 	return fs, warns, nil
 }

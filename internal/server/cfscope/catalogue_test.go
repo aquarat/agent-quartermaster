@@ -12,7 +12,7 @@ func testCfg() *config.Cloudflare {
 	return &config.Cloudflare{
 		Enabled: true, AccountID: "0123456789abcdef0123456789abcdef",
 		Zones:            []config.CFObject{{Name: "example.com", ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
-		Tunnels:          []config.CFObject{{Name: "home", ID: "aa11bb22-0000-4000-8000-000000000000"}},
+		Tunnels:          []config.CFObject{{Name: "home", ID: "0b1c2d3e-0000-4000-8000-000000000000"}},
 		D1Databases:      []config.CFObject{{Name: "app-db", ID: "11111111-2222-4333-8444-555555555555"}},
 		TokenIPCondition: []string{"203.0.113.7/32"},
 		Scopes:           map[string]config.CFScopeOverride{},
@@ -24,7 +24,7 @@ func TestResolve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := c.Resolve(api.CloudflareRequest{Scope: api.CFScopeDNSEdit, Params: map[string]string{"zone": "example.com", "name": "*.example.com"}})
+	r, err := c.Resolve(api.CloudflareRequest{Scope: api.CFScopeDNSEdit, Params: map[string]string{"zone": "Example.com", "name": "*.example.com"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestResolve(t *testing.T) {
 			t.Errorf("accepted %+v", b)
 		}
 	}
-	tr, err := c.Resolve(api.CloudflareRequest{Scope: api.CFScopeWorkersDeploy, Mode: api.CFModeToken, Params: map[string]string{"script": "my-worker", "zone": "example.com"}})
+	tr, err := c.Resolve(api.CloudflareRequest{Scope: api.CFScopeWorkersDeploy, Mode: api.CFModeToken, Params: map[string]string{"script": "hello", "zone": "example.com"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,5 +86,21 @@ func TestOverrides(t *testing.T) {
 	}
 	if len(c.API().Scopes) != len(builtins)-1 {
 		t.Fatal("catalogue size")
+	}
+}
+
+func TestEmailScopeRisk(t *testing.T) {
+	c, err := NewCatalogue(testCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _ := c.Lookup(api.CFScopeEmail)
+	if e.Risk != api.CFRiskHigh || e.StandingAllowed || e.AutoApprove {
+		t.Fatalf("cf.email %+v", e)
+	}
+	for _, s := range c.Scopes() {
+		if strings.Contains(s.Description, "alice") {
+			t.Errorf("%s description names a site", s.Name)
+		}
 	}
 }

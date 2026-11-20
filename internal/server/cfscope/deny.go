@@ -96,6 +96,28 @@ var denyList = []denyEntry{
 	de("DELETE", "/zones/*", exact, quiet, "zone deletion"),
 	de("*", "/graphql", below, quiet, "GraphQL analytics"),
 	de("!GET", "/accounts", exact, quiet, "account creation"),
+	// Other shapes that write objects a guarded route owns (they would skip its guard rails
+	// and snapshots), and hostname-bearing objects nobody manages through aqmas.
+	de("!GET", "/zones/*/access", below, quiet, "zone-level Access (use the account-level apps)"),
+	de("*", "/zones/*/dns_records/batch", below, quiet, "DNS batch writes (write records one by one)"),
+	de("*", "/zones/*/dns_records/import", below, quiet, "DNS import (write records one by one)"),
+	de("PUT|PATCH|DELETE", "/zones/*/dns_records", exact, quiet, "bulk DNS writes"),
+	de("!GET", "/accounts/*/access/apps/*/settings", below, quiet, "partial Access app writes (PUT the whole app)"),
+	de("!GET", "/accounts/*/tunnels", below, push, "legacy tunnels"),
+	de("!GET", "/accounts/*/warp_connector", below, push, "WARP connectors"),
+	de("PUT|PATCH", "/zones/*", exact, quiet, "zone pause/plan/type changes"),
+	de("!GET", "/zones/*/hostnames/settings", below, quiet, "per-hostname TLS settings"),
+	de("!GET", "/zones/*/pagerules", below, quiet, "page rules (use rulesets)"),
+	de("!GET", "/zones/*/snippets", below, quiet, "Snippets"),
+	de("!GET", "/zones/*/workers/filters", below, quiet, "legacy Worker filters"),
+	de("!GET", "/zones/*/load_balancers", below, quiet, "load balancer hostnames"),
+	de("!GET", "/zones/*/spectrum", below, quiet, "Spectrum"),
+	de("!GET", "/zones/*/custom_hostnames", below, quiet, "custom hostnames"),
+	de("POST", "/zones/*/rulesets", exact, quiet, "ruleset creation (PUT the phase entrypoint)"),
+	de("DELETE", "/zones/*/rulesets/*", exact, quiet, "ruleset deletion (rules are added, never dropped wholesale)"),
+	de("!GET", "/accounts/*/workers/services", below, quiet, "legacy Workers services API writes"),
+	de("!GET", "/accounts/*/workers/workers", below, quiet, "Workers API writes (wrangler uses the scripts API)"),
+	de("PUT|PATCH|POST", "/accounts/*/workers/domains/*", below, quiet, "Worker custom domain writes by id"),
 }
 
 // Synthetic endpoints answered by aqmasd itself (docs/CLOUDFLARE.md 3.2); never denied.

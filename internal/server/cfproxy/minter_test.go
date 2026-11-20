@@ -39,16 +39,16 @@ func TestMinter(t *testing.T) {
 	})
 	m := NewMinter(cfg, fakeMinter, cf.srv.Client()).WithCatalogue(cat)
 	nb := time.Date(2026, 11, 20, 12, 0, 0, 500, time.UTC)
-	res, err := cat.Resolve(api.CloudflareRequest{Scope: api.CFScopeWorkersDeploy, Mode: api.CFModeToken, Params: map[string]string{"script": "my-worker", "zone": "example.com"}})
+	res, err := cat.Resolve(api.CloudflareRequest{Scope: api.CFScopeWorkersDeploy, Mode: api.CFModeToken, Params: map[string]string{"script": "hello", "zone": "example.com"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := m.Mint(context.Background(), MintRequest{Name: "aqmas:G1:build-box", NotBefore: nb, ExpiresOn: nb.Add(2 * time.Hour), IPIn: []string{"203.0.113.7/32"}, Resolved: res})
+	got, err := m.Mint(context.Background(), MintRequest{Name: "aqmas:G1:hosta", NotBefore: nb, ExpiresOn: nb.Add(2 * time.Hour), IPIn: []string{"203.0.113.7/32"}, Resolved: res})
 	if err != nil || got.ID != "tok1" || got.Value != "CHILD-VALUE" {
 		t.Fatalf("mint %+v %v", got, err)
 	}
 	b := mintBodies[0]
-	if b["name"] != "aqmas:G1:build-box" || b["not_before"] != "2026-11-20T12:00:00Z" || b["expires_on"] != "2026-11-20T14:00:00Z" {
+	if b["name"] != "aqmas:G1:hosta" || b["not_before"] != "2026-11-20T12:00:00Z" || b["expires_on"] != "2026-11-20T14:00:00Z" {
 		t.Fatalf("body %v", b)
 	}
 	if in := b["condition"].(map[string]any)["request_ip"].(map[string]any)["in"].([]any); len(in) != 1 || in[0] != "203.0.113.7/32" {

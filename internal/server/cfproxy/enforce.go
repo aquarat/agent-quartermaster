@@ -188,38 +188,53 @@ func enforceRulesetPhase(before any, grantPhase string) error {
 
 // ---- D1 read-only SQL ----
 
-// d1Statements extracts the SQL of a D1 query body: {"sql": "..."} or [{"sql": "..."}...]
-// ("batch").
+// d1Statements extracts every SQL string of a D1 query body. Accepted shapes, nothing else
+// (unknown keys are refused so Cloudflare cannot run SQL aqmasd did not check):
+// {"sql": "...", "params": [...]}, {"batch": [{"sql", "params"}...]}, [{"sql", "params"}...].
 func d1Statements(body any) ([]string, error) {
 	var out []string
-	add := func(v any) error {
-		s, ok := obj(v)["sql"].(string)
+	one := func(v any) error {
+		m := obj(v)
+		if m == nil {
+			return fmt.Errorf("D1 query entries must be objects")
+		}
+		for k := range m {
+			if k != "sql" && k != "params" {
+				return fmt.Errorf("unknown key %q in a D1 query", asciiOnly(k))
+			}
+		}
+		s, ok := m["sql"].(string)
 		if !ok {
-			return fmt.Errorf(`D1 query body needs "sql"`)
+			return fmt.Errorf(`D1 query needs a "sql" string`)
+		}
+		if p, ok := m["params"]; ok && p != nil && arr(p) == nil {
+			return fmt.Errorf(`D1 "params" must be an array`)
 		}
 		out = append(out, s)
 		return nil
 	}
-	if a := arr(body); a != nil {
-		for _, e := range a {
-			if err := add(e); err != nil {
-				return nil, err
-			}
-		}
-		return out, nil
-	}
+	list := arr(body)
 	if b := obj(body); b != nil {
-		if batch := arr(b["batch"]); batch != nil {
-			for _, e := range batch {
-				if err := add(e); err != nil {
-					return nil, err
-				}
+		if batch, ok := b["batch"]; ok {
+			if len(b) != 1 || arr(batch) == nil {
+				return nil, fmt.Errorf(`a D1 "batch" body has only the "batch" array`)
 			}
-			return out, nil
+			list = arr(batch)
+		} else {
+			return out, one(b)
 		}
-		return out, add(b)
+	} else if list == nil {
+		return nil, fmt.Errorf("D1 query body must be JSON")
 	}
-	return nil, fmt.Errorf("D1 query body must be JSON")
+	if len(list) == 0 {
+		return nil, fmt.Errorf("empty D1 batch")
+	}
+	for _, e := range list {
+		if err := one(e); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // sqlTokens splits SQL into upper-case words, single-character punctuation and ";", dropping
@@ -346,6 +361,56 @@ func readOnlySQL(sql string) error {
 			}
 			return fmt.Errorf("access=read does not allow %s", t)
 		}
+	}
+	return nil
+}
+
+// findByID finds the object with id in a list result (or the result itself).
+func findByID(v any, id string) map[string]any {
+	if id == "" {
+		return nil
+	}
+	if m := obj(v); m != nil && str(m["id"]) == id {
+		return m
+	}
+	for _, e := range arr(v) {
+		if m := obj(e); m != nil && str(m["id"]) == id {
+			return m
+		}
+	}
+	return nil
+}
+
+func nonEmpty(in []string) []string {
+	var out []string
+	for _, s := range in {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// enforceR2Domain: an R2 custom domain must be in a configured zone (and zoneId, when given,
+// that zone's id).
+func (p *Proxy) enforceR2Domain(g *guardCtx) error {
+	d := g.route.Vars["name"]
+	if b := obj(g.body); b != nil && str(b["domain"]) != "" {
+		if d != "" && !strings.EqualFold(d, str(b["domain"])) {
+			return fmt.Errorf("the body's domain differs from the path")
+		}
+		d = str(b["domain"])
+	}
+	h, ok := hostOf(d)
+	if !ok || h == "" {
+		return fmt.Errorf("R2 custom domain needs a plain host name")
+	}
+	z, ok := zoneFor(p.cfg, h)
+	if !ok {
+		return fmt.Errorf("R2 custom domain %s is not in a zone configured in aqmasd", h)
+	}
+	if zid := str(obj(g.body)["zoneId"]); zid != "" && zid != z.ID {
+		return fmt.Errorf("zoneId is not the id of zone %s", z.Name)
 	}
 	return nil
 }

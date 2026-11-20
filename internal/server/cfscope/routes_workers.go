@@ -15,13 +15,13 @@ func workersRoutes() []rdef {
 		rt("GET", a+"/services/{script}/environments/{name}/bindings|routes|subdomain"),
 		rt("GET", a+"/workers/{script}"),
 		// Upload: first deploy / migrations (PUT), otherwise versions + deployments.
-		rt("PUT", s, optU),
+		rt("PUT", s, optU, optG(GuardWorkersBindings)),
 		rt("GET", s+"/versions"),
-		rt("POST", s+"/versions", optU),
+		rt("POST", s+"/versions", optU, optG(GuardWorkersBindings)),
 		rt("GET", s+"/versions/{id}"),
 		rt("GET|POST", s+"/deployments"),
 		rt("GET", s+"/settings|script-settings"),
-		rt("PATCH", s+"/settings|script-settings", optS(SnapWorkersScriptSettings)),
+		rt("PATCH", s+"/settings|script-settings", optSG(SnapWorkersScriptSettings, GuardWorkersBindings)),
 		// Static assets: the session uses the parent token, the uploads the session's JWT.
 		rt("POST", s+"/assets-upload-session"),
 		rt("POST", a+"/assets/upload", optU, optJ),
@@ -65,7 +65,7 @@ func pagesRoutes() []rdef {
 	const p = "/accounts/{acct}/pages/projects/{project}"
 	return []rdef{
 		rt("GET", p),
-		rt("PATCH", p, optS(SnapPagesProject)),
+		rt("PATCH", p, optSG(SnapPagesProject, GuardPagesBindings)),
 		rt("GET", p+"/upload-token"),
 		rt("POST", "/pages/assets/check-missing|upload|upsert-hashes", optU, optJ),
 		rt("GET", p+"/deployments"),
@@ -73,7 +73,9 @@ func pagesRoutes() []rdef {
 		rt("GET|DELETE", p+"/deployments/{id}"),
 		rt("POST", p+"/deployments/{id}/retry|rollback"),
 		rt("GET", p+"/deployments/{id}/history/logs"),
-		rt("GET|POST", p+"/domains"),
-		rt("GET|PATCH|DELETE", p+"/domains/{name}"),
+		rt("GET", p+"/domains"),
+		rt("POST", p+"/domains", optG(GuardPagesDomain)),
+		rt("GET", p+"/domains/{name}"),
+		rt("PATCH|DELETE", p+"/domains/{name}", optG(GuardPagesDomain)),
 	}
 }

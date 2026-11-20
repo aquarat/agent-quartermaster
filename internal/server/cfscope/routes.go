@@ -45,6 +45,14 @@ const (
 	GuardD1             = "d1"
 	GuardEmailRules     = "email-rules"
 	GuardAccessAppDelWn = "access-app-delete" // warning only (domain still in a tunnel config)
+	// Bodies checked for data bindings (scope enforcement, worker_bindings config).
+	GuardWorkersBindings = "workers-bindings"
+	GuardPagesBindings   = "pages-bindings"
+	// Hostname-bearing writes: protected hostnames (and, for R2, configured zones).
+	GuardPagesDomain = "pages-domain"
+	GuardR2Domain    = "r2-domain"
+	// Email destination addresses (email_forward_allow).
+	GuardEmailAddress = "email-address"
 )
 
 // tseg is one template segment.
@@ -256,6 +264,8 @@ var scopeRoutes = map[string][]rdef{
 		rt("PUT", "/zones/{zone}/rulesets/phases/{phase}/entrypoint", optSG(SnapRulesetEntrypoint, GuardRuleset)),
 		rt("POST", "/zones/{zone}/rulesets/{id}/rules", optSG(SnapRuleset, GuardRuleset)),
 		rt("PATCH|DELETE", "/zones/{zone}/rulesets/{id}/rules/{id}", optSG(SnapRuleset, GuardRuleset)),
+		// Replacing a whole ruleset by id: the same object as the entrypoint (keep-rules applies).
+		rt("PUT", "/zones/{zone}/rulesets/{id}", optSG(SnapRuleset, GuardRuleset)),
 	},
 
 	api.CFScopeZoneSettings: {
@@ -289,8 +299,10 @@ var scopeRoutes = map[string][]rdef{
 		rt("GET|POST", "/accounts/{acct}/r2/buckets"),
 		rt("GET", "/accounts/{acct}/r2/buckets/{bucket*}"),
 		rt("GET|PUT|DELETE", "/accounts/{acct}/r2/buckets/{bucket*}/cors|lifecycle"),
-		rt("GET|POST", "/accounts/{acct}/r2/buckets/{bucket*}/domains/custom"),
-		rt("GET|PUT|DELETE", "/accounts/{acct}/r2/buckets/{bucket*}/domains/custom/{name}"),
+		rt("GET", "/accounts/{acct}/r2/buckets/{bucket*}/domains/custom"),
+		rt("POST", "/accounts/{acct}/r2/buckets/{bucket*}/domains/custom", optG(GuardR2Domain)),
+		rt("GET", "/accounts/{acct}/r2/buckets/{bucket*}/domains/custom/{name}"),
+		rt("PUT|DELETE", "/accounts/{acct}/r2/buckets/{bucket*}/domains/custom/{name}", optG(GuardR2Domain)),
 		rt("GET|PUT", "/accounts/{acct}/r2/buckets/{bucket*}/domains/managed"),
 	},
 
@@ -310,7 +322,8 @@ var scopeRoutes = map[string][]rdef{
 		rt("PUT|DELETE", "/zones/{zone}/email/routing/rules/{id}", optSG(SnapEmailRules, GuardEmailRules)),
 		rt("GET|POST|PATCH|DELETE", "/zones/{zone}/email/routing/dns"),
 		rt("POST", "/zones/{zone}/email/routing/enable|disable"),
-		rt("GET|POST", "/accounts/{acct}/email/routing/addresses"),
+		rt("GET", "/accounts/{acct}/email/routing/addresses"),
+		rt("POST", "/accounts/{acct}/email/routing/addresses", optG(GuardEmailAddress)),
 		rt("GET|DELETE", "/accounts/{acct}/email/routing/addresses/{id}"),
 		rt("GET|POST|DELETE", "/zones/{zone}/email/sending/{key...}"),
 	},

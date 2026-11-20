@@ -15,7 +15,7 @@ var tunPath = "/accounts/" + acct + "/cfd_tunnel/" + tunHome + "/configurations"
 
 func liveTunnel(version int) map[string]any {
 	return map[string]any{"tunnel_id": tunHome, "version": version, "config": map[string]any{"ingress": []any{
-		map[string]any{"hostname": "git.example.com", "service": "https://192.0.2.50:9443",
+		map[string]any{"hostname": "git.example.com", "service": "https://192.0.2.10:8443",
 			"originRequest": map[string]any{"originServerName": "git.example.com", "matchSNItoHost": true, "http2Origin": true, "access": map[string]any{"required": true, "audTag": []any{"aud1"}}}},
 		map[string]any{"hostname": "old.example.com", "service": "http://localhost:8080"},
 		map[string]any{"service": "http_status:404"},
@@ -25,7 +25,7 @@ func liveTunnel(version int) map[string]any {
 // tunnelBody: the live config with one rule changed/added.
 func tunnelBody(extra ...map[string]any) map[string]any {
 	ing := []any{
-		map[string]any{"hostname": "git.example.com", "service": "https://192.0.2.50:9443",
+		map[string]any{"hostname": "git.example.com", "service": "https://192.0.2.10:8443",
 			"originRequest": map[string]any{"originServerName": "git.example.com", "matchSNItoHost": true, "http2Origin": true, "access": map[string]any{"required": true, "audTag": []any{"aud1"}}}},
 	}
 	for _, e := range extra {
@@ -48,7 +48,7 @@ func TestTunnelWriteFlow(t *testing.T) {
 	})
 	h.cf.result("GET /zones/"+zoneA+"/dns_records", []any{map[string]any{"name": "new.example.com", "proxied": true}})
 	h.cf.result("GET /accounts/"+acct+"/access/apps", []any{map[string]any{"domain": "git.example.com"}})
-	good := tunnelBody(map[string]any{"hostname": "new.example.com", "service": "https://192.0.2.50:9443",
+	good := tunnelBody(map[string]any{"hostname": "new.example.com", "service": "https://192.0.2.10:8443",
 		"originRequest": map[string]any{"originServerName": "new.example.com", "matchSNItoHost": true, "http2Origin": true}})
 
 	// Never read through the proxy: 409.
@@ -73,7 +73,7 @@ func TestTunnelWriteFlow(t *testing.T) {
 		t.Fatalf("snapshot headers %v", r.Header())
 	}
 	b, err := h.p.snaps.get(bid)
-	if err != nil || b.Phase != "before" || b.ObjectKey != "tunnel-config:"+tunHome || b.PairID != aid || b.GrantID != "T" || b.Host != "build-box" || !strings.Contains(string(b.Content), "old.example.com") {
+	if err != nil || b.Phase != "before" || b.ObjectKey != "tunnel-config:"+tunHome || b.PairID != aid || b.GrantID != "T" || b.Host != "hosta" || !strings.Contains(string(b.Content), "old.example.com") {
 		t.Fatalf("before %+v %v", b, err)
 	}
 	a, err := h.p.snaps.get(aid)
@@ -86,10 +86,10 @@ func TestTunnelWriteFlow(t *testing.T) {
 		t.Fatal("snapshot modes")
 	}
 	au := h.grants.last("cf_write")
-	if au == nil || au.Object != "grant:T" || au.Actor != "host:build-box" || !strings.Contains(au.Detail, "hosts=+new.example.com -old.example.com") || !strings.Contains(au.Detail, "before="+bid) {
+	if au == nil || au.Object != "grant:T" || au.Actor != "host:hosta" || !strings.Contains(au.Detail, "hosts=+new.example.com -old.example.com") || !strings.Contains(au.Detail, "before="+bid) {
 		t.Fatalf("audit %+v", au)
 	}
-	if h.pushes[len(h.pushes)-1] != "aqmas: build-box PUT tunnel-config:"+tunHome+" [ref REFT]" {
+	if h.pushes[len(h.pushes)-1] != "aqmas: hosta PUT tunnel-config:"+tunHome+" (+new.example.com -old.example.com) [ref REFT]" {
 		t.Fatalf("push %q", h.pushes[len(h.pushes)-1])
 	}
 	// The after-snapshot's version counts as read: a second PUT works without a GET...
@@ -105,12 +105,12 @@ func TestTunnelGuards(t *testing.T) {
 	h.grant("A", api.CFScopeAdmin, nil)
 	h.cf.result("GET "+tunPath, liveTunnel(3))
 	expect(t, h.call("GET", tunPath, nil, g("T")), 200, "")
-	traefik := "https://192.0.2.50:9443"
+	traefik := "https://192.0.2.10:8443"
 	cases := map[string]any{
 		GTunnelWholeConfig: map[string]any{"config": map[string]any{"ingress": []any{}}, "extra": 1},
 		GTunnelCatchAll:    map[string]any{"config": map[string]any{"ingress": []any{map[string]any{"hostname": "x.example.com", "service": "http_status:404"}}}},
 		GTunnelTraefikSNI:  tunnelBody(map[string]any{"hostname": "n.example.com", "service": traefik}),
-		GTunnelPlainOrigin: tunnelBody(map[string]any{"hostname": "n.example.com", "service": "http://192.0.2.50:80/"}),
+		GTunnelPlainOrigin: tunnelBody(map[string]any{"hostname": "n.example.com", "service": "http://192.0.2.10:80/"}),
 		GTunnelNoTLSVerify: tunnelBody(map[string]any{"hostname": "n.example.com", "service": "https://10.0.0.1", "originRequest": map[string]any{"noTLSVerify": true}}),
 		GTunnelAccessAud: map[string]any{"config": map[string]any{"ingress": []any{
 			map[string]any{"hostname": "git.example.com", "service": traefik, "originRequest": map[string]any{"originServerName": "git.example.com"}},
@@ -167,17 +167,17 @@ func TestAccessApps(t *testing.T) {
 	apps := "/accounts/" + acct + "/access/apps"
 	bad := []map[string]any{
 		{"domain": "id.example.com"},
-		{"domain": "ID.example.com."},
+		{"domain": "ID.Example.COM."},
 		{"domain": "id.example.com/admin"},
 		{"domain": "id.example.com:443/x"},
 		{"domain": "https://id.example.com"},
 		{"domain": "*.example.com"},
-		{"domain": "*.co.uk"},
+		{"domain": "*.com"},
 		{"domain": "i*.example.com"},
 		{"domain": "*"},
 		{"domain": "ok.example.com", "self_hosted_domains": []any{"ok.example.com", "id.example.com"}},
 		{"domain": "ok.example.com", "destinations": []any{map[string]any{"type": "public", "uri": "id.example.com/path"}}},
-		{"domain": "id.alice.co%2euk"},
+		{"domain": "id.example%2ecom"},
 	}
 	for _, b := range bad {
 		r := h.call("POST", apps, b, g("AP"))
@@ -320,7 +320,7 @@ func TestDNS(t *testing.T) {
 	if len(r.Header().Values(api.CFWarningHeader)) != 1 {
 		t.Fatalf("warnings %v", r.Header().Values(api.CFWarningHeader))
 	}
-	r = h.call("PUT", recs+"/a1", map[string]any{"name": "www", "type": "A", "content": "192.0.2.50"}, g("D"))
+	r = h.call("PUT", recs+"/a1", map[string]any{"name": "www", "type": "A", "content": "10.0.0.5"}, g("D"))
 	if !strings.Contains(strings.Join(r.Header().Values(api.CFWarningHeader), "|"), "private") {
 		t.Fatal("RFC 1918 warning")
 	}
@@ -487,28 +487,29 @@ func TestD1(t *testing.T) {
 
 func TestWorkersScopeChecks(t *testing.T) {
 	h := newHarness(t)
-	h.grant("W", api.CFScopeWorkersDeploy, map[string]string{"script": "my-worker"})
-	h.grant("WZ", api.CFScopeWorkersDeploy, map[string]string{"script": "my-worker", "zone": "example.com"})
+	h.grant("W", api.CFScopeWorkersDeploy, map[string]string{"script": "hello"})
+	h.grant("WZ", api.CFScopeWorkersDeploy, map[string]string{"script": "hello", "zone": "example.com"})
 	h.grant("A", api.CFScopeAdmin, nil)
 	a := "/accounts/" + acct + "/workers"
-	dom := map[string]any{"hostname": "my-worker.example.com", "service": "my-worker", "zone_id": zoneA, "environment": "production"}
+	dom := map[string]any{"hostname": "hello.example.com", "service": "hello", "zone_id": zoneA, "environment": "production"}
 	expect(t, h.call("PUT", a+"/domains", dom, g("W")), 403, api.CFErrNoGrant) // no zone param
 	expect(t, h.call("PUT", a+"/domains", dom, g("WZ")), 200, "")
-	expect(t, h.call("PUT", a+"/domains", map[string]any{"hostname": "my-worker.example.org", "service": "my-worker"}, g("WZ")), 403, api.CFErrNoGrant)
+	expect(t, h.call("PUT", a+"/domains", map[string]any{"hostname": "hello.example.org", "service": "hello"}, g("WZ")), 403, api.CFErrNoGrant)
 	expect(t, h.call("PUT", a+"/domains", map[string]any{"hostname": "x.example.com", "service": "other"}, g("WZ")), 403, api.CFErrNoGrant)
-	expect(t, h.call("PUT", a+"/domains", map[string]any{"hostname": "x.example.com", "service": "my-worker", "zone_id": zoneB}, g("WZ")), 403, api.CFErrNoGrant)
-	recs := a + "/scripts/my-worker/domains/records"
+	expect(t, h.call("PUT", a+"/domains", map[string]any{"hostname": "x.example.com", "service": "hello", "zone_id": zoneB}, g("WZ")), 403, api.CFErrNoGrant)
+	recs := a + "/scripts/hello/domains/records"
 	expect(t, h.call("PUT", recs, map[string]any{"origins": []any{map[string]any{"hostname": "p.example.com"}}, "override_scope": true}, g("WZ")), 200, "")
-	expect(t, h.call("POST", a+"/scripts/my-worker/domains/changeset?replace_state=true", []any{map[string]any{"hostname": "p.example.org"}}, g("WZ")), 403, api.CFErrNoGrant)
+	expect(t, h.call("POST", a+"/scripts/hello/domains/changeset?replace_state=true", []any{map[string]any{"hostname": "p.example.org"}}, g("WZ")), 403, api.CFErrNoGrant)
 	// Custom domain removal: guard rail.
 	expect(t, h.call("DELETE", a+"/domains/dom1", nil, g("WZ")), 403, api.CFErrGuardRail)
 	expect(t, h.call("DELETE", a+"/domains/dom1", nil, gh("A", api.CFOverrideHeader, GWorkersDomainRm)), 200, "")
 	// Routes.
 	zr := "/zones/" + zoneA + "/workers/routes"
-	expect(t, h.call("POST", zr, map[string]any{"pattern": "example.com/p/*", "script": "my-worker"}, g("WZ")), 200, "")
+	expect(t, h.call("POST", zr, map[string]any{"pattern": "example.com/p/*", "script": "hello"}, g("WZ")), 200, "")
 	expect(t, h.call("POST", zr, map[string]any{"pattern": "example.com/p/*", "script": "other"}, g("WZ")), 403, api.CFErrNoGrant)
-	sr := a + "/scripts/my-worker/routes"
-	expect(t, h.call("PUT", sr, []any{map[string]any{"pattern": "*.example.com/api/*", "zone_name": "example.com"}}, g("WZ")), 200, "")
+	sr := a + "/scripts/hello/routes"
+	expect(t, h.call("PUT", sr, []any{map[string]any{"pattern": "app.example.com/api/*", "zone_name": "example.com"}}, g("WZ")), 200, "")
+	expect(t, h.call("PUT", sr, []any{map[string]any{"pattern": "*.example.com/api/*", "zone_name": "example.com"}}, g("WZ")), 403, api.CFErrGuardRail)
 	expect(t, h.call("PUT", sr, []any{map[string]any{"pattern": "example.org/*"}}, g("WZ")), 403, api.CFErrNoGrant)
 	expect(t, h.call("PUT", sr, []any{map[string]any{"pattern": "example.com/*"}}, g("W")), 403, api.CFErrNoGrant)
 	// Script binding: another script is not this grant's.
@@ -518,11 +519,11 @@ func TestWorkersScopeChecks(t *testing.T) {
 		t.Fatalf("hint %q", r.Header().Get(api.CFNeedsScopeHeader))
 	}
 	// Secrets and settings.
-	expect(t, h.call("PUT", a+"/scripts/my-worker/secrets", map[string]any{"name": "K", "text": "v", "type": "secret_text"}, g("W")), 200, "")
-	expect(t, h.call("DELETE", a+"/scripts/my-worker/secrets/K?url_encoded=true", nil, g("W")), 200, "")
-	r = h.call("PATCH", a+"/scripts/my-worker/script-settings", map[string]any{"logpush": false}, g("W"))
+	expect(t, h.call("PUT", a+"/scripts/hello/secrets", map[string]any{"name": "K", "text": "v", "type": "secret_text"}, g("W")), 200, "")
+	expect(t, h.call("DELETE", a+"/scripts/hello/secrets/K?url_encoded=true", nil, g("W")), 200, "")
+	r = h.call("PATCH", a+"/scripts/hello/script-settings", map[string]any{"logpush": false}, g("W"))
 	expect(t, r, 200, "")
-	if b, _ := h.p.snaps.get(r.Header().Get(api.CFSnapshotBeforeHeader)); b == nil || b.ObjectKey != "workers-script-settings:my-worker" {
+	if b, _ := h.p.snaps.get(r.Header().Get(api.CFSnapshotBeforeHeader)); b == nil || b.ObjectKey != "workers-script-settings:hello" {
 		t.Fatalf("settings snapshot %+v", b)
 	}
 }

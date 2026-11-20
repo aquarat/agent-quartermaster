@@ -93,6 +93,11 @@ account_id = "$ACCT"
 proxy_token_file = "$T/tok/proxy"
 minter_token_file = "$T/tok/minter"
 token_ip_condition = ["127.0.0.1/32"]
+# Guard-rail facts the checks below rely on (no built-in defaults; keep in step with the
+# hostnames and origins used in this script).
+protected_access_hostnames = ["id.example.com"]
+traefik_origin = "https://192.0.2.50:9443"
+traefik_plain_origins = ["http://192.0.2.50", "http://192.0.2.50:80"]
 
 [[cloudflare.zones]]
 name = "example.com"
@@ -103,6 +108,9 @@ id = "$TUN"
 [[cloudflare.d1_databases]]
 name = "times"
 id = "$DB"
+[[cloudflare.worker_bindings]]
+script = "interop-worker"
+allow = ["d1:times"]
 EOF
 
 "$AQMASD" -config "$T/config.toml" serve >"$T/aqmasd.log" 2>&1 &
