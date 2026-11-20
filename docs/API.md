@@ -23,7 +23,7 @@ TLS 1.3. The server presents **leaf + internal CA**; the leaf has the `serverAut
 only, and aqmasd refuses its own server certificate as a client identity. The CLI pins the
 CA: pin = `sha256:<hex of SHA-256 over the CA certificate DER>`, printed on the bastion by
 `aqmasd tls-fingerprint` (the same as `openssl x509 -noout -fingerprint -sha256`, colons
-allowed). It verifies the chain to the pin, the server name (IP SAN `192.0.2.60`) and the
+allowed). It verifies the chain to the pin, the server name (e.g. IP SAN `192.0.2.10`) and the
 `serverAuth` EKU. Because the CA (not the leaf) is pinned, renewing the leaf does not break
 enrolled hosts.
 
@@ -250,7 +250,7 @@ flagged).
   `host_name`, `client_cert`, `client_key`, `client_ca`, `default_ttl`); key and certificate
   in the same directory (0600, directory 0700). Overrides: `AQMAS_CONFIG_DIR`,
   `AQMAS_CACHE_DIR`.
-- `aqmas enroll --name HOST [--server URL] [--ca-pin sha256:HEX] [--note TEXT] [--force]`:
+- `aqmas enroll --name HOST --server URL [--ca-pin sha256:HEX] [--note TEXT] [--force]`:
   creates the client key + CSR, prints the approve URL and Ref, waits. Without `--ca-pin`, the
   CA is trusted only after the user confirms its fingerprint at a terminal.
 - `aqmas ssh [USER@]HOST [--ttl 30m] [--why "..."] [--fresh] [-- COMMAND...]`: reuses a cached

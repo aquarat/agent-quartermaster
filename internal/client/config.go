@@ -17,9 +17,6 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// DefaultServer is the bastion's agent API.
-const DefaultServer = "https://192.0.2.60:8443"
-
 // DefaultTTL is used when neither --ttl nor default_ttl is given.
 const DefaultTTL = 30 * time.Minute
 
@@ -117,7 +114,7 @@ func LoadConfig(p Paths) (*Config, error) {
 		return nil, fmt.Errorf("%s: unknown keys %v", p.ConfigFile(), und)
 	}
 	if c.Server == "" {
-		c.Server = DefaultServer
+		return nil, fmt.Errorf("%s: no server set; re-enroll with --server https://<bastion>:8443", p.ConfigFile())
 	}
 	return &c, nil
 }

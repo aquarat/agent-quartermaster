@@ -79,6 +79,24 @@ func TestEnrollWithPin(t *testing.T) {
 	}
 }
 
+func TestEnrollNeedsServer(t *testing.T) {
+	e := newTestEnv(t)
+	err := e.Enroll(context.Background(), EnrollOptions{Name: "agenthost"})
+	if ExitCode(err) != ExitUsage || !strings.Contains(err.Error(), "--server is required") {
+		t.Fatalf("first enroll without --server: err=%v code=%d", err, ExitCode(err))
+	}
+	// A config without a server is refused rather than defaulted.
+	if err := os.MkdirAll(e.Paths.ConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(e.Paths.ConfigFile(), []byte("host_name = \"agenthost\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(e.Paths); err == nil || !strings.Contains(err.Error(), "no server set") {
+		t.Fatalf("config without server: %v", err)
+	}
+}
+
 func TestEnrollWrongPin(t *testing.T) {
 	f := newFakeServer(t)
 	e := newTestEnv(t)

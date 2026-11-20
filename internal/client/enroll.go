@@ -30,7 +30,7 @@ var hostNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 // EnrollOptions are the flags of `aqmas enroll`.
 type EnrollOptions struct {
 	Name   string
-	Server string // empty: config value or DefaultServer
+	Server string // empty: the server in the existing config; required on a first enrollment
 	CAPin  string // "sha256:<hex>"; empty: existing config pin, else TOFU
 	Force  bool   // replace an existing client certificate
 	Note   string
@@ -57,7 +57,7 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 		if old != nil && old.Server != "" {
 			server = old.Server
 		} else {
-			server = DefaultServer
+			return &UsageError{Msg: "--server is required (the bastion's agent API, e.g. https://192.0.2.10:8443)"}
 		}
 	}
 	if _, _, err := serverHostPort(server); err != nil {

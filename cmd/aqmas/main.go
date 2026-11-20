@@ -24,8 +24,9 @@ import (
 const usage = `aqmas: request short-lived, owner-approved access through agent-quartermaster
 
 Usage:
-  aqmas enroll --name HOST [--server URL] [--ca-pin sha256:HEX] [--force]
+  aqmas enroll --name HOST --server URL [--ca-pin sha256:HEX] [--force]
       Enroll this host once: creates a client key, waits for the owner to approve.
+      --server (the bastion's agent API, https://HOST:8443) is required the first time.
       Without --ca-pin, the server CA is trusted only after you confirm its
       fingerprint at a terminal.
   aqmas ssh [USER@]HOST [--ttl 30m] [--why "..."] [--fresh] [-- COMMAND...]
