@@ -13,7 +13,7 @@
 # Backs up whatever it replaces to /var/backups/aqmas-host-trust/<UTC time>/, validates with
 # `sshd -t` and checks `sshd -T` shows the new values before reloading sshd; on a failed check
 # it restores the backup. Keep a second root session open while running it with --apply.
-set -euo pipefail
+set -Eeuo pipefail
 umask 022
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -31,6 +31,7 @@ ROOT=/
 NAME=
 CA_KEY=
 USERS=()
+USERS_GIVEN=0
 OWNER_OK=0
 SSHD=
 SYSTEMCTL=${SYSTEMCTL:-systemctl}
@@ -63,8 +64,8 @@ while [[ $# -gt 0 ]]; do
 	--name=*) NAME=${1#*=} ;;
 	--ca-key) CA_KEY=${2:-}; shift ;;
 	--ca-key=*) CA_KEY=${1#*=} ;;
-	--user) USERS+=("${2:-}"); shift ;;
-	--user=*) USERS+=("${1#*=}") ;;
+	--user) USERS+=("${2:-}"); USERS_GIVEN=1; shift ;;
+	--user=*) USERS+=("${1#*=}"); USERS_GIVEN=1 ;;
 	--root) ROOT=${2:-}; shift ;;
 	--root=*) ROOT=${1#*=} ;;
 	--sshd) SSHD=${2:-}; shift ;;
@@ -78,8 +79,11 @@ done
 [[ ${#USERS[@]} -gt 0 ]] || USERS=(alice)
 
 [[ -n $ROOT && -d $ROOT ]] || die "--root $ROOT is not a directory"
-ROOT=$(cd "$ROOT" && pwd)
-R=${ROOT%/} # prefix for paths; empty for /
+# Physical path, so "//" or a symlink to / cannot pose as a test root and skip the checks
+# and the sshd validation that apply to the real system.
+ROOT=$(cd "$ROOT" && pwd -P)
+[[ ! $ROOT =~ ^/+$ ]] || ROOT=/ # bash keeps "//" as is
+R=${ROOT%/} # prefix for paths; empty for the real system
 if [[ -z $SSHD && -z $R ]]; then SSHD=$(command -v sshd || echo /usr/sbin/sshd); fi
 
 ETC_SSH=$R/etc/ssh
@@ -107,7 +111,8 @@ fi
 host_names=()
 [[ -n $NAME ]] && host_names+=("$NAME")
 if [[ -r $R/etc/hostname ]]; then host_names+=("$(head -n1 "$R/etc/hostname" | cut -d. -f1)"); fi
-if [[ -z $R ]]; then host_names+=("$(hostname -s 2>/dev/null || uname -n)"); fi
+# The machine we run on is checked even with --root.
+host_names+=("$(hostname -s 2>/dev/null || uname -n)")
 for h in "${host_names[@]}"; do
 	for d in "${HARD_DENY[@]}"; do
 		[[ $h != "$d" ]] || die "refusing to run on $d: it is the aqmas bastion and only accepts the owner's key"
@@ -118,7 +123,7 @@ for h in "${host_names[@]}"; do
 		fi
 	done
 done
-if [[ -z $R ]] && command -v ip >/dev/null; then
+if command -v ip >/dev/null; then
 	addrs=$(ip -o addr show 2>/dev/null || true)
 	for a in "${HARD_DENY_ADDRS[@]}"; do
 		if grep -qF " $a/" <<<"$addrs"; then die "refusing to run on the aqmas bastion ($a)"; fi
@@ -143,7 +148,15 @@ plan_file() {
 }
 
 # backup FILES...: copies each existing file into BACKUP (relative to ROOT); records absent ones.
+# From then on any unexpected failure restores the backup (ERR trap; set -E covers functions).
 BACKUP=
+on_err() {
+	local rc=$?
+	trap - ERR
+	say "unexpected failure (exit $rc)"
+	if [[ -n $BACKUP && -f $BACKUP/MANIFEST ]]; then restore; fi
+	exit "$rc"
+}
 backup() {
 	BACKUP=$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$$
 	mkdir -p "$BACKUP"
@@ -159,6 +172,7 @@ backup() {
 		fi
 	done
 	say "backup     ${BACKUP#"$R"}"
+	trap on_err ERR
 }
 
 restore() {
@@ -190,7 +204,8 @@ sshd_check() {
 	fi
 	local cfg=()
 	[[ -z $R ]] || cfg=(-f "$SSHD_CONFIG")
-	if ! "$SSHD" -t "${cfg[@]}"; then
+	# ${cfg[@]+...}: an empty array is "unbound" under set -u in bash < 4.4 (macOS /bin/bash).
+	if ! "$SSHD" -t ${cfg[@]+"${cfg[@]}"}; then
 		say "sshd -t failed"
 		return 1
 	fi
@@ -198,7 +213,7 @@ sshd_check() {
 	[[ $MODE == install ]] || return 0
 	local eff u
 	for u in "${USERS[@]}"; do
-		eff=$("$SSHD" -T "${cfg[@]}" -C "user=$u,host=${NAME},addr=192.0.2.50" 2>&1) || { say "sshd -T failed: $eff"; return 1; }
+		eff=$("$SSHD" -T ${cfg[@]+"${cfg[@]}"} -C "user=$u,host=${NAME},addr=192.0.2.50" 2>&1) || { say "sshd -T failed: $eff"; return 1; }
 		if ! grep -qxi "trustedusercakeys /etc/ssh/aqmas_user_ca.pub" <<<"$eff" ||
 			! grep -qxi "authorizedprincipalsfile /etc/ssh/aqmas_principals/%u" <<<"$eff"; then
 			say "sshd -T for user $u does not show the aqmas values (another setting wins):"
@@ -313,14 +328,26 @@ do_uninstall() {
 		grep -qF "$MARKER" "$CONF_DST" || die "${CONF_DST#"$R"} was not written by this script; leaving it alone"
 		targets+=("$CONF_DST")
 	fi
-	[[ ! -f $CA_DST ]] || targets+=("$CA_DST")
-	for u in "${USERS[@]}"; do
+	if [[ -f $CA_DST ]]; then
+		[[ $(grep -cvE '^[[:space:]]*(#|$)' "$CA_DST") -eq 1 ]] &&
+			grep -qE '^(ssh-|ecdsa-|sk-|rsa-)[^ ]+ [A-Za-z0-9+/]+=*( |$)' "$CA_DST" ||
+			die "${CA_DST#"$R"} is not a single public key line as this script writes it; leaving it alone"
+		targets+=("$CA_DST")
+	fi
+	# Without --user, every principals file this script could have written.
+	local users=("${USERS[@]}")
+	if [[ $USERS_GIVEN -eq 0 && -d $PRINC_DIR ]]; then
+		users=()
+		for f in "$PRINC_DIR"/*; do [[ -f $f ]] && users+=("$(basename "$f")"); done
+	fi
+	for u in ${users[@]+"${users[@]}"}; do
 		f=$PRINC_DIR/$u
 		[[ -f $f ]] || continue
 		if [[ -n $NAME ]]; then
 			[[ "$(cat "$f")" == "$u@$NAME" ]] || die "${f#"$R"} does not hold exactly '$u@$NAME'; leaving it alone"
 		else
-			grep -qxE "$u@[a-z0-9-]+" "$f" || die "${f#"$R"} has unexpected content; leaving it alone"
+			[[ $u =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$(cat "$f")" =~ ^$u@[a-z0-9-]+$ ]] ||
+				die "${f#"$R"} has unexpected content; leaving it alone"
 		fi
 		targets+=("$f")
 	done

@@ -286,10 +286,41 @@ func TestApplyOnRealSystemNeedsRoot(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root")
 	}
-	cmd := exec.Command("bash", "install-host-trust.sh", "--name", "db-1", "--ca-key", "/nonexistent", "--apply")
-	out, err := cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(out), "needs root") {
-		t.Fatalf("got %v:\n%s", err, out)
+	// "//" and a symlink to / are the real system too, not a test root.
+	link := filepath.Join(t.TempDir(), "slash")
+	if err := os.Symlink("/", link); err != nil {
+		t.Fatal(err)
+	}
+	for _, extra := range [][]string{nil, {"--root", "//"}, {"--root", link}} {
+		args := append([]string{"install-host-trust.sh", "--name", "db-1", "--ca-key", "/nonexistent", "--apply"}, extra...)
+		out, err := exec.Command("bash", args...).CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "needs root") {
+			t.Fatalf("%v: got %v:\n%s", extra, err, out)
+		}
+	}
+}
+
+func TestUnexpectedFailureRestores(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	f := newFixture(t, "db-1")
+	confDir := f.path("etc/ssh/sshd_config.d")
+	os.Chmod(confDir, 0o555) // the drop-in is written last: CA + principals are in place by then
+	defer os.Chmod(confDir, 0o755)
+	before := f.snapshot()
+	out, err := f.run(nil, "--name", "db-1", "--ca-key", f.caKey, "--sshd", f.sshd, "--apply")
+	if err == nil || !strings.Contains(out, "unexpected failure") || !strings.Contains(out, "restoring") {
+		t.Fatalf("expected a restore:\n%s", out)
+	}
+	after := f.snapshot()
+	for k := range after {
+		if k == f.path("var") || strings.HasPrefix(k, f.path("var")+"/") {
+			delete(after, k)
+		}
+	}
+	if !equalMaps(before, after) {
+		t.Errorf("not restored:\n%s", out)
 	}
 }
 

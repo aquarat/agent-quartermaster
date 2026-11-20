@@ -130,14 +130,17 @@ func (e *Env) List(ctx context.Context, asJSON bool) error {
 }
 
 // SSHConfigSnippet renders the opt-in ~/.ssh/config snippet for hosts.
-func (e *Env) SSHConfigSnippet(hosts []string, aqmasPath string) (string, error) {
-	if len(hosts) == 0 {
-		return "", &UsageError{Msg: "usage: aqmas ssh-config HOST... (the fleet hosts plain `ssh HOST` should reach through aqmas)"}
+func (e *Env) SSHConfigSnippet(targets []string, aqmasPath string) (string, error) {
+	if len(targets) == 0 {
+		return "", &UsageError{Msg: "usage: aqmas ssh-config [USER@]HOST... (the fleet hosts plain `ssh HOST` should reach through aqmas)"}
 	}
-	for _, h := range hosts {
-		if !hostNameRE.MatchString(h) {
-			return "", &UsageError{Msg: fmt.Sprintf("invalid host %q", h)}
+	var ts []Target
+	for _, a := range targets {
+		t, err := ParseTarget(a, e.User)
+		if err != nil {
+			return "", err
 		}
+		ts = append(ts, t)
 	}
 	cache := e.Paths.CacheDir
 	if !safePathRE.MatchString(cache) || !safePathRE.MatchString(aqmasPath) {
@@ -150,23 +153,30 @@ func (e *Env) SSHConfigSnippet(hosts []string, aqmasPath string) (string, error)
 # Limitations (read before using):
 # - The Match runs "aqmas cert" on every ssh to these hosts. When no cached certificate
 #   is valid it blocks until the owner approves; if the request is denied, expires or the
-#   server is unreachable, the Match is false and ssh goes on with your usual keys.
+#   server is unreachable, the Match is false and ssh goes on with your usual keys and
+#   your other config (this snippet cannot make the certificate the only identity).
 # - The reason sent with the request is the fixed text below; agents should use
 #   "aqmas ssh --why ..." instead so the owner sees why.
-# - %r is the remote user as known when the Match is evaluated: give it on the command
-#   line (user@host) or in a User line ABOVE this snippet, else it is your local user name.
+# - Each block matches one login user (Match user) as well as the host: user and host are
+#   written literally, no %-tokens reach a shell. Set the user on the command line or in a
+#   User line ABOVE this snippet. Generate blocks for other users with USER@HOST.
 # - Address and port come from your own config/DNS, not from the grant; the host key is
-#   checked against the key aqmas pinned for the target (HostKeyAlias below).
+#   checked against the key aqmas pinned for the target (HostKeyAlias below), so the grant
+#   must carry a known_hosts line.
+# - ssh reads the files through the "current" link; if another aqmas process renews the
+#   grant in the instant between ssh reading the key and the certificate, that login fails
+#   and falls back. "aqmas ssh" does not have this race.
 # - The cache path below is fixed at generation time (` + cache + `).
 #   Regenerate the snippet if XDG_RUNTIME_DIR or AQMAS_CACHE_DIR changes.
 `)
-	for _, h := range hosts {
-		fmt.Fprintf(&b, "\nMatch originalhost %s exec \"%s cert --quiet --why 'ssh-config: %%r@%s' %%r@%s\"\n", h, aqmasPath, h, h)
+	for _, t := range ts {
+		d := cache + "/" + t.String() + "/" + currentLink
+		fmt.Fprintf(&b, "\nMatch originalhost %s user %s exec \"%s cert --quiet --why 'ssh-config: %s' %s\"\n", t.Host, t.User, aqmasPath, t, t)
 		fmt.Fprintf(&b, "    IdentitiesOnly yes\n    IdentityAgent none\n    PreferredAuthentications publickey\n")
-		fmt.Fprintf(&b, "    IdentityFile %s/%%r@%s/%s\n", cache, h, keyFile)
-		fmt.Fprintf(&b, "    CertificateFile %s/%%r@%s/%s\n", cache, h, certFile)
-		fmt.Fprintf(&b, "    UserKnownHostsFile %s/%%r@%s/%s\n", cache, h, knownHostsFile)
-		fmt.Fprintf(&b, "    HostKeyAlias %s\n", HostKeyAlias(h))
+		fmt.Fprintf(&b, "    IdentityFile %s/%s\n", d, keyFile)
+		fmt.Fprintf(&b, "    CertificateFile %s/%s\n", d, certFile)
+		fmt.Fprintf(&b, "    UserKnownHostsFile %s/%s\n", d, knownHostsFile)
+		fmt.Fprintf(&b, "    HostKeyAlias %s\n", HostKeyAlias(t.Host))
 		fmt.Fprintf(&b, "    StrictHostKeyChecking yes\n")
 	}
 	return b.String(), nil

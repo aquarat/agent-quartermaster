@@ -205,7 +205,7 @@ func TestSSHFlowApproved(t *testing.T) {
 		t.Errorf("requester = %+v", fr.req.Requester)
 	}
 	stderr := e.stderr.String()
-	for _, s := range []string{"request REQ0001: ssh alice@db-1 for 30m0s by claude-code on build-box: check backups", "approve at: https://aqmas.example/r/REQ0001", "approved: grant GREQ0001"} {
+	for _, s := range []string{"request REQ0001 (Ref EQ0001): ssh alice@db-1 for 30m0s by claude-code on build-box: check backups", "approve at: https://aqmas.example/r/REQ0001", "approved: grant GREQ0001"} {
 		if !strings.Contains(stderr, s) {
 			t.Errorf("stderr lacks %q:\n%s", s, stderr)
 		}
@@ -213,8 +213,12 @@ func TestSSHFlowApproved(t *testing.T) {
 	if strings.Contains(stderr, "PRIVATE KEY") {
 		t.Error("private key printed")
 	}
-	dir := filepath.Join(e.Paths.CacheDir, "alice@db-1")
-	if mode(t, e.Paths.CacheDir) != 0o700 || mode(t, dir) != 0o700 {
+	tdir := filepath.Join(e.Paths.CacheDir, "alice@db-1")
+	dir := filepath.Join(tdir, "g-REQ0001")
+	if link, err := os.Readlink(filepath.Join(tdir, "current")); err != nil || link != "g-REQ0001" {
+		t.Errorf("current -> %q, %v", link, err)
+	}
+	if mode(t, e.Paths.CacheDir) != 0o700 || mode(t, tdir) != 0o700 || mode(t, dir) != 0o700 {
 		t.Error("cache dirs not 0700")
 	}
 	for _, n := range []string{keyFile, certFile, knownHostsFile, grantFile} {
@@ -231,7 +235,7 @@ func TestSSHFlowApproved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantArgv := []string{"ssh",
+	wantArgv := []string{"ssh", "-F", "none",
 		"-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "PreferredAuthentications=publickey",
 		"-i", filepath.Join(dir, "id_ed25519"),
 		"-o", "CertificateFile=" + filepath.Join(dir, "id_ed25519-cert.pub"),
@@ -257,6 +261,19 @@ func TestSSHFlowApproved(t *testing.T) {
 	e.Now = func() time.Time { return time.Now().Add(29 * time.Minute) }
 	if p3, err := e.EnsureSSHCert(context.Background(), sshOpts("near expiry")); err != nil || p3.Reused || f.created != 3 {
 		t.Fatalf("near expiry: %v created=%d", err, f.created)
+	}
+	// The first grant's files are untouched by the renewals (a running ssh may use them);
+	// expired grant directories are pruned on the next store.
+	if _, err := os.Stat(filepath.Join(dir, keyFile)); err != nil {
+		t.Errorf("old grant removed while still valid: %v", err)
+	}
+	e.Now = func() time.Time { return time.Now().Add(31 * time.Minute) }
+	e.pruneGrants(tdir, "g-REQ0003")
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("expired grant dir not pruned: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tdir, "g-REQ0003", keyFile)); err != nil {
+		t.Errorf("current grant pruned: %v", err)
 	}
 
 	// list and status work against the server.
@@ -306,8 +323,8 @@ func TestSSHDecisions(t *testing.T) {
 			if strings.ContainsAny(err.Error(), "\x1b\x07") {
 				t.Errorf("control characters from the server reach the terminal: %q", err.Error())
 			}
-			if _, err := os.Stat(filepath.Join(e.Paths.CacheDir, "alice@db-1", keyFile)); !os.IsNotExist(err) {
-				t.Error("key saved for a request that was not approved")
+			if _, err := os.Lstat(filepath.Join(e.Paths.CacheDir, "alice@db-1", "current")); !os.IsNotExist(err) {
+				t.Error("grant saved for a request that was not approved")
 			}
 		})
 	}
@@ -324,8 +341,8 @@ func TestSSHCancel(t *testing.T) {
 	if ExitCode(err) != ExitCancelled {
 		t.Fatalf("err=%v code=%d", err, ExitCode(err))
 	}
-	if _, err := os.Stat(filepath.Join(e.Paths.CacheDir, "alice@db-1", keyFile)); !os.IsNotExist(err) {
-		t.Error("key saved after cancel")
+	if ents, _ := os.ReadDir(filepath.Join(e.Paths.CacheDir, "alice@db-1")); len(ents) != 1 || ents[0].Name() != ".lock" {
+		t.Errorf("files saved after cancel: %v", ents)
 	}
 	if !strings.Contains(e.stderr.String(), "cancelled; request REQ0001 stays pending") {
 		t.Errorf("stderr: %s", e.stderr)
@@ -423,7 +440,7 @@ func TestGrantValidation(t *testing.T) {
 			if _, err := e.EnsureSSHCert(context.Background(), sshOpts("x")); err == nil {
 				t.Fatal("hostile grant accepted")
 			}
-			if _, err := os.Stat(filepath.Join(e.Paths.CacheDir, "alice@db-1", grantFile)); !os.IsNotExist(err) {
+			if _, err := os.Lstat(filepath.Join(e.Paths.CacheDir, "alice@db-1", "current")); !os.IsNotExist(err) {
 				t.Error("grant stored")
 			}
 		})
@@ -541,8 +558,11 @@ func TestCertValidity(t *testing.T) {
 	if _, err := CertValidity(mk(now.Add(-time.Hour), now.Add(-time.Minute), ssh.UserCert), upk, now); err == nil {
 		t.Error("expired cert accepted")
 	}
-	if _, err := CertValidity(mk(now.Add(time.Minute), now.Add(time.Hour), ssh.UserCert), upk, now); err == nil {
+	if _, err := CertValidity(mk(now.Add(10*time.Minute), now.Add(time.Hour), ssh.UserCert), upk, now); err == nil {
 		t.Error("not-yet-valid cert accepted")
+	}
+	if _, err := CertValidity(mk(now.Add(2*time.Minute), now.Add(time.Hour), ssh.UserCert), upk, now); err != nil {
+		t.Errorf("cert starting within the clock-skew allowance refused: %v", err)
 	}
 	if _, err := CertValidity(mk(now.Add(-time.Minute), now.Add(time.Hour), ssh.HostCert), upk, now); err == nil {
 		t.Error("host cert accepted")
@@ -602,24 +622,44 @@ func TestKnownHostsFor(t *testing.T) {
 func TestSSHConfigSnippet(t *testing.T) {
 	e := newTestEnv(t)
 	e.Paths.CacheDir = "/run/user/1000/aqmas"
-	s, err := e.SSHConfigSnippet([]string{"db-1", "dev-1"}, "/home/alice/.local/bin/aqmas")
+	s, err := e.SSHConfigSnippet([]string{"db-1", "git@forgejo"}, "/home/alice/.local/bin/aqmas")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`Match originalhost db-1 exec "/home/alice/.local/bin/aqmas cert --quiet --why 'ssh-config: %r@db-1' %r@db-1"`,
-		"    CertificateFile /run/user/1000/aqmas/%r@dev-1/id_ed25519-cert.pub",
-		"    HostKeyAlias aqmas.dev-1",
+		`Match originalhost db-1 user alice exec "/home/alice/.local/bin/aqmas cert --quiet --why 'ssh-config: alice@db-1' alice@db-1"`,
+		"    CertificateFile /run/user/1000/aqmas/git@forgejo/current/id_ed25519-cert.pub",
+		"    HostKeyAlias aqmas.forgejo",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("snippet lacks %q:\n%s", want, s)
 		}
+	}
+	if strings.Contains(s, "%r") {
+		t.Error("snippet uses %r")
+	}
+	if _, err := e.SSHConfigSnippet([]string{"$(id)@db-1"}, "/x"); err == nil {
+		t.Error("bad user accepted")
 	}
 	if _, err := e.SSHConfigSnippet([]string{"bad host"}, "/x"); err == nil {
 		t.Error("bad host accepted")
 	}
 	if _, err := e.SSHConfigSnippet(nil, "/x"); err == nil {
 		t.Error("no hosts accepted")
+	}
+}
+
+func TestRefCode(t *testing.T) {
+	// Same as the web UI's refCode (web/src/app.ts): id.slice(-6).toUpperCase().
+	for in, want := range map[string]string{
+		"01jd3k9x2mabcdef": "ABCDEF",
+		"01JD3K9X2M7QZ4XY": "7QZ4XY",
+		"ab1":              "AB1",
+		"":                 "",
+	} {
+		if got := RefCode(in); got != want {
+			t.Errorf("RefCode(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

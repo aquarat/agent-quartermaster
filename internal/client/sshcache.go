@@ -24,6 +24,9 @@ import (
 // MinRemaining is how much validity a cached certificate needs to be reused.
 const MinRemaining = 2 * time.Minute
 
+// CertClockSkew is how far a certificate's start time may lie in this host's future.
+const CertClockSkew = 5 * time.Minute
+
 // File names inside a per-target cache directory <cache>/<user>@<host>/.
 const (
 	keyFile        = "id_ed25519"
@@ -31,7 +34,13 @@ const (
 	knownHostsFile = "known_hosts"
 	grantFile      = "grant.json"
 	lockFile       = ".lock"
+	// currentLink points at the newest grant directory g-<request id>. Each grant gets its own
+	// directory and the link is swapped atomically, so an ssh started from an older grant
+	// never sees a key from one grant next to a certificate from another.
+	currentLink = "current"
 )
+
+var grantDirRE = regexp.MustCompile(`^g-[A-Za-z0-9_-]{1,64}$`)
 
 var (
 	loginUserRE = regexp.MustCompile(`^[a-z_][a-z0-9_.-]{0,31}$`)
@@ -124,11 +133,13 @@ func CertValidity(certText []byte, pub ssh.PublicKey, now time.Time) (*ssh.Certi
 	if cert.ValidBefore == ssh.CertTimeInfinity {
 		return nil, errors.New("certificate: no expiry (refusing an unbounded certificate)")
 	}
-	unix := now.Unix()
+	// Tolerate this host's clock running a little behind the bastion's: the target's sshd
+	// checks the start time again anyway.
+	unix := now.Add(CertClockSkew).Unix()
 	if unix < 0 || uint64(unix) < cert.ValidAfter {
 		return nil, fmt.Errorf("certificate: not valid before %s", certTime(cert.ValidAfter).Format(time.RFC3339))
 	}
-	if uint64(unix) >= cert.ValidBefore {
+	if uint64(now.Unix()) >= cert.ValidBefore {
 		return nil, fmt.Errorf("certificate: expired at %s", certTime(cert.ValidBefore).Format(time.RFC3339))
 	}
 	return cert, nil
@@ -142,7 +153,18 @@ func certTime(t uint64) time.Time {
 }
 
 // loadCached returns the cached credentials for t if they are valid for at least MinRemaining.
-func (e *Env) loadCached(dir string, t Target) (*Prepared, error) {
+func (e *Env) loadCached(tdir string, t Target) (*Prepared, error) {
+	link, err := os.Readlink(filepath.Join(tdir, currentLink))
+	if err != nil {
+		return nil, err
+	}
+	if !grantDirRE.MatchString(link) {
+		return nil, fmt.Errorf("%s/%s points somewhere unexpected", tdir, currentLink)
+	}
+	dir := filepath.Join(tdir, link)
+	if err := checkPrivatePath(dir, true); err != nil {
+		return nil, err
+	}
 	gdata, err := os.ReadFile(filepath.Join(dir, grantFile))
 	if err != nil {
 		return nil, err
@@ -194,9 +216,10 @@ func (e *Env) loadCached(dir string, t Target) (*Prepared, error) {
 	return p, nil
 }
 
-// storeGrant validates an approved grant against what was asked for and writes key, cert,
-// known_hosts and grant.json (all 0600) into dir.
-func (e *Env) storeGrant(dir string, t Target, requestID string, priv ed25519.PrivateKey, g *api.Grant) (*Prepared, error) {
+// storeGrant validates an approved grant against what was asked for, writes key, cert,
+// known_hosts and grant.json (all 0600) into a new directory tdir/g-<request id> (0700) and
+// then points tdir/current at it.
+func (e *Env) storeGrant(tdir string, t Target, requestID string, priv ed25519.PrivateKey, g *api.Grant) (*Prepared, error) {
 	if g == nil || g.SSH == nil {
 		return nil, errors.New("approved, but the server sent no SSH grant")
 	}
@@ -239,9 +262,17 @@ func (e *Env) storeGrant(dir string, t Target, requestID string, priv ed25519.Pr
 	if err != nil {
 		return nil, err
 	}
-	// Remove the old grant first so a crash half-way leaves no stale key/cert pairing that
-	// loadCached would accept (it needs grant.json, and checks the cert against the key).
-	os.Remove(filepath.Join(dir, grantFile))
+	if !safeID(requestID) {
+		return nil, fmt.Errorf("invalid request id %q", sanitize(requestID))
+	}
+	gname := "g-" + requestID
+	dir := filepath.Join(tdir, gname)
+	if err := os.RemoveAll(dir); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return nil, err
+	}
 	certLine := append(bytes.TrimSpace(ssh.MarshalAuthorizedKey(cert)), '\n')
 	files := []struct {
 		name string
@@ -255,8 +286,6 @@ func (e *Env) storeGrant(dir string, t Target, requestID string, priv ed25519.Pr
 			name string
 			data []byte
 		}{knownHostsFile, known})
-	} else {
-		os.Remove(filepath.Join(dir, knownHostsFile))
 	}
 	files = append(files, struct {
 		name string
@@ -264,9 +293,20 @@ func (e *Env) storeGrant(dir string, t Target, requestID string, priv ed25519.Pr
 	}{grantFile, append(gjson, '\n')})
 	for _, f := range files {
 		if err := writeFileAtomic(filepath.Join(dir, f.name), f.data, 0o600); err != nil {
+			os.RemoveAll(dir)
 			return nil, err
 		}
 	}
+	tmp := filepath.Join(tdir, fmt.Sprintf(".%s.tmp-%d", currentLink, os.Getpid()))
+	os.Remove(tmp)
+	if err := os.Symlink(gname, tmp); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmp, filepath.Join(tdir, currentLink)); err != nil {
+		os.Remove(tmp)
+		return nil, err
+	}
+	e.pruneGrants(tdir, gname)
 	p := &Prepared{
 		Dir: dir, KeyPath: filepath.Join(dir, keyFile), CertPath: filepath.Join(dir, certFile),
 		Grant: stored, ValidBefore: certTime(cert.ValidBefore),
@@ -275,6 +315,32 @@ func (e *Env) storeGrant(dir string, t Target, requestID string, priv ed25519.Pr
 		p.KnownHostsPath = filepath.Join(dir, knownHostsFile)
 	}
 	return p, nil
+}
+
+// pruneGrants removes grant directories other than keep whose certificate has expired (a
+// running ssh has read its key and certificate long before that).
+func (e *Env) pruneGrants(tdir, keep string) {
+	ents, err := os.ReadDir(tdir)
+	if err != nil {
+		return
+	}
+	for _, ent := range ents {
+		if !ent.IsDir() || ent.Name() == keep || !grantDirRE.MatchString(ent.Name()) {
+			continue
+		}
+		dir := filepath.Join(tdir, ent.Name())
+		var g StoredGrant
+		data, err := os.ReadFile(filepath.Join(dir, grantFile))
+		if err == nil && json.Unmarshal(data, &g) == nil && g.NotAfter.After(e.now()) {
+			continue
+		}
+		if err != nil {
+			if fi, ferr := ent.Info(); ferr == nil && e.now().Sub(fi.ModTime()) < time.Hour {
+				continue // possibly being written by another process; keep for now
+			}
+		}
+		os.RemoveAll(dir)
+	}
 }
 
 // validateEndpoint checks a server-provided address and port before they reach ssh's argv.
@@ -330,8 +396,9 @@ func KnownHostsFor(line, addr string, port int, host string) ([]byte, error) {
 	return []byte(out), nil
 }
 
-// lockDir takes an exclusive flock on dir/.lock, polling so Ctrl-C still works. The lock fd is
-// close-on-exec, so it is released when we exec ssh.
+// lockDir takes an exclusive flock on dir/.lock, polling so Ctrl-C still works. It serialises
+// "check the cache, else request and store" between aqmas processes; processes already using
+// a grant are protected by the per-grant directories, not by this lock.
 func (e *Env) lockDir(ctxDone <-chan struct{}, dir string) (func(), error) {
 	f, err := os.OpenFile(filepath.Join(dir, lockFile), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {

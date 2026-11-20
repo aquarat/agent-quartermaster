@@ -12,7 +12,12 @@ as written, and the "assumptions" are what it does where the contract is silent.
    certificates issued at enrollment should carry `clientAuth` only: if server and client
    certificates came from the same CA, the EKU check is what stops an enrolled host from
    impersonating aqmasd to other hosts. Separate server and client CAs are better still.
-2. **The server sends its CA in the TLS chain** (leaf + CA). `--ca-pin sha256:<hex>` is matched
+2. **The server must send its CA in the TLS chain** (leaf + CA). **Mismatch today:** the
+   review found that `ws/server` (`internal/server/pki`, `loadServer`/`TLSConfig`) sends only
+   the leaf. Then `--ca-pin <CA fingerprint>` always fails ("chain does not contain the pinned
+   CA"), TOFU can only pin the leaf, and every automatic leaf renewal on the server would make
+   all enrolled hosts exit 5 until they re-enroll. Fix on the server: append the CA DER to the
+   served certificate chain. `--ca-pin sha256:<hex>` is matched
    against the presented chain, and enroll then saves that CA as `server-ca.pem`; later runs
    verify against the saved file. A server that only sends its leaf can only be pinned by the
    leaf's own fingerprint.
@@ -42,7 +47,15 @@ as written, and the "assumptions" are what it does where the contract is silent.
    `CLAUDE_SESSION_ID`, else `CLAUDE_CODE_SESSION_ID` (what Claude Code actually exports), else
    `AQMAS_SESSION_ID`. OpenCode is detected by any `OPENCODE*` variable.
 10. **TTL:** the CLI refuses `--ttl` outside 1 min .. 8 h before asking.
-11. **`RequestCreated.status == "approved"`** (standing approval): the CLI fetches the grant at
+11. **Cache sharing:** a cached grant for (user, host) is reused by any aqmas process of the
+    same Unix user on that host while >= 2 min remain, whatever its `--why`; the owner approved
+    access for the host, not for one agent session. Each grant lives in its own directory
+    `<cache>/<user>@<host>/g-<request id>/` and `current` is swapped atomically.
+12. **ssh is run with `-F none`** plus the options in API.md section 3, `PreferredAuthentications=publickey`,
+    so nothing from `~/.ssh/config` (other identities, ControlMaster, ProxyCommand) applies.
+13. **Ref:** the CLI prints `Ref <last 6 chars of the id, upper-cased>` with each request and
+    enrollment, matching the web UI's `refCode` (ws/web `web/src/app.ts`).
+14. **`RequestCreated.status == "approved"`** (standing approval): the CLI fetches the grant at
     once with `GET /v1/requests/{id}` (no `wait`).
 
 ## Proposed contract changes

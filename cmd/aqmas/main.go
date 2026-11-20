@@ -34,7 +34,7 @@ Usage:
       Like ssh, but only make sure a certificate is cached and print its paths.
   aqmas status [REQUEST-ID]   enrollment + cached certificates, or one request
   aqmas list [--json]         this host's active grants on the server
-  aqmas ssh-config HOST...    print an opt-in ~/.ssh/config snippet (read its notes)
+  aqmas ssh-config [USER@]HOST...  print an opt-in ~/.ssh/config snippet (read its notes)
   aqmas version | help
 
 Exit codes: 0 ok (or ssh's own), 1 error, 2 usage, 3 denied, 4 expired,
@@ -174,7 +174,7 @@ func fail(err error) int {
 	case errors.Is(err, client.ErrCancelled), errors.Is(err, context.Canceled):
 		fmt.Fprintln(os.Stderr, "aqmas: cancelled")
 	default:
-		fmt.Fprintf(os.Stderr, "aqmas: %v\n", err)
+		fmt.Fprintf(os.Stderr, "aqmas: %s\n", client.Sanitize(err.Error()))
 	}
 	return code
 }
@@ -213,7 +213,7 @@ func parseFlags(args []string, spec map[string]bool) (*flags, error) {
 			continue
 		}
 		if !hasVal {
-			if i+1 >= len(args) {
+			if i+1 >= len(args) || args[i+1] == "--" {
 				return nil, &client.UsageError{Msg: fmt.Sprintf("flag --%s needs a value", name)}
 			}
 			i++

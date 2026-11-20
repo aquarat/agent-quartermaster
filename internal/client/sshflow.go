@@ -101,7 +101,7 @@ func (e *Env) EnsureSSHCert(ctx context.Context, o SSHOptions) (*Prepared, error
 	if shownWhy == "" {
 		shownWhy = "(no reason given)"
 	}
-	e.logf("request %s: ssh %s for %s by %s on %s: %s", created.ID, o.Target, ttl, req.Requester.Tool, cfg.HostName, shownWhy)
+	e.logf("request %s (Ref %s): ssh %s for %s by %s on %s: %s", created.ID, RefCode(created.ID), o.Target, ttl, req.Requester.Tool, cfg.HostName, shownWhy)
 	if created.Status == api.StatusPending {
 		e.logf("approve at: %s  (waiting; Ctrl-C cancels)", sanitize(created.ApproveURL))
 	}
@@ -171,6 +171,16 @@ func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.Reques
 	}
 }
 
+// RefCode is the short reference the approval UI shows on each card (web/src/app.ts
+// refCode: id.slice(-6).toUpperCase()), printed here so the owner can match the card to this
+// terminal. Ids are ASCII (safeID), so bytes and UTF-16 units agree.
+func RefCode(id string) string {
+	if len(id) > 6 {
+		id = id[len(id)-6:]
+	}
+	return strings.ToUpper(id)
+}
+
 // BuildSSHArgv returns the argv (argv[0] = "ssh") that logs in with p's certificate only.
 // Every server-provided value is re-validated here, and the destination follows "--" so
 // nothing can be read as an ssh option.
@@ -188,6 +198,10 @@ func BuildSSHArgv(p *Prepared, command []string) ([]string, error) {
 		}
 	}
 	argv := []string{"ssh",
+		// No ssh_config at all: nothing from ~/.ssh/config (IdentityFile, CertificateFile,
+		// ControlMaster/ControlPath, ProxyCommand, HostName...) may add another identity,
+		// reuse a connection made with another key, or redirect the connection.
+		"-F", "none",
 		"-o", "IdentitiesOnly=yes",
 		"-o", "IdentityAgent=none",
 		"-o", "PreferredAuthentications=publickey",

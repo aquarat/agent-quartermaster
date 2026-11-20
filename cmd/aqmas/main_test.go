@@ -17,7 +17,7 @@ func TestParseFlags(t *testing.T) {
 	if !reflect.DeepEqual(f.pos, []string{"db-1"}) || !reflect.DeepEqual(f.cmd, []string{"df", "-h", "--why"}) {
 		t.Errorf("pos %q cmd %q", f.pos, f.cmd)
 	}
-	for _, bad := range [][]string{{"--bogus"}, {"--ttl"}, {"--fresh=1"}} {
+	for _, bad := range [][]string{{"--bogus"}, {"--ttl"}, {"--fresh=1"}, {"--why", "--", "ls"}} {
 		if _, err := parseFlags(bad, spec); err == nil {
 			t.Errorf("%q accepted", bad)
 		}

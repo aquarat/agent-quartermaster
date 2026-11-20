@@ -244,6 +244,10 @@ func waitQuery(wait time.Duration) string {
 	return "?wait=" + url.QueryEscape(wait.String())
 }
 
+// Sanitize is sanitize for callers outside the package (error messages may quote
+// server-controlled text such as certificate names).
+func Sanitize(s string) string { return sanitize(s) }
+
 // sanitize strips control characters (terminal escape injection) from server- or
 // user-supplied text before it is printed, and caps its length.
 func sanitize(s string) string {

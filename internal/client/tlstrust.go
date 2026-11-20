@@ -267,6 +267,10 @@ func ConfirmTOFU(ctx context.Context, in io.Reader, out io.Writer, server string
 			sanitize(c.Subject.String()), sanitize(c.Issuer.String()), FormatPin(CertPin(c)),
 			c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339), c.IsCA)
 	}
+	if !(cand.BasicConstraintsValid && cand.IsCA) {
+		fmt.Fprintf(out, "WARNING: the server sent no CA certificate, so only its own certificate can be pinned;\n"+
+			"  when the server renews it, this host must re-enroll. Prefer --ca-pin with the CA fingerprint.\n")
+	}
 	fmt.Fprintf(out, "Pin this certificate as the server CA?\n  %q\n  %s\n", sanitize(cand.Subject.String()), FormatPin(CertPin(cand)))
 	fmt.Fprintf(out, "Compare it with the server CA fingerprint on the bastion first. Type yes to trust it: ")
 	type answer struct {

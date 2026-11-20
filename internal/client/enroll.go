@@ -129,7 +129,7 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 	if !safeID(created.ID) {
 		return fmt.Errorf("server returned an invalid enrollment id %q", sanitize(created.ID))
 	}
-	e.logf("enrollment %s for host %q sent to %s", created.ID, o.Name, sanitize(server))
+	e.logf("enrollment %s (Ref %s) for host %q sent to %s", created.ID, RefCode(created.ID), o.Name, sanitize(server))
 	e.logf("server CA pinned: %s", FormatPin(trust.Pin))
 	e.logf("approve at: %s", sanitize(created.ApproveURL))
 	e.logf("waiting for approval (Ctrl-C to stop waiting)...")
