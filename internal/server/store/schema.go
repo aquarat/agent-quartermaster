@@ -145,4 +145,10 @@ BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit
 BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 `,
+	// 2 (integration review): standing approvals are bound to the address the source request
+	// came from; enrollment status/cert polls need the enroller's poll token.
+	`
+ALTER TABLE standing ADD COLUMN peer_address TEXT NOT NULL DEFAULT '';
+ALTER TABLE enrollments ADD COLUMN poll_token_hash TEXT NOT NULL DEFAULT '';
+`,
 }

@@ -12,7 +12,7 @@
 # source-address, key id and validity; reuse of a cached certificate without a new request;
 # `aqmas list` / `list --json` / `status` / `status ID`; Ctrl-C cancels a pending request
 # (exit 130, status cancelled); a denied request exits 3; GET /v1/ssh-ca agrees with
-# `aqmasd print-ssh-ca`.
+# `aqmasd print-ssh-ca`; enrollment status needs the poll token; a revoked grant is not reused.
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -131,6 +131,9 @@ unset CLAUDECODE CLAUDE_SESSION_ID CLAUDE_CODE_SESSION_ID AQMAS_SESSION_ID SSH_A
 	</dev/null >"$T/enroll.out" 2>"$T/enroll.err" &
 EPID=$!
 EID=$(owner wait enrollment interop-host 20)
+CSRFP=$(owner item enrollment "$EID" | bun -e 'console.log((await Bun.stdin.json()).enrollment.csr_fingerprint)')
+grep -q "client key: $CSRFP" "$T/enroll.err" || { cat "$T/enroll.err"; fail "enroll did not print the card's client key $CSRFP"; }
+curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:$PA/v1/enroll/$EID" | grep -qx 404 || fail "enrollment status readable without the poll token"
 owner approve "$EID" >/dev/null 2>"$T/owner-enroll.err"
 wait $EPID || { cat "$T/enroll.err"; fail "aqmas enroll exited $?"; }
 grep -q "Ref ${EID: -6}" "$T/enroll.err" || fail "enroll did not print the card's Ref"
@@ -220,5 +223,16 @@ owner revoke-grant "$GID" >/dev/null 2>&1
 "$AQMAS" list --json | bun -e 'const j = await Bun.stdin.json(); if (j.grants?.some((g) => g.id === process.argv[1])) process.exit(1)' "$GID" ||
 	fail "revoked grant still listed as active"
 ok "revoked grant $GID is no longer active"
+
+# --- after the revoke, aqmas does not reuse the cached certificate ---
+"$AQMAS" ssh testhost --why "interop after revoke" -- true </dev/null >/dev/null 2>"$T/after-revoke.err" &
+APID=$!
+AID=$(owner wait ssh interop-host 20)
+grep -q "is revoked on the server; requesting a new one" "$T/after-revoke.err" || { cat "$T/after-revoke.err"; fail "no revoked-grant message"; }
+owner deny "$AID" >/dev/null 2>&1
+RC=0
+wait $APID || RC=$?
+((RC == 3)) || fail "after-revoke request exited $RC, want 3"
+ok "after the revoke, aqmas asked again instead of reusing the cached certificate"
 
 echo "interop: ALL OK"

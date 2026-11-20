@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
 
@@ -733,5 +734,38 @@ func TestRefCode(t *testing.T) {
 func TestSanitize(t *testing.T) {
 	if got := sanitize("ok\x1b[31m\u202ered\n"); got != "ok?[31m?red?" {
 		t.Errorf("sanitize = %q", got)
+	}
+}
+
+// Integration review: a cached grant the owner revoked is not reused; an unreachable server
+// does not block reuse of a still-valid certificate.
+func TestSSHRevokedGrantNotReused(t *testing.T) {
+	f := newFakeServer(t)
+	e := newTestEnv(t)
+	enroll(t, f, e)
+	if _, err := e.EnsureSSHCert(context.Background(), sshOpts("first")); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.requests["REQ0001"].revoked = true
+	f.mu.Unlock()
+	p, err := e.EnsureSSHCert(context.Background(), sshOpts("after revoke"))
+	if err != nil || p.Reused || f.created != 2 {
+		t.Fatalf("revoked grant reused: %v created=%d", err, f.created)
+	}
+	if !strings.Contains(e.stderr.String(), "is revoked on the server") {
+		t.Errorf("stderr: %s", e.stderr)
+	}
+	f.srv.Close() // server gone: the valid cached certificate is still used
+	if p, err := e.EnsureSSHCert(context.Background(), sshOpts("server down")); err != nil || !p.Reused {
+		t.Fatalf("cached certificate not used while the server is down: %v", err)
+	}
+}
+
+func TestTruncateBytes(t *testing.T) {
+	s := strings.Repeat("—", 100) // 3 bytes each
+	got := truncateBytes(s, 128)
+	if len(got) > 128 || !utf8.ValidString(got) || len(got) != 126 {
+		t.Fatalf("len %d valid %v", len(got), utf8.ValidString(got))
 	}
 }

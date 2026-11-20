@@ -16,8 +16,8 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/api"
 )
 
-// MaxReasonLen matches the server's limit on AccessRequest.Reason.
-const MaxReasonLen = 500
+// MaxReasonLen is the server's limit on AccessRequest.Reason, in UTF-8 bytes.
+const MaxReasonLen = api.MaxReasonBytes
 
 // SSHOptions are the flags of `aqmas ssh` / `aqmas cert`.
 type SSHOptions struct {
@@ -34,8 +34,8 @@ func (e *Env) EnsureSSHCert(ctx context.Context, o SSHOptions) (*Prepared, error
 	if why == "" && !e.StdinIsTTY {
 		return nil, &UsageError{Msg: "--why \"...\" is required when stdin is not a terminal (say what you need the access for)"}
 	}
-	if utf8.RuneCountInString(why) > MaxReasonLen {
-		return nil, &UsageError{Msg: fmt.Sprintf("--why is longer than %d characters", MaxReasonLen)}
+	if len(why) > MaxReasonLen {
+		return nil, &UsageError{Msg: fmt.Sprintf("--why is longer than %d bytes", MaxReasonLen)}
 	}
 	if !utf8.ValidString(why) || sanitize(why) != why {
 		return nil, &UsageError{Msg: "--why must be plain single-line text"}
@@ -65,7 +65,7 @@ func (e *Env) EnsureSSHCert(ctx context.Context, o SSHOptions) (*Prepared, error
 	defer unlock()
 
 	if !o.Fresh {
-		if p, err := e.loadCached(dir, o.Target); err == nil {
+		if p, err := e.loadCached(dir, o.Target); err == nil && e.stillGranted(ctx, c, p) {
 			e.logf("reusing grant %s for %s, valid until %s", p.Grant.GrantID, o.Target, p.ValidBefore.Local().Format("15:04:05"))
 			return p, nil
 		}
@@ -127,6 +127,32 @@ func (e *Env) EnsureSSHCert(ctx context.Context, o SSHOptions) (*Prepared, error
 	}
 	e.logf("approved: grant %s valid until %s", p.Grant.GrantID, p.ValidBefore.Local().Format("15:04:05"))
 	return p, nil
+}
+
+// stillGranted asks the server whether a cached grant's request is still approved, so a grant
+// the owner revoked is not reused by later aqmas runs (the certificate itself stays valid until
+// it expires; this only stops honest reuse). When the server is unreachable the cached
+// certificate is still used, with a warning: a new request would fail anyway, and existing
+// grants keep working during an aqmasd outage.
+func (e *Env) stillGranted(ctx context.Context, c *APIClient, p *Prepared) bool {
+	if p.Grant.RequestID == "" {
+		return false
+	}
+	st, err := c.RequestStatus(ctx, p.Grant.RequestID, 0)
+	if err != nil {
+		var ue *UnreachableError
+		if errors.As(err, &ue) {
+			e.logf("warning: cannot check grant %s with the server (%v); using the cached certificate", p.Grant.GrantID, err)
+			return true
+		}
+		e.logf("cached grant %s not confirmed by the server (%v); requesting a new one", p.Grant.GrantID, err)
+		return false
+	}
+	if st.Status != api.StatusApproved {
+		e.logf("cached grant %s is %s on the server; requesting a new one", p.Grant.GrantID, sanitize(st.Status))
+		return false
+	}
+	return true
 }
 
 // cancelRequest withdraws a request after Ctrl-C so it leaves the owner's queue. It uses its

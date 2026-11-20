@@ -37,13 +37,15 @@ func TestApproverTTL(t *testing.T) {
 
 func TestMatches(t *testing.T) {
 	now := time.Now()
-	r := Rule{HostID: 1, Kind: "ssh", Target: "db-1", LoginUser: "alice", MaxTTL: 600, ExpiresAt: now.Add(time.Hour)}
-	c := Candidate{HostID: 1, Kind: "ssh", Target: "db-1", LoginUser: "alice", TTL: 600}
+	r := Rule{HostID: 1, PeerAddress: "192.0.2.50", Kind: "ssh", Target: "db-1", LoginUser: "alice", MaxTTL: 600, ExpiresAt: now.Add(time.Hour)}
+	c := Candidate{HostID: 1, PeerAddress: "192.0.2.50", Kind: "ssh", Target: "db-1", LoginUser: "alice", TTL: 600}
 	if !Matches(r, c, now) {
 		t.Fatal("identical candidate must match")
 	}
 	mut := map[string]func(*Rule, *Candidate){
 		"host":    func(_ *Rule, c *Candidate) { c.HostID = 2 },
+		"address": func(_ *Rule, c *Candidate) { c.PeerAddress = "192.0.2.71" },
+		"legacy":  func(r *Rule, c *Candidate) { r.PeerAddress, c.PeerAddress = "", "" },
 		"kind":    func(_ *Rule, c *Candidate) { c.Kind = "github" },
 		"target":  func(_ *Rule, c *Candidate) { c.Target = "forgejo" },
 		"user":    func(_ *Rule, c *Candidate) { c.LoginUser = "root" },

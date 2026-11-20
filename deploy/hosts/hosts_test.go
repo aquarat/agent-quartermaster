@@ -107,7 +107,12 @@ func equalMaps(a, b map[string]string) bool {
 func TestDryRunChangesNothing(t *testing.T) {
 	f := newFixture(t, "db-1")
 	before := f.snapshot()
-	out, err := f.run(nil, "--name", "db-1", "--ca-key", f.caKey)
+	raw, _ := os.ReadFile(f.caKey)
+	pk, _, _, _, err := ssh.ParseAuthorizedKey(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.run(nil, "--name", "db-1", "--ca-key", f.caKey, "--ca-fingerprint", ssh.FingerprintSHA256(pk))
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -252,7 +257,11 @@ func TestRefusals(t *testing.T) {
 		{"options prefix", "db-1", []string{"--name", "db-1"}, func(f *fixture) {
 			data, _ := os.ReadFile(f.caKey)
 			os.WriteFile(f.caKey, append([]byte(`command="/bin/sh" `), data...), 0o644)
-		}, "not a plain OpenSSH public key"},
+		}, "not a plain ssh-ed25519 public key"},
+		{"rsa ca key", "db-1", []string{"--name", "db-1"}, func(f *fixture) {
+			os.WriteFile(f.caKey, []byte("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7 rsa-ca\n"), 0o644)
+		}, "not a plain ssh-ed25519 public key"},
+		{"wrong fingerprint", "db-1", []string{"--name", "db-1", "--ca-fingerprint", "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}, nil, "is not the expected"},
 		{"private key", "db-1", []string{"--name", "db-1"}, func(f *fixture) {
 			os.WriteFile(f.caKey, []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n"), 0o600)
 		}, "exactly one public key"},

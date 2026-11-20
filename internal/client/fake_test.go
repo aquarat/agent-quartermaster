@@ -94,6 +94,7 @@ type fakeReq struct {
 	polls     int
 	granted   *api.Grant
 	cancelled bool
+	revoked   bool
 }
 
 // fakeServer implements the agent API (docs/API.md section 1) from internal/api types.
@@ -111,6 +112,7 @@ type fakeServer struct {
 	enrollPending  int    // pending answers before the decision
 	enrollDecision string // approved / denied / expired
 	enrollCSR      map[string]*x509.CertificateRequest
+	enrollToken    map[string]string
 	enrollPolls    map[string]int
 	enrollPosts    int
 	// request behaviour
@@ -149,6 +151,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 		sshCA:           sshCA,
 		enrollDecision:  api.StatusApproved,
 		enrollCSR:       map[string]*x509.CertificateRequest{},
+		enrollToken:     map[string]string{},
 		enrollPolls:     map[string]int{},
 		requestDecision: api.StatusApproved,
 		certTTL:         30 * time.Minute,
@@ -221,6 +224,10 @@ func (f *fakeServer) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	f.enrollPosts++
 	id := fmt.Sprintf("ENR%04d", f.enrollPosts)
 	f.enrollCSR[id] = csr
+	if len(req.PollToken) < 32 {
+		f.t.Errorf("fake server: enrollment without a poll token")
+	}
+	f.enrollToken[id] = req.PollToken
 	writeJSON(w, 201, api.EnrollResponse{ID: id, Status: api.StatusPending, ApproveURL: "https://aqmas.example/enroll/" + id, PollAfterMS: 1})
 }
 
@@ -229,7 +236,7 @@ func (f *fakeServer) handleEnrollStatus(w http.ResponseWriter, r *http.Request) 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	csr, ok := f.enrollCSR[id]
-	if !ok {
+	if !ok || r.Header.Get(api.EnrollTokenHeader) != f.enrollToken[id] {
 		apiErr(w, 404, "not_found", "no such enrollment")
 		return
 	}
@@ -303,6 +310,10 @@ func (f *fakeServer) handleRequestStatus(w http.ResponseWriter, r *http.Request)
 	fr.polls++
 	if fr.cancelled {
 		writeJSON(w, 200, api.RequestStatus{ID: id, Kind: api.KindSSH, Status: api.StatusCancelled})
+		return
+	}
+	if fr.revoked {
+		writeJSON(w, 200, api.RequestStatus{ID: id, Kind: api.KindSSH, Status: api.StatusRevoked})
 		return
 	}
 	if fr.polls <= f.requestPending {

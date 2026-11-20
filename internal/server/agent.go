@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -112,6 +113,10 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, errBad("note too long or contains control characters"))
 		return
 	}
+	if l := len(in.PollToken); l < 32 || l > 128 || hasControl(in.PollToken, false) {
+		s.writeErr(w, r, errBad("poll_token must be 32-128 characters (random, kept by the enrolling host)"))
+		return
+	}
 	if len(in.SSHHostKeyFingerprints) > 16 {
 		s.writeErr(w, r, errBad("too many ssh_host_key_fingerprints"))
 		return
@@ -138,6 +143,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		PeerAddress:    peerIP(r),
 		CreatedAt:      now,
 		ExpiresAt:      now.Add(secs(s.cfg.TTL.EnrollmentExpirySeconds)),
+		PollTokenHash:  ids.Hash(in.PollToken),
 	}
 	ctx := r.Context()
 	err = s.store.Tx(ctx, func(q *store.Q) error {
@@ -175,6 +181,15 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleEnrollStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	ctx := r.Context()
+	// Only the enroller (who holds the poll token) may see the status or collect the
+	// certificate: otherwise anyone who learns the id (it is in the approve link and the push
+	// notification) could collect the once-only certificate first and force a re-enrollment.
+	token := r.Header.Get(api.EnrollTokenHeader)
+	if e, err := s.store.Q().GetEnrollment(ctx, id); err != nil || token == "" ||
+		subtle.ConstantTimeCompare([]byte(ids.Hash(token)), []byte(e.PollTokenHash)) != 1 {
+		s.writeErr(w, r, errNotFound())
+		return
+	}
 	var e *store.Enrollment
 	err := s.longPoll(ctx, parseWait(r.URL.Query().Get("wait")), func() (bool, error) {
 		var err error
@@ -214,7 +229,7 @@ func (s *Server) handleEnrollStatus(w http.ResponseWriter, r *http.Request) {
 // ---- access requests ----
 
 func validRequester(rq api.Requester) error {
-	if len(rq.Tool) > 32 || len(rq.SessionID) > 128 || len(rq.CWD) > 1024 || len(rq.User) > 64 || rq.PID < 0 {
+	if len(rq.Tool) > 32 || len(rq.SessionID) > api.MaxSessionIDBytes || len(rq.CWD) > api.MaxCWDBytes || len(rq.User) > 64 || rq.PID < 0 {
 		return errBad("requester field too long")
 	}
 	for _, f := range []string{rq.Tool, rq.SessionID, rq.CWD, rq.User} {
@@ -260,7 +275,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 	now := s.now()
 	ttl := policy.ClampTTL(in.TTLSeconds, s.cfg.TTL)
 	if tgt.MaxTTLSeconds > 0 && ttl > tgt.MaxTTLSeconds {
-		ttl = max(tgt.MaxTTLSeconds, s.cfg.TTL.MinSeconds)
+		ttl = tgt.MaxTTLSeconds // config validation keeps it >= ttl.min_seconds
 	}
 	req := &store.Request{
 		ID:             ids.New(),
@@ -289,9 +304,9 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		if err != nil {
 			return err
 		}
-		cand := policy.Candidate{HostID: h.ID, Kind: req.Kind, Target: req.TargetHost, LoginUser: req.LoginUser, TTL: ttl}
+		cand := policy.Candidate{HostID: h.ID, PeerAddress: req.PeerAddress, Kind: req.Kind, Target: req.TargetHost, LoginUser: req.LoginUser, TTL: ttl}
 		for _, st := range rules {
-			rule := policy.Rule{HostID: st.HostID, Kind: st.Kind, Target: st.TargetHost, LoginUser: st.LoginUser,
+			rule := policy.Rule{HostID: st.HostID, PeerAddress: st.PeerAddress, Kind: st.Kind, Target: st.TargetHost, LoginUser: st.LoginUser,
 				MaxTTL: st.MaxTTL, ExpiresAt: st.ExpiresAt, Revoked: st.RevokedAt != nil}
 			if !policy.Matches(rule, cand, now) {
 				continue

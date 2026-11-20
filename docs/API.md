@@ -35,20 +35,26 @@ Long-polls: `?wait=25s` (or `?wait=25`), capped at 25 s. `poll_after_ms` says ho
 before the next poll when an answer comes back early.
 
 ### POST /v1/enroll  (no client cert)
-`EnrollRequest {hostname, csr_pem, ssh_host_key_fingerprints[]?, note?}` ->
+`EnrollRequest {hostname, csr_pem, ssh_host_key_fingerprints[]?, note?, poll_token}` ->
 `201 EnrollResponse {id, status:"pending", approve_url, poll_after_ms}`.
 
 - `hostname`: `[a-z0-9][a-z0-9-]{0,62}`; the CSR's CommonName must equal it. CSR key: ECDSA
   P-256 or Ed25519.
 - `ssh_host_key_fingerprints`: `SHA256:...` of the host's `/etc/ssh/ssh_host_*_key.pub`
-  (best effort, untrusted, display only).
+  (best effort; self-reported, anyone can copy them with `ssh-keyscan`: display only).
+- `poll_token`: 32-128 random characters the enrolling host keeps. Only polls presenting it
+  see the enrollment (below), so someone who learns the id from the approve link or the push
+  notification cannot collect the once-only certificate first. The CLI also prints the CSR
+  key fingerprint (`client key: SHA256:<hex>`), which the card shows as "Client key".
+- `note`: at most 500 bytes.
 - If a host of that name is enrolled, approving the enrollment **replaces** it (old client
   certificate revoked at once, its pending requests expired); the card shows risk `high`.
 - Limits: 20 pending enrollments in total, 3 per source address (429 `rate_limited`).
   Undecided enrollments expire after `ttl.enrollment_expiry_seconds` (1 h).
 
-### GET /v1/enroll/{id}  (no client cert; long-poll)
--> `EnrollStatus {id, status: pending|approved|denied|expired, client_cert_pem?, ca_cert_pem?}`.
+### GET /v1/enroll/{id}  (no client cert; long-poll; header `X-Aqmas-Enroll-Token: <poll_token>`)
+404 without the right token. ->
+`EnrollStatus {id, status: pending|approved|denied|expired, client_cert_pem?, ca_cert_pem?}`.
 The certificate is returned once; afterwards `status` stays `approved` without it. The CLI
 refuses a certificate whose key is not the CSR's or whose CN is not the requested name, and
 checks it against `ca_cert_pem`.
@@ -62,13 +68,15 @@ checks it against `ca_cert_pem`.
   in aqmasd's config, `login_user` one of that target's `users`, `public_key` an Ed25519 key in
   authorized_keys format (ephemeral, generated per request by the CLI).
 - `Requester {tool, session_id?, cwd?, pid?, user}`: self-reported (`tool` = `claude-code` /
-  `opencode` / `owner-cli` / `other`); **untrusted, display only**.
-- `reason`: max 500 characters, no control characters; **untrusted, display only**.
+  `opencode` / `owner-cli` / `other`); **untrusted, display only**. `session_id` at most 128
+  bytes, `cwd` 1024 (`api.Max*Bytes`; the CLI truncates on a UTF-8 boundary).
+- `reason`: at most 500 **bytes** of UTF-8, no control characters; **untrusted, display only**.
 - `ttl_seconds`: clamped to `[ttl.min_seconds, min(ttl.max_seconds, target max_ttl_seconds)]`
   (defaults 60 s .. 8 h; 0 means `ttl.default_seconds`, 30 min). The clamped value is the
   card's `ttl_max`: the owner may shorten, never lengthen.
-- `status` is already `approved` when a standing approval matched; the CLI then fetches the
-  grant at once.
+- `status` is already `approved` when a standing approval matched (same host **connecting from
+  the same address** as the request the owner approved, same target and login user, TTL within
+  the rule's maximum); the CLI then fetches the grant at once.
 - At most 5 pending requests per host (429 `rate_limited`). Undecided requests expire after
   `ttl.pending_expiry_seconds` (10 min). Requests from a revoked or replaced host cannot be
   approved and are expired on revoke.
@@ -158,8 +166,10 @@ lives on the server, keyed by `challenge_id` (no state in cookies).
   **rejected with 400**, never clamped (a clamped value in `canonical` would differ from the
   owner's choice). `standing_hours` above `ttl.max_standing_hours` (24) -> 400; the UI offers
   1, 4 or 8. A standing approval auto-approves later requests from the same host for the same
-  target and login user, up to its TTL, until it expires or is revoked; revoking a grant also
-  revokes the standing approval created with it.
+  target and login user, from the same address, up to its TTL, until it expires or is
+  revoked; revoking a grant also revokes the standing approval created with it and the one
+  that auto-approved it. Standing approvals are refused (400) for high-risk requests: a
+  `high_risk` target, login user `root`, or a TTL above 4 h (the UI does not offer them there).
 - After every decision aqmasd pushes what it **applied** to ntfy
   (`aqmas: approve ssh alice@db-1 for hosta, ttl 300s, standing 1h [ref ABC123]`), so a
   page that showed something else is noticed on the phone.
@@ -208,7 +218,9 @@ the canonical fields only (each value isolated in `<bdi>`, invisible/bidi charac
 - `aqmas ssh [USER@]HOST [--ttl 30m] [--why "..."] [--fresh] [-- COMMAND...]`: reuses a cached
   certificate for (user, host) from `$XDG_RUNTIME_DIR/aqmas/` (or `~/.cache/aqmas/`) while at
   least 2 min remain, whichever aqmas process of the same Unix user requested it (the owner
-  approved access for the host, not for one agent session); otherwise generates an Ed25519 key,
+  approved access for the host, not for one agent session), after asking the server that its
+  request is still `approved` (a revoked grant is not reused; if the server is unreachable the
+  cached certificate is used with a warning); otherwise generates an Ed25519 key,
   `POST /v1/requests`, prints the approve URL and a one-line summary with the Ref, long-polls
   (Ctrl-C cancels the request), checks the grant (target, user, address, port, certificate
   key, validity, signer = `GET /v1/ssh-ca`), saves it (0600, one directory per grant, `current`

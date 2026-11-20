@@ -152,3 +152,65 @@ func (i *headerInjector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Set("Cf-Access-Jwt-Assertion", i.tok)
 	i.h.ServeHTTP(w, r)
 }
+
+// Integration review: revoking an auto-approved grant also ends the standing approval that
+// approved it, so the next request needs the owner again.
+func TestGrantRevokeEndsTheStandingThatApprovedIt(t *testing.T) {
+	e := newEnv(t)
+	e.setupOwner()
+	c := e.agentClient(ptr(e.enrollHost("hosta")))
+	rc, _, _ := e.request(c, "db-1", "alice", 600)
+	mustStatus(t, "approve", e.approve("/api/ui/requests/"+rc.ID, "decide", api.ChallengeRequest{Action: "approve", StandingHours: 4}), 200)
+	r2, _, _ := e.request(c, "db-1", "alice", 600)
+	if r2.Status != "approved" {
+		t.Fatalf("standing approval did not apply: %s", r2.Status)
+	}
+	rs2, _ := e.status(c, r2.ID, "")
+	mustStatus(t, "revoke auto grant", e.approve("/api/ui/grants/"+rs2.Grant.ID, "revoke", api.ChallengeRequest{Action: "revoke"}), 200)
+	if r3, _, _ := e.request(c, "db-1", "alice", 600); r3.Status != "pending" {
+		t.Fatal("the standing approval that approved a revoked grant survived")
+	}
+	if rs2, _ = e.status(c, r2.ID, ""); rs2.Status != api.StatusRevoked {
+		t.Fatalf("revoked grant's request is %s", rs2.Status)
+	}
+}
+
+// Integration review: no standing approvals for high-risk requests.
+func TestNoStandingForHighRisk(t *testing.T) {
+	e := newEnv(t)
+	e.cfg.Targets[0].HighRisk = true // db-1
+	e.setupOwner()
+	c := e.agentClient(ptr(e.enrollHost("hosta")))
+	rc, _, _ := e.request(c, "db-1", "alice", 600)
+	_, st := e.challenge("/api/ui/requests/"+rc.ID, api.ChallengeRequest{Action: "approve", StandingHours: 1})
+	mustStatus(t, "standing on high-risk target", st, 400)
+	mustStatus(t, "plain approve", e.approve("/api/ui/requests/"+rc.ID, "decide", api.ChallengeRequest{Action: "approve"}), 200)
+}
+
+// Integration review: only the enroller (poll token) sees an enrollment's status and cert.
+func TestEnrollPollToken(t *testing.T) {
+	e := newEnv(t)
+	e.setupOwner()
+	_, csr := newCSR(t, "tokhost")
+	anon := e.agentClient(nil)
+	var er api.EnrollResponse
+	st, _ := agentDo(t, anon, "POST", e.agent.URL+"/v1/enroll", api.EnrollRequest{Hostname: "tokhost", CSRPEM: csr, PollToken: "short"}, nil)
+	mustStatus(t, "short token", st, 400)
+	st, _ = agentDo(t, anon, "POST", e.agent.URL+"/v1/enroll", api.EnrollRequest{Hostname: "tokhost", CSRPEM: csr}, &er)
+	mustStatus(t, "enroll", st, 201)
+	for _, tok := range []string{"", "wrong-token-0123456789abcdefghijklmnop"} {
+		req, _ := http.NewRequest("GET", e.agent.URL+"/v1/enroll/"+er.ID, nil)
+		if tok != "" {
+			req.Header.Set(api.EnrollTokenHeader, tok)
+		}
+		resp, err := anon.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		mustStatus(t, "poll with token "+tok, resp.StatusCode, 404)
+	}
+	var es api.EnrollStatus
+	st, _ = agentDo(t, anon, "GET", e.agent.URL+"/v1/enroll/"+er.ID, nil, &es)
+	mustStatus(t, "poll with the right token", st, 200)
+}

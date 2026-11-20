@@ -81,7 +81,10 @@ SSH `ProxyJump` through aqmasd to cut sessions at expiry; KRL-based revocation.
   text always equals the choice), and can choose "approve similar requests for 1/4/8 hours"
   (same requesting host + same target + same login user; server cap 24 h), which auto-approves
   matching requests until it expires (shown in the UI, revocable; revoking a grant also
-  revokes the standing approval created with it). No other auto-approval in M1. Undecided
+  revokes the standing approval created with it and the one that issued it). A standing
+  approval only matches requests from the address the approved request came from (a host's
+  stolen client key used elsewhere gets no silent grants), and none is allowed for high-risk
+  requests (`high_risk` targets, root, TTL above 4 h). No other auto-approval in M1. Undecided
   requests expire after 10 min, enrollments after 1 h. A host may have 5 pending requests;
   enrollments are limited to 20 pending, 3 per address. Ctrl-C in `aqmas` cancels the pending
   request (`cancelled`).
@@ -128,6 +131,17 @@ Build and test: `make vet test build` (aqmasd linux/arm64; aqmas linux/arm64 and
 
 ## Open questions
 
+- **Port forwarding:** every certificate carries `permit-port-forwarding` (design decision; it
+  is not in the canonical text). A grant can be used as a SOCKS pivot into the target's
+  networks; making it a per-target opt-in would need a config key and possibly a canonical
+  field.
+- **Cached certificates after revoke:** the CLI stops reusing a revoked grant, but the files
+  stay on the requesting host until expiry and a compromised agent there can still use them
+  (KRL distribution is a later milestone). An unreachable server does not block reuse.
+- **Re-enrolling an expired host** still shows "replaces an existing host" (the old row is only
+  expired, not revoked), which is accurate but makes the warning routine every 730 days.
+- **Forgejo TTL:** `max_ttl_seconds = 3600` is the only control while `source-address` is
+  unenforced; consider 900.
 - **Cloudflare zone control** (residual above): narrow that token or move the UI to a
   zone agents cannot edit. Owner's decision.
 - **Forgejo, untested:** whether the built-in server enforces `source-address` (believed not),

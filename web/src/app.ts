@@ -567,7 +567,7 @@ function enrollFacts(p: PendingItem): HTMLElement {
     { class: "facts" },
     fact("Connecting from", h("span", { class: "addr" }, vt(p.requesting_address))),
     e?.csr_fingerprint ? fact("Client key", h("span", { class: "mono" }, vt(e.csr_fingerprint))) : null,
-    e?.ssh_host_key_fingerprints?.length ? fact("SSH host keys", e.ssh_host_key_fingerprints.map((f) => h("span", { class: "mono block" }, vt(f)))) : null,
+    e?.ssh_host_key_fingerprints?.length ? fact("SSH host keys (self-reported)", e.ssh_host_key_fingerprints.map((f) => h("span", { class: "mono block" }, vt(f)))) : null,
     fact("Asked", since(p.created_at)),
     fact("Ref", h("span", { class: "mono" }, vt(refCode(p.id)))),
   );
@@ -767,7 +767,8 @@ class Sheet {
         h("label", { class: "chip" }, h("input", { type: "radio", name: "ttl", value: String(t), checked: t === def }), h("span", null, duration(t), t === p.ttl_requested ? h("small", null, " requested") : null)),
       ),
     );
-    const standSet = h(
+    // aqmasd refuses standing approvals for high-risk requests (high_risk target, root, > 4 h).
+    const standSet = p.risk === "high" ? null : h(
       "fieldset",
       { class: "chips" },
       h("legend", null, "Also auto-approve the same request (", h("bdi", null, vt(p.requesting_host)), " to ", h("bdi", null, vt(p.ssh?.login_user ?? "?")), "@", h("bdi", null, vt(p.ssh?.target_host ?? "?")), ")"),
@@ -778,7 +779,7 @@ class Sheet {
     const go = h("button", { class: "btn approve", type: "button", "data-autofocus": "" }, "Continue");
     go.addEventListener("click", () => {
       const ttl = Number(ttlSet.querySelector<HTMLInputElement>("input:checked")?.value ?? def);
-      const standing = Number(standSet.querySelector<HTMLInputElement>("input:checked")?.value ?? 0);
+      const standing = Number(standSet?.querySelector<HTMLInputElement>("input:checked")?.value ?? 0);
       void this.prepare(seq, target, { action: "approve", ttl_seconds: ttl, standing_hours: standing }, again);
     });
     this.render(h("h2", { id: "sheet-title" }, "Approve access"), this.summary(p), ttlSet, standSet, h("div", { class: "actions" }, this.cancelButton(), go));
@@ -915,7 +916,8 @@ class Sheet {
     }
     const words: Record<string, string> = { approve: "Approved", deny: "Denied", revoke: "Revoked" };
     const lines: Child[] = [];
-    if (c.object === "grant") lines.push("Marked revoked. The certificate itself stays valid until it expires (no revocation list yet).");
+    if (c.object === "grant")
+      lines.push("Marked revoked, with any auto-approval that issued it or came with it. aqmas on the host stops reusing it; the certificate itself stays valid until it expires (no revocation list yet).");
     else if (c.object === "standing") lines.push("Matching requests need your approval again.");
     else if (c.object === "enrollment" && c.action === "approve") lines.push(h("span", null, h("bdi", null, vt(c.requesting_host ?? "The host")), " can now ask for access."));
     else if (c.object === "request" && c.action === "approve") {

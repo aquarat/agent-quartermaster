@@ -43,13 +43,26 @@ const (
 	KindSSH = "ssh"
 )
 
+// Byte limits the server enforces on untrusted text (UTF-8 bytes, not characters).
+const (
+	MaxReasonBytes    = 500  // AccessRequest.Reason, EnrollRequest.Note
+	MaxSessionIDBytes = 128  // Requester.SessionID
+	MaxCWDBytes       = 1024 // Requester.CWD
+)
+
 // ---- Host enrollment (agent API, no client certificate) ----
+
+// EnrollTokenHeader carries EnrollRequest.PollToken on GET /v1/enroll/{id}.
+const EnrollTokenHeader = "X-Aqmas-Enroll-Token"
 
 type EnrollRequest struct {
 	Hostname               string   `json:"hostname"`
 	CSRPEM                 string   `json:"csr_pem"`
 	SSHHostKeyFingerprints []string `json:"ssh_host_key_fingerprints,omitempty"`
 	Note                   string   `json:"note,omitempty"`
+	// PollToken is a random secret (32-128 characters) the enrolling host keeps; only a poll
+	// that presents it in EnrollTokenHeader sees the status and collects the certificate.
+	PollToken string `json:"poll_token"`
 }
 
 type EnrollResponse struct {

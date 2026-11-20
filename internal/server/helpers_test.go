@@ -233,8 +233,16 @@ func (e *env) agentClient(cert *tls.Certificate) *http.Client {
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: tc}, Timeout: 40 * time.Second}
 }
 
+// testPollToken is the enrollment poll token agentDo adds to every enrollment (and presents on
+// every GET /v1/enroll/{id}) unless the test sets its own.
+const testPollToken = "test-poll-token-0123456789abcdefghij"
+
 func agentDo(t *testing.T, c *http.Client, method, url string, body any, out any) (int, error) {
 	t.Helper()
+	if er, ok := body.(api.EnrollRequest); ok && er.PollToken == "" {
+		er.PollToken = testPollToken
+		body = er
+	}
 	var rd io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -242,6 +250,9 @@ func agentDo(t *testing.T, c *http.Client, method, url string, body any, out any
 	}
 	req, _ := http.NewRequest(method, url, rd)
 	req.Header.Set("Content-Type", "application/json")
+	if method == http.MethodGet && strings.Contains(url, "/v1/enroll/") {
+		req.Header.Set(api.EnrollTokenHeader, testPollToken)
+	}
 	resp, err := c.Do(req)
 	if err != nil {
 		return 0, err

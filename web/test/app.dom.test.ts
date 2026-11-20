@@ -97,4 +97,14 @@ describe("App in a DOM", () => {
     expect(dlg.querySelector("h2.ok")!.textContent).toBe("Approved");
     expect(m.store.applied.at(-1)!.canonical).toMatchObject({ ttl_seconds: 900, target: "db-1" });
   });
+
+  test("no auto-approval choice for a high-risk request", async () => {
+    const doc = win.document as unknown as Document;
+    doc.querySelector("dialog")?.close();
+    const card = root.querySelector<HTMLElement>('[data-id="01JDEMO0SSH0ROOT00000002"]')!;
+    card.querySelector<HTMLButtonElement>("button.approve")!.click();
+    const dlg = doc.querySelector("dialog")!;
+    await until(() => !!dlg.querySelector('input[name="ttl"]'));
+    expect(dlg.querySelectorAll('input[name="standing"]').length).toBe(0);
+  });
 });

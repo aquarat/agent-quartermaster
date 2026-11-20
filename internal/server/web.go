@@ -493,13 +493,20 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// highRisk marks requests the card flags as risk "high": unknown or high_risk targets, root,
+// TTLs above 4 h. Standing approvals are refused for them.
+func (s *Server) highRisk(rq *store.Request) bool {
+	tgt, ok := s.cfg.Target(rq.TargetHost)
+	return !ok || tgt.HighRisk || rq.LoginUser == "root" || rq.TTLRequested > 4*3600
+}
+
 func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.PendingItem, error) {
 	similar, err := s.store.Q().CountSimilar(ctx, rq.HostID, rq.TargetHost, rq.LoginUser, s.now().Add(-7*24*time.Hour))
 	if err != nil {
 		return nil, err
 	}
 	risk := "normal"
-	if tgt, ok := s.cfg.Target(rq.TargetHost); !ok || tgt.HighRisk || rq.LoginUser == "root" || rq.TTLRequested > 4*3600 {
+	if s.highRisk(rq) {
 		risk = "high"
 	}
 	return &api.PendingItem{

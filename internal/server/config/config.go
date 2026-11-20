@@ -200,6 +200,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	seen := map[string]bool{}
+	principals := map[string]string{} // principal -> target that issues it
 	for i := range c.Targets {
 		tg := &c.Targets[i]
 		if !ValidName(tg.Name) {
@@ -226,8 +227,8 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("config: target %q user %q invalid", tg.Name, u)
 			}
 		}
-		if tg.MaxTTLSeconds < 0 {
-			return fmt.Errorf("config: target %q max_ttl_seconds negative", tg.Name)
+		if tg.MaxTTLSeconds < 0 || (tg.MaxTTLSeconds > 0 && tg.MaxTTLSeconds < t.MinSeconds) {
+			return fmt.Errorf("config: target %q max_ttl_seconds must be 0 (no cap) or at least ttl.min_seconds", tg.Name)
 		}
 		if tg.PrincipalOverride != "" && tg.ForgejoUser != "" && tg.PrincipalOverride != tg.ForgejoUser {
 			return fmt.Errorf("config: target %q sets both principal and forgejo_user", tg.Name)
@@ -240,6 +241,14 @@ func (c *Config) Validate() error {
 		}
 		if p != "" && (!principalRE.MatchString(p) || !strings.Contains(p, "@")) {
 			return fmt.Errorf("config: target %q principal must look like <name>@<service>, e.g. alice@forgejo", tg.Name)
+		}
+		// One certificate must never open two targets: every principal belongs to one target.
+		for _, u := range tg.Users {
+			pr := tg.Principal(u)
+			if other, dup := principals[pr]; dup && other != tg.Name {
+				return fmt.Errorf("config: targets %q and %q would both issue principal %q", other, tg.Name, pr)
+			}
+			principals[pr] = tg.Name
 		}
 		if tg.HostKey != "" {
 			if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(tg.HostKey)); err != nil {

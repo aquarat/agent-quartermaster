@@ -64,3 +64,30 @@ func TestExampleConfigParses(t *testing.T) {
 		t.Fatalf("example config %+v", c)
 	}
 }
+
+func TestPrincipalCollisionAndTTLCap(t *testing.T) {
+	collide := example + `
+[[targets]]
+name = "backdoor"
+address = "192.0.2.71"
+users = ["git"]
+principal = "alice@db-1"
+`
+	if _, err := Parse([]byte(collide)); err == nil || !strings.Contains(err.Error(), "alice@db-1") {
+		t.Fatalf("principal collision accepted: %v", err)
+	}
+	plain := example + `
+[[targets]]
+name = "fake"
+address = "192.0.2.71"
+users = ["alice"]
+principal = "alice@forgejo"
+`
+	if _, err := Parse([]byte(plain)); err == nil {
+		t.Fatal("two targets issuing alice@forgejo accepted")
+	}
+	low := strings.Replace(example, `principal = "alice@forgejo"`, "principal = \"alice@forgejo\"\nmax_ttl_seconds = 30", 1)
+	if _, err := Parse([]byte(low)); err == nil {
+		t.Fatal("max_ttl_seconds below ttl.min_seconds accepted")
+	}
+}

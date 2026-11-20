@@ -41,7 +41,7 @@ const (
 	MaxPendingEnrollsPerIP = 3
 	// MaxPendingPerHost limits how many undecided requests one host may queue.
 	MaxPendingPerHost = 5
-	MaxReasonLen      = 500
+	MaxReasonLen      = 500 // api.MaxReasonBytes
 	sessionCookie     = "__Host-aqmas_session"
 	csrfHeader        = "X-Aqmas"
 )

@@ -99,6 +99,9 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 			if err := policy.StandingHours(in.StandingHours, s.cfg.TTL); err != nil {
 				return a, errBad(err.Error())
 			}
+			if in.StandingHours > 0 && s.highRisk(r) {
+				return a, errBad("no standing approvals for high-risk requests (high_risk target, root, or TTL above 4 h)")
+			}
 			a.TTLSeconds, a.StandingHours = ttl, in.StandingHours
 		} else if in.TTLSeconds != 0 || in.StandingHours != 0 {
 			return a, errBad("deny takes no ttl_seconds or standing_hours")
@@ -215,13 +218,14 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				return err
 			}
 			if a.StandingHours > 0 {
-				if a.StandingHours > s.cfg.TTL.MaxStandingHours {
+				if a.StandingHours > s.cfg.TTL.MaxStandingHours || s.highRisk(r) {
 					return errConflict("signed standing_hours outside policy")
 				}
 				st := &store.Standing{
 					ID: ids.New(), HostID: r.HostID, HostName: r.HostName, Kind: r.Kind, TargetHost: r.TargetHost,
 					LoginUser: r.LoginUser, MaxTTL: a.TTLSeconds, CreatedAt: now,
 					ExpiresAt: now.Add(time.Duration(a.StandingHours) * time.Hour), SourceRequestID: r.ID,
+					PeerAddress: r.PeerAddress,
 				}
 				if err := q.InsertStanding(ctx, st); err != nil {
 					return err
@@ -297,12 +301,22 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 			if err := q.MarkRequestRevoked(ctx, g.RequestID); err != nil {
 				return err
 			}
-			// "Stop this" also stops the standing approval created with this grant (only ever
-			// reduces access, so it needs no separate signature).
+			// "Stop this" also stops the standing approval created with this grant, and the one
+			// that auto-approved it, if any: otherwise the agent's next request would be approved
+			// again at once. Both only reduce access, so they need no separate signature.
 			if n, err := q.RevokeStandingFromRequest(ctx, g.RequestID, now); err != nil {
 				return err
 			} else if n > 0 {
 				detail += fmt.Sprintf(" standing_revoked=%d", n)
+			}
+			if rq, err := q.GetRequest(ctx, g.RequestID); err != nil {
+				return err
+			} else if rq.StandingID != "" {
+				if err := q.RevokeStanding(ctx, rq.StandingID, now); err == nil {
+					detail += " standing_revoked=" + rq.StandingID
+				} else if !errors.Is(err, store.ErrConflict) {
+					return err
+				}
 			}
 			return q.Audit(ctx, now, "owner", "grant_revoke", "grant:"+a.ID, "certificate stays valid until "+g.NotAfter.Format(time.RFC3339)+" "+detail)
 		}

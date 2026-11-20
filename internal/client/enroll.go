@@ -6,8 +6,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -116,11 +119,17 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 		h, _ := os.Hostname()
 		note = fmt.Sprintf("aqmas enroll by %s on %s", e.User, h)
 	}
+	tok := make([]byte, 32)
+	if _, err := rand.Read(tok); err != nil {
+		return err
+	}
+	pollToken := base64.RawURLEncoding.EncodeToString(tok)
 	req := &api.EnrollRequest{
+		PollToken:              pollToken,
 		Hostname:               o.Name,
 		CSRPEM:                 string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})),
 		SSHHostKeyFingerprints: hostKeyFingerprints(o.SSHHostKeyGlob),
-		Note:                   truncate(note, 500),
+		Note:                   truncateBytes(note, api.MaxReasonBytes),
 	}
 	created, err := c.Enroll(ctx, req)
 	if err != nil {
@@ -130,11 +139,12 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 		return fmt.Errorf("server returned an invalid enrollment id %q", sanitize(created.ID))
 	}
 	e.logf("enrollment %s (Ref %s) for host %q sent to %s", created.ID, RefCode(created.ID), o.Name, sanitize(server))
+	e.logf("client key: %s (the approval card shows it as \"Client key\")", csrFingerprint(&key.PublicKey))
 	e.logf("server CA pinned: %s", FormatPin(trust.Pin))
 	e.logf("approve at: %s", sanitize(created.ApproveURL))
 	e.logf("waiting for approval (Ctrl-C to stop waiting)...")
 
-	st, err := e.waitEnrollment(ctx, c, created)
+	st, err := e.waitEnrollment(ctx, c, created, pollToken)
 	if err != nil {
 		if errors.Is(err, ErrCancelled) {
 			e.logf("stopped waiting; enrollment %s stays pending on the server until it expires", created.ID)
@@ -221,12 +231,22 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 	return nil
 }
 
-func (e *Env) waitEnrollment(ctx context.Context, c *APIClient, created *api.EnrollResponse) (*api.EnrollStatus, error) {
+// csrFingerprint matches the server's CSR key fingerprint (SHA256:<hex> of the PKIX key).
+func csrFingerprint(pub any) string {
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return "?"
+	}
+	h := sha256.Sum256(der)
+	return "SHA256:" + hex.EncodeToString(h[:])
+}
+
+func (e *Env) waitEnrollment(ctx context.Context, c *APIClient, created *api.EnrollResponse, pollToken string) (*api.EnrollStatus, error) {
 	pollAfter := created.PollAfterMS
 	failures := 0
 	for {
 		start := time.Now()
-		st, err := c.EnrollStatus(ctx, created.ID, 25*time.Second)
+		st, err := c.EnrollStatus(ctx, created.ID, pollToken, 25*time.Second)
 		if err != nil {
 			var ue *UnreachableError
 			if errors.As(err, &ue) && failures < 5 {

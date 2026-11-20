@@ -30,6 +30,7 @@ MODE=install
 ROOT=/
 NAME=
 CA_KEY=
+CA_FP=
 USERS=()
 USERS_GIVEN=0
 OWNER_OK=0
@@ -43,6 +44,8 @@ usage() {
 Options:
   --name NAME                  the host's name in aqmasd's [[targets]] (required for install)
   --ca-key FILE                the aqmas SSH user CA public key (required for install)
+  --ca-fingerprint SHA256:...  refuse unless --ca-key has this fingerprint (as the owner read
+                               it on the bastion: ssh-keygen -lf of aqmasd print-ssh-ca)
   --user USER                  login user to write a principals file for (default alice;
                                repeatable; root is refused)
   --apply                      make the changes (default: dry run, print the plan)
@@ -64,6 +67,8 @@ while [[ $# -gt 0 ]]; do
 	--name=*) NAME=${1#*=} ;;
 	--ca-key) CA_KEY=${2:-}; shift ;;
 	--ca-key=*) CA_KEY=${1#*=} ;;
+	--ca-fingerprint) CA_FP=${2:-}; shift ;;
+	--ca-fingerprint=*) CA_FP=${1#*=} ;;
 	--user) USERS+=("${2:-}"); USERS_GIVEN=1; shift ;;
 	--user=*) USERS+=("${1#*=}"); USERS_GIVEN=1 ;;
 	--root) ROOT=${2:-}; shift ;;
@@ -276,11 +281,19 @@ do_install() {
 	lines=$(grep -vE '^[[:space:]]*(#|$)' "$CA_KEY" || true)
 	[[ -n $lines && $(wc -l <<<"$lines") -eq 1 ]] || die "--ca-key must hold exactly one public key line"
 	key_line=$lines
-	[[ $key_line =~ ^(ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com|rsa-sha2-512|rsa-sha2-256|ssh-rsa)\ [A-Za-z0-9+/]+=*(\ [[:print:]]*)?$ ]] ||
-		die "--ca-key is not a plain OpenSSH public key line"
+	# aqmasd's SSH user CA is always Ed25519 (internal/server/pki).
+	[[ $key_line =~ ^ssh-ed25519\ [A-Za-z0-9+/]+=*(\ [[:print:]]*)?$ ]] ||
+		die "--ca-key is not a plain ssh-ed25519 public key line (aqmasd print-ssh-ca)"
 	if command -v ssh-keygen >/dev/null; then
 		ssh-keygen -l -f "$CA_KEY" >/dev/null 2>&1 || die "ssh-keygen cannot read --ca-key"
+		local fp
+		fp=$(ssh-keygen -l -f "$CA_KEY" | cut -d' ' -f2)
 		say "CA key     $(ssh-keygen -l -f "$CA_KEY")"
+		if [[ -n $CA_FP && $fp != "$CA_FP" ]]; then
+			die "--ca-key fingerprint $fp is not the expected $CA_FP"
+		fi
+	elif [[ -n $CA_FP ]]; then
+		die "--ca-fingerprint needs ssh-keygen"
 	fi
 
 	check_conflicts

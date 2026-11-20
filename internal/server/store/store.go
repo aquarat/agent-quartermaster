@@ -247,9 +247,10 @@ type Enrollment struct {
 	DecisionNote   string
 	CertPEM        string
 	CertDelivered  bool
+	PollTokenHash  string // SHA-256 hex of the enroller's poll token
 }
 
-const enrollCols = "id, hostname, csr_pem, key_fingerprint, ssh_host_key_fps, note, peer_address, status, created_at, expires_at, decided_at, decision_note, cert_pem, cert_delivered"
+const enrollCols = "id, hostname, csr_pem, key_fingerprint, ssh_host_key_fps, note, peer_address, status, created_at, expires_at, decided_at, decision_note, cert_pem, cert_delivered, poll_token_hash"
 
 func scanEnrollment(sc interface{ Scan(...any) error }) (*Enrollment, error) {
 	var e Enrollment
@@ -258,7 +259,7 @@ func scanEnrollment(sc interface{ Scan(...any) error }) (*Enrollment, error) {
 	var decided sql.NullInt64
 	var delivered int
 	if err := sc.Scan(&e.ID, &e.Hostname, &e.CSRPEM, &e.KeyFingerprint, &fps, &e.Note, &e.PeerAddress, &e.Status,
-		&created, &expires, &decided, &e.DecisionNote, &e.CertPEM, &delivered); err != nil {
+		&created, &expires, &decided, &e.DecisionNote, &e.CertPEM, &delivered, &e.PollTokenHash); err != nil {
 		return nil, notFound(err)
 	}
 	_ = json.Unmarshal([]byte(fps), &e.SSHHostKeyFPs)
@@ -273,9 +274,9 @@ func (q *Q) InsertEnrollment(ctx context.Context, e *Enrollment) error {
 	if e.SSHHostKeyFPs == nil {
 		fps = []byte("[]")
 	}
-	_, err := q.q.ExecContext(ctx, `INSERT INTO enrollments(id, hostname, csr_pem, key_fingerprint, ssh_host_key_fps, note, peer_address, status, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-		e.ID, e.Hostname, e.CSRPEM, e.KeyFingerprint, string(fps), e.Note, e.PeerAddress, ms(e.CreatedAt), ms(e.ExpiresAt))
+	_, err := q.q.ExecContext(ctx, `INSERT INTO enrollments(id, hostname, csr_pem, key_fingerprint, ssh_host_key_fps, note, peer_address, status, created_at, expires_at, poll_token_hash)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+		e.ID, e.Hostname, e.CSRPEM, e.KeyFingerprint, string(fps), e.Note, e.PeerAddress, ms(e.CreatedAt), ms(e.ExpiresAt), e.PollTokenHash)
 	return err
 }
 
@@ -643,15 +644,16 @@ type Standing struct {
 	RevokedAt       *time.Time
 	Uses            int
 	SourceRequestID string
+	PeerAddress     string // address of the source request; later requests must come from it
 }
 
-const standingCols = "id, host_id, host_name, kind, target_host, login_user, max_ttl, created_at, expires_at, revoked_at, uses, source_request_id"
+const standingCols = "id, host_id, host_name, kind, target_host, login_user, max_ttl, created_at, expires_at, revoked_at, uses, source_request_id, peer_address"
 
 func scanStanding(sc interface{ Scan(...any) error }) (*Standing, error) {
 	var s Standing
 	var created, expires int64
 	var revoked sql.NullInt64
-	if err := sc.Scan(&s.ID, &s.HostID, &s.HostName, &s.Kind, &s.TargetHost, &s.LoginUser, &s.MaxTTL, &created, &expires, &revoked, &s.Uses, &s.SourceRequestID); err != nil {
+	if err := sc.Scan(&s.ID, &s.HostID, &s.HostName, &s.Kind, &s.TargetHost, &s.LoginUser, &s.MaxTTL, &created, &expires, &revoked, &s.Uses, &s.SourceRequestID, &s.PeerAddress); err != nil {
 		return nil, notFound(err)
 	}
 	s.CreatedAt, s.ExpiresAt, s.RevokedAt = fromMS(created), fromMS(expires), fromNullMS(revoked)
@@ -660,9 +662,9 @@ func scanStanding(sc interface{ Scan(...any) error }) (*Standing, error) {
 
 // InsertStanding stores a standing approval.
 func (q *Q) InsertStanding(ctx context.Context, s *Standing) error {
-	_, err := q.q.ExecContext(ctx, `INSERT INTO standing(id, host_id, host_name, kind, target_host, login_user, max_ttl, created_at, expires_at, source_request_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.ID, s.HostID, s.HostName, s.Kind, s.TargetHost, s.LoginUser, s.MaxTTL, ms(s.CreatedAt), ms(s.ExpiresAt), s.SourceRequestID)
+	_, err := q.q.ExecContext(ctx, `INSERT INTO standing(id, host_id, host_name, kind, target_host, login_user, max_ttl, created_at, expires_at, source_request_id, peer_address)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.ID, s.HostID, s.HostName, s.Kind, s.TargetHost, s.LoginUser, s.MaxTTL, ms(s.CreatedAt), ms(s.ExpiresAt), s.SourceRequestID, s.PeerAddress)
 	return err
 }
 

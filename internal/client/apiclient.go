@@ -143,6 +143,10 @@ func NewAPIClient(server string, trust *Trust, clientCert *tls.Certificate, now 
 func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 func (c *APIClient) do(ctx context.Context, method, path string, in, out any) error {
+	return c.doWith(ctx, method, path, nil, in, out)
+}
+
+func (c *APIClient) doWith(ctx context.Context, method, path string, hdr http.Header, in, out any) error {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
@@ -154,6 +158,9 @@ func (c *APIClient) do(ctx context.Context, method, path string, in, out any) er
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
 		return err
+	}
+	for k, v := range hdr {
+		req.Header[k] = v
 	}
 	req.Header.Set("Accept", "application/json")
 	if in != nil {
@@ -204,10 +211,12 @@ func (c *APIClient) Enroll(ctx context.Context, req *api.EnrollRequest) (*api.En
 	return &out, nil
 }
 
-// EnrollStatus long-polls an enrollment (wait 0 = no long-poll).
-func (c *APIClient) EnrollStatus(ctx context.Context, id string, wait time.Duration) (*api.EnrollStatus, error) {
+// EnrollStatus long-polls an enrollment (wait 0 = no long-poll) with the enrollment's poll token.
+func (c *APIClient) EnrollStatus(ctx context.Context, id, pollToken string, wait time.Duration) (*api.EnrollStatus, error) {
 	var out api.EnrollStatus
-	if err := c.do(ctx, http.MethodGet, "/v1/enroll/"+url.PathEscape(id)+waitQuery(wait), nil, &out); err != nil {
+	hdr := http.Header{}
+	hdr.Set(api.EnrollTokenHeader, pollToken)
+	if err := c.doWith(ctx, http.MethodGet, "/v1/enroll/"+url.PathEscape(id)+waitQuery(wait), hdr, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

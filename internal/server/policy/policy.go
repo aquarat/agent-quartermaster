@@ -47,30 +47,35 @@ func StandingHours(h int, t config.TTL) error {
 
 // Rule is a standing approval.
 type Rule struct {
-	HostID    int64
-	Kind      string
-	Target    string
-	LoginUser string
-	MaxTTL    int
-	ExpiresAt time.Time
-	Revoked   bool
+	HostID      int64
+	PeerAddress string
+	Kind        string
+	Target      string
+	LoginUser   string
+	MaxTTL      int
+	ExpiresAt   time.Time
+	Revoked     bool
 }
 
 // Candidate is a new request that might be auto-approved.
 type Candidate struct {
-	HostID    int64
-	Kind      string
-	Target    string
-	LoginUser string
-	TTL       int // after clamping
+	HostID      int64
+	PeerAddress string
+	Kind        string
+	Target      string
+	LoginUser   string
+	TTL         int // after clamping
 }
 
-// Matches reports whether rule auto-approves c at now: same enrolled host, kind, target and login
-// user, TTL within the rule's maximum, rule neither expired nor revoked.
+// Matches reports whether rule auto-approves c at now: same enrolled host connecting from the
+// same address as the request the owner approved, kind, target and login user, TTL within the
+// rule's maximum, rule neither expired nor revoked. Binding the address means a host's stolen
+// client key used from another machine gets no silent approvals.
 func Matches(r Rule, c Candidate, now time.Time) bool {
 	return !r.Revoked &&
 		now.Before(r.ExpiresAt) &&
 		r.HostID == c.HostID &&
+		r.PeerAddress != "" && r.PeerAddress == c.PeerAddress &&
 		r.Kind == c.Kind &&
 		r.Target == c.Target &&
 		r.LoginUser == c.LoginUser &&

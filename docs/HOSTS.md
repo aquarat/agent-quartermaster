@@ -8,7 +8,8 @@ and `sshd -T` before reloading sshd, restores the backup on a failed check, `--u
 reverses it):
 
 - `/etc/ssh/aqmas_user_ca.pub` (root:root 0644): the SSH user CA, from `aqmasd print-ssh-ca`
-  on the bastion (the same key `GET /v1/ssh-ca` publishes).
+  on the bastion (the same key `GET /v1/ssh-ca` publishes). Only an `ssh-ed25519` line is
+  accepted; `--ca-fingerprint` refuses any other key than the one the owner read.
 - `/etc/ssh/aqmas_principals/alice` (root:root 0644, directory 0755): exactly one line,
   `alice@<name>`, where `<name>` is the host's name in aqmasd's `[[targets]]` (not
   necessarily `hostname -s`). `--user` adds other login users; `root` is refused
@@ -25,7 +26,8 @@ script checks `sshd -T`).
 
 ```
 sudo ./install-host-trust.sh --name dev-1 --ca-key aqmas_user_ca.pub            # plan
-sudo ./install-host-trust.sh --name dev-1 --ca-key aqmas_user_ca.pub --apply    # do it
+sudo ./install-host-trust.sh --name dev-1 --ca-key aqmas_user_ca.pub --apply \
+     --ca-fingerprint SHA256:<as read on the bastion>                              # do it
 ```
 
 The script refuses the bastion (bastion, 192.0.2.60) outright, and web-1 and
@@ -65,6 +67,10 @@ Details and the source reading behind them: `deploy/hosts/forgejo-ca.md`. In sho
   anything else.
 - Fleet hosts accept only `alice@<host>` and Forgejo only the registered `alice@forgejo`,
   so a host certificate does not open Forgejo and a Forgejo certificate does not open a host.
+  aqmasd's config validation refuses two targets that would issue the same principal.
+- With `ALLOW = anything`, any *other* Forgejo account could register a principal such as
+  `alice@db-1`, and a db-1 grant would then open Forgejo as that account. Only matters if
+  other accounts exist; register the owner's principal first.
 
 ## aqmasd targets config (excerpt)
 

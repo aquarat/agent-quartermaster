@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/user"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
 )
@@ -46,25 +47,29 @@ func (e *Env) Requester() api.Requester {
 	// Claude Code exports CLAUDE_CODE_SESSION_ID; CLAUDE_SESSION_ID is what API.md names.
 	for _, k := range []string{"CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "AQMAS_SESSION_ID"} {
 		if v := e.Getenv(k); v != "" {
-			r.SessionID = truncate(v, 200)
+			r.SessionID = truncateBytes(v, api.MaxSessionIDBytes)
 			break
 		}
 	}
 	if e.Getwd != nil {
 		if wd, err := e.Getwd(); err == nil {
-			r.CWD = truncate(wd, 500)
+			r.CWD = truncateBytes(wd, api.MaxCWDBytes)
 		}
 	}
 	return r
 }
 
 // truncate caps s at n runes.
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
+// truncateBytes cuts s to at most n bytes without splitting a UTF-8 sequence (the server's
+// limits are in bytes).
+func truncateBytes(s string, n int) string {
+	if len(s) <= n {
 		return s
 	}
-	return string(r[:n])
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 func currentUser() string {
