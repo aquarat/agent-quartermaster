@@ -7,7 +7,8 @@
 #   AQMASD=... AQMAS=... test/interop/run.sh   # use prebuilt binaries for this machine
 #   KEEP=1 test/interop/run.sh     # keep the temp dir (logs, config) for inspection
 #
-# Checks: passkey registration + login; enrollment with --ca-pin from `aqmasd tls-fingerprint`;
+# Checks: passkey registration + login; a second passkey added, renamed, used, the first removed,
+# removing the last refused; enrollment with --ca-pin from `aqmasd tls-fingerprint`;
 # `aqmas ssh testhost -- echo ok` after a passkey approval; the certificate's principal,
 # source-address, key id and validity; reuse of a cached certificate without a new request;
 # `aqmas list` / `list --json` / `status` / `status ID`; Ctrl-C cancels a pending request
@@ -123,6 +124,28 @@ owner session | grep -q '"authenticated":true' || fail "not signed in after regi
 owner login >/dev/null
 owner session | grep -q '"authenticated":true' || fail "login with the saved passkey failed"
 ok "passkey registered; login works"
+
+# --- passkey management: add a second, rename it, sign in with it, remove the first ---
+FIRST=$(owner passkeys | bun -e 'const p = await Bun.stdin.json(); if (p.length !== 1 || !p[0].current) process.exit(1); console.log(p[0].nickname)') ||
+	fail "passkey list after registration"
+[[ $FIRST == "Passkey 1" ]] || fail "first passkey is named '$FIRST', want 'Passkey 1'"
+SECOND=$(owner add-passkey "interop second" 2>"$T/owner-add.err")
+[[ $SECOND == "interop second" ]] || { cat "$T/owner-add.err"; fail "add-passkey printed '$SECOND'"; }
+grep -q '"action":"add".*"object":"passkey"' "$T/owner-add.err" || fail "passkey add was not signed"
+owner rename-passkey "interop second" "interop backup" >/dev/null 2>"$T/owner-rename.err" || { cat "$T/owner-rename.err"; fail "rename-passkey"; }
+grep -q '"action":"rename".*"new_nickname":"interop backup","nickname":"interop second"' "$T/owner-rename.err" ||
+	{ cat "$T/owner-rename.err"; fail "rename canonical lacks the nicknames"; }
+owner use-passkey "interop backup" >/dev/null
+owner login >/dev/null
+owner passkeys | bun -e 'const p = await Bun.stdin.json(); const b = p.find((x) => x.nickname === "interop backup");
+	if (p.length !== 2 || !b?.current || p.find((x) => x.nickname === "Passkey 1")?.current) process.exit(1)' ||
+	fail "after rename + login: $(owner passkeys)"
+owner remove-passkey "Passkey 1" >"$T/owner-remove.out" 2>"$T/owner-remove.err" || { cat "$T/owner-remove.err"; fail "remove-passkey"; }
+grep -q '"signed_out":false' "$T/owner-remove.out" || fail "removing another passkey signed this session out"
+if owner remove-passkey "interop backup" >/dev/null 2>"$T/owner-remove-last.err"; then fail "removed the last passkey"; fi
+grep -q "409 conflict.*last passkey" "$T/owner-remove-last.err" || { cat "$T/owner-remove-last.err"; fail "last-passkey refusal"; }
+owner state | grep -q '"action":"passkey_rename"' && owner state | grep -q '"action":"passkey_remove"' || fail "passkey changes not audited"
+ok "passkeys: added 'interop second', renamed to 'interop backup', signed in with it, removed 'Passkey 1'; last one refused"
 
 # --- client: enroll with the pinned CA ---
 export AQMAS_CONFIG_DIR=$T/client/config AQMAS_CACHE_DIR=$T/client/cache

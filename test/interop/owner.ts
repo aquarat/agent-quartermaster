@@ -17,7 +17,14 @@
 //   approve ID [TTL [STANDING_H]] approve a pending request (TTL seconds) or enrollment
 //   deny ID                       deny a pending request or enrollment
 //   revoke-grant ID               revoke an active grant
-//   canonical                     with approve/deny: also print the signed canonical text (stderr)
+//   passkeys                      print the passkey list (state.passkeys) as JSON
+//   add-passkey [NAME]            sign "passkey add" with the active passkey, create a new one
+//                                 (named NAME, or by the server), print its nickname
+//   rename-passkey NAME NEW       sign and apply a rename
+//   remove-passkey NAME           sign and apply a remove; prints the PasskeyChange
+//   use-passkey NAME              make NAME the active passkey (then `login`)
+//
+// Every signed action prints its canonical text on stderr ("owner: signing ...").
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { softAuthenticator, type SavedAuthenticator } from "./softauthn.ts";
@@ -40,10 +47,14 @@ const { createApi } = await import(`${web}/src/api.ts`);
 const flows = await import(`${web}/src/flows.ts`);
 
 interface Saved {
-  passkey?: SavedAuthenticator;
+  /** Every passkey this helper holds, by nickname, and the one it signs with. */
+  keys?: Record<string, SavedAuthenticator>;
+  active?: string;
   cookie?: string;
 }
 const saved: Saved = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : {};
+const keys: Record<string, SavedAuthenticator> = saved.keys ?? {};
+let active = saved.active ?? "";
 let cookie = saved.cookie ?? "";
 
 // The session cookie is Secure; this helper talks plain HTTP to 127.0.0.1 exactly like
@@ -59,16 +70,22 @@ const jar = (async (input: RequestInfo | URL, init?: RequestInit) => {
   return res;
 }) as typeof fetch;
 const api = createApi({ base, fetch: jar });
-const auth = await softAuthenticator(origin, saved.passkey);
+let auth = await softAuthenticator(origin, active ? keys[active] : undefined);
 
 async function persist() {
-  const out: Saved = { cookie };
   try {
-    out.passkey = await auth.save();
+    if (active) keys[active] = await auth.save();
   } catch {
-    out.passkey = saved.passkey;
+    // no credential yet
   }
-  writeFileSync(stateFile, JSON.stringify(out), { mode: 0o600 });
+  writeFileSync(stateFile, JSON.stringify({ keys, active, cookie } satisfies Saved), { mode: 0o600 });
+}
+
+async function findPasskey(name: string) {
+  const s = await api.state();
+  const p = (s.passkeys ?? []).find((x: { nickname: string }) => x.nickname === name);
+  if (!p) throw new Error(`no passkey named ${JSON.stringify(name)}`);
+  return p;
 }
 
 async function findPending(id: string) {
@@ -83,7 +100,8 @@ const [cmd, ...args] = process.argv.slice(2);
 try {
   switch (cmd) {
     case "register": {
-      await flows.completeRegistration(api, auth, await flows.prepareRegistrationWithCode(api, args[0] ?? ""));
+      const res = await flows.completeRegistration(api, auth, await flows.prepareRegistrationWithCode(api, args[0] ?? ""));
+      active = (res as { passkey?: { nickname?: string } }).passkey?.nickname ?? "first";
       await persist();
       cookie = "";
       await flows.completeLogin(api, auth, await flows.prepareLogin(api));
@@ -150,6 +168,54 @@ try {
       const p = await flows.prepareAction(api, flows.targetForGrant(g), { action: "revoke" });
       console.error("owner: signing " + p.canonicalText);
       console.log(JSON.stringify(await flows.completeAction(api, auth, p)));
+      break;
+    }
+    case "passkeys":
+      console.log(JSON.stringify((await api.state()).passkeys ?? []));
+      break;
+    case "add-passkey": {
+      const p = await flows.prepareAction(api, flows.PASSKEY_TARGET, { action: "add" });
+      console.error("owner: signing " + p.canonicalText);
+      const reg = await flows.authorizeAddPasskey(api, auth, p);
+      const fresh = await softAuthenticator(origin);
+      const res = (await flows.completeRegistration(api, fresh, reg, args[0] ?? "")) as { passkey?: { nickname?: string } };
+      const name = res.passkey?.nickname;
+      if (!name) throw new Error("register/finish returned no passkey nickname");
+      keys[name] = await fresh.save();
+      console.log(name);
+      break;
+    }
+    case "rename-passkey": {
+      const [from, to] = args;
+      const pk = await findPasskey(from!);
+      const p = await flows.prepareAction(api, flows.targetForPasskey(pk), { action: "rename", nickname: to });
+      console.error("owner: signing " + p.canonicalText);
+      const out = (await flows.completeAction(api, auth, p)) as { nickname: string };
+      if (keys[from!]) {
+        keys[out.nickname] = keys[from!]!;
+        delete keys[from!];
+        if (active === from) active = out.nickname;
+      }
+      console.log(JSON.stringify(out));
+      break;
+    }
+    case "remove-passkey": {
+      const pk = await findPasskey(args[0]!);
+      const p = await flows.prepareAction(api, flows.targetForPasskey(pk), { action: "remove" });
+      console.error("owner: signing " + p.canonicalText);
+      const out = await flows.completeAction(api, auth, p);
+      delete keys[args[0]!];
+      if (active === args[0]) active = "";
+      console.log(JSON.stringify(out));
+      break;
+    }
+    case "use-passkey": {
+      const name = args[0]!;
+      if (!keys[name]) throw new Error(`this helper holds no passkey named ${JSON.stringify(name)}`);
+      await persist(); // save the current one's counter first
+      active = name;
+      auth = await softAuthenticator(origin, keys[name]);
+      console.log("using " + name);
       break;
     }
     default:

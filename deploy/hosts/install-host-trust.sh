@@ -239,10 +239,39 @@ reload_sshd() {
 		if "$SYSTEMCTL" is-active --quiet "$unit.service" 2>/dev/null; then
 			"$SYSTEMCTL" reload "$unit.service"
 			say "reloaded   $unit.service (existing sessions stay up)"
+			wait_sshd_listening
 			return 0
 		fi
 	done
 	say "WARNING: no active sshd.service/ssh.service found; reload sshd yourself"
+}
+
+# A reload can briefly close sshd's listening socket (seen on Fedora: a login right after the
+# reload got "connection refused"). Wait up to SSHD_WAIT_SECONDS (10) for every configured port
+# to listen again before reporting success.
+wait_sshd_listening() {
+	local ports port waited=0 limit=${SSHD_WAIT_SECONDS:-10} missing
+	ports=$("$SSHD" -T 2>/dev/null | awk 'tolower($1)=="port"{print $2}' | sort -u) || true
+	[[ -n $ports ]] || ports=22
+	while :; do
+		missing=
+		for port in $ports; do
+			if command -v ss >/dev/null 2>&1; then
+				[[ -n $(ss -Hltn "sport = :$port" 2>/dev/null) ]] || missing+=" $port"
+			else
+				(exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || missing+=" $port"
+			fi
+		done
+		if [[ -z $missing ]]; then
+			say "ok         sshd listening on port(s) $(echo $ports) after ${waited} s"
+			return 0
+		fi
+		if ((waited >= limit)); then
+			die "sshd is not listening on port(s)$missing ${limit} s after the reload; the new config IS in place. From your second root session check: systemctl status sshd; ss -ltn"
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
 }
 
 # conflicts: other sshd config lines that would win over ours (sshd keeps the first value).

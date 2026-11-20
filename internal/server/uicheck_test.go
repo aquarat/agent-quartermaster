@@ -59,9 +59,9 @@ func uiCheck(t *testing.T, cr challengeResp) map[string]any {
 		"enrollment": append(slices.Clone(common), "requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"),
 		"standing":   append(slices.Clone(common), "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"),
 		"grant":      append(slices.Clone(common), "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"),
-		"passkey":    common,
+		"passkey":    append(slices.Clone(common), "nickname", "new_nickname"),
 	}
-	actions := map[string][]string{"request": {"approve", "deny"}, "enrollment": {"approve", "deny"}, "standing": {"revoke"}, "grant": {"revoke"}, "passkey": {"add"}}
+	actions := map[string][]string{"request": {"approve", "deny"}, "enrollment": {"approve", "deny"}, "standing": {"revoke"}, "grant": {"revoke"}, "passkey": {"add", "rename", "remove"}}
 	obj, _ := v["object"].(string)
 	al, ok := allowed[obj]
 	if !ok {

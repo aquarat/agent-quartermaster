@@ -151,4 +151,11 @@ BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 ALTER TABLE standing ADD COLUMN peer_address TEXT NOT NULL DEFAULT '';
 ALTER TABLE enrollments ADD COLUMN poll_token_hash TEXT NOT NULL DEFAULT '';
 `,
+	// 3 (passkey management): every passkey has a nickname. Rows registered without one get
+	// "Passkey 1", "Passkey 2", ... in registration order. AAGUID, transports, backup flags and
+	// sign count already live in credential_json (go-webauthn's credential record).
+	`
+UPDATE passkeys SET name = 'Passkey ' || (SELECT count(*) FROM passkeys p WHERE p.id <= passkeys.id)
+WHERE trim(name) = '';
+`,
 }

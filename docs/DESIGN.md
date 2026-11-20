@@ -50,6 +50,13 @@ SSH `ProxyJump` through aqmasd to cut sessions at expiry; KRL-based revocation.
 - **Owner passkey bootstrap:** the first passkey is registered with a one-time code that
   `aqmasd passkey-enroll-code` prints on .60 (root/aqmas user only). Later passkeys need an
   existing passkey to approve them.
+- **Several passkeys (2026-11-20):** the owner keeps more than one (Bitwarden, iCloud
+  Keychain, later YubiKey Security Key C NFC hardware keys). The UI lists them (nickname,
+  authenticator from the AAGUID, synced vs device-bound, created, last used, "this device")
+  and can add, rename and remove them; rename and remove are passkey-signed actions with their
+  own canonical text (API.md), every change is audited and pushed to ntfy, and the **last
+  passkey can never be removed** (server-enforced): losing them all means a new enroll code on
+  the bastion. Removing a passkey ends its web sessions.
 - **Host identity:** each fleet host enrolls once (`aqmas enroll`): it generates an ECDSA P-256
   client key, aqmasd issues a client certificate (`clientAuth` EKU, `client_cert_days`, default
   730) from its internal CA after the owner approves the enrollment in the web UI (the card shows

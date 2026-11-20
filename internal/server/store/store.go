@@ -779,6 +779,38 @@ func (q *Q) UpdatePasskeyAfterUse(ctx context.Context, credID []byte, oldJSON, n
 	return id, err
 }
 
+// SessionPasskeyID returns the passkey row id a web session signed in with.
+func (q *Q) SessionPasskeyID(ctx context.Context, sessionHash string) (int64, error) {
+	var id int64
+	err := q.q.QueryRowContext(ctx, "SELECT passkey_id FROM web_sessions WHERE hash = ?", sessionHash).Scan(&id)
+	return id, notFound(err)
+}
+
+// RenamePasskey sets a passkey's nickname if it is still oldName (ErrConflict otherwise).
+func (q *Q) RenamePasskey(ctx context.Context, id int64, oldName, newName string) error {
+	return one(q.q.ExecContext(ctx, "UPDATE passkeys SET name = ? WHERE id = ? AND name = ?", newName, id, oldName))
+}
+
+// DeletePasskey removes a passkey and ends every web session that signed in with it. It
+// returns how many sessions ended. ErrNotFound if the passkey does not exist.
+func (q *Q) DeletePasskey(ctx context.Context, id int64) (int64, error) {
+	res, err := q.q.ExecContext(ctx, "DELETE FROM web_sessions WHERE passkey_id = ?", id)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := one(q.q.ExecContext(ctx, "DELETE FROM passkeys WHERE id = ?", id)); err != nil {
+		if errors.Is(err, ErrConflict) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return n, nil
+}
+
 // ---- challenges ----
 
 // Challenge is a stored WebAuthn ceremony (per-action approval, login or registration).

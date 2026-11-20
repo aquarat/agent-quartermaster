@@ -21,6 +21,8 @@ var b64 = base64.RawURLEncoding
 const (
 	FlagUP = 0x01
 	FlagUV = 0x04
+	FlagBE = 0x08
+	FlagBS = 0x10
 	FlagAT = 0x40
 )
 
@@ -32,6 +34,11 @@ type Authenticator struct {
 	UserHandle []byte
 	RPID       string
 	Counter    uint32
+	// AAGUID reported at registration (zero when nil). Synced sets the backup-eligible and
+	// backup-state flags on every ceremony (a synced passkey); otherwise device-bound.
+	AAGUID     []byte
+	Synced     bool
+	Transports []string // reported at registration; default ["internal"]
 }
 
 // New creates an authenticator that claims to run at origin.
@@ -68,10 +75,15 @@ func (a *Authenticator) clientData(typ string, challenge []byte) []byte {
 func (a *Authenticator) authData(flags byte, withCred bool) []byte {
 	h := sha256.Sum256([]byte(a.RPID))
 	out := append([]byte{}, h[:]...)
+	if a.Synced {
+		flags |= FlagBE | FlagBS
+	}
 	out = append(out, flags)
 	out = binary.BigEndian.AppendUint32(out, a.Counter)
 	if withCred {
-		out = append(out, make([]byte, 16)...) // AAGUID zero
+		aaguid := make([]byte, 16)
+		copy(aaguid, a.AAGUID)
+		out = append(out, aaguid...)
 		out = binary.BigEndian.AppendUint16(out, uint16(len(a.CredID)))
 		out = append(out, a.CredID...)
 		x := a.Key.PublicKey.X.FillBytes(make([]byte, 32))
@@ -80,6 +92,13 @@ func (a *Authenticator) authData(flags byte, withCred bool) []byte {
 		out = append(out, cose...)
 	}
 	return out
+}
+
+func (a *Authenticator) transports() []string {
+	if a.Transports == nil {
+		return []string{"internal"}
+	}
+	return a.Transports
 }
 
 // Register answers PublicKeyCredentialCreationOptions JSON with a "none" attestation.
@@ -112,7 +131,7 @@ func (a *Authenticator) Register(optionsJSON []byte) (json.RawMessage, error) {
 		"response": map[string]any{
 			"clientDataJSON":    b64.EncodeToString(a.clientData("webauthn.create", ch)),
 			"attestationObject": b64.EncodeToString(att),
-			"transports":        []string{"internal"},
+			"transports":        a.transports(),
 		},
 		"clientExtensionResults":  map[string]any{"credProps": map[string]any{"rk": true}},
 		"authenticatorAttachment": "platform",
