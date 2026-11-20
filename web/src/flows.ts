@@ -81,7 +81,16 @@ export interface ActionTarget {
 
 export function targetForPending(item: PendingItem): ActionTarget {
   if (item.kind === "enrollment") {
-    return { object: "enrollment", id: item.id, facts: { requesting_host: item.requesting_host } };
+    return {
+      object: "enrollment",
+      id: item.id,
+      facts: {
+        requesting_host: item.requesting_host,
+        kind: "enrollment",
+        key_fingerprint: item.enrollment?.csr_fingerprint,
+        replaces: item.enrollment?.replaces_existing ?? false,
+      },
+    };
   }
   return {
     object: "request",
@@ -175,7 +184,8 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
   if (!commits) throw new FlowError("Not signing: the passkey challenge does not match the action shown.");
 
   const options = decodeRequestOptions(r.public_key);
-  const timeout = typeof options.timeout === "number" && options.timeout > 0 ? options.timeout : CHALLENGE_LIFETIME_MS;
+  const timeout = typeof options.timeout === "number" && options.timeout > 0 ? Math.min(options.timeout, CHALLENGE_LIFETIME_MS) : CHALLENGE_LIFETIME_MS;
+  options.timeout = timeout;
   return {
     target,
     choice,
@@ -184,7 +194,7 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
     canonical,
     description: describe(canonical),
     options,
-    validUntil: now + Math.min(timeout, CHALLENGE_LIFETIME_MS),
+    validUntil: now + timeout,
   };
 }
 
@@ -203,6 +213,17 @@ export async function authorizeAddPasskey(api: Api, auth: Authenticator, p: Prep
 }
 
 // ---- errors in words ----
+
+/** True when an error proves the action was NOT applied: refused before signing, passkey
+ * prompt cancelled, or a 4xx from aqmas. 5xx and network errors may come after the server
+ * applied it (a proxy timing out, a lost response), so they are "unknown". */
+export function nothingChanged(e: unknown): boolean {
+  if (e instanceof FlowError) return true;
+  if (e instanceof ApiError) return e.status >= 400 && e.status < 500;
+  if (e instanceof Error) return ["NotAllowedError", "AbortError", "InvalidStateError", "SecurityError", "WebAuthnFormatError", "Base64UrlError"].includes(e.name);
+  return false;
+}
+
 
 export function explainError(e: unknown): string {
   if (e instanceof ApiError) {

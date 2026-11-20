@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ago, countdown, duration, ttlChoices, visibleText } from "../src/format";
+import { ago, countdown, duration, isPlainName, ttlChoices, visibleText } from "../src/format";
 
 describe("format", () => {
   test("duration", () => {
@@ -37,4 +37,23 @@ describe("format", () => {
     expect(visibleText("<img src=x onerror=alert(1)>")).toBe("<img src=x onerror=alert(1)>");
     expect(visibleText(undefined)).toBe("");
   });
+
+  test("visibleText also covers astral tag characters, variation selectors and mark runs", () => {
+    const tagA = String.fromCodePoint(0xe0041);
+    const vs17 = String.fromCodePoint(0xe0100);
+    expect(visibleText("x" + tagA + "y")).toBe("x⟨U+E0041⟩y");
+    expect(visibleText("x" + vs17)).toBe("x⟨U+E0100⟩");
+    const mark = String.fromCharCode(0x301);
+    expect(visibleText("e" + mark.repeat(30))).toBe("e" + mark + mark + "⟨…⟩");
+    expect(visibleText("café")).toBe("café");
+  });
+
+  test("isPlainName", () => {
+    expect(isPlainName("bastion")).toBe(true);
+    expect(isPlainName("alice")).toBe(true);
+    expect(isPlainName("b" + String.fromCharCode(0x430) + "ckup")).toBe(false);
+    expect(isPlainName("a b")).toBe(false);
+    expect(isPlainName("")).toBe(false);
+  });
 });
+

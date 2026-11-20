@@ -74,7 +74,27 @@ The UI refuses to sign unless **all** hold:
   one), `kind`, `target`, `login_user`; approve: `ttl_seconds` == chosen TTL (absent counts
   as 0), `standing_hours` == chosen (absent = 0); deny/revoke: `standing_hours` absent or 0.
 
-The text shown to the owner is generated from the canonical fields only.
+- **Only known keys**, per object, else the UI refuses to sign (an unknown field such as a
+  forced command must not be signed blind):
+  common `v, action, object, id, nonce, issued_at`; `request` + `requesting_host, kind, target,
+  login_user, key_fingerprint, ttl_seconds, standing_hours`; `enrollment` + `requesting_host,
+  kind, key_fingerprint, replaces, ttl_seconds, standing_hours`; `standing` and `grant` +
+  `requesting_host, kind, target, login_user, ttl_seconds, standing_hours`; `passkey`: common
+  only. Actions: request/enrollment `approve|deny`, standing/grant `revoke`, passkey `add`.
+  Adding a field later means updating `web/src/canonical.ts` in the same change.
+- Enrollments: `kind` is `"enrollment"`, `key_fingerprint` is the CSR public key fingerprint
+  (compared with `enrollment.csr_fingerprint` when the card has it), and **`replaces: true`**
+  must be present when approving revokes an existing host's certificate (compared with
+  `enrollment.replaces_existing`; absent counts as false).
+- Server note: Go's `json.Marshal` of a struct emits keys in declaration order, not sorted.
+  Marshal a `map[string]any` (sorted by Go) or declare the struct fields alphabetically. Keep
+  keys ASCII (Go sorts by bytes, JavaScript by UTF-16 units). Values are strings, integers and
+  booleans only.
+
+The text shown to the owner is generated from the canonical fields only; each value is rendered
+in its own `<bdi>`, invisible/bidi control characters are shown as `⟨U+XXXX⟩`, and a host or
+user name outside `[A-Za-z0-9._-]` gets a warning. The server should restrict host names to
+`[a-z0-9-]` anyway.
 
 ## 6. Challenge request bodies
 
@@ -102,6 +122,14 @@ with absolute paths (`/index-abc.js`), so serve dist at `/`. No inline scripts o
 `default-src 'self'; frame-ancestors 'none'` is enough (the mock also sends `base-uri 'none';
 form-action 'none'; object-src 'none'`). Suggested caching: `index.html` `no-cache`, hashed
 assets immutable.
+
+Cards show **Ref** = the last 6 characters of the item id, upper-cased. Proposal for the CLI:
+print the same ref in its one-line summary, so the owner can match a card to the terminal
+(the agent relays `approve_url`, so the highlighted card alone proves nothing).
+
+The UI forces `userVerification: "required"`, `residentKey: "required"` on creation and
+`userVerification: "required"` on assertions, drops server-sent extensions (creation sends
+only `credProps`), and caps an action challenge's `timeout` at 120 s.
 
 `approve_url` in `RequestCreated`/`EnrollResponse`: the UI scrolls to and highlights an item
 when opened as `https://approvals.example.com/#r=<id>` (fragment, so no server routing).

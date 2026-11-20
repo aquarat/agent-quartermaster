@@ -63,6 +63,11 @@ describe("request options (go-webauthn -> browser)", () => {
     expect(o.userVerification).toBe("required");
   });
 
+  test("drops server-sent extensions", () => {
+    const o = decodeRequestOptions({ publicKey: { ...goAssertion.publicKey, extensions: { appid: "https://evil" } } });
+    expect(o.extensions).toBeUndefined();
+  });
+
   test("discoverable login: empty/absent allowCredentials is left out", () => {
     const o = decodeRequestOptions({ publicKey: { challenge: encode(ch), allowCredentials: [] } });
     expect(o.allowCredentials).toBeUndefined();
@@ -87,6 +92,12 @@ describe("creation options (go-webauthn -> browser)", () => {
     expect(bytesEqual(o.excludeCredentials![0]!.id as ArrayBuffer, credId)).toBe(true);
     expect(o.authenticatorSelection?.residentKey).toBe("required");
     expect(o.attestation).toBe("none");
+  });
+
+  test("forces discoverable credentials and user verification; only credProps extension", () => {
+    const o = decodeCreationOptions({ publicKey: { ...goCreation.publicKey, authenticatorSelection: { userVerification: "discouraged", residentKey: "discouraged", authenticatorAttachment: "platform" }, extensions: { evil: true } } });
+    expect(o.authenticatorSelection).toEqual({ authenticatorAttachment: "platform", residentKey: "required", requireResidentKey: true, userVerification: "required" });
+    expect(o.extensions).toEqual({ credProps: true });
   });
 
   test("requires rp, user and pubKeyCredParams", () => {

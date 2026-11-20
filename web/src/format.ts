@@ -64,12 +64,23 @@ export function ttlChoices(requested: number, max: number): { options: number[];
   return { options, def };
 }
 
-// Invisible and direction-changing characters (bidi overrides/isolates, zero-width, BOM,
-// control characters other than tab/newline). Untrusted text could use them to make what is
-// displayed differ from what it is, so they are shown as visible ⟨U+XXXX⟩ markers instead.
-const INVISIBLE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u00AD\u061C\u115F\u1160\u17B4\u17B5\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF9-\uFFFB]/g;
+// Invisible and direction-changing characters (bidi overrides/isolates, zero-width, BOM, tag
+// characters, variation selectors, private use, control characters other than tab/newline).
+// Untrusted text could use them to make what is displayed differ from what it is, so they are
+// shown as visible <U+XXXX> markers instead. Runs of combining marks (which can draw over
+// neighbouring text) are cut to two.
+const INVISIBLE = /(?![\n\t])[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}\u034F\u115F\u1160\u17B4\u17B5\u180B-\u180F\u3164\uFE00-\uFE0F\uFFA0\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu;
+const MARK_RUN = /(\p{M}{2})\p{M}+/gu;
 
 export function visibleText(s: unknown): string {
   const str = typeof s === "string" ? s : s === undefined || s === null ? "" : String(s);
-  return str.replace(INVISIBLE, (c) => `⟨U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}⟩`);
+  return str
+    .replace(INVISIBLE, (c) => `⟨U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}⟩`)
+    .replace(MARK_RUN, "$1⟨…⟩");
+}
+
+/** Host and user names as aqmas issues them: ASCII letters, digits, dot, dash, underscore.
+ * Anything else (look-alike letters, RTL text) gets a visible warning. */
+export function isPlainName(s: unknown): boolean {
+  return typeof s === "string" && /^[A-Za-z0-9._-]{1,253}$/.test(s);
 }

@@ -41,7 +41,9 @@ export function canonicalJSON(v: unknown): string {
   return enc(v)
     .replace(/</g, "\\u003c")
     .replace(/>/g, "\\u003e")
-    .replace(/&/g, "\\u0026");
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 
 interface ChallengeRec {
@@ -339,7 +341,15 @@ export function startMock(opts: MockOptions = {}) {
       if (!p) throw new HttpError(404, "not_found", `no pending ${object} ${id}`);
       if (action !== "approve" && action !== "deny") throw new HttpError(400, "bad_request", "action must be approve or deny");
       if (object === "enrollment") {
-        return { ...base, requesting_host: p.requesting_host, kind: "enrollment", key_fingerprint: p.enrollment?.csr_fingerprint ?? "", ttl_seconds: 0, standing_hours: 0 };
+        return {
+          ...base,
+          requesting_host: p.requesting_host,
+          kind: "enrollment",
+          key_fingerprint: p.enrollment?.csr_fingerprint ?? "",
+          replaces: p.enrollment?.replaces_existing ? true : undefined,
+          ttl_seconds: 0,
+          standing_hours: 0,
+        };
       }
       let ttl = 0;
       let standing = 0;

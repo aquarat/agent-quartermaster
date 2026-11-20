@@ -83,4 +83,39 @@ describe("canonical", () => {
     expect(d.fields.map(([k]) => k)).toContain("Nonce");
     expect(d.fields.length).toBe(Object.keys(base).length);
   });
+
+  test("refuses fields and actions the page can't describe", () => {
+    expect(() => parseCanonical(canonicalJSON({ ...base, force_command: "rm -rf /" }))).toThrow(/force_command/);
+    expect(() => parseCanonical(canonicalJSON({ ...base, principals: ["root@x"] }))).toThrow(/principals/);
+    expect(() => parseCanonical(canonicalJSON({ ...base, action: "revoke" }))).toThrow(/unknown action/);
+    expect(() => parseCanonical(canonicalJSON({ ...base, object: "user" }))).toThrow(/unknown object/);
+    expect(() => parseCanonical(canonicalJSON({ v: 1, action: "add", object: "passkey", id: "new", target: "x" }))).toThrow(/target/);
+    expect(() => parseCanonical(canonicalJSON({ ...base, target: 5 }))).toThrow(/target/);
+  });
+
+  test("enrollment that replaces a host says so and must match the card", () => {
+    const enr = { v: 1, action: "approve", object: "enrollment", id: "e1", requesting_host: "db-1", kind: "enrollment", key_fingerprint: "SHA256:k", replaces: true, nonce: "n", issued_at: "t" };
+    const c = parseCanonical(canonicalJSON(enr));
+    const d = describeAction(c);
+    expect(d.headline).toBe("Let db-1 join the fleet, replacing the existing host of that name.");
+    expect(d.warnings.join(" ")).toMatch(/loses its client certificate/);
+    expect(mismatches(c, { action: "approve", object: "enrollment", id: "e1", replaces: false })).toHaveLength(1);
+    expect(mismatches(c, { action: "approve", object: "enrollment", id: "e1", replaces: true, key_fingerprint: "SHA256:other" })).toHaveLength(1);
+  });
+
+  test("values are separate parts (rendered isolated) and odd names are flagged", () => {
+    const cyrillicA = String.fromCharCode(0x430);
+    const d = describeAction(parseCanonical(canonicalJSON({ ...base, target: "b" + cyrillicA + "ckup" })));
+    expect(d.headlineParts.filter((p) => typeof p !== "string").map((p) => (p as { value: string }).value)).toEqual(["SSH", "alice", "b" + cyrillicA + "ckup", "30 min", "build-box"]);
+    expect(d.warnings.join(" ")).toMatch(/target host name contains unusual characters/);
+    expect(describeAction(parseCanonical(canonicalJSON(base))).warnings).toEqual([]);
+  });
+
+  test("Go escapes U+2028/2029; both forms parse", () => {
+    const ls = String.fromCharCode(0x2028);
+    const text = canonicalJSON({ ...base, key_fingerprint: "a" + ls + "b" });
+    expect(text).not.toContain(ls);
+    expect(parseCanonical(text).key_fingerprint).toBe("a" + ls + "b");
+  });
 });
+

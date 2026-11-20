@@ -74,14 +74,15 @@ function copyIf(src: Json, dst: Json, keys: string[]): void {
 }
 
 /** go-webauthn assertion options JSON -> PublicKeyCredentialRequestOptions. User verification
- * is always forced to "required" (the server requires the UV flag anyway). */
+ * is always forced to "required" (the server requires the UV flag anyway); extensions are
+ * dropped (M1 uses none, and binary-valued ones would need their own decoding). */
 export function decodeRequestOptions(json: unknown): PublicKeyCredentialRequestOptions {
   const pk = unwrapPublicKey(json);
   const out: Json = {
     challenge: bin(req(pk["challenge"], "publicKey.challenge"), "publicKey.challenge"),
     userVerification: "required",
   };
-  copyIf(pk, out, ["timeout", "rpId", "hints", "extensions"]);
+  copyIf(pk, out, ["timeout", "rpId", "hints"]);
   const allow = descriptors(pk["allowCredentials"], "publicKey.allowCredentials");
   if (allow && allow.length > 0) out["allowCredentials"] = allow;
   return out as unknown as PublicKeyCredentialRequestOptions;
@@ -106,7 +107,11 @@ export function decodeCreationOptions(json: unknown): PublicKeyCredentialCreatio
     challenge: bin(req(pk["challenge"], "publicKey.challenge"), "publicKey.challenge"),
     pubKeyCredParams: params,
   };
-  copyIf(pk, out, ["timeout", "authenticatorSelection", "attestation", "attestationFormats", "hints", "extensions"]);
+  copyIf(pk, out, ["timeout", "attestation", "attestationFormats", "hints"]);
+  // Login is discoverable and every approval needs user verification: insist on both.
+  const sel = isObject(pk["authenticatorSelection"]) ? pk["authenticatorSelection"] : {};
+  out["authenticatorSelection"] = { ...sel, residentKey: "required", requireResidentKey: true, userVerification: "required" };
+  out["extensions"] = { credProps: true };
   const exclude = descriptors(pk["excludeCredentials"], "publicKey.excludeCredentials");
   if (exclude && exclude.length > 0) out["excludeCredentials"] = exclude;
   return out as unknown as PublicKeyCredentialCreationOptions;

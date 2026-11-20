@@ -30,6 +30,10 @@ export interface Attrs {
 }
 
 const BOOL = new Set(["hidden", "disabled", "checked", "open"]);
+const ALLOWED = new Set([
+  "class", "id", "role", "type", "name", "value", "for", "title", "autocomplete", "inputmode",
+  "enterkeyhint", "spellcheck", "tabindex", "dir", "datetime",
+]);
 
 export function append(parent: Node, children: Child[]): void {
   for (const c of children) {
@@ -49,9 +53,7 @@ export function h<K extends keyof HTMLElementTagNameMap>(tag: K, attrs?: Attrs |
       } else if (BOOL.has(k)) {
         if (v) el.setAttribute(k, "");
       } else if (v !== undefined && v !== null) {
-        if (/^on/i.test(k) || k === "style" || k === "src" || k === "href" || k === "srcdoc") {
-          throw new Error(`dom: attribute ${k} not allowed`);
-        }
+        if (!ALLOWED.has(k) && !/^(aria|data)-[a-z-]+$/.test(k)) throw new Error(`dom: attribute ${k} not allowed`);
         el.setAttribute(k, String(v));
       }
     }
