@@ -48,6 +48,7 @@ const (
 	// Bodies checked for data bindings (scope enforcement, worker_bindings config).
 	GuardWorkersBindings = "workers-bindings"
 	GuardPagesBindings   = "pages-bindings"
+	GuardPagesDeploy     = "pages-deploy" // deployment upload: parts and _worker.bundle bindings
 	// Hostname-bearing writes: protected hostnames (and, for R2, configured zones).
 	GuardPagesDomain = "pages-domain"
 	GuardR2Domain    = "r2-domain"

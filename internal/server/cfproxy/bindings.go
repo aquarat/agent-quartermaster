@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net/textproto"
 	"sort"
 	"strings"
 
@@ -17,6 +18,16 @@ import (
 // Pages project may only bind the data the owner listed for it in
 // [[cloudflare.worker_bindings]] (docs/CLOUDFLARE.md 4). Without it, a deploy grant for one
 // script would reach every D1 database, bucket and namespace on the account.
+
+// bindingAliases: fields refused per binding type (alternative names for the data).
+var bindingAliases = map[string][]string{
+	"d1":           {"database_name", "uuid"},
+	"kv_namespace": {"id", "namespace"},
+	"r2_bucket":    {"bucket", "id"},
+	"queue":        {"queue", "id"},
+	"service":      {"script", "script_name"},
+	"hyperdrive":   {"hyperdrive_id"},
+}
 
 // freeBindings carry no account data.
 var freeBindings = map[string]bool{
@@ -39,11 +50,20 @@ func bindingNeed(b map[string]any, script string, cfg *config.Cloudflare) (strin
 		}
 		return kind + ":" + v, nil
 	}
+	// Alias fields Cloudflare might read instead of the one aqmasd checks.
+	for _, alias := range bindingAliases[t] {
+		if _, ok := b[alias]; ok {
+			return "", fmt.Errorf("binding %q: field %q is not accepted (use the canonical field)", asciiOnly(str(b["name"])), alias)
+		}
+	}
 	switch t {
 	case "d1":
 		id := str(b["id"])
-		if id == "" {
-			id = str(b["database_id"])
+		if dbid, ok := b["database_id"]; ok {
+			if id != "" && str(dbid) != id {
+				return "", fmt.Errorf("D1 binding %q has two different database ids", asciiOnly(str(b["name"])))
+			}
+			id = str(dbid)
 		}
 		for _, d := range cfg.D1Databases {
 			if d.ID == id {
@@ -105,10 +125,17 @@ func allowSet(list []string) map[string]bool {
 	return m
 }
 
-// checkWorkerSettings checks a Workers metadata/settings object: bindings[] and
-// tail_consumers[] (a tail consumer receives the script's logs: a service binding).
+// checkWorkerSettings checks a Workers metadata/settings object against the script's
+// worker_bindings entry.
 func checkWorkerSettings(meta map[string]any, script string, cfg *config.Cloudflare) error {
-	allow := allowSet(cfg.AllowedBindings(script, false))
+	return checkBindingsMeta(meta, script, "script", allowSet(cfg.AllowedBindings(script, false)), cfg)
+}
+
+// checkBindingsMeta checks bindings[], tail_consumers[] (a tail consumer receives the
+// script's logs) and Durable Object migrations (a transfer from another script takes over its
+// objects' data) of a Workers metadata/settings object. owner is the script (or Pages project)
+// the upload is for.
+func checkBindingsMeta(meta map[string]any, owner, what string, allow map[string]bool, cfg *config.Cloudflare) error {
 	var missing []string
 	if v, ok := meta["bindings"]; ok && v != nil && arr(v) == nil {
 		return errors.New("bindings must be an array")
@@ -118,7 +145,7 @@ func checkWorkerSettings(meta map[string]any, script string, cfg *config.Cloudfl
 		if m == nil {
 			return errors.New("bindings entries must be objects")
 		}
-		n, err := bindingNeed(m, script, cfg)
+		n, err := bindingNeed(m, owner, cfg)
 		if err != nil {
 			return err
 		}
@@ -131,29 +158,47 @@ func checkWorkerSettings(meta map[string]any, script string, cfg *config.Cloudfl
 		if s == "" {
 			return errors.New("tail consumer without service")
 		}
-		if s != script && !allow["service:"+s] {
+		if s != owner && !allow["service:"+s] {
 			missing = append(missing, "service:"+s)
+		}
+	}
+	if mig, ok := meta["migrations"]; ok && mig != nil {
+		k := map[string][]string{"from_script": nil}
+		collect(mig, k)
+		for _, fs := range k["from_script"] {
+			if fs != owner && !allow["durable_object:"+fs] {
+				missing = append(missing, "durable_object:"+fs)
+			}
+		}
+		if obj(mig) == nil && arr(mig) == nil {
+			return errors.New("migrations must be an object")
 		}
 	}
 	if len(missing) > 0 {
 		missing = uniq(missing)
-		return fmt.Errorf("script %s may not bind %s (not in aqmasd's worker_bindings for it)", script, strings.Join(missing, ", "))
+		return fmt.Errorf("%s %s may not bind %s (not in aqmasd's worker_bindings for it)", what, owner, strings.Join(missing, ", "))
 	}
 	return nil
 }
 
-// workerParts reads the named JSON parts of a multipart body. Every part whose name folds to
-// one of names must be spelled exactly and appear once; transfer encodings are refused.
-func workerParts(ct string, body []byte, names ...string) (map[string]map[string]any, error) {
+// mpPart is one part of a multipart/form-data body as aqmasd parsed it.
+type mpPart struct {
+	name, filename, ctype string
+	body                  []byte
+}
+
+// parseMultipartStrict parses a multipart/form-data body so that aqmasd and Cloudflare cannot
+// disagree about it: every part has exactly one parseable Content-Disposition (form-data, a
+// unique ASCII name, optionally a filename, no other parameters), at most one Content-Type,
+// no other headers; names are unique. The body is re-encoded from these parts
+// (encodeMultipart) before it goes upstream.
+func parseMultipartStrict(ct string, body []byte) ([]mpPart, error) {
 	mt, params, err := mime.ParseMediaType(ct)
 	if err != nil || mt != "multipart/form-data" || params["boundary"] == "" {
 		return nil, errors.New("this upload must be multipart/form-data")
 	}
-	want := map[string]string{}
-	for _, n := range names {
-		want[foldKey(n)] = n
-	}
-	out := map[string]map[string]any{}
+	var out []mpPart
+	seen := map[string]bool{}
 	mr := multipart.NewReader(bytes.NewReader(body), params["boundary"])
 	for {
 		p, err := mr.NextRawPart()
@@ -163,34 +208,149 @@ func workerParts(ct string, body []byte, names ...string) (map[string]map[string
 		if err != nil {
 			return nil, errors.New("malformed multipart body")
 		}
-		name := p.FormName()
-		canon, isWanted := want[foldKey(name)]
-		if !isWanted {
-			continue
+		for k, v := range p.Header {
+			if k != "Content-Disposition" && k != "Content-Type" {
+				return nil, fmt.Errorf("multipart header %q is not accepted", asciiOnly(k))
+			}
+			if len(v) != 1 {
+				return nil, fmt.Errorf("repeated multipart header %s", k)
+			}
 		}
-		if canon != name {
-			return nil, fmt.Errorf("multipart part %q must be named %q", asciiOnly(name), canon)
+		rawCD := p.Header.Get("Content-Disposition")
+		dt, dp, err := mime.ParseMediaType(rawCD)
+		// RFC 2231 forms (name*=, name*0=) are decoded by Go but maybe not by Cloudflare.
+		if err != nil || dt != "form-data" || strings.Contains(rawCD, "*") {
+			return nil, errors.New("unparseable multipart Content-Disposition")
 		}
-		if _, dup := out[name]; dup {
-			return nil, fmt.Errorf("duplicate multipart part %q", name)
+		for k := range dp {
+			if k != "name" && k != "filename" {
+				return nil, fmt.Errorf("multipart Content-Disposition parameter %q is not accepted", asciiOnly(k))
+			}
 		}
-		if p.Header.Get("Content-Transfer-Encoding") != "" || p.Header.Get("Content-Encoding") != "" {
-			return nil, fmt.Errorf("multipart part %q: transfer encodings are not accepted", name)
+		name := dp["name"]
+		if name == "" || !printableASCII(name) || !printableASCII(dp["filename"]) {
+			return nil, errors.New("multipart part names must be printable ASCII")
 		}
-		b, err := io.ReadAll(io.LimitReader(p, 4<<20+1))
-		if err != nil || len(b) > 4<<20 {
-			return nil, fmt.Errorf("multipart part %q unreadable or too large", name)
+		if seen[foldKey(name)] {
+			return nil, fmt.Errorf("duplicate multipart part %q", asciiOnly(name))
 		}
-		if err := checkJSONKeys(b); err != nil {
-			return nil, fmt.Errorf("multipart part %q: %v", name, err)
+		seen[foldKey(name)] = true
+		ctype := p.Header.Get("Content-Type")
+		if ctype != "" {
+			if _, _, err := mime.ParseMediaType(ctype); err != nil {
+				return nil, fmt.Errorf("multipart part %q: bad Content-Type", name)
+			}
 		}
-		v, err := decodeJSON(b)
-		if err != nil || obj(v) == nil {
-			return nil, fmt.Errorf("multipart part %q must be a JSON object", name)
+		b, err := io.ReadAll(p)
+		if err != nil {
+			return nil, errors.New("malformed multipart body")
 		}
-		out[name] = obj(v)
+		out = append(out, mpPart{name: name, filename: dp["filename"], ctype: ctype, body: b})
 	}
 	return out, nil
+}
+
+func printableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// quoteEscaper escapes quoted-string content as mime/multipart's Writer does.
+var quoteEscaper = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
+
+// encodeMultipart writes parts as a fresh multipart/form-data body.
+func encodeMultipart(parts []mpPart) ([]byte, string) {
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	for _, p := range parts {
+		cd := `form-data; name="` + quoteEscaper.Replace(p.name) + `"`
+		if p.filename != "" {
+			cd += `; filename="` + quoteEscaper.Replace(p.filename) + `"`
+		}
+		h := textproto.MIMEHeader{"Content-Disposition": {cd}}
+		if p.ctype != "" {
+			h.Set("Content-Type", p.ctype)
+		}
+		w, _ := mw.CreatePart(h)
+		_, _ = w.Write(p.body)
+	}
+	_ = mw.Close()
+	return b.Bytes(), mw.FormDataContentType()
+}
+
+// jsonParts returns the named parts as JSON objects; a part whose name folds to one of names
+// must be spelled exactly.
+func jsonParts(parts []mpPart, names ...string) (map[string]map[string]any, error) {
+	want := map[string]string{}
+	for _, n := range names {
+		want[foldKey(n)] = n
+	}
+	out := map[string]map[string]any{}
+	for _, p := range parts {
+		canon, ok := want[foldKey(p.name)]
+		if !ok {
+			continue
+		}
+		if canon != p.name {
+			return nil, fmt.Errorf("multipart part %q must be named %q", asciiOnly(p.name), canon)
+		}
+		if err := checkJSONKeys(p.body); err != nil {
+			return nil, fmt.Errorf("multipart part %q: %v", p.name, err)
+		}
+		v, err := decodeJSON(p.body)
+		if err != nil || obj(v) == nil {
+			return nil, fmt.Errorf("multipart part %q must be a JSON object", p.name)
+		}
+		out[p.name] = obj(v)
+	}
+	return out, nil
+}
+
+// pagesDeployParts are the parts `wrangler pages deploy` sends; anything else is refused.
+var pagesDeployParts = map[string]bool{
+	"manifest": true, "branch": true, "commit_message": true, "commit_hash": true, "commit_dirty": true,
+	"_headers": true, "_redirects": true, "_routes.json": true, "_worker.bundle": true,
+	"functions-filepath-routing-config.json": true, "wrangler_config_hash": true, "pages_build_output_dir": true,
+}
+
+// checkPagesDeployment checks a Pages deployment upload: only known parts; the
+// `_worker.bundle` part (itself a Workers multipart upload whose metadata carries the
+// bindings of the project's wrangler config) is parsed, checked against the project's
+// worker_bindings entry and re-encoded. It returns the parts to send.
+func checkPagesDeployment(parts []mpPart, project string, cfg *config.Cloudflare) ([]mpPart, error) {
+	for i, p := range parts {
+		if !pagesDeployParts[p.name] {
+			return nil, fmt.Errorf("Pages deployment part %q is not accepted through aqmas", asciiOnly(p.name))
+		}
+		if p.name != "_worker.bundle" {
+			continue
+		}
+		line, _, _ := bytes.Cut(p.body, []byte("\r\n"))
+		if !bytes.HasPrefix(line, []byte("--")) || len(line) < 3 {
+			return nil, errors.New("_worker.bundle is not a multipart bundle")
+		}
+		inner, err := parseMultipartStrict(mime.FormatMediaType("multipart/form-data", map[string]string{"boundary": string(line[2:])}), p.body)
+		if err != nil {
+			return nil, fmt.Errorf("_worker.bundle: %v", err)
+		}
+		metas, err := jsonParts(inner, "metadata")
+		if err != nil {
+			return nil, fmt.Errorf("_worker.bundle: %v", err)
+		}
+		if len(metas) != 1 {
+			return nil, errors.New("_worker.bundle needs exactly one metadata part")
+		}
+		if err := checkBindingsMeta(metas["metadata"], project, "project", allowSet(cfg.AllowedBindings(project, true)), cfg); err != nil {
+			return nil, err
+		}
+		body, _ := encodeMultipart(inner)
+		parts[i].body = body
+	}
+	return parts, nil
 }
 
 // pagesBindingKeys maps deployment_configs.<env> keys holding data bindings to the kind and

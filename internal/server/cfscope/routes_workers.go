@@ -69,7 +69,7 @@ func pagesRoutes() []rdef {
 		rt("GET", p+"/upload-token"),
 		rt("POST", "/pages/assets/check-missing|upload|upsert-hashes", optU, optJ),
 		rt("GET", p+"/deployments"),
-		rt("POST", p+"/deployments", optU),
+		rt("POST", p+"/deployments", optU, optG(GuardPagesDeploy)),
 		rt("GET|DELETE", p+"/deployments/{id}"),
 		rt("POST", p+"/deployments/{id}/retry|rollback"),
 		rt("GET", p+"/deployments/{id}/history/logs"),
