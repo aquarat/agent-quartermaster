@@ -75,7 +75,7 @@ Next steps (by hand, on the bastion):
   3. systemctl enable --now aqmasd && journalctl -u aqmasd -n 20
      (first start generates /var/lib/aqmas/ca/*: SSH user CA, client CA, server cert)
   4. sudo -u aqmas aqmasd print-ssh-ca       -> /etc/ssh/aqmas_user_ca.pub on fleet hosts (docs/HOSTS.md)
-     sudo -u aqmas aqmasd print-client-ca    -> CA pin for `aqmas enroll --ca-pin`
+     sudo -u aqmas aqmasd tls-fingerprint    -> the pin for `aqmas enroll --ca-pin` (sha256:<hex>)
   5. Tunnel: cloudflared-aqmas.yml.example -> /etc/cloudflared/aqmas.yml, cloudflared-aqmas.service
      -> /etc/systemd/system/, then systemctl enable --now cloudflared-aqmas. Put an Access app
      (owner, OIDC IdP) on approvals.example.com.

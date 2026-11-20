@@ -1,5 +1,9 @@
 # agent-quartermaster (`aqmas`): design, milestone 1
 
+Status (2026-11-20): milestone 1 is built and tested (unit tests, `TestUIFlows`, and
+`test/interop/run.sh` with the real binaries), not deployed. Deployment plan:
+`docs/DEPLOY-M1.md`. Wire contract: `docs/API.md`; host and Forgejo trust: `docs/HOSTS.md`.
+
 Owner's home-lab credential broker. Agents (Claude Code, OpenCode) and the owner ask it for
 short-lived, approved access to other machines and services instead of holding long-lived keys.
 
@@ -35,36 +39,68 @@ SSH `ProxyJump` through aqmasd to cut sessions at expiry; KRL-based revocation.
   a Cloudflare Access app (owner, OIDC IdP). Access is convenience only; the security boundary
   is the **WebAuthn assertion per approval**, whose challenge commits to the exact request
   (see API.md "approval challenge"). No LAN DNS override for that name.
-  Known residual until the Cloudflare account token leaves the agents' hosts (a later milestone
-  moves it into aqmas): root on the token's host could mint a certificate and phish the page. Documented, accepted for M1.
+  **Accepted residual (wider than first thought):** whoever can change the Cloudflare zone
+  (Workers, Snippets, DNS, the tunnel) controls the approval page's code and can show one action
+  while having the owner sign another. A Cloudflare token on another host
+  is readable by the agents' user there, not only by root. Mitigations in M1: the UI renders the
+  confirmation from the signed canonical text only, the CLI prints the same **Ref** as the card,
+  and after every decision aqmasd pushes what it **applied** to ntfy (a mismatch shows on the
+  phone). Real fix (owner's decision): narrow that token, or serve the UI from a zone it cannot
+  edit; a later milestone moves the Cloudflare token into aqmas.
 - **Owner passkey bootstrap:** the first passkey is registered with a one-time code that
   `aqmasd passkey-enroll-code` prints on .60 (root/aqmas user only). Later passkeys need an
   existing passkey to approve them.
 - **Host identity:** each fleet host enrolls once (`aqmas enroll`): it generates an ECDSA P-256
-  or Ed25519 client key, aqmasd issues a client certificate from its own internal client CA
-  after the owner approves the enrollment in the web UI. Agents on that host use it (it lives in
-  the agent user's config dir: an agent already has root on its own host by design). A request
-  is attributed to the host whose certificate authenticated it.
+  client key, aqmasd issues a client certificate (`clientAuth` EKU, `client_cert_days`, default
+  730) from its internal CA after the owner approves the enrollment in the web UI (the card shows
+  the CSR key fingerprint, the host's SSH host key fingerprints and the CLI's Ref). Agents on
+  that host use it (it lives in the agent user's config dir: an agent already has root on its
+  own host by design). A request is attributed to the host whose certificate authenticated it.
+  Re-enrolling an existing name is a high-risk card; approving it revokes the old certificate.
+  `aqmasd revoke-host NAME` on the bastion revokes a host at once.
+- **Agent API trust:** one internal CA signs both the agent-API server certificate
+  (`serverAuth` only, SANs from `tls_sans`) and host client certificates (`clientAuth` only);
+  the TLS handshake carries leaf + CA. Hosts pin the **CA** (`aqmas enroll --ca-pin` with the
+  value of `aqmasd tls-fingerprint`), check the server name and require `serverAuth`, so an
+  enrolled host cannot impersonate aqmasd and the server leaf can be renewed freely. aqmasd
+  refuses its own server certificate as a client identity. Separate CAs would be cleaner and
+  are deferred.
 - **SSH certificates:** aqmasd signs the requester's **ephemeral** Ed25519 public key (generated
   per request by the CLI, private key never leaves the requesting host) with:
   principals `["<login-user>@<target-hostname>"]`; validity `now-1m .. now+ttl`;
-  critical option `source-address` = the requesting host's LAN address(es) as seen in the mTLS
-  connection; extensions `permit-pty`, `permit-port-forwarding` (and `permit-agent-forwarding`
-  off); key id `aqmas:<grant-id>:<requesting-host>:<target>`; serial = grant row id.
-  Target hosts map that principal via `AuthorizedPrincipalsFile` (see HOSTS.md).
-- **TTLs:** default 30 min, max 8 h for SSH. The approver can shorten, never lengthen, and can
-  choose "approve similar requests for N hours" (same requesting host + same target + same
-  login user), which auto-approves matching requests until it expires (re-shown in the UI,
-  revocable). No other auto-approval in M1.
+  critical option `source-address` = the requesting host's address as seen on the mTLS
+  connection, as a `/32`; extensions `permit-pty`, `permit-port-forwarding` only; key id
+  `aqmas:<grant-id>:<requesting-host>:<target>`; serial = grant row id. Target hosts map that
+  principal via `AuthorizedPrincipalsFile` (see HOSTS.md). Forgejo targets carry an explicit
+  `principal` that must contain `@` (a bare name would double as a Unix login on a host that
+  trusts the CA without a principals file), and a short `max_ttl_seconds`, because Forgejo's
+  built-in server probably ignores `source-address`. The CLI checks each certificate against
+  the CA published at `GET /v1/ssh-ca`.
+- **TTLs:** default 30 min, min 1 min, max 8 h for SSH, optionally capped per target. The
+  approver can shorten, never lengthen (a longer choice is refused, not clamped, so the signed
+  text always equals the choice), and can choose "approve similar requests for 1/4/8 hours"
+  (same requesting host + same target + same login user; server cap 24 h), which auto-approves
+  matching requests until it expires (shown in the UI, revocable; revoking a grant also
+  revokes the standing approval created with it). No other auto-approval in M1. Undecided
+  requests expire after 10 min, enrollments after 1 h. A host may have 5 pending requests;
+  enrollments are limited to 20 pending, 3 per address. Ctrl-C in `aqmas` cancels the pending
+  request (`cancelled`).
+- **Certificate reuse:** a cached certificate for (user, host) is reused by any aqmas process
+  of the same Unix user on the requesting host while >= 2 min remain: the owner approves access
+  for a host, not for one agent session (agents on one host are one trust domain anyway).
 - **Revocation in M1:** short TTLs only; revoking a grant in the UI marks it revoked (shown,
   audited) but cannot kill an issued certificate. KRL distribution is a later milestone.
-- **Notifications:** ntfy (publish to a configured topic URL with a random topic name; message
-  carries only "aqmas: <host> wants ssh <user>@<target>" and the link). Configurable; failure to
-  notify never blocks a request.
+- **Notifications:** ntfy (publish to a configured topic URL with a random topic name): "aqmas:
+  <host> wants ssh <user>@<target>" plus the link for new requests and enrollments, and after
+  every decision what was applied, with the Ref. Configurable; failure to notify never blocks a
+  request.
 - **Storage:** SQLite (pure Go driver `modernc.org/sqlite`), WAL, at `/var/lib/aqmas/aqmas.db`;
   CA keys under `/var/lib/aqmas/ca/` (mode 600, user `aqmas`). Audit log table, append-only.
-- **Runtime on .60:** system user `aqmas`, systemd unit with hardening; agent API on
-  `:8443` (TLS, client certs required), web UI on `127.0.0.1:8080` (cloudflared → it).
+- **Runtime on .60:** system user `aqmas`, systemd unit with hardening
+  (`deploy/bastion/aqmasd.service`); agent API on `:8443` (TLS 1.3, client certs required except
+  for enrollment; firewall it to the LAN), web UI on `127.0.0.1:8080` (its own cloudflared
+  connector → it). Web API guards: `X-Aqmas` header, `Origin`/`Sec-Fetch-Site` checks, strict
+  CSP, optional Cloudflare Access JWT validation bound to the owner's identity.
 - **Toolchain:** Go 1.27 (user-local install at `~/.local/toolchains/go`), web UI in TypeScript built with Bun 1.4.4 into
   static files embedded in the aqmasd binary (`go:embed`). Target linux/arm64 (all fleet Linux
   hosts are arm64 except db-1, amd64; build both CLI arches).
@@ -79,8 +115,32 @@ internal/server/...            server packages         (workstream: server)
 cmd/aqmas/                     CLI main               (workstream: client)
 internal/client/...            client packages         (workstream: client)
 web/                           TS sources, Bun build -> web/dist (workstream: web)
-internal/webui/                go:embed of web/dist     (workstream: server; reads web/dist)
-deploy/                        systemd units, install scripts, sshd snippets (workstream: client
-                               for hosts/, server for bastion/)
-docs/                          DESIGN.md, API.md, HOSTS.md
+internal/webui/                go:embed of web/dist (`make build` copies it in)
+deploy/bastion/                aqmasd.service, install.sh, cloudflared unit + config template
+deploy/hosts/                  10-aqmas.conf, install-host-trust.sh, forgejo-ca.md
+test/interop/                  run.sh (real binaries end to end), owner.ts, softauthn.ts
+docs/                          DESIGN.md, API.md, HOSTS.md, DEPLOY-M1.md
 ```
+
+Build and test: `make vet test build` (aqmasd linux/arm64; aqmas linux/arm64 and amd64, with
+`web/dist` embedded), `cd web && bun test`, `AQMAS_WEB_DIR=$PWD/web go test ./internal/server
+-run TestUIFlows` (the UI's own flow code against a real server), `make interop`.
+
+## Open questions
+
+- **Cloudflare zone control** (residual above): narrow that token or move the UI to a
+  zone agents cannot edit. Owner's decision.
+- **Forgejo, untested:** whether the built-in server enforces `source-address` (believed not),
+  and whether the principals UI accepts `alice@forgejo` with
+  `SSH_AUTHORIZED_PRINCIPALS_ALLOW = anything` (alternative: `email` with an address on the
+  owner's account as the principal; it also contains `@`). Test before relying on Forgejo
+  grants.
+- **One CA for server and client certificates** (EKU split today); separate CAs later.
+- **`Requester.ppid`** (client proposal): the parent pid identifies the agent process better
+  than aqmas's own pid. Not added; display only either way.
+- **`aqmas git-ssh`**: a `GIT_SSH_COMMAND` helper mapping `git@build-box:2222` to the
+  `forgejo` target.
+- **Host revocation from the UI:** only `aqmasd revoke-host` on the bastion in M1; a web action
+  needs a new canonical object (`host`, `revoke`) in both the server and `web/src/canonical.ts`.
+- **cloudflared runs as root** (packaged default) with systemd hardening; a dedicated user is
+  possible later. aqmasd has no outbound IP filter (it needs ntfy and the Access certs).

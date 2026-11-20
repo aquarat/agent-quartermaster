@@ -298,7 +298,7 @@ describe("first run (no passkey yet)", () => {
   });
 });
 
-describe("server without the proposed grants field", () => {
+describe("server without the grants field", () => {
   test("state has no grants key; UI treats it as unknown, not empty", async () => {
     const m = startMock({ port: 0, distDir: null, grants: false });
     try {

@@ -12,8 +12,13 @@ In the `environment:` list of the Forgejo service (same style as the existing
 ```yaml
       # aqmas: accept SSH user certificates signed by the aqmas CA (built-in SSH server)
       - GITEA__server__SSH_TRUSTED_USER_CA_KEYS=ssh-ed25519 AAAA...the CA public key... aqmas-user-ca
-      - GITEA__server__SSH_AUTHORIZED_PRINCIPALS_ALLOW=username
+      - GITEA__server__SSH_AUTHORIZED_PRINCIPALS_ALLOW=anything
 ```
+
+`anything` is needed because the principal aqmasd issues for Forgejo contains `@` (see below):
+`username` would only allow registering `alice`, `email` only one of the account's email
+addresses. It only governs what a Forgejo user may *register*; logins still need a
+certificate from the CA carrying a registered principal.
 
 | ini (`[server]`) | env var | meaning in Forgejo 17 |
 |---|---|---|
@@ -29,20 +34,25 @@ so the plain variable is fine.
 ## One manual step: register the principal
 
 Forgejo does **not** map a certificate principal to a user by name. After the settings above,
-the owner adds the principal `alice` (must equal the username, because of
-`ALLOW=username`) under *Settings → SSH / GPG keys → "Manage SSH Certificate Principals" →
+the owner adds the principal `alice@forgejo` (exactly the `principal` of the `forgejo`
+target in aqmasd's config) under *Settings → SSH / GPG keys → "Manage SSH Certificate Principals" →
 "Add principal"* (the section only appears when principals are enabled). Forgejo's own text:
 "These SSH certificate principals are associated with your account and allow full access to
 your repositories." Principals are unique across all users.
 
-aqmasd then issues Forgejo grants with principal `alice`, login user `git`, target
+aqmasd then issues Forgejo grants with principal `alice@forgejo`, login user `git`, target
 `192.0.2.50` port `2222`, and a `known_hosts_line` with the Forgejo built-in server's host
 key (`ssh-keyscan -p 2222 192.0.2.50`). Client side: `aqmas ssh git@forgejo` or, for git,
-`aqmas cert git@forgejo` and a `GIT_SSH_COMMAND` using the printed paths (see
-CONTRACT-NOTES-client.md: a `git` helper is proposed).
+`aqmas cert git@forgejo` and a `GIT_SSH_COMMAND` using the printed paths (a `git-ssh` helper
+is an open question in docs/DESIGN.md).
+
+**Why the principal contains `@`:** a bare principal such as `alice` would also be accepted
+as Unix user `alice` by any sshd that trusts the CA without an `AuthorizedPrincipalsFile`
+(sshd then accepts a certificate whose principals include the login name). aqmasd's config
+validation therefore refuses a Forgejo `principal` (or `forgejo_user`) without `@`.
 
 Because fleet hosts only accept `alice@<host>` (their `AuthorizedPrincipalsFile`) and Forgejo
-only accepts registered principals (`alice`), a host certificate does not open Forgejo and a
+only accepts registered principals (`alice@forgejo`), a host certificate does not open Forgejo and a
 Forgejo certificate does not open a host.
 
 ## What was verified, and how

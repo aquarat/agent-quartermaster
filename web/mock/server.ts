@@ -66,7 +66,7 @@ export interface MockOptions {
   enrollCode?: string;
   /** Seed fake pending items etc. (default true). */
   seed?: boolean;
-  /** Include the proposed `grants` field in /api/ui/state (default true). */
+  /** Include the `grants` field in /api/ui/state (default true; false mimics an older server). */
   grants?: boolean;
   log?: boolean;
 }
