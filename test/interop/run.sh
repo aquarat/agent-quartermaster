@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# Interop test with the real binaries: aqmasd + aqmas + a throwaway unprivileged sshd, with the
+# owner played by test/interop/owner.ts (the web UI's own flow code + a software passkey).
+# Everything runs on 127.0.0.1 in a temp dir; no real fleet host, key or config is touched.
+#
+#   test/interop/run.sh            # builds with `make build` first (needs Go + Bun)
+#   AQMASD=... AQMAS=... test/interop/run.sh   # use prebuilt binaries for this machine
+#   KEEP=1 test/interop/run.sh     # keep the temp dir (logs, config) for inspection
+#
+# Checks: passkey registration + login; enrollment with --ca-pin from `aqmasd tls-fingerprint`;
+# `aqmas ssh testhost -- echo ok` after a passkey approval; the certificate's principal,
+# source-address, key id and validity; reuse of a cached certificate without a new request;
+# `aqmas list` / `list --json` / `status` / `status ID`; Ctrl-C cancels a pending request
+# (exit 130, status cancelled); a denied request exits 3; GET /v1/ssh-ca agrees with
+# `aqmasd print-ssh-ca`.
+set -Eeuo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+export PATH=$HOME/.local/toolchains/go/bin:$PATH
+
+fail() { echo "interop: FAIL: $*" >&2; exit 1; }
+ok() { echo "interop: ok: $*"; }
+
+for b in bun ssh ssh-keygen curl; do command -v $b >/dev/null || fail "$b not found"; done
+SSHD=$(command -v sshd || true)
+[[ -n $SSHD ]] || for p in /usr/sbin/sshd /usr/local/sbin/sshd; do [[ -x $p ]] && SSHD=$p; done
+[[ -n $SSHD ]] || fail "sshd not found"
+
+case $(uname -m) in
+aarch64 | arm64) ARCH=arm64 ;;
+x86_64 | amd64) ARCH=amd64 ;;
+*) fail "unsupported arch $(uname -m)" ;;
+esac
+if [[ -z ${AQMASD:-} || -z ${AQMAS:-} ]]; then
+	make -C "$ROOT" --no-print-directory web build >/dev/null
+	AQMASD=${AQMASD:-$ROOT/bin/aqmasd-linux-$ARCH}
+	AQMAS=${AQMAS:-$ROOT/bin/aqmas-linux-$ARCH}
+	if [[ ! -x $AQMASD ]]; then # make builds aqmasd for arm64 only; build it for this machine
+		AQMASD=$ROOT/bin/aqmasd-interop
+		(cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -o "$AQMASD" ./cmd/aqmasd)
+	fi
+fi
+"$AQMASD" version | grep -q 'web ui: embedded' || fail "aqmasd has no embedded web UI"
+
+T=$(mktemp -d "${TMPDIR:-/tmp}/aqmas-interop.XXXXXX")
+PIDS=()
+cleanup() {
+	for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+	wait 2>/dev/null || true
+	if [[ ${KEEP:-0} == 1 ]]; then echo "interop: kept $T"; else rm -rf "$T"; fi
+}
+trap cleanup EXIT
+trap 'echo "interop: failed at line $LINENO; logs in $T (KEEP=1 keeps them)" >&2; KEEP=1' ERR
+
+free_port() { bun -e 'const s = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } }); console.log(s.port); s.stop(true);'; }
+PA=$(free_port) PW=$(free_port) PS=$(free_port)
+ME=$(id -un)
+ORIGIN=https://aqmas.interop.test
+mkdir -p "$T"/{data,sshd/principals,client/config,client/cache}
+chmod 700 "$T"/data "$T"/client/config "$T"/client/cache
+
+# --- test sshd: host key, principals file (CA key is added once aqmasd made it) ---
+ssh-keygen -q -t ed25519 -N '' -C interop-host -f "$T/sshd/hostkey"
+echo "$ME@testhost" >"$T/sshd/principals/$ME"
+
+cat >"$T/config.toml" <<EOF
+listen_agent    = "127.0.0.1:$PA"
+listen_web      = "127.0.0.1:$PW"
+data_dir        = "$T/data"
+public_base_url = "$ORIGIN"
+owner_name      = "interop-owner"
+tls_sans        = ["127.0.0.1"]
+client_cert_days = 2
+
+[ttl]
+pending_expiry_seconds = 120
+
+[[targets]]
+name     = "testhost"
+address  = "127.0.0.1"
+port     = $PS
+users    = ["$ME"]
+host_key = "$(cut -d' ' -f1-2 "$T/sshd/hostkey.pub")"
+EOF
+
+# --- aqmasd ---
+"$AQMASD" -config "$T/config.toml" serve >"$T/aqmasd.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 50); do curl -fsS "http://127.0.0.1:$PW/api/ui/session" >/dev/null 2>&1 && break; sleep 0.1; done
+curl -fsS "http://127.0.0.1:$PW/api/ui/session" >/dev/null || { cat "$T/aqmasd.log"; fail "aqmasd did not start"; }
+curl -fsS "http://127.0.0.1:$PW/" | grep -q '<script' || fail "web UI index not served"
+ok "aqmasd up (agent :$PA, web :$PW)"
+
+"$AQMASD" -config "$T/config.toml" print-ssh-ca >"$T/sshd/ca.pub"
+PIN=$("$AQMASD" -config "$T/config.toml" tls-fingerprint)
+[[ $PIN =~ ^sha256:[0-9a-f]{64}$ ]] || fail "tls-fingerprint printed '$PIN'"
+
+cat >"$T/sshd/sshd_config" <<EOF
+Port $PS
+ListenAddress 127.0.0.1
+HostKey $T/sshd/hostkey
+PidFile $T/sshd/sshd.pid
+TrustedUserCAKeys $T/sshd/ca.pub
+AuthorizedPrincipalsFile $T/sshd/principals/%u
+AuthorizedKeysFile none
+StrictModes no
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+LogLevel VERBOSE
+EOF
+"$SSHD" -D -e -f "$T/sshd/sshd_config" >"$T/sshd.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PS") 2>/dev/null && break; sleep 0.1; done
+ok "test sshd up on :$PS trusting the aqmas SSH CA"
+
+# --- owner: first passkey via enroll code, sign in ---
+export AQMAS_WEB_DIR=$ROOT/web AQMAS_BASE=http://127.0.0.1:$PW AQMAS_ORIGIN=$ORIGIN OWNER_STATE=$T/owner.json
+owner() { bun "$ROOT/test/interop/owner.ts" "$@"; }
+CODE=$("$AQMASD" -config "$T/config.toml" passkey-enroll-code | head -1)
+owner register "$CODE" >/dev/null
+owner session | grep -q '"authenticated":true' || fail "not signed in after registration"
+owner login >/dev/null
+owner session | grep -q '"authenticated":true' || fail "login with the saved passkey failed"
+ok "passkey registered; login works"
+
+# --- client: enroll with the pinned CA ---
+export AQMAS_CONFIG_DIR=$T/client/config AQMAS_CACHE_DIR=$T/client/cache
+unset CLAUDECODE CLAUDE_SESSION_ID CLAUDE_CODE_SESSION_ID AQMAS_SESSION_ID SSH_AUTH_SOCK || true
+"$AQMAS" enroll --name interop-host --server "https://127.0.0.1:$PA" --ca-pin "$PIN" --note "interop test" \
+	</dev/null >"$T/enroll.out" 2>"$T/enroll.err" &
+EPID=$!
+EID=$(owner wait enrollment interop-host 20)
+owner approve "$EID" >/dev/null 2>"$T/owner-enroll.err"
+wait $EPID || { cat "$T/enroll.err"; fail "aqmas enroll exited $?"; }
+grep -q "Ref ${EID: -6}" "$T/enroll.err" || fail "enroll did not print the card's Ref"
+ok "enrolled interop-host (Ref ${EID: -6})"
+
+# --- ssh: first request, approved for 10 min ---
+"$AQMAS" ssh testhost --ttl 15m --why "interop first login" -- echo ok </dev/null >"$T/ssh1.out" 2>"$T/ssh1.err" &
+SPID=$!
+RID=$(owner wait ssh interop-host 20)
+owner approve "$RID" 600 >/dev/null 2>"$T/owner-ssh1.err"
+grep -q '"ttl_seconds":600' "$T/owner-ssh1.err" || fail "signed canonical lacks the chosen TTL"
+wait $SPID || { cat "$T/ssh1.err" "$T/sshd.log"; fail "aqmas ssh exited $?"; }
+[[ $(cat "$T/ssh1.out") == ok ]] || fail "remote command printed '$(cat "$T/ssh1.out")'"
+grep -q "Accepted certificate ID \"aqmas:" "$T/sshd.log" || fail "sshd did not log a certificate login"
+ok "aqmas ssh testhost -- echo ok printed ok (request $RID)"
+
+CERT=$(readlink -f "$T/client/cache/$ME@testhost/current")/id_ed25519-cert.pub
+[[ -f $CERT ]] || fail "no cached certificate at $CERT"
+ssh-keygen -L -f "$CERT" >"$T/cert.txt"
+grep -A1 'Principals:' "$T/cert.txt" | grep -qx "                $ME@testhost" || { cat "$T/cert.txt"; fail "principal is not $ME@testhost"; }
+grep -q 'source-address 127.0.0.1/32' "$T/cert.txt" || { cat "$T/cert.txt"; fail "source-address is not 127.0.0.1/32"; }
+grep -q 'Key ID: "aqmas:.*:interop-host:testhost"' "$T/cert.txt" || { cat "$T/cert.txt"; fail "unexpected key id"; }
+grep -q 'permit-agent-forwarding' "$T/cert.txt" && fail "certificate permits agent forwarding"
+read -r FROM TO < <(sed -n 's/^ *Valid: from \(.*\) to \(.*\)$/\1 \2/p' "$T/cert.txt")
+SPAN=$(($(date -d "$TO" +%s) - $(date -d "$FROM" +%s)))
+((SPAN >= 600 && SPAN <= 600 + 120)) || fail "certificate validity is ${SPAN}s, want 600 s (+ back-dating)"
+CA_FP=$(ssh-keygen -lf "$T/sshd/ca.pub" | cut -d' ' -f2)
+grep -q "Signing CA: ED25519 $CA_FP\|Signing CA: .* $CA_FP" "$T/cert.txt" || { cat "$T/cert.txt"; fail "not signed by the aqmasd SSH CA"; }
+ok "certificate: principal $ME@testhost, source-address 127.0.0.1/32, valid ${SPAN}s, signed by $CA_FP"
+
+# --- second ssh within the TTL reuses the certificate ---
+N1=$(owner state | grep -o '"action":"request"' | wc -l || true)
+"$AQMAS" ssh testhost --why "interop reuse" -- echo ok2 </dev/null >"$T/ssh2.out" 2>"$T/ssh2.err"
+[[ $(cat "$T/ssh2.out") == ok2 ]] || fail "second ssh printed '$(cat "$T/ssh2.out")'"
+grep -q 'reusing grant' "$T/ssh2.err" || fail "second ssh did not reuse the cached grant"
+grep -q 'request ' "$T/ssh2.err" && fail "second ssh sent a new request"
+N2=$(owner state | grep -o '"action":"request"' | wc -l || true)
+[[ $N1 == "$N2" ]] || fail "server saw a new request ($N1 -> $N2)"
+ok "second aqmas ssh reused the cached certificate (no new request)"
+
+# --- list / status ---
+"$AQMAS" list >"$T/list.out" 2>&1 || fail "aqmas list failed: $(cat "$T/list.out")"
+grep -q testhost "$T/list.out" || fail "aqmas list does not show the grant"
+"$AQMAS" list --json | bun -e 'const j = await Bun.stdin.json(); if (!j.grants?.some((g) => g.target_host === "testhost" && g.status === "approved")) process.exit(1)' ||
+	fail "aqmas list --json lacks the active grant"
+"$AQMAS" status >"$T/status.out" 2>&1 || fail "aqmas status failed"
+grep -q 'host name *interop-host' "$T/status.out" && grep -q "$ME@testhost.*valid" "$T/status.out" || { cat "$T/status.out"; fail "aqmas status output"; }
+"$AQMAS" status "$RID" >"$T/status-id.out" || fail "aqmas status ID failed"
+grep -q 'status *approved' "$T/status-id.out" || { cat "$T/status-id.out"; fail "aqmas status ID"; }
+ok "aqmas list, list --json, status, status ID"
+
+# --- GET /v1/ssh-ca (mTLS) agrees with print-ssh-ca ---
+KEY=$(sed -n 's/^client_key *= *"\(.*\)"/\1/p' "$T/client/config/config.toml")
+CRT=$(sed -n 's/^client_cert *= *"\(.*\)"/\1/p' "$T/client/config/config.toml")
+SCA=$(sed -n 's/^server_ca *= *"\(.*\)"/\1/p' "$T/client/config/config.toml")
+curl -fsS --cacert "$SCA" --cert "$CRT" --key "$KEY" "https://127.0.0.1:$PA/v1/ssh-ca" >"$T/ssh-ca.json"
+grep -qF "$(cut -d' ' -f2 "$T/sshd/ca.pub")" "$T/ssh-ca.json" || fail "/v1/ssh-ca differs from print-ssh-ca"
+curl -sS -o /dev/null -w '%{http_code}' --cacert "$SCA" "https://127.0.0.1:$PA/v1/ssh-ca" 2>/dev/null | grep -qv '^200$' || fail "/v1/ssh-ca answered without a client certificate"
+ok "GET /v1/ssh-ca matches aqmasd print-ssh-ca and needs a client certificate"
+
+# --- Ctrl-C cancels a pending request ---
+"$AQMAS" ssh testhost --fresh --why "interop cancel" -- true </dev/null >/dev/null 2>"$T/cancel.err" &
+CPID=$!
+CID=$(owner wait ssh interop-host 20)
+kill -INT $CPID
+RC=0
+wait $CPID || RC=$?
+((RC == 130)) || { cat "$T/cancel.err"; fail "cancelled aqmas exited $RC, want 130"; }
+grep -q "cancelled request $CID" "$T/cancel.err" || { cat "$T/cancel.err"; fail "cancel message"; }
+"$AQMAS" status "$CID" | grep -q 'status *cancelled' || fail "server status is not cancelled"
+owner state | grep -q "\"id\":\"$CID\"" && fail "cancelled request still pending in the UI"
+ok "Ctrl-C cancelled request $CID (exit 130, status cancelled, gone from the owner's queue)"
+
+# --- a denied request exits 3 ---
+"$AQMAS" ssh testhost --fresh --why "interop deny" -- true </dev/null >/dev/null 2>"$T/deny.err" &
+DPID=$!
+DID=$(owner wait ssh interop-host 20)
+owner deny "$DID" >/dev/null 2>&1
+RC=0
+wait $DPID || RC=$?
+((RC == 3)) || { cat "$T/deny.err"; fail "denied aqmas exited $RC, want 3"; }
+ok "denied request $DID exits 3"
+
+# --- revoking the grant in the UI shows on the agent side ---
+GID=$(owner state | bun -e 'const s = await Bun.stdin.json(); console.log(s.grants.find((g) => g.target_host === "testhost").id)')
+owner revoke-grant "$GID" >/dev/null 2>&1
+"$AQMAS" list --json | bun -e 'const j = await Bun.stdin.json(); if (j.grants?.some((g) => g.id === process.argv[1])) process.exit(1)' "$GID" ||
+	fail "revoked grant still listed as active"
+ok "revoked grant $GID is no longer active"
+
+echo "interop: ALL OK"
