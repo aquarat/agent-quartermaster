@@ -184,4 +184,12 @@ ALTER TABLE standing ADD COLUMN scope        TEXT NOT NULL DEFAULT '';
 ALTER TABLE standing ADD COLUMN scope_params TEXT NOT NULL DEFAULT '';
 ALTER TABLE standing ADD COLUMN mode         TEXT NOT NULL DEFAULT '';
 `,
+	// 5: bind enrollment class and snapshot the SSH destination at request time.
+	`ALTER TABLE enrollments ADD COLUMN class TEXT NOT NULL DEFAULT 'agent' CHECK(class IN ('agent','owner-device'));
+ALTER TABLE requests ADD COLUMN requested_target TEXT NOT NULL DEFAULT '';
+ALTER TABLE requests ADD COLUMN target_address TEXT NOT NULL DEFAULT '';
+ALTER TABLE requests ADD COLUMN target_port INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE requests ADD COLUMN principal TEXT NOT NULL DEFAULT '';
+UPDATE requests SET status='expired', decision_note='request again to confirm destination' WHERE kind='ssh' AND status='pending';
+CREATE INDEX requests_host_time ON requests(host_id, created_at);`,
 }

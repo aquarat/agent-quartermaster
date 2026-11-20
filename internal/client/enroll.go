@@ -29,11 +29,12 @@ var hostNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // EnrollOptions are the flags of `aqmas enroll`.
 type EnrollOptions struct {
-	Name   string
-	Server string // empty: the server in the existing config; required on a first enrollment
-	CAPin  string // "sha256:<hex>"; empty: existing config pin, else TOFU
-	Force  bool   // replace an existing client certificate
-	Note   string
+	OwnerDevice bool
+	Name        string
+	Server      string // empty: the server in the existing config; required on a first enrollment
+	CAPin       string // "sha256:<hex>"; empty: existing config pin, else TOFU
+	Force       bool   // replace an existing client certificate
+	Note        string
 	// SSHHostKeyGlob lists the host's SSH public host keys to report (fingerprints only).
 	SSHHostKeyGlob string
 }
@@ -131,6 +132,9 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 		SSHHostKeyFingerprints: hostKeyFingerprints(o.SSHHostKeyGlob),
 		Note:                   truncateBytes(note, api.MaxReasonBytes),
 	}
+	if o.OwnerDevice {
+		req.Class = api.ClassOwner
+	}
 	created, err := c.Enroll(ctx, req)
 	if err != nil {
 		return err
@@ -140,6 +144,11 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 	}
 	e.logf("enrollment %s (Ref %s) for host %q sent to %s", created.ID, RefCode(created.ID), o.Name, sanitize(server))
 	e.logf("client key: %s (the approval card shows it as \"Client key\")", csrFingerprint(&key.PublicKey))
+	class := req.Class
+	if class == "" {
+		class = api.ClassAgent
+	}
+	e.logf("enrollment class: %s", class)
 	e.logf("server CA pinned: %s", FormatPin(trust.Pin))
 	e.logf("approve at: %s", sanitize(created.ApproveURL))
 	e.logf("waiting for approval (Ctrl-C to stop waiting)...")

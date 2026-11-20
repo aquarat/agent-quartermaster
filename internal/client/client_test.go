@@ -266,6 +266,14 @@ func TestSSHFlowApproved(t *testing.T) {
 	}
 
 	// Reuse: no new request while >= 2 min remain.
+	for _, selector := range []string{f.targetAddress, "db-alias"} {
+		opts := sshOpts("reuse by alias")
+		opts.Target.Host = selector
+		p2, err := e.EnsureSSHCert(context.Background(), opts)
+		if err != nil || !p2.Reused || p2.KeyPath != p.KeyPath || f.created != 1 {
+			t.Fatalf("%s did not reuse canonical grant: %v", selector, err)
+		}
+	}
 	p2, err := e.EnsureSSHCert(context.Background(), sshOpts("again"))
 	if err != nil || !p2.Reused || f.created != 1 {
 		t.Fatalf("reuse: %v reused=%v created=%d", err, p2 != nil && p2.Reused, f.created)
@@ -545,6 +553,9 @@ func TestGrantValidation(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeServer(t)
 			f.mutateGrant = tc.mut
+			endpoint := api.SSHGrant{TargetAddress: f.targetAddress, TargetPort: f.targetPort}
+			tc.mut(&endpoint)
+			f.targetAddress, f.targetPort = endpoint.TargetAddress, endpoint.TargetPort
 			e := newTestEnv(t)
 			enroll(t, f, e)
 			p, err := e.EnsureSSHCert(context.Background(), sshOpts("x"))
@@ -572,6 +583,12 @@ func TestBuildSSHArgvRejectsUnsafe(t *testing.T) {
 	if _, err := BuildSSHArgv(&base, nil); err != nil {
 		t.Fatal(err)
 	}
+	argv, err := BuildMoshArgv(&base, []string{"--predict=never"})
+	ssh, _ := BuildSSHArgv(&base, nil)
+	want := []string{"mosh", "--predict=never", "--ssh=" + strings.Join(ssh[:len(ssh)-2], " "), "--", "alice@192.0.2.61"}
+	if err != nil || !reflect.DeepEqual(argv, want) {
+		t.Fatalf("mosh argv %q: %v", argv, err)
+	}
 	for name, mut := range map[string]func(*Prepared){
 		"user option":  func(p *Prepared) { p.Grant.LoginUser = "-oProxyCommand=x" },
 		"addr option":  func(p *Prepared) { p.Grant.TargetAddress = "-oProxyCommand=x" },
@@ -581,6 +598,9 @@ func TestBuildSSHArgvRejectsUnsafe(t *testing.T) {
 	} {
 		p := base
 		mut(&p)
+		if _, err := BuildMoshArgv(&p, nil); err == nil {
+			t.Errorf("mosh accepted %s", name)
+		}
 		if _, err := BuildSSHArgv(&p, nil); err == nil {
 			t.Errorf("%s accepted", name)
 		}
@@ -588,13 +608,18 @@ func TestBuildSSHArgvRejectsUnsafe(t *testing.T) {
 }
 
 func TestParseTarget(t *testing.T) {
+	for _, arg := range []string{"--local", "--ssh=other", "other-host", "--", "--port=70000"} {
+		if CheckMoshArgs([]string{arg}) == nil {
+			t.Errorf("accepted mosh override %s", arg)
+		}
+	}
 	if tg, err := ParseTarget("db-1", "alice"); err != nil || tg != (Target{"alice", "db-1"}) {
 		t.Errorf("%v %v", tg, err)
 	}
 	if tg, err := ParseTarget("git@forgejo", "alice"); err != nil || tg != (Target{"git", "forgejo"}) {
 		t.Errorf("%v %v", tg, err)
 	}
-	for _, bad := range []string{"-oProxyCommand=x", "a@-b", "a b", "../x", "root@host;id", "Db-1", "a@b@c", ""} {
+	for _, bad := range []string{"-oProxyCommand=x", "a@-b", "a b", "../x", "root@host;id", "db-1:0", "a@b@c", ""} {
 		if _, err := ParseTarget(bad, "alice"); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
@@ -707,13 +732,19 @@ func TestKnownHostsFor(t *testing.T) {
 
 func TestSSHConfigSnippet(t *testing.T) {
 	e := newTestEnv(t)
+	f := newFakeServer(t)
+	enroll(t, f, e)
+	ctx := context.Background()
+	if _, err := e.SSHConfigSnippet(ctx, []string{"db-alias"}, "/x"); err == nil {
+		t.Fatal("accepted alias")
+	}
 	e.Paths.CacheDir = "/run/user/1000/aqmas"
-	s, err := e.SSHConfigSnippet([]string{"db-1", "git@forgejo"}, "/home/alice/.local/bin/aqmas")
+	s, err := e.SSHConfigSnippet(ctx, []string{"db-1", "git@forgejo"}, "/home/alice/.local/bin/aqmas")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`Match originalhost db-1 user alice exec "/home/alice/.local/bin/aqmas cert --quiet --why 'ssh-config: alice@db-1' alice@db-1"`,
+		`Match originalhost db-1 user alice exec "/home/alice/.local/bin/aqmas cert --canonical-only --quiet --why 'ssh-config: alice@db-1' alice@db-1"`,
 		"    CertificateFile /run/user/1000/aqmas/git@forgejo/current/id_ed25519-cert.pub",
 		"    HostKeyAlias aqmas.forgejo",
 	} {
@@ -724,13 +755,13 @@ func TestSSHConfigSnippet(t *testing.T) {
 	if strings.Contains(s, "%r") {
 		t.Error("snippet uses %r")
 	}
-	if _, err := e.SSHConfigSnippet([]string{"$(id)@db-1"}, "/x"); err == nil {
+	if _, err := e.SSHConfigSnippet(ctx, []string{"$(id)@db-1"}, "/x"); err == nil {
 		t.Error("bad user accepted")
 	}
-	if _, err := e.SSHConfigSnippet([]string{"bad host"}, "/x"); err == nil {
+	if _, err := e.SSHConfigSnippet(ctx, []string{"bad host"}, "/x"); err == nil {
 		t.Error("bad host accepted")
 	}
-	if _, err := e.SSHConfigSnippet(nil, "/x"); err == nil {
+	if _, err := e.SSHConfigSnippet(ctx, nil, "/x"); err == nil {
 		t.Error("no hosts accepted")
 	}
 }

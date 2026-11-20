@@ -5,6 +5,9 @@ passkey-approved access (SSH certificates, Cloudflare API grants; GitHub, Forgej
 APIs later) instead of holding long-lived keys. The server (`aqmasd`) runs on a dedicated
 bastion host; hosts enroll with the `aqmas` CLI.
 
+Use the approval queue for daily work, the gear icon for passkeys and enrolled hosts,
+and **Help** for enrollment and command examples using the running server’s URL and CA pin.
+
 - Design and milestone 1 scope: [docs/DESIGN.md](docs/DESIGN.md)
 - API contract: [docs/API.md](docs/API.md), shared types in `internal/api`
 - Host and Forgejo trust: [docs/HOSTS.md](docs/HOSTS.md)

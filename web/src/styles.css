@@ -1190,3 +1190,10 @@ dialog.sheet::backdrop {
   flex-shrink: 0;
   min-width: auto;
 }
+.topbar nav { display:flex; align-items:center; gap:1rem; }
+.topbar a { color:inherit; text-decoration:none; }
+.topbar a:hover { text-decoration:underline; }
+.subpage { max-width:54rem; margin:auto; padding:1rem; }
+.subpage section, .command { margin-block:1rem; }
+.help .card { padding:1rem; }
+.command pre { overflow-x:auto; white-space:pre-wrap; overflow-wrap:anywhere; }

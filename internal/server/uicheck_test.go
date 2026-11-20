@@ -55,8 +55,9 @@ func uiCheck(t *testing.T, cr challengeResp) map[string]any {
 	}
 	common := []string{"v", "action", "object", "id", "nonce", "issued_at"}
 	allowed := map[string][]string{
-		"request":    append(slices.Clone(common), "requesting_host", "kind", "target", "login_user", "key_fingerprint", "ttl_seconds", "standing_hours"),
-		"enrollment": append(slices.Clone(common), "requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"),
+		"request":    append(slices.Clone(common), "principal", "address", "target_address", "target_port", "requesting_host", "kind", "target", "login_user", "key_fingerprint", "ttl_seconds", "standing_hours"),
+		"enrollment": append(slices.Clone(common), "replaces_id", "address", "class", "requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"),
+		"host":       append(slices.Clone(common), "address", "class", "requesting_host"),
 		"standing":   append(slices.Clone(common), "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"),
 		"grant":      append(slices.Clone(common), "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"),
 		"passkey":    append(slices.Clone(common), "nickname", "new_nickname"),
@@ -68,6 +69,7 @@ func uiCheck(t *testing.T, cr challengeResp) map[string]any {
 		"grant":    append(slices.Clone(common), "requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"),
 	}
 	obj, _ := v["object"].(string)
+	actions["host"] = []string{"revoke"}
 	al, ok := allowed[obj]
 	if kind, _ := v["kind"].(string); kind == "cloudflare" {
 		if al, ok = cfAllowed[obj]; !ok {

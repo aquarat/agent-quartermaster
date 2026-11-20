@@ -69,7 +69,11 @@ SSH `ProxyJump` through aqmasd to cut sessions at expiry; KRL-based revocation.
   that host use it (it lives in the agent user's config dir: an agent already has root on its
   own host by design). A request is attributed to the host whose certificate authenticated it.
   Re-enrolling an existing name is a high-risk card; approving it revokes the old certificate.
-  `aqmasd revoke-host NAME` on the bastion revokes a host at once.
+  Revoke a host from Admin with a signed confirmation bound to its immutable enrollment ID,
+  or with `aqmasd revoke-host NAME` on the bastion. Owner-device enrollment signs the class;
+  existing and ordinary hosts remain agent-class. The owner defaults are a 24-hour maximum
+  SSH TTL and 30-day standing window. Existing high-risk and per-target limits still apply.
+  Owner-device sessions are never subject to any future “cut sessions at grant expiry” policy.
 - **Agent API trust:** one internal CA signs both the agent-API server certificate
   (`serverAuth` only, SANs from `tls_sans`) and host client certificates (`clientAuth` only);
   the TLS handshake carries leaf + CA. Hosts pin the **CA** (`aqmas enroll --ca-pin` with the
@@ -171,7 +175,5 @@ Build and test: `make vet test build` (aqmasd linux/arm64; aqmas linux/arm64 and
   than aqmas's own pid. Not added; display only either way.
 - **`aqmas git-ssh`**: a `GIT_SSH_COMMAND` helper mapping `git@<forgejo host>:2222` to the
   `forgejo` target.
-- **Host revocation from the UI:** only `aqmasd revoke-host` on the bastion in M1; a web action
-  needs a new canonical object (`host`, `revoke`) in both the server and `web/src/canonical.ts`.
 - **cloudflared runs as root** (packaged default) with systemd hardening; a dedicated user is
   possible later. aqmasd has no outbound IP filter (it needs ntfy and the Access certs).

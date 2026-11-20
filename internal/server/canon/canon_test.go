@@ -17,7 +17,7 @@ func TestBuildIsCanonical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"action":"approve","id":"01ABC","issued_at":"2026-11-20T11:00:00Z","key_fingerprint":"SHA256:abc<>&","kind":"ssh","login_user":"alice","nonce":"NONCE","object":"request","requesting_host":"build-box","standing_hours":2,"target":"db-1","ttl_seconds":1800,"v":1}`
+	want := `{"action":"approve","address":"","id":"01ABC","issued_at":"2026-11-20T11:00:00Z","key_fingerprint":"SHA256:abc<>&","kind":"ssh","login_user":"alice","nonce":"NONCE","object":"request","principal":"","requesting_host":"build-box","standing_hours":2,"target":"db-1","target_address":"","target_port":0,"ttl_seconds":1800,"v":1}`
 	if got != want {
 		t.Fatalf("canonical\n got %s\nwant %s", got, want)
 	}
@@ -73,7 +73,7 @@ func TestPerObjectKeySets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if en != `{"action":"approve","id":"E","issued_at":"2026-11-20T12:00:00Z","key_fingerprint":"SHA256:x","kind":"enrollment","nonce":"N","object":"enrollment","replaces":true,"requesting_host":"h","standing_hours":0,"ttl_seconds":0,"v":1}` {
+	if en != `{"action":"approve","address":"","class":"","id":"E","issued_at":"2026-11-20T12:00:00Z","key_fingerprint":"SHA256:x","kind":"enrollment","nonce":"N","object":"enrollment","replaces":true,"replaces_id":"","requesting_host":"h","standing_hours":0,"ttl_seconds":0,"v":1}` {
 		t.Fatal(en)
 	}
 	pk, _ := Build(Action{Action: "add", Object: "passkey", ID: "new"}, "N", at)
@@ -188,7 +188,7 @@ func TestCloudflareKeySets(t *testing.T) {
 		}
 	}
 	// The M1 ssh text is unchanged by the new fields.
-	if ssh != `{"action":"deny","id":"R","issued_at":"2026-11-20T12:00:00Z","key_fingerprint":"","kind":"ssh","login_user":"","nonce":"N","object":"request","requesting_host":"","standing_hours":0,"target":"","ttl_seconds":0,"v":1}` {
+	if ssh != `{"action":"deny","address":"","id":"R","issued_at":"2026-11-20T12:00:00Z","key_fingerprint":"","kind":"ssh","login_user":"","nonce":"N","object":"request","principal":"","requesting_host":"","standing_hours":0,"target":"","target_address":"","target_port":0,"ttl_seconds":0,"v":1}` {
 		t.Fatal(ssh)
 	}
 }

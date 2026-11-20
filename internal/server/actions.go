@@ -23,7 +23,7 @@ func secs(n int) time.Duration { return time.Duration(n) * time.Second }
 // Validity starts at approval time (now), not request time.
 func (s *Server) issueGrant(ctx context.Context, q *store.Q, req *store.Request, ttl int, now time.Time) (*store.Grant, error) {
 	tgt, ok := s.cfg.Target(req.TargetHost)
-	if !ok || !tgt.AllowsUser(req.LoginUser) {
+	if !ok || !tgt.AllowsUser(req.LoginUser) || tgt.Principal(req.LoginUser) != req.Principal || tgt.Address != req.TargetAddress || tgt.Port != req.TargetPort || tgt.MaxTTLSeconds > 0 && ttl > tgt.MaxTTLSeconds {
 		return nil, errConflict("target or login user no longer configured")
 	}
 	pub, err := sshcert.ParseEd25519(req.PublicKey)
@@ -89,19 +89,22 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 		if r.Status != api.StatusPending {
 			return a, statusErr(r.Status)
 		}
-		if h, err := q.GetHost(ctx, r.HostID); err != nil || h.RevokedAt != nil {
+		h, err := q.GetHost(ctx, r.HostID)
+		if err != nil || h.RevokedAt != nil {
 			return a, errConflict("the requesting host's identity was revoked")
 		}
 		if r.Kind == api.KindCloudflare {
-			return s.buildCFRequestAction(a, r, in)
+			return s.buildCFRequestAction(a, r, in, s.cfg.TTL.ForHost(h.Class).MaxStandingHours)
 		}
+		a.TargetAddress, a.TargetPort = r.TargetAddress, r.TargetPort
+		a.Address, a.Principal = r.PeerAddress, r.Principal
 		a.RequestingHost, a.Kind, a.Target, a.LoginUser, a.KeyFingerprint = r.HostName, r.Kind, r.TargetHost, r.LoginUser, r.KeyFingerprint
 		if in.Action == canon.ActionApprove {
 			ttl, err := policy.ApproverTTL(r.TTLRequested, in.TTLSeconds, s.cfg.TTL)
 			if err != nil {
 				return a, errBad(err.Error())
 			}
-			if err := policy.StandingHours(in.StandingHours, s.cfg.TTL); err != nil {
+			if err := policy.StandingHours(in.StandingHours, s.cfg.TTL.ForHost(h.Class)); err != nil {
 				return a, errBad(err.Error())
 			}
 			if in.StandingHours > 0 && s.highRisk(r) {
@@ -126,11 +129,26 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 			return a, statusErr(e.Status)
 		}
 		a.RequestingHost, a.Kind, a.KeyFingerprint = e.Hostname, "enrollment", e.KeyFingerprint
-		if _, err := q.ActiveHostByName(ctx, e.Hostname); err == nil {
+		a.Class, a.Address = e.Class, e.PeerAddress
+		if old, err := q.ActiveHostByName(ctx, e.Hostname); err == nil {
+			a.ReplacesID = old.EnrollmentID
 			a.Replaces = true // approving revokes the current host of that name
 		} else if !errors.Is(err, store.ErrNotFound) {
 			return a, err
 		}
+	case canon.ObjectHost:
+		if in.Action != canon.ActionRevoke || in.TTLSeconds != 0 || in.StandingHours != 0 || in.Nickname != "" {
+			return a, errBad("hosts can only be revoked")
+		}
+		e, err := q.GetEnrollment(ctx, id)
+		if err != nil {
+			return a, mapNotFound(err)
+		}
+		h, err := q.ActiveHostByName(ctx, e.Hostname)
+		if err != nil || h.EnrollmentID != id {
+			return a, errConflict("host identity no longer active")
+		}
+		a.RequestingHost, a.Class, a.Address = h.Name, h.Class, e.PeerAddress
 	case canon.ObjectStanding:
 		if in.Action != canon.ActionRevoke || in.TTLSeconds != 0 || in.StandingHours != 0 {
 			return a, errBad("standing approvals can only be revoked")
@@ -218,7 +236,7 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 }
 
 // buildCFRequestAction is buildAction for a pending Cloudflare request (docs/API.md 5.4).
-func (s *Server) buildCFRequestAction(a canon.Action, r *store.Request, in api.ChallengeRequest) (canon.Action, error) {
+func (s *Server) buildCFRequestAction(a canon.Action, r *store.Request, in api.ChallengeRequest, maxStanding int) (canon.Action, error) {
 	a.RequestingHost, a.Kind, a.Scope, a.ScopeParams, a.Mode, a.IPCondition = r.HostName, r.Kind, r.Scope, r.ScopeParams, r.Mode, r.IPCondition
 	if in.Action != canon.ActionApprove {
 		if in.TTLSeconds != 0 || in.StandingHours != 0 {
@@ -234,7 +252,9 @@ func (s *Server) buildCFRequestAction(a canon.Action, r *store.Request, in api.C
 	if err != nil {
 		return a, errBad(err.Error())
 	}
-	if err := policy.StandingHours(in.StandingHours, s.cfg.TTL); err != nil {
+	p := s.cfg.TTL
+	p.MaxStandingHours = maxStanding
+	if err := policy.StandingHours(in.StandingHours, p); err != nil {
 		return a, errBad(err.Error())
 	}
 	if in.StandingHours > 0 && !(res.Scope.StandingAllowed && r.Mode == api.CFModeProxy) {
@@ -246,7 +266,7 @@ func (s *Server) buildCFRequestAction(a canon.Action, r *store.Request, in api.C
 
 // applyCFApprove approves a Cloudflare request inside apply's transaction, re-checking the
 // signed values against the current config and policy.
-func (s *Server) applyCFApprove(ctx context.Context, q *store.Q, r *store.Request, a canon.Action, detail string, now time.Time) error {
+func (s *Server) applyCFApprove(ctx context.Context, q *store.Q, r *store.Request, a canon.Action, detail string, now time.Time, maxStanding int) error {
 	res, err := s.cfCheckApprovable(r)
 	if err != nil {
 		return err
@@ -254,7 +274,7 @@ func (s *Server) applyCFApprove(ctx context.Context, q *store.Q, r *store.Reques
 	if a.TTLSeconds <= 0 || a.TTLSeconds > r.TTLRequested || a.TTLSeconds > res.Scope.MaxTTL || a.TTLSeconds > s.cfg.TTL.MaxSeconds {
 		return errConflict("signed ttl outside policy")
 	}
-	if a.StandingHours > 0 && (a.StandingHours > s.cfg.TTL.MaxStandingHours || !res.Scope.StandingAllowed || r.Mode != api.CFModeProxy) {
+	if a.StandingHours > 0 && (a.StandingHours > maxStanding || !res.Scope.StandingAllowed || r.Mode != api.CFModeProxy) {
 		return errConflict("signed standing_hours outside policy")
 	}
 	if err := q.DecideRequest(ctx, r.ID, api.StatusApproved, "approved by owner", now); err != nil {
@@ -315,12 +335,16 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				return mapNotFound(err)
 			}
 			// The stored request must still be the one that was signed.
-			if r.HostName != a.RequestingHost || r.Kind != a.Kind || r.TargetHost != a.Target ||
+			if r.Kind == api.KindSSH && (r.PeerAddress != a.Address || r.Principal != a.Principal) {
+				return errConflict("SSH request changed")
+			}
+			if r.TargetAddress != a.TargetAddress || r.TargetPort != a.TargetPort || r.HostName != a.RequestingHost || r.Kind != a.Kind || r.TargetHost != a.Target ||
 				r.LoginUser != a.LoginUser || r.KeyFingerprint != a.KeyFingerprint ||
 				r.Scope != a.Scope || r.ScopeParams != a.ScopeParams || r.Mode != a.Mode || r.IPCondition != a.IPCondition {
 				return errConflict("request changed since the challenge was issued")
 			}
-			if h, err := q.GetHost(ctx, r.HostID); err != nil || h.RevokedAt != nil {
+			h, err := q.GetHost(ctx, r.HostID)
+			if err != nil || h.RevokedAt != nil {
 				return errConflict("the requesting host's identity was revoked")
 			}
 			if a.Action == canon.ActionDeny {
@@ -333,10 +357,11 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				}
 				return q.Audit(ctx, now, "owner", "deny", "request:"+r.ID, detail)
 			}
+			p := s.cfg.TTL.ForHost(h.Class)
 			if r.Kind == api.KindCloudflare {
-				return s.applyCFApprove(ctx, q, r, a, detail, now)
+				return s.applyCFApprove(ctx, q, r, a, detail, now, p.MaxStandingHours)
 			}
-			if a.TTLSeconds <= 0 || a.TTLSeconds > r.TTLRequested || a.TTLSeconds > s.cfg.TTL.MaxSeconds {
+			if a.TTLSeconds <= 0 || a.TTLSeconds > r.TTLRequested || a.TTLSeconds > p.MaxSeconds {
 				return errConflict("signed ttl outside policy")
 			}
 			if err := q.DecideRequest(ctx, r.ID, api.StatusApproved, "approved by owner", now); err != nil {
@@ -351,7 +376,7 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				return err
 			}
 			if a.StandingHours > 0 {
-				if a.StandingHours > s.cfg.TTL.MaxStandingHours || s.highRisk(r) {
+				if a.StandingHours > p.MaxStandingHours || s.highRisk(r) {
 					return errConflict("signed standing_hours outside policy")
 				}
 				st := &store.Standing{
@@ -373,7 +398,7 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 			if err != nil {
 				return mapNotFound(err)
 			}
-			if e.Hostname != a.RequestingHost || e.KeyFingerprint != a.KeyFingerprint {
+			if e.Class != a.Class || e.PeerAddress != a.Address || e.Hostname != a.RequestingHost || e.KeyFingerprint != a.KeyFingerprint {
 				return errConflict("enrollment changed since the challenge was issued")
 			}
 			if a.Action == canon.ActionDeny {
@@ -392,7 +417,7 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				return err
 			}
 			// The owner signed whether this replaces an existing host; the state must still agree.
-			if (old != nil) != a.Replaces {
+			if (old != nil) != a.Replaces || old != nil && old.EnrollmentID != a.ReplacesID {
 				return errConflict("host list changed since the challenge was issued; start again")
 			}
 			if old != nil {
@@ -415,7 +440,23 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				CreatedAt: now, NotAfter: now.Add(time.Duration(s.cfg.ClientCertDays) * 24 * time.Hour)}); err != nil {
 				return err
 			}
-			return q.Audit(ctx, now, "owner", "enroll_approve", "enrollment:"+e.ID, "hostname="+e.Hostname+" key="+e.KeyFingerprint+replaced+" "+detail)
+			return q.Audit(ctx, now, "owner", "enroll_approve", "enrollment:"+e.ID, "hostname="+e.Hostname+" class="+e.Class+" key="+e.KeyFingerprint+replaced+" "+detail)
+		case canon.ObjectHost:
+			h, err := q.ActiveHostByName(ctx, a.RequestingHost)
+			if err != nil || h.EnrollmentID != a.ID || h.Class != a.Class {
+				return errConflict("host identity changed")
+			}
+			e, err := q.GetEnrollment(ctx, h.EnrollmentID)
+			if err != nil {
+				return err
+			}
+			if e.PeerAddress != a.Address {
+				return errConflict("host address changed")
+			}
+			if err := q.RevokeHost(ctx, h.ID, now); err != nil {
+				return decideErr(err)
+			}
+			return q.Audit(ctx, now, "owner", "host_revoke", "host:"+h.Name, "enrollment="+a.ID+" "+detail)
 
 		case canon.ObjectStanding:
 			st, err := q.GetStanding(ctx, a.ID)

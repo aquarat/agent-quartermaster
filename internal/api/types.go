@@ -57,6 +57,7 @@ const (
 const EnrollTokenHeader = "X-Aqmas-Enroll-Token"
 
 type EnrollRequest struct {
+	Class                  string   `json:"class,omitempty"`
 	Hostname               string   `json:"hostname"`
 	CSRPEM                 string   `json:"csr_pem"`
 	SSHHostKeyFingerprints []string `json:"ssh_host_key_fingerprints,omitempty"`
@@ -172,13 +173,21 @@ type GrantList struct {
 // ---- Web UI API ----
 
 type PendingSSH struct {
-	TargetHost     string `json:"target_host"`
-	LoginUser      string `json:"login_user"`
-	KeyFingerprint string `json:"key_fingerprint"`
+	Principal       string `json:"principal"`
+	RequestedTarget string `json:"requested_target"`
+	TargetAddress   string `json:"target_address"`
+	TargetPort      int    `json:"target_port"`
+	TargetHost      string `json:"target_host"`
+	LoginUser       string `json:"login_user"`
+	KeyFingerprint  string `json:"key_fingerprint"`
 }
 
 // PendingEnrollment is the enrollment detail of a PendingItem with kind "enrollment".
 type PendingEnrollment struct {
+	ReplacesID             string   `json:"replaces_id"`
+	MaxSSHSeconds          int      `json:"max_ssh_seconds"`
+	MaxStandingHours       int      `json:"max_standing_hours"`
+	Class                  string   `json:"class"`
 	CSRFingerprint         string   `json:"csr_fingerprint"`           // SHA256:<hex> of the CSR's PKIX public key
 	SSHHostKeyFingerprints []string `json:"ssh_host_key_fingerprints"` // as reported by the host (untrusted)
 	ReplacesExisting       bool     `json:"replaces_existing"`         // approving revokes the current host of that name
@@ -188,6 +197,7 @@ type PendingEnrollment struct {
 // web UI. For enrollments requesting_host is the proposed name, reason the enroll note, and
 // ttl_requested/ttl_max are 0.
 type PendingItem struct {
+	MaxStandingHours  int                `json:"max_standing_hours"`
 	ID                string             `json:"id"`
 	Kind              string             `json:"kind"` // ssh, enrollment, cloudflare
 	CreatedAt         time.Time          `json:"created_at"`

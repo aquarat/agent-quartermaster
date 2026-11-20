@@ -9,6 +9,8 @@ import type {
   PendingItem,
   UIState,
 } from "./types";
+import type { HostInfo } from './admin';
+import type { HelpConfig } from './help';
 
 export class ApiError extends Error {
   override name = "ApiError";
@@ -23,6 +25,7 @@ export class ApiError extends Error {
 
 /** Objects with a challenge endpoint, and the verb that applies the signed action. */
 export const OBJECT_PATHS = {
+  host: {path:'hosts', apply:'revoke'},
   request: { path: "requests", apply: "decide" },
   enrollment: { path: "enrollments", apply: "decide" },
   standing: { path: "standing", apply: "revoke" },
@@ -37,6 +40,8 @@ export interface ApiOptions {
 }
 
 export interface Api {
+  hosts(): Promise<HostInfo[]>;
+  help(): Promise<HelpConfig>;
   state(): Promise<UIState>;
   request(id: string): Promise<PendingItem>;
   challenge(object: ObjectKind, id: string, body: ChallengeRequest): Promise<ChallengeResponse>;
@@ -99,6 +104,8 @@ export function createApi(opts: ApiOptions = {}): Api {
   }
 
   return {
+    hosts: () => call('GET','/api/ui/hosts'),
+    help: () => call('GET','/api/ui/help'),
     state: () => call<UIState>("GET", "/api/ui/state"),
     request: (id) => call<PendingItem>("GET", `/api/ui/requests/${seg(id)}`),
     challenge: (object, id, body) => {

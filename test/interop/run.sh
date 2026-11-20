@@ -163,7 +163,7 @@ grep -q "Ref ${EID: -6}" "$T/enroll.err" || fail "enroll did not print the card'
 ok "enrolled interop-host (Ref ${EID: -6})"
 
 # --- ssh: first request, approved for 10 min ---
-"$AQMAS" ssh testhost --ttl 15m --why "interop first login" -- echo ok </dev/null >"$T/ssh1.out" 2>"$T/ssh1.err" &
+"$AQMAS" ssh 127.0.0.1 --ttl 15m --why "interop first login" -- echo ok </dev/null >"$T/ssh1.out" 2>"$T/ssh1.err" &
 SPID=$!
 RID=$(owner wait ssh interop-host 20)
 owner approve "$RID" 600 >/dev/null 2>"$T/owner-ssh1.err"

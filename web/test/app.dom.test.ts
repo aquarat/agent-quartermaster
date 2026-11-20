@@ -63,7 +63,7 @@ describe("App in a DOM", () => {
   test("untrusted fields render as text, inside the fenced box", async () => {
     const card = root.querySelector<HTMLElement>('[data-id="01JDEMO0SSH0ROOT00000002"]')!;
     expect(card).toBeTruthy();
-    expect(root.querySelectorAll("img, script, b, iframe, a").length).toBe(0);
+    expect(card.querySelectorAll("img, script, b, iframe, a").length).toBe(0);
     const agent = card.querySelector(".agent")!;
     expect(agent.textContent).toContain('<img src=x onerror="alert(1)">');
     expect(agent.textContent).toContain("<b>not-bold</b>");
@@ -109,6 +109,7 @@ describe("App in a DOM", () => {
   });
 
   test("passkeys: listed with authenticator, sync state and this-device; hostile nicknames stay text", async () => {
+    expect(root.querySelector('#sec-passkeys')).toBeNull();win.location.hash='#/admin';win.dispatchEvent(new win.Event('hashchange'));
     const evil = '<img src=x onerror="alert(3)">\u202Ekey';
     m.store.passkeys[1]!.info.nickname = evil;
     m.store.audit("owner", "passkey_rename", "passkey:" + m.store.passkeys[1]!.info.id, `to=${JSON.stringify(evil)}`);
@@ -140,6 +141,7 @@ describe("App in a DOM", () => {
   });
 
   test("activity: day groups, kinds as text + icon, filters, untrusted detail as text", async () => {
+    win.location.hash='#/';win.dispatchEvent(new win.Event('hashchange'));await until(()=>!!root.querySelector('#sec-recent'));
     const sec = root.querySelector<HTMLElement>("#sec-recent")!;
     await until(() => !!sec.querySelector(".ev-day"));
     const days = [...sec.querySelectorAll(".ev-day-h")].map((x) => x.textContent);
@@ -184,5 +186,14 @@ describe("App in a DOM", () => {
     expect(jump!.getAttribute("aria-label")).toMatch(/^Show the .+ card$/);
     jump!.click();
     expect(root.querySelectorAll(".focus").length).toBe(1);
+  });
+
+  test('Help uses live values and every displayed command has a copy button', async () => {
+    win.location.hash='#/help';win.dispatchEvent(new win.Event('hashchange'));
+    await until(()=>!!root.querySelector('.command'));
+    expect(root.querySelector('#sec-passkeys')).toBeNull();
+    expect(root.textContent).toContain('https://agent.example.com:8443');
+    expect(root.textContent).toContain('sha256:'+'0'.repeat(64));
+    expect(root.querySelectorAll('pre').length).toBe(root.querySelectorAll('.command button').length);
   });
 });

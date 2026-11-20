@@ -11,6 +11,8 @@ const base = {
   requesting_host: "web-1",
   kind: "ssh",
   target: "db-1",
+  target_address:'192.0.2.10',target_port:22,
+  address:'192.0.2.8',principal:'alice@db-1',
   login_user: "alice",
   key_fingerprint: "SHA256:abc",
   ttl_seconds: 1800,
@@ -76,7 +78,7 @@ describe("canonical", () => {
     const s = describeAction(parseCanonical(canonicalJSON({ ...base, standing_hours: 4 })));
     expect(s.standing).toBe("Also auto-approve the same request (web-1 to alice@db-1) for the next 4 hours.");
     expect(describeAction(parseCanonical(canonicalJSON({ ...base, action: "deny", ttl_seconds: 0 }))).headline).toBe("Deny SSH as alice@db-1, requested by web-1.");
-    expect(describeAction(parseCanonical(canonicalJSON({ v: 1, action: "revoke", object: "grant", id: "g", requesting_host: "laptop-2", kind: "ssh", target: "db-1", login_user: "alice" }))).headline).toBe(
+    expect(describeAction(parseCanonical(canonicalJSON({ v: 1, action: "revoke", object: "grant", id: "g", requesting_host: "laptop-2", kind: "ssh", target: "db-1", login_user: "alice",nonce:'n',issued_at:'t',ttl_seconds:0,standing_hours:0 }))).headline).toBe(
       "Revoke laptop-2's SSH access as alice@db-1.",
     );
     // Every field is listed, including the nonce.
@@ -94,8 +96,9 @@ describe("canonical", () => {
   });
 
   test("enrollment that replaces a host says so and must match the card", () => {
-    const enr = { v: 1, action: "approve", object: "enrollment", id: "e1", requesting_host: "db-1", kind: "enrollment", key_fingerprint: "SHA256:k", replaces: true, nonce: "n", issued_at: "t" };
-    const c = parseCanonical(canonicalJSON(enr));
+    const enr = { v: 1, action: "approve", object: "enrollment", id: "e1", requesting_host: "db-1", kind: "enrollment", key_fingerprint: "SHA256:k", replaces: true, nonce: "n", issued_at: "t",address:'192.0.2.10',class:'agent',ttl_seconds:0,standing_hours:0 };
+    const c = parseCanonical(canonicalJSON({...enr,replaces_id:'old'}));
+    expect(mismatches(c,{action:'approve',object:'enrollment',id:'e1',replaces:true,class:'owner-device'})).toHaveLength(1);
     const d = describeAction(c);
     expect(d.headline).toBe("Let db-1 join the fleet, replacing the existing host of that name.");
     expect(d.warnings.join(" ")).toMatch(/loses its client certificate/);
@@ -118,4 +121,3 @@ describe("canonical", () => {
     expect(parseCanonical(text).key_fingerprint).toBe("a" + ls + "b");
   });
 });
-

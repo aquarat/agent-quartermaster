@@ -41,6 +41,8 @@ func (s *Server) WebHandler() http.Handler {
 	// Session required.
 	api.Handle("POST /api/ui/logout", s.requireSession(s.handleLogout))
 	api.Handle("GET /api/ui/state", s.requireSession(s.handleState))
+	api.Handle("GET /api/ui/hosts", s.requireSession(s.handleHosts))
+	api.Handle("GET /api/ui/help", s.requireSession(s.handleHelp))
 	api.Handle("GET /api/ui/requests/{id}", s.requireSession(s.handleRequestItem))
 	api.Handle("GET /api/ui/enrollments/{id}", s.requireSession(s.handleEnrollmentItem))
 	for _, o := range []struct{ path, object, verb string }{
@@ -48,6 +50,7 @@ func (s *Server) WebHandler() http.Handler {
 		{"enrollments", canon.ObjectEnrollment, "decide"},
 		{"standing", canon.ObjectStanding, "revoke"},
 		{"grants", canon.ObjectGrant, "revoke"},
+		{"hosts", canon.ObjectHost, "revoke"},
 	} {
 		api.Handle("POST /api/ui/"+o.path+"/{id}/challenge", s.requireSession(s.challengeHandler(o.object)))
 		api.Handle("POST /api/ui/"+o.path+"/{id}/"+o.verb, s.requireSession(s.decideHandler(o.object)))
@@ -558,8 +561,17 @@ func (s *Server) highRisk(rq *store.Request) bool {
 }
 
 func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.PendingItem, error) {
+	h, err := s.store.Q().GetHost(ctx, rq.HostID)
+	if err != nil {
+		return nil, err
+	}
+	maxHours := s.cfg.TTL.ForHost(h.Class).MaxStandingHours
 	if rq.Kind == api.KindCloudflare {
-		return s.cfRequestItem(ctx, rq)
+		it, err := s.cfRequestItem(ctx, rq)
+		if err == nil {
+			it.MaxStandingHours = maxHours
+		}
+		return it, err
 	}
 	similar, err := s.store.Q().CountSimilar(ctx, rq.HostID, rq.TargetHost, rq.LoginUser, s.now().Add(-7*24*time.Hour))
 	if err != nil {
@@ -572,7 +584,7 @@ func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.Pendi
 	return &api.PendingItem{
 		ID: rq.ID, Kind: rq.Kind, CreatedAt: rq.CreatedAt, ExpiresAt: rq.ExpiresAt,
 		RequestingHost: rq.HostName, RequestingAddress: rq.PeerAddress, Requester: rq.Requester, Reason: rq.Reason,
-		SSH:          &api.PendingSSH{TargetHost: rq.TargetHost, LoginUser: rq.LoginUser, KeyFingerprint: rq.KeyFingerprint},
+		MaxStandingHours: maxHours, SSH: &api.PendingSSH{Principal: rq.Principal, RequestedTarget: rq.RequestedTarget, TargetAddress: rq.TargetAddress, TargetPort: rq.TargetPort, TargetHost: rq.TargetHost, LoginUser: rq.LoginUser, KeyFingerprint: rq.KeyFingerprint},
 		TTLRequested: rq.TTLRequested, TTLMax: rq.TTLRequested, Risk: risk, SimilarRecent: similar,
 	}, nil
 }
@@ -615,7 +627,10 @@ func (s *Server) cfRequestItem(ctx context.Context, rq *store.Request) (*api.Pen
 
 func (s *Server) enrollmentItem(ctx context.Context, e *store.Enrollment) api.PendingItem {
 	risk, replaces := "normal", false
-	if _, err := s.store.Q().ActiveHostByName(ctx, e.Hostname); err == nil {
+	replacesID := ""
+	p := s.cfg.TTL.ForHost(e.Class)
+	if old, err := s.store.Q().ActiveHostByName(ctx, e.Hostname); err == nil {
+		replacesID = old.EnrollmentID
 		risk, replaces = "high", true // replaces an existing host identity
 	}
 	fps := e.SSHHostKeyFPs
@@ -625,7 +640,7 @@ func (s *Server) enrollmentItem(ctx context.Context, e *store.Enrollment) api.Pe
 	return api.PendingItem{
 		ID: e.ID, Kind: "enrollment", CreatedAt: e.CreatedAt, ExpiresAt: e.ExpiresAt,
 		RequestingHost: e.Hostname, RequestingAddress: e.PeerAddress, Reason: e.Note, Risk: risk,
-		Enrollment: &api.PendingEnrollment{CSRFingerprint: e.KeyFingerprint, SSHHostKeyFingerprints: fps, ReplacesExisting: replaces},
+		Enrollment: &api.PendingEnrollment{MaxSSHSeconds: p.MaxSeconds, MaxStandingHours: p.MaxStandingHours, ReplacesID: replacesID, Class: e.Class, CSRFingerprint: e.KeyFingerprint, SSHHostKeyFingerprints: fps, ReplacesExisting: replaces},
 	}
 }
 
@@ -667,7 +682,9 @@ func (s *Server) notifyDecision(sg canon.Signed) {
 			text = fmt.Sprintf("aqmas: %s cloudflare %s (%s) for %s, ttl %ds, standing %dh", a.Action, cfDesc(a.Scope, a.ScopeParams), a.Mode, a.RequestingHost, a.TTLSeconds, a.StandingHours)
 		}
 	case canon.ObjectEnrollment:
-		text = fmt.Sprintf("aqmas: %s enrollment of %s (replaces existing: %t)", a.Action, a.RequestingHost, a.Replaces)
+		text = fmt.Sprintf("aqmas: %s enrollment of %s (%s, replaces existing: %t)", a.Action, a.RequestingHost, a.Class, a.Replaces)
+	case canon.ObjectHost:
+		text = fmt.Sprintf("aqmas: revoke host %s (%s from %s)", a.RequestingHost, a.Class, a.Address)
 	case canon.ObjectStanding, canon.ObjectGrant:
 		text = fmt.Sprintf("aqmas: %s %s %s@%s for %s", a.Action, a.Object, a.LoginUser, a.Target, a.RequestingHost)
 		if a.Kind == api.KindCloudflare {
@@ -784,6 +801,9 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 		}
 		if object == canon.ObjectGrant {
 			s.afterGrantRevoke(ctx, id) // token grants: delete the child token upstream now
+		}
+		if s.cf.minter != nil && (object == canon.ObjectHost || object == canon.ObjectEnrollment && sg.Replaces && sg.Action.Action == canon.ActionApprove) {
+			s.sweepTokens(ctx)
 		}
 		s.bcast.notify()
 		s.notifyDecision(sg)

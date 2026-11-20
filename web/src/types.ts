@@ -11,6 +11,10 @@ export interface Requester {
 }
 
 export interface PendingSSH {
+  principal: string;
+  target_address: string;
+  target_port: number;
+  requested_target?: string;
   target_host: string;
   login_user: string;
   key_fingerprint: string;
@@ -18,6 +22,10 @@ export interface PendingSSH {
 
 /** Enrollment detail for kind "enrollment" (api.PendingEnrollment). */
 export interface PendingEnrollment {
+  replaces_id: string;
+  max_ssh_seconds: number;
+  max_standing_hours: number;
+  class: "agent" | "owner-device";
   csr_fingerprint?: string;
   ssh_host_key_fingerprints?: string[];
   replaces_existing?: boolean;
@@ -39,6 +47,7 @@ export interface PendingCloudflare {
 }
 
 export interface PendingItem {
+  max_standing_hours?: number;
   id: string;
   kind: string; // "ssh" | "enrollment" | "cloudflare"
   created_at: string;

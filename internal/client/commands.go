@@ -168,17 +168,31 @@ func (e *Env) List(ctx context.Context, asJSON bool) error {
 }
 
 // SSHConfigSnippet renders the opt-in ~/.ssh/config snippet for hosts.
-func (e *Env) SSHConfigSnippet(targets []string, aqmasPath string) (string, error) {
+func (e *Env) SSHConfigSnippet(ctx context.Context, targets []string, aqmasPath string) (string, error) {
 	if len(targets) == 0 {
 		return "", &UsageError{Msg: "usage: aqmas ssh-config [USER@]HOST... (the fleet hosts plain `ssh HOST` should reach through aqmas)"}
 	}
 	var ts []Target
+	_, client, err := e.authedClient()
+	if err != nil {
+		return "", err
+	}
 	for _, a := range targets {
 		t, err := ParseTarget(a, e.User)
 		if err != nil {
 			return "", err
 		}
+		if !hostNameRE.MatchString(t.Host) {
+			return "", &UsageError{Msg: "ssh-config needs a canonical target name"}
+		}
 		ts = append(ts, t)
+		r, err := client.Resolve(ctx, t)
+		if err != nil {
+			return "", err
+		}
+		if r.Name != t.Host {
+			return "", &UsageError{Msg: "ssh-config requires the resolved target name; use " + sanitize(r.Name)}
+		}
 	}
 	cache := e.Paths.CacheDir
 	if !safePathRE.MatchString(cache) || !safePathRE.MatchString(aqmasPath) {
@@ -209,7 +223,7 @@ func (e *Env) SSHConfigSnippet(targets []string, aqmasPath string) (string, erro
 `)
 	for _, t := range ts {
 		d := cache + "/" + t.String() + "/" + currentLink
-		fmt.Fprintf(&b, "\nMatch originalhost %s user %s exec \"%s cert --quiet --why 'ssh-config: %s' %s\"\n", t.Host, t.User, aqmasPath, t, t)
+		fmt.Fprintf(&b, "\nMatch originalhost %s user %s exec \"%s cert --canonical-only --quiet --why 'ssh-config: %s' %s\"\n", t.Host, t.User, aqmasPath, t, t)
 		fmt.Fprintf(&b, "    IdentitiesOnly yes\n    IdentityAgent none\n    PreferredAuthentications publickey\n")
 		fmt.Fprintf(&b, "    IdentityFile %s/%s\n", d, keyFile)
 		fmt.Fprintf(&b, "    CertificateFile %s/%s\n", d, certFile)

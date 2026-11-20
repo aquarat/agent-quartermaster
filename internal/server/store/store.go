@@ -304,6 +304,7 @@ func (q *Q) ExpireStale(ctx context.Context, now time.Time) (int64, error) {
 
 // Enrollment is a host enrollment request.
 type Enrollment struct {
+	Class          string
 	ID             string
 	Hostname       string
 	CSRPEM         string
@@ -321,7 +322,7 @@ type Enrollment struct {
 	PollTokenHash  string // SHA-256 hex of the enroller's poll token
 }
 
-const enrollCols = "id, hostname, csr_pem, key_fingerprint, ssh_host_key_fps, note, peer_address, status, created_at, expires_at, decided_at, decision_note, cert_pem, cert_delivered, poll_token_hash"
+const enrollCols = "id, hostname, csr_pem, key_fingerprint, ssh_host_key_fps, note, peer_address, status, created_at, expires_at, decided_at, decision_note, cert_pem, cert_delivered, poll_token_hash, class"
 
 func scanEnrollment(sc interface{ Scan(...any) error }) (*Enrollment, error) {
 	var e Enrollment
@@ -330,7 +331,7 @@ func scanEnrollment(sc interface{ Scan(...any) error }) (*Enrollment, error) {
 	var decided sql.NullInt64
 	var delivered int
 	if err := sc.Scan(&e.ID, &e.Hostname, &e.CSRPEM, &e.KeyFingerprint, &fps, &e.Note, &e.PeerAddress, &e.Status,
-		&created, &expires, &decided, &e.DecisionNote, &e.CertPEM, &delivered, &e.PollTokenHash); err != nil {
+		&created, &expires, &decided, &e.DecisionNote, &e.CertPEM, &delivered, &e.PollTokenHash, &e.Class); err != nil {
 		return nil, notFound(err)
 	}
 	_ = json.Unmarshal([]byte(fps), &e.SSHHostKeyFPs)
@@ -345,9 +346,12 @@ func (q *Q) InsertEnrollment(ctx context.Context, e *Enrollment) error {
 	if e.SSHHostKeyFPs == nil {
 		fps = []byte("[]")
 	}
-	_, err := q.q.ExecContext(ctx, `INSERT INTO enrollments(id, hostname, csr_pem, key_fingerprint, ssh_host_key_fps, note, peer_address, status, created_at, expires_at, poll_token_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
-		e.ID, e.Hostname, e.CSRPEM, e.KeyFingerprint, string(fps), e.Note, e.PeerAddress, ms(e.CreatedAt), ms(e.ExpiresAt), e.PollTokenHash)
+	if e.Class == "" {
+		e.Class = api.ClassAgent
+	}
+	_, err := q.q.ExecContext(ctx, `INSERT INTO enrollments(id, hostname, csr_pem, key_fingerprint, ssh_host_key_fps, note, peer_address, status, created_at, expires_at, poll_token_hash,class)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?,?)`,
+		e.ID, e.Hostname, e.CSRPEM, e.KeyFingerprint, string(fps), e.Note, e.PeerAddress, ms(e.CreatedAt), ms(e.ExpiresAt), e.PollTokenHash, e.Class)
 	return err
 }
 
@@ -415,6 +419,7 @@ func (q *Q) MarkCertDelivered(ctx context.Context, id string) (bool, error) {
 
 // Host is an enrolled host identity (one client certificate).
 type Host struct {
+	Class        string
 	ID           int64
 	Name         string
 	CertSHA256   string
@@ -424,13 +429,13 @@ type Host struct {
 	RevokedAt    *time.Time
 }
 
-const hostCols = "id, name, cert_sha256, enrollment_id, created_at, not_after, revoked_at"
+const hostCols = "id, name, cert_sha256, enrollment_id, created_at, not_after, revoked_at, (SELECT class FROM enrollments WHERE id=hosts.enrollment_id)"
 
 func scanHost(sc interface{ Scan(...any) error }) (*Host, error) {
 	var h Host
 	var created, notAfter int64
 	var revoked sql.NullInt64
-	if err := sc.Scan(&h.ID, &h.Name, &h.CertSHA256, &h.EnrollmentID, &created, &notAfter, &revoked); err != nil {
+	if err := sc.Scan(&h.ID, &h.Name, &h.CertSHA256, &h.EnrollmentID, &created, &notAfter, &revoked, &h.Class); err != nil {
 		return nil, notFound(err)
 	}
 	h.CreatedAt, h.NotAfter, h.RevokedAt = fromMS(created), fromMS(notAfter), fromNullMS(revoked)
@@ -487,24 +492,27 @@ func (q *Q) RevokeHost(ctx context.Context, id int64, now time.Time) error {
 
 // Request is an access request.
 type Request struct {
-	ID             string
-	HostID         int64
-	HostName       string
-	PeerAddress    string
-	Kind           string
-	TargetHost     string
-	LoginUser      string
-	PublicKey      string
-	KeyFingerprint string
-	Reason         string
-	Requester      api.Requester
-	TTLRequested   int
-	Status         string
-	CreatedAt      time.Time
-	ExpiresAt      time.Time
-	DecidedAt      *time.Time
-	DecisionNote   string
-	StandingID     string
+	Principal                      string
+	RequestedTarget, TargetAddress string
+	TargetPort                     int
+	ID                             string
+	HostID                         int64
+	HostName                       string
+	PeerAddress                    string
+	Kind                           string
+	TargetHost                     string
+	LoginUser                      string
+	PublicKey                      string
+	KeyFingerprint                 string
+	Reason                         string
+	Requester                      api.Requester
+	TTLRequested                   int
+	Status                         string
+	CreatedAt                      time.Time
+	ExpiresAt                      time.Time
+	DecidedAt                      *time.Time
+	DecisionNote                   string
+	StandingID                     string
 	// Kind "cloudflare" (milestone 2): scope, canonical scope_params, mode and, in token mode,
 	// the child token's IP condition (sorted CIDRs joined by ",") as it will be signed.
 	Scope       string
@@ -513,7 +521,7 @@ type Request struct {
 	IPCondition string
 }
 
-const reqCols = "id, host_id, host_name, peer_address, kind, target_host, login_user, public_key, key_fingerprint, reason, requester_json, ttl_requested, status, created_at, expires_at, decided_at, decision_note, standing_id, scope, scope_params, mode, ip_condition"
+const reqCols = "id, host_id, host_name, peer_address, kind, target_host, login_user, public_key, key_fingerprint, reason, requester_json, ttl_requested, status, created_at, expires_at, decided_at, decision_note, standing_id, scope, scope_params, mode, ip_condition, requested_target,target_address,target_port,principal"
 
 func scanRequest(sc interface{ Scan(...any) error }) (*Request, error) {
 	var r Request
@@ -523,7 +531,7 @@ func scanRequest(sc interface{ Scan(...any) error }) (*Request, error) {
 	var standing sql.NullString
 	if err := sc.Scan(&r.ID, &r.HostID, &r.HostName, &r.PeerAddress, &r.Kind, &r.TargetHost, &r.LoginUser, &r.PublicKey,
 		&r.KeyFingerprint, &r.Reason, &reqJSON, &r.TTLRequested, &r.Status, &created, &expires, &decided, &r.DecisionNote, &standing,
-		&r.Scope, &r.ScopeParams, &r.Mode, &r.IPCondition); err != nil {
+		&r.Scope, &r.ScopeParams, &r.Mode, &r.IPCondition, &r.RequestedTarget, &r.TargetAddress, &r.TargetPort, &r.Principal); err != nil {
 		return nil, notFound(err)
 	}
 	_ = json.Unmarshal([]byte(reqJSON), &r.Requester)
@@ -539,10 +547,10 @@ func (q *Q) InsertRequest(ctx context.Context, r *Request) error {
 	if r.StandingID != "" {
 		standing = r.StandingID
 	}
-	_, err := q.q.ExecContext(ctx, `INSERT INTO requests(`+reqCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err := q.q.ExecContext(ctx, `INSERT INTO requests(`+reqCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.HostID, r.HostName, r.PeerAddress, r.Kind, r.TargetHost, r.LoginUser, r.PublicKey, r.KeyFingerprint, r.Reason,
 		string(rj), r.TTLRequested, r.Status, ms(r.CreatedAt), ms(r.ExpiresAt), nullMS(r.DecidedAt), r.DecisionNote, standing,
-		r.Scope, r.ScopeParams, r.Mode, r.IPCondition)
+		r.Scope, r.ScopeParams, r.Mode, r.IPCondition, r.RequestedTarget, r.TargetAddress, r.TargetPort, r.Principal)
 	return err
 }
 

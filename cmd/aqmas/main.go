@@ -24,7 +24,7 @@ import (
 const usage = `aqmas: request short-lived, owner-approved access through agent-quartermaster
 
 Usage:
-  aqmas enroll --name HOST --server URL [--ca-pin sha256:HEX] [--force]
+  aqmas enroll --name HOST --server URL [--ca-pin sha256:HEX] [--force] [--owner-device]
       Enroll this host once: creates a client key, waits for the owner to approve.
       --server (the bastion's agent API, https://HOST:8443) is required the first time.
       Without --ca-pin, the server CA is trusted only after you confirm its
@@ -32,6 +32,8 @@ Usage:
   aqmas ssh [USER@]HOST [--ttl 30m] [--why "..."] [--fresh] [-- COMMAND...]
       Log in with a short-lived certificate (cached and reused while >= 2 min valid).
       --why is required when stdin is not a terminal.
+  aqmas mosh [USER@]HOST[:PORT] [--ttl 30m] [--why "..."] [-- MOSH-OPTIONS...]
+      Open mosh with the same certificate and host-key policy as ssh.
   aqmas cert [USER@]HOST [--ttl 30m] [--why "..."] [--fresh] [--quiet]
       Like ssh, but only make sure a certificate is cached and print its paths.
   aqmas status [REQUEST-ID]   enrollment + cached certificates, or one request
@@ -72,7 +74,7 @@ func run(args []string) int {
 		fmt.Printf("aqmas %s (%s %s/%s)\n", client.Version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		return 0
 	case "enroll":
-		f, err := parseFlags(rest, map[string]bool{"name": true, "server": true, "ca-pin": true, "note": true, "force": false})
+		f, err := parseFlags(rest, map[string]bool{"name": true, "server": true, "ca-pin": true, "note": true, "force": false, "owner-device": false})
 		if err != nil {
 			return fail(err)
 		}
@@ -84,12 +86,13 @@ func run(args []string) int {
 		}
 		return fail(env.Enroll(ctx, client.EnrollOptions{
 			Name: f.str["name"], Server: f.str["server"], CAPin: f.str["ca-pin"],
-			Note: f.str["note"], Force: f.bool["force"],
+			Note: f.str["note"], Force: f.bool["force"], OwnerDevice: f.bool["owner-device"],
 		}))
-	case "ssh", "cert":
+	case "ssh", "cert", "mosh":
 		spec := map[string]bool{"ttl": true, "why": true, "fresh": false}
 		if cmd == "cert" {
 			spec["quiet"] = false
+			spec["canonical-only"] = false // ssh-config reads a fixed cache path
 		}
 		f, err := parseFlags(rest, spec)
 		if err != nil {
@@ -111,7 +114,12 @@ func run(args []string) int {
 				return fail(&client.UsageError{Msg: "--ttl: " + err.Error()})
 			}
 		}
-		p, err := env.EnsureSSHCert(ctx, client.SSHOptions{Target: target, TTL: ttl, Why: f.str["why"], Fresh: f.bool["fresh"]})
+		if cmd == "mosh" {
+			if err := client.CheckMoshArgs(f.cmd); err != nil {
+				return fail(err)
+			}
+		}
+		p, err := env.EnsureSSHCert(ctx, client.SSHOptions{Target: target, TTL: ttl, Why: f.str["why"], Fresh: f.bool["fresh"], CanonicalOnly: f.bool["canonical-only"]})
 		if err != nil {
 			return fail(err)
 		}
@@ -123,11 +131,15 @@ func run(args []string) int {
 			}
 			return 0
 		}
-		argv, err := client.BuildSSHArgv(p, f.cmd)
+		build := client.BuildSSHArgv
+		if cmd == "mosh" {
+			build = client.BuildMoshArgv
+		}
+		argv, err := build(p, f.cmd)
 		if err != nil {
 			return fail(err)
 		}
-		sshPath, err := exec.LookPath("ssh")
+		sshPath, err := exec.LookPath(argv[0])
 		if err != nil {
 			return fail(err)
 		}
@@ -161,7 +173,7 @@ func run(args []string) int {
 		} else if abs, err := filepath.EvalSymlinks(self); err == nil {
 			self = abs
 		}
-		s, err := env.SSHConfigSnippet(rest, self)
+		s, err := env.SSHConfigSnippet(ctx, rest, self)
 		if err != nil {
 			return fail(err)
 		}

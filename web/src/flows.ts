@@ -115,7 +115,9 @@ export function targetForPending(item: PendingItem): ActionTarget {
       facts: {
         requesting_host: item.requesting_host,
         kind: "enrollment",
-        key_fingerprint: item.enrollment?.csr_fingerprint,
+        class:item.enrollment?.class ?? '', address:item.requesting_address ?? '',
+        replaces_id:item.enrollment?.replaces_id ?? '',
+        key_fingerprint: item.enrollment?.csr_fingerprint ?? '',
         replaces: item.enrollment?.replaces_existing ?? false,
       },
     };
@@ -139,9 +141,10 @@ export function targetForPending(item: PendingItem): ActionTarget {
     facts: {
       requesting_host: item.requesting_host,
       kind: item.kind,
-      target: item.ssh?.target_host,
-      login_user: item.ssh?.login_user,
-      key_fingerprint: item.ssh?.key_fingerprint,
+      target: item.ssh?.target_host ?? '', target_address:item.ssh?.target_address ?? '', target_port:item.ssh?.target_port ?? 0,
+      principal:item.ssh?.principal ?? '',address:item.requesting_address ?? '',
+      login_user: item.ssh?.login_user ?? '',
+      key_fingerprint: item.ssh?.key_fingerprint ?? '',
     },
   };
 }

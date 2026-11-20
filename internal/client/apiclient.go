@@ -263,6 +263,12 @@ func (c *APIClient) CancelRequest(ctx context.Context, id string) (*api.RequestS
 }
 
 // SSHCA fetches the SSH user CA public key (GET /v1/ssh-ca).
+func (c *APIClient) Resolve(ctx context.Context, t Target) (api.ResolvedTarget, error) {
+	var out api.ResolvedTarget
+	err := c.do(ctx, "GET", "/v1/ssh-target?"+url.Values{"target": {t.Host}, "user": {t.User}}.Encode(), nil, &out)
+	return out, err
+}
+
 func (c *APIClient) SSHCA(ctx context.Context) (*api.SSHCA, error) {
 	var out api.SSHCA
 	if err := c.do(ctx, http.MethodGet, "/v1/ssh-ca", nil, &out); err != nil {

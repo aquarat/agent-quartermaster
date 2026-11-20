@@ -81,6 +81,7 @@ Details and the source reading behind them: `deploy/hosts/forgejo-ca.md`. In sho
 [[targets]]
 name = "db-1"            # [a-z0-9-]; used in principals and in `aqmas ssh db-1`
 address = "192.0.2.61"
+aliases = ["db.example.com"]  # optional; may not shadow another selector
 port = 22
 users = ["alice"]
 host_key = "ssh-ed25519 AAAA..."   # pinned, sent as known_hosts_line in grants
@@ -97,6 +98,12 @@ host_key = "ssh-ed25519 AAAA..."   # the built-in server's key (ssh-keyscan -p 2
 
 Other per-target keys: `high_risk = true` marks the card `high`. `forgejo_user` is a
 deprecated alias of `principal` and is subject to the same `@` rule.
+
+`aqmas ssh alice@192.0.2.61` and `aqmas mosh alice@db.example.com` share the
+`alice@db-1` cache. For services sharing an address, use `user@address:port` or the
+canonical target name. Names and aliases are matched case-insensitively without DNS lookups.
+Use canonical names for `ssh-config`. Mosh needs the client locally, mosh-server on the
+destination, and a reachable UDP port. The SSH certificate authenticates its bootstrap.
 
 Using a Forgejo grant from git: `aqmas cert git@forgejo --why "..."` prints the key,
 certificate and known_hosts paths; use them in `GIT_SSH_COMMAND` with the same options

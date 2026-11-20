@@ -22,6 +22,8 @@ import {
 import { duration, hours, isPlainName, kindLabel } from "./format";
 
 export interface Canonical {
+  principal?: string; replaces_id?: string;
+  class?: string; address?: string; target_address?: string; target_port?: number;
   v: number;
   action: string;
   object: string;
@@ -50,8 +52,9 @@ export interface Canonical {
 // knows how to describe, so an unknown field (say, a forced command) must not be signed blind.
 const COMMON_KEYS = ["v", "action", "object", "id", "nonce", "issued_at"];
 const ALLOWED_KEYS: Record<string, string[]> = {
-  request: [...COMMON_KEYS, "requesting_host", "kind", "target", "login_user", "key_fingerprint", "ttl_seconds", "standing_hours"],
-  enrollment: [...COMMON_KEYS, "requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"],
+  host: [...COMMON_KEYS, 'address','class','requesting_host'],
+  request: [...COMMON_KEYS,'address','principal', 'target_address','target_port',"requesting_host", "kind", "target", "login_user", "key_fingerprint", "ttl_seconds", "standing_hours"],
+  enrollment: [...COMMON_KEYS,'replaces_id','address','class', "requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"],
   standing: [...COMMON_KEYS, "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"],
   grant: [...COMMON_KEYS, "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"],
   passkey: [...COMMON_KEYS, "nickname", "new_nickname"],
@@ -64,6 +67,7 @@ const CF_KEYS: Record<string, string[]> = {
 };
 const STRING_KEYS = ["requesting_host", "kind", "target", "login_user", "key_fingerprint", "nickname", "new_nickname", "scope", "scope_params", "mode", "ip_condition", "nonce", "issued_at"] as const;
 const ALLOWED_ACTIONS: Record<string, string[]> = {
+  host:['revoke'],
   request: ["approve", "deny"],
   enrollment: ["approve", "deny"],
   standing: ["revoke"],
@@ -115,7 +119,7 @@ export function parseCanonical(text: string): Canonical {
   for (const k of ["action", "object", "id"] as const) {
     if (typeof c[k] !== "string" || c[k] === "") throw new CanonicalError(`canonical action has no ${k}`);
   }
-  if (!ALLOWED_KEYS[c.object]) throw new CanonicalError(`unknown object ${JSON.stringify(c.object)}`);
+  if (!Object.hasOwn(ALLOWED_KEYS,c.object)) throw new CanonicalError(`unknown object ${JSON.stringify(c.object)}`);
   // The key set depends on (object, kind): a Cloudflare request carries scope/params/mode
   // instead of target/user/key.
   const cf = c.kind === "cloudflare" && CF_KEYS[c.object] !== undefined;
@@ -123,12 +127,18 @@ export function parseCanonical(text: string): Canonical {
   if (!ALLOWED_ACTIONS[c.object]!.includes(c.action)) throw new CanonicalError(`unknown action ${JSON.stringify(c.action)} for ${c.object}`);
   const extra = Object.keys(c).filter((k) => !allowed.includes(k));
   if (extra.length) throw new CanonicalError(`canonical action has fields this page can't show (${extra.join(", ")})`);
+  const missing = allowed.filter(k => !Object.hasOwn(c,k));
+  if (missing.length) throw new CanonicalError(`canonical action lacks ${missing.join(', ')}`);
+  if (c.object==='request' && !cf && (typeof c.principal!=='string'||!c.principal||typeof c.address!=='string'||!c.address)) throw new CanonicalError('invalid SSH source or principal');
+  if (c.object==='enrollment' && (typeof c.replaces_id!=='string'||Boolean(c.replaces_id)!==c.replaces||c.ttl_seconds!==0||c.standing_hours!==0)) throw new CanonicalError('inconsistent enrollment');
+  if ((c.object==='host'||c.object==='enrollment') && (typeof c.address!=='string'||!c.address||!['owner-device','agent'].includes(c.class ?? ''))) throw new CanonicalError('invalid host address or class');
+  if(c.object==='request' && !cf && (!c.target_address || typeof c.target_address!=='string'|| !Number.isInteger(c.target_port)||c.target_port!<1||c.target_port!>65535)) throw new CanonicalError('invalid SSH destination');
   for (const k of STRING_KEYS) {
     if (c[k] !== undefined && typeof c[k] !== "string") throw new CanonicalError(`canonical ${k} is not a string`);
   }
   if (c.replaces !== undefined && typeof c.replaces !== "boolean") throw new CanonicalError("canonical replaces is not a boolean");
   for (const k of ["ttl_seconds", "standing_hours"] as const) {
-    if (c[k] !== undefined && c[k] !== null && (typeof c[k] !== "number" || !Number.isInteger(c[k]) || c[k]! < 0)) {
+    if (c[k] !== undefined && (typeof c[k] !== "number" || !Number.isSafeInteger(c[k]) || c[k]! < 0)) {
       throw new CanonicalError(`canonical ${k} is not a whole number`);
     }
   }
@@ -197,6 +207,8 @@ export async function challengeCommitsTo(canonical: string, challengeB64url: str
 
 /** What the owner chose plus the facts on the card. Unset fields are not checked. */
 export interface Expectation {
+  principal?: string; replaces_id?: string;
+  class?: string; address?: string; target_address?: string; target_port?: number;
   action: string;
   object: string;
   id: string;
@@ -231,6 +243,7 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
   cmp("requesting_host", c.requesting_host, e.requesting_host);
   cmp("kind", c.kind, e.kind);
   cmp("target", c.target, e.target);
+  for(const k of ['replaces_id','principal','address','class','target_address','target_port'] as const) cmp(k,c[k],e[k]);
   cmp("login_user", c.login_user, e.login_user);
   cmp("key_fingerprint", c.key_fingerprint, e.key_fingerprint);
   cmp("scope", c.scope, e.scope);
@@ -279,6 +292,7 @@ export interface Description {
 }
 
 const FIELD_LABELS: Record<string, string> = {
+  address:'Source address',class:'Host class',target_address:'Target address',target_port:'Target port',principal:'Certificate principal',replaces_id:'Enrollment replaced',
   action: "Action",
   object: "Applies to",
   kind: "Kind",
@@ -361,6 +375,10 @@ export function describe(c: Canonical): Description {
       headline = c.replaces ? t`Let ${host} join the fleet, replacing the existing host of that name.` : t`Let ${host} join the fleet as a trusted host.`;
       if (c.replaces) warnings.push(`The current ${host} loses its client certificate. Only approve if you re-installed or re-keyed that host yourself.`);
       break;
+    case 'host:revoke':
+      headline=t`Revoke host ${host} (${c.class!}, enrolled from ${c.address!}, enrollment ${c.id}).`;
+      warnings.push('Pending requests expire; standing approvals and proxy grants stop. Child tokens may work until deleted upstream. Issued SSH certificates remain valid until expiry. Existing SSH and mosh sessions are not disconnected.');
+      break;
     case "enrollment:deny":
       headline = t`Refuse ${host} joining the fleet.`;
       break;
@@ -401,6 +419,7 @@ export function describe(c: Canonical): Description {
     standing: standing ? partsText(standing) : undefined,
     standingParts: standing,
     warnings,
+    details: c.object==='enrollment' ? [t`Class: ${c.class!}. Enrolling from ${c.address!}.`, ...(c.replaces ? [t`Replaces enrollment ${c.replaces_id!}.`] : [])] : c.object==='request' ? [t`Resolved address: ${c.target_address!}, port ${String(c.target_port)}.`,t`Certificate principal ${c.principal!}, usable from ${c.address!}.`] : undefined,
     fields: fieldList(c),
   };
 }

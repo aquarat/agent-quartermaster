@@ -296,7 +296,7 @@ export class MockStore {
       requesting_address: addr,
       requester: { tool: "claude-code", session_id: crypto.randomUUID(), cwd: "/home/alice/src/app", pid: 4242, user: "alice" },
       reason: "Read the database autovacuum stats on db-1 to explain last night's slow queries.",
-      ssh: { target_host: "db-1", login_user: "alice", key_fingerprint: fingerprint() },
+      ssh: { principal:'alice@db-1',target_address:'192.0.2.10',target_port:22,target_host: "db-1", login_user: "alice", key_fingerprint: fingerprint() },
       ttl_requested: 1800,
       ttl_max: 28800,
       risk: "normal",
@@ -364,7 +364,7 @@ export class MockStore {
         pid: 777,
         user: "alice",
       },
-      ssh: { target_host: "laptop-2", login_user: "root", key_fingerprint: fingerprint() },
+      ssh: { principal:'root@laptop-2',target_address:'192.0.2.20',target_port:22,target_host: "laptop-2", login_user: "root", key_fingerprint: fingerprint() },
     });
     this.pending.unshift({
       id: "01JDEMO0ENROLL0KIOSK00003",
@@ -375,7 +375,7 @@ export class MockStore {
       requesting_address: "192.0.2.40",
       requester: { tool: "owner-cli", user: "pi" },
       reason: "Lobby kiosk; wants to reach db-1 for its display config.",
-      enrollment: { csr_fingerprint: fingerprint(), ssh_host_key_fingerprints: [fingerprint()] },
+      enrollment: { replaces_id:'',max_ssh_seconds:28800,max_standing_hours:24,class:'agent',csr_fingerprint: fingerprint(), ssh_host_key_fingerprints: [fingerprint()] },
       ttl_requested: 0,
       ttl_max: 0,
       risk: "normal",
@@ -648,7 +648,8 @@ export function startMock(opts: MockOptions = {}) {
           requesting_host: p.requesting_host,
           kind: "enrollment",
           key_fingerprint: p.enrollment?.csr_fingerprint ?? "",
-          replaces: p.enrollment?.replaces_existing ? true : undefined,
+          replaces: !!p.enrollment?.replaces_existing, address:p.requesting_address,class:p.enrollment?.class,
+          replaces_id:p.enrollment?.replaces_id,
           ttl_seconds: 0,
           standing_hours: 0,
         };
@@ -681,6 +682,8 @@ export function startMock(opts: MockOptions = {}) {
         requesting_host: p.requesting_host,
         kind: p.kind,
         target: p.ssh?.target_host,
+        target_address:p.ssh?.target_address,target_port:p.ssh?.target_port,
+        address:p.requesting_address,principal:p.ssh?.principal,
         login_user: p.ssh?.login_user,
         key_fingerprint: p.ssh?.key_fingerprint,
         ttl_seconds: ttl,
@@ -848,6 +851,8 @@ export function startMock(opts: MockOptions = {}) {
     const p = url.pathname;
     const isPost = req.method === "POST";
     let m: RegExpMatchArray | null;
+    if(p==='/api/ui/hosts' && !isPost){needSession();return json([]);}
+    if(p==='/api/ui/help' && !isPost){needSession();return json({agent_api_url:'https://agent.example.com:8443',cli_download_base_url:'',ca_pin:'sha256:'+ '0'.repeat(64),owner_max_seconds:86400});}
 
     if (p === "/api/ui/state" && !isPost) {
       needSession();

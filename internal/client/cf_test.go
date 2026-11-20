@@ -538,7 +538,13 @@ func helperCmd(mode string) []string {
 }
 
 func helperEnv(e *testEnv) {
-	base := append(os.Environ(), "GO_WANT_HELPER=1", "CLOUDFLARE_API_KEY=legacy", "CF_API_EMAIL=me@example.com",
+	var inherited []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(strings.ToUpper(kv), "NO_PROXY=") {
+			inherited = append(inherited, kv)
+		}
+	}
+	base := append(inherited, "GO_WANT_HELPER=1", "CLOUDFLARE_API_KEY=legacy", "CF_API_EMAIL=me@example.com",
 		"CLOUDFLARE_API_BASE_URL=https://elsewhere.example", "NO_PROXY=corp.example")
 	e.Environ = func() []string { return base }
 }

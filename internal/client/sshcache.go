@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
+	"github.com/aquarat/agent-quartermaster/internal/sshtarget"
 )
 
 // MinRemaining is how much validity a cached certificate needs to be reused.
@@ -68,7 +69,7 @@ func ParseTarget(s, defaultUser string) (Target, error) {
 	if !loginUserRE.MatchString(t.User) {
 		return t, &UsageError{Msg: fmt.Sprintf("invalid login user %q", t.User)}
 	}
-	if !hostNameRE.MatchString(t.Host) {
+	if _, _, err := sshtarget.Split(t.Host); err != nil {
 		return t, &UsageError{Msg: fmt.Sprintf("invalid target host %q: use the fleet host name aqmasd knows (e.g. db-1)", t.Host)}
 	}
 	return t, nil

@@ -5,8 +5,9 @@
 // Each object has a fixed key set (the web UI refuses to sign text with any other key):
 //
 //	common:     v, action, object, id, nonce, issued_at
-//	request:    + requesting_host, kind, target, login_user, key_fingerprint, ttl_seconds, standing_hours
-//	enrollment: + requesting_host, kind, key_fingerprint, replaces, ttl_seconds, standing_hours
+//	request:    + requesting_host, address, kind, target, target_address, target_port, principal, login_user, key_fingerprint, ttl_seconds, standing_hours
+//	enrollment: + requesting_host, address, class, kind, key_fingerprint, replaces, replaces_id, ttl_seconds, standing_hours
+//	host:       + requesting_host, address, class (id identifies the enrolled identity)
 //	standing:   + requesting_host, kind, target, login_user, ttl_seconds, standing_hours
 //	grant:      + requesting_host, kind, target, login_user, ttl_seconds, standing_hours
 //	passkey:    + nickname, new_nickname
@@ -51,6 +52,7 @@ const (
 // Objects.
 const (
 	ObjectRequest    = "request"
+	ObjectHost       = "host"
 	ObjectEnrollment = "enrollment"
 	ObjectStanding   = "standing"
 	ObjectGrant      = "grant"
@@ -61,8 +63,9 @@ var commonKeys = []string{"v", "action", "object", "id", "nonce", "issued_at"}
 
 // objectKeys are the keys each object carries besides the common ones.
 var objectKeys = map[string][]string{
-	ObjectRequest:    {"requesting_host", "kind", "target", "login_user", "key_fingerprint", "ttl_seconds", "standing_hours"},
-	ObjectEnrollment: {"requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"},
+	ObjectRequest:    {"address", "principal", "requesting_host", "kind", "target", "target_address", "target_port", "login_user", "key_fingerprint", "ttl_seconds", "standing_hours"},
+	ObjectEnrollment: {"replaces_id", "class", "address", "requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"},
+	ObjectHost:       {"class", "address", "requesting_host"},
 	ObjectStanding:   {"requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"},
 	ObjectGrant:      {"requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"},
 	ObjectPasskey:    {"nickname", "new_nickname"},
@@ -90,6 +93,7 @@ func keysFor(object, kind string) ([]string, bool) {
 }
 
 var objectActions = map[string][]string{
+	ObjectHost:       {ActionRevoke},
 	ObjectRequest:    {ActionApprove, ActionDeny},
 	ObjectEnrollment: {ActionApprove, ActionDeny},
 	ObjectStanding:   {ActionRevoke},
@@ -99,6 +103,12 @@ var objectActions = map[string][]string{
 
 // Action is everything the owner approves with one passkey assertion.
 type Action struct {
+	Principal      string `json:"principal"`
+	ReplacesID     string `json:"replaces_id"`
+	Class          string `json:"class"`
+	Address        string `json:"address"`
+	TargetAddress  string `json:"target_address"`
+	TargetPort     int    `json:"target_port"`
 	Action         string `json:"action"`
 	Object         string `json:"object"`
 	ID             string `json:"id"`
@@ -139,6 +149,8 @@ func NewNonce() string {
 
 func (a Action) values() map[string]any {
 	return map[string]any{
+		"principal": a.Principal, "replaces_id": a.ReplacesID,
+		"class": a.Class, "address": a.Address, "target_address": a.TargetAddress, "target_port": a.TargetPort,
 		"requesting_host": a.RequestingHost,
 		"kind":            a.Kind,
 		"target":          a.Target,

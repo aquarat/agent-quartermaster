@@ -21,10 +21,11 @@ const MaxReasonLen = api.MaxReasonBytes
 
 // SSHOptions are the flags of `aqmas ssh` / `aqmas cert`.
 type SSHOptions struct {
-	Target Target
-	TTL    time.Duration // 0: config default
-	Why    string
-	Fresh  bool // ignore a cached certificate
+	CanonicalOnly bool // generated ssh-config snippet: cache path must equal the selector
+	Target        Target
+	TTL           time.Duration // 0: config default
+	Why           string
+	Fresh         bool // ignore a cached certificate
 }
 
 // EnsureSSHCert returns a key + certificate for o.Target, reusing a cached one that is valid
@@ -50,11 +51,26 @@ func (e *Env) EnsureSSHCert(ctx context.Context, o SSHOptions) (*Prepared, error
 			return nil, err
 		}
 	}
-	if ttl < time.Minute || ttl > MaxTTL {
-		return nil, &UsageError{Msg: fmt.Sprintf("--ttl must be between 1m and %s", MaxTTL)}
+	resolved, resolveErr := c.Resolve(ctx, o.Target)
+	canonical := o.Target
+	if resolveErr != nil {
+		var offline *UnreachableError
+		if !errors.As(resolveErr, &offline) || o.Fresh || !hostNameRE.MatchString(canonical.Host) {
+			return nil, resolveErr
+		}
+	} else {
+		if !hostNameRE.MatchString(resolved.Name) || validateEndpoint(resolved.Address, resolved.Port) != nil {
+			return nil, fmt.Errorf("invalid SSH target resolution")
+		}
+		canonical.Host = resolved.Name
+		if o.CanonicalOnly && canonical.Host != o.Target.Host {
+			return nil, &UsageError{Msg: "target name changed: regenerate the ssh-config snippet"}
+		}
+		if ttl < time.Minute || ttl/time.Second > time.Duration(resolved.MaxSeconds) {
+			return nil, &UsageError{Msg: fmt.Sprintf("--ttl must be between 1m and %ds", resolved.MaxSeconds)}
+		}
 	}
-
-	dir, err := e.targetDir(o.Target)
+	dir, err := e.targetDir(canonical)
 	if err != nil {
 		return nil, err
 	}
@@ -65,12 +81,15 @@ func (e *Env) EnsureSSHCert(ctx context.Context, o SSHOptions) (*Prepared, error
 	defer unlock()
 
 	if !o.Fresh {
-		if p, err := e.loadCached(dir, o.Target); err == nil && e.stillGranted(ctx, c, p) {
+		if p, err := e.loadCached(dir, canonical); err == nil && (resolveErr != nil || (p.Grant.TargetAddress == resolved.Address && p.Grant.TargetPort == resolved.Port)) && e.stillGranted(ctx, c, p) {
 			e.logf("reusing grant %s for %s, valid until %s", p.Grant.GrantID, o.Target, p.ValidBefore.Local().Format("15:04:05"))
 			return p, nil
 		}
 	}
 
+	if resolveErr != nil {
+		return nil, resolveErr
+	}
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
@@ -121,7 +140,10 @@ func (e *Env) EnsureSSHCert(ctx context.Context, o SSHOptions) (*Prepared, error
 	} else if caKey, _, _, _, err = ssh.ParseAuthorizedKey([]byte(ca.PublicKey)); err != nil {
 		return nil, fmt.Errorf("server sent an unreadable SSH CA key: %w", err)
 	}
-	p, err := e.storeGrant(dir, o.Target, created.ID, priv, st.Grant, caKey)
+	if st.Grant == nil || st.Grant.SSH == nil || st.Grant.SSH.TargetAddress != resolved.Address || st.Grant.SSH.TargetPort != resolved.Port {
+		return nil, fmt.Errorf("grant does not match resolved SSH destination")
+	}
+	p, err := e.storeGrant(dir, canonical, created.ID, priv, st.Grant, caKey)
 	if err != nil {
 		return nil, err
 	}
@@ -288,4 +310,49 @@ func BuildSSHArgv(p *Prepared, command []string) ([]string, error) {
 		"--", g.LoginUser+"@"+g.TargetAddress,
 	)
 	return append(argv, command...), nil
+}
+
+// mosh interprets --ssh as a command string. BuildSSHArgv permits only plain
+// absolute paths, a validated endpoint and a numeric port in these words.
+func BuildMoshArgv(p *Prepared, args []string) ([]string, error) {
+	if err := CheckMoshArgs(args); err != nil {
+		return nil, err
+	}
+	ssh, err := BuildSSHArgv(p, nil)
+	if err != nil {
+		return nil, err
+	}
+	argv := append([]string{"mosh"}, args...)
+	return append(argv, "--ssh="+strings.Join(ssh[:len(ssh)-2], " "), "--", ssh[len(ssh)-1]), nil
+}
+
+// CheckMoshArgs allows transport and prediction settings only. A positional
+// host, --local, or a bootstrap override would bypass the signed destination.
+func CheckMoshArgs(args []string) error {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "-4", "-6", "--predict=always", "--predict=never", "--predict=adaptive", "--predict=experimental", "--no-init":
+			continue
+		}
+		p, ok := strings.CutPrefix(arg, "--port=")
+		if !ok && (arg == "-p" || arg == "--port") && i+1 < len(args) {
+			i++
+			p = args[i]
+			ok = true
+		}
+		if ok {
+			lo, hi, rng := strings.Cut(p, ":")
+			if !rng {
+				hi = lo
+			}
+			a, e := strconv.Atoi(lo)
+			b, f := strconv.Atoi(hi)
+			if e == nil && f == nil && a >= 1 && a <= b && b <= 65535 && strconv.Itoa(a) == lo && strconv.Itoa(b) == hi {
+				continue
+			}
+		}
+		return &UsageError{Msg: "unsupported mosh option: " + sanitize(arg)}
+	}
+	return nil
 }

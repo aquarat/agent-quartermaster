@@ -35,7 +35,7 @@ Long-polls: `?wait=25s` (or `?wait=25`), capped at 25 s. `poll_after_ms` says ho
 before the next poll when an answer comes back early.
 
 ### POST /v1/enroll  (no client cert)
-`EnrollRequest {hostname, csr_pem, ssh_host_key_fingerprints[]?, note?, poll_token}` ->
+`EnrollRequest {hostname, class?, csr_pem, ssh_host_key_fingerprints[]?, note?, poll_token}` ->
 `201 EnrollResponse {id, status:"pending", approve_url, poll_after_ms}`.
 
 - `hostname`: `[a-z0-9][a-z0-9-]{0,62}`; the CSR's CommonName must equal it. CSR key: ECDSA
@@ -47,6 +47,8 @@ before the next poll when an answer comes back early.
   notification cannot collect the once-only certificate first. The CLI also prints the CSR
   key fingerprint (`client key: SHA256:<hex>`), which the card shows as "Client key".
 - `note`: at most 500 bytes.
+- `class`: `agent` (default) or `owner-device` (CLI `--owner-device`). The server stores
+  the passkey-approved class with the enrollment, never trusting a class on an access request.
 - If a host of that name is enrolled, approving the enrollment **replaces** it (old client
   certificate revoked at once, its pending requests expired); the card shows risk `high`.
 - Limits: 20 pending enrollments in total, 3 per source address (429 `rate_limited`).
@@ -64,8 +66,10 @@ checks it against `ca_cert_pem`.
 `201 RequestCreated {id, status, approve_url, poll_after_ms, expires_at}`.
 
 - `kind`: `"ssh"` (M1) or `"cloudflare"` (M2, section 5).
-- `SSHRequest {target_host, login_user, public_key}`: `target_host` is a `[[targets]]` name
-  in aqmasd's config, `login_user` one of that target's `users`, `public_key` an Ed25519 key in
+- `SSHRequest {target_host, login_user, public_key}`: `target_host` is a configured name, alias
+  or address, optionally `host:port` (`[IPv6]:port`). The server filters by port and login user;
+  an ambiguous selector is a 400 listing the candidates. The request records the original
+  selector and snapshots the resolved endpoint and principal. `public_key` is an Ed25519 key in
   authorized_keys format (ephemeral, generated per request by the CLI).
 - `Requester {tool, session_id?, cwd?, pid?, user}`: self-reported (`tool` = `claude-code` /
   `opencode` / `owner-cli` / `other`); **untrusted, display only**. `session_id` at most 128
@@ -98,7 +102,13 @@ Requesting host only (others 404). Withdraws a pending request -> `RequestStatus
 -> `GrantList {grants: [GrantSummary]}` for the calling host (no certificates, no
 `requesting_host`).
 
+### GET /v1/ssh-target
+
+The mTLS `GET /v1/ssh-target?target=SELECTOR&user=USER` returns
+`{name,address,port,max_seconds}` for cache lookup; `max_seconds` is the host-class SSH maximum.
+
 ### GET /v1/ssh-ca
+
 -> `SSHCA {public_key, fingerprint}`: the SSH user CA (authorized_keys format, `SHA256:...`).
 The CLI checks every new grant's certificate signature against it.
 
@@ -145,6 +155,9 @@ lives on the server, keyed by `challenge_id` (no state in cookies).
 | `POST /api/ui/passkeys/{id}/challenge` | `{action: "rename", nickname}` or `{action: "remove"}` | `ChallengeResponse` (object `passkey`, id `{id}`) |
 | `POST /api/ui/passkeys/{id}/rename`, `.../remove` | `DecideRequest` | `PasskeyChange {ok, id, action, nickname, signed_out}` |
 | `GET /api/ui/state` | | `UIState {owner, pending: [PendingItem], standing: [StandingApproval], grants: [GrantSummary], recent: [AuditEntry], passkeys: [PasskeyInfo]}` |
+| `GET /api/ui/hosts` | session | Array of `{id,name,class,address,enrolled_at,not_before,not_after,last_request_at,revoked_at}`; `id` is the enrollment ID; absent times are null |
+| `GET /api/ui/help` | session | `{agent_api_url,cli_download_base_url,ca_pin,owner_max_seconds}`; no secrets, no inferred URLs from request headers |
+| `POST /api/ui/hosts/{id}/challenge` / `revoke` | `{action:"revoke"}` / `DecideRequest` | `ChallengeResponse` / `RevokeResult`; expires pending requests, revokes the host and standing/CF access, audits `host_revoke` |
 | `GET /api/ui/requests/{id}`, `GET /api/ui/enrollments/{id}` | | `PendingItem` plus `status` |
 | `POST /api/ui/requests/{id}/challenge` | `ChallengeRequest {action: approve\|deny, ttl_seconds?, standing_hours?}` | `ChallengeResponse {challenge_id, canonical, public_key}` |
 | `POST /api/ui/requests/{id}/decide` | `DecideRequest {challenge_id, assertion}` | `RequestStatus` **without** `grant` (browsers never get certificates) |
@@ -194,8 +207,10 @@ lives on the server, keyed by `challenge_id` (no state in cookies).
   to ntfy, as is every new passkey.
 - **TTL choice:** `ttl_seconds` above the card's `ttl_max` or below `ttl.min_seconds` is
   **rejected with 400**, never clamped (a clamped value in `canonical` would differ from the
-  owner's choice). `standing_hours` above `ttl.max_standing_hours` (24) -> 400; the UI offers
-  1, 4 or 8. A standing approval auto-approves later requests from the same host for the same
+  owner's choice). `standing_hours` above the host-class policy -> 400. For owner devices
+  `ttl.owner_max_seconds` (86400) replaces the general SSH max, and `ttl.owner_max_standing_hours`
+  (720) replaces `ttl.max_standing_hours`. CF scope TTLs and standing prohibitions are unchanged.
+  A standing approval auto-approves later requests from the same host for the same
   target and login user, from the same address, up to its TTL, until it expires or is
   revoked; revoking a grant also revokes the standing approval created with it and the one
   that auto-approved it. Standing approvals are refused (400) for high-risk requests: a
@@ -213,8 +228,9 @@ object (a missing or extra key cannot be built by the server and is refused by t
 
 | object | actions | keys besides `v` (1), `action`, `object`, `id`, `nonce` (32 random bytes, base64url), `issued_at` |
 |---|---|---|
-| `request` | `approve`, `deny` | `requesting_host, kind, target, login_user, key_fingerprint, ttl_seconds, standing_hours` |
-| `enrollment` | `approve`, `deny` | `requesting_host, kind` (`"enrollment"`), `key_fingerprint` (CSR key), `replaces`, `ttl_seconds` (0), `standing_hours` (0) |
+| `request` | `approve`, `deny` | `requesting_host, address` (source IP), `kind, target, target_address, target_port, principal, login_user, key_fingerprint, ttl_seconds, standing_hours` |
+| `enrollment` | `approve`, `deny` | `requesting_host, address, class, kind` (`"enrollment"`), `key_fingerprint` (CSR key), `replaces, replaces_id` (incumbent enrollment ID or empty), `ttl_seconds` (0), `standing_hours` (0) |
+| `host` | `revoke` | `requesting_host` (host name), `address` (enrollment address), `class`; `id` identifies the particular enrollment, not just its reusable name |
 | `standing` | `revoke` | `requesting_host, kind, target, login_user, ttl_seconds` (the rule's max TTL), `standing_hours` |
 | `grant` | `revoke` | `requesting_host, kind, target, login_user, ttl_seconds` (0), `standing_hours` |
 | `passkey` | `add`, `rename`, `remove` | `nickname` (the passkey's current nickname; `""` for add), `new_nickname` (rename: the new one; add: the chosen nickname or `""`; remove: `""`). For add `id` is `"new"`, otherwise the passkey's id |
@@ -225,6 +241,10 @@ a page from before this change refuses the new add text (unknown keys), which fa
 The key sets above are for `kind` `ssh`. For `kind` `cloudflare` (M2) the `request`,
 `standing` and `grant` objects carry a different set (section 5.4); the parser picks the set
 from (`object`, `kind`).
+
+Migration 5 defaults existing enrollments to `agent`. SSH requests pending at upgrade
+expire; old SSH standing rules without a signed destination cannot auto-approve new requests.
+Request again to create a rule bound to the resolved address, port and principal.
 
 Fingerprints: SSH keys `SHA256:<base64>` (OpenSSH style), CSR keys `SHA256:<hex>` of the PKIX
 public key. Deny and revoke carry `standing_hours` 0.
@@ -250,7 +270,7 @@ flagged).
   `host_name`, `client_cert`, `client_key`, `client_ca`, `default_ttl`); key and certificate
   in the same directory (0600, directory 0700). Overrides: `AQMAS_CONFIG_DIR`,
   `AQMAS_CACHE_DIR`.
-- `aqmas enroll --name HOST --server URL [--ca-pin sha256:HEX] [--note TEXT] [--force]`:
+- `aqmas enroll --name HOST --server URL [--ca-pin sha256:HEX] [--note TEXT] [--force] [--owner-device]`:
   creates the client key + CSR, prints the approve URL and Ref, waits. Without `--ca-pin`, the
   CA is trusted only after the user confirms its fingerprint at a terminal.
 - `aqmas ssh [USER@]HOST [--ttl 30m] [--why "..."] [--fresh] [-- COMMAND...]`: reuses a cached
@@ -268,10 +288,13 @@ flagged).
   -o StrictHostKeyChecking=yes -p PORT -- user@address command...`. The CLI writes its own
   known_hosts patterns from `known_hosts_line`'s key (`address` / `[address]:port` and
   `aqmas.<target>`); without the line it falls back to ssh's normal known_hosts files.
-  `--ttl` outside 1 min .. 8 h is refused locally. `--why` is required when stdin is not a
+  `--ttl` outside 1 min .. the class maximum is refused locally. `--why` is required when stdin is not a
   terminal.
 - `aqmas cert [USER@]HOST [...] [--quiet]`: like `ssh` but only makes sure a certificate is
   cached and prints its paths (used by the `ssh-config` snippet).
+- `aqmas mosh [USER@]HOST [--ttl D] [--why TEXT] [-- MOSH-OPTIONS...]` uses the same cache
+  and strict SSH bootstrap. Supports `-4`, `-6`, `--no-init`, `--predict=MODE`, `--port=N[:N]`
+  (also `-p N[:N]`); executable overrides, local mode and alternate destinations are refused.
 - `aqmas ssh-config [USER@]HOST...` prints an opt-in `Match exec` snippet.
 - `aqmas status [ID]`, `aqmas list [--json]`, `aqmas version`.
 - Exit codes: 0 / ssh's own, 1 error, 2 usage, 3 denied or revoked, 4 expired, 5 server
@@ -286,7 +309,7 @@ flagged).
 `serve`, `passkey-enroll-code` (one-time code, 15 min, single use, for the first passkey),
 `print-ssh-ca` (for `TrustedUserCAKeys`), `print-client-ca` (internal CA PEM),
 `tls-fingerprint` (the `--ca-pin` value), `revoke-host NAME` (revoke a host's client
-certificate at once; there is no web action for this in M1), `version`.
+certificate at once; also available on Admin), `version`.
 
 
 ## 5. Cloudflare (milestone 2 contract)

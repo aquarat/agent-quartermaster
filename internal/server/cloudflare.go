@@ -317,6 +317,9 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 	what := cfDesc(req.Scope, req.ScopeParams)
 	ctx := r.Context()
 	err = s.store.Tx(ctx, func(q *store.Q) error {
+		if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
+			return err
+		}
 		approve := func(note string) (*store.Grant, error) {
 			req.Status, req.DecidedAt, req.DecisionNote = api.StatusApproved, &now, note
 			if err := q.InsertRequest(ctx, req); err != nil {

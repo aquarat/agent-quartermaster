@@ -288,11 +288,15 @@ func newCSR(t *testing.T, cn string) (*ecdsa.PrivateKey, string) {
 
 // enrollHost enrolls a host through the API and the owner's passkey; returns its client cert.
 func (e *env) enrollHost(name string) tls.Certificate {
+	return e.enrollClass(name, api.ClassAgent)
+}
+
+func (e *env) enrollClass(name, class string) tls.Certificate {
 	e.t.Helper()
 	key, csr := newCSR(e.t, name)
 	anon := e.agentClient(nil)
 	var er api.EnrollResponse
-	st, err := agentDo(e.t, anon, "POST", e.agent.URL+"/v1/enroll", api.EnrollRequest{Hostname: name, CSRPEM: csr, Note: "test"}, &er)
+	st, err := agentDo(e.t, anon, "POST", e.agent.URL+"/v1/enroll", api.EnrollRequest{Class: class, Hostname: name, CSRPEM: csr, Note: "test"}, &er)
 	if err != nil || st != 201 {
 		e.t.Fatalf("enroll: %d %v", st, err)
 	}
@@ -327,7 +331,7 @@ func (e *env) enrollHost(name string) tls.Certificate {
 		e.t.Fatalf("enrollment challenge: %d", st)
 	}
 	c := uiCheck(e.t, cr)
-	if c["replaces"] != card.ReplacesExisting || c["key_fingerprint"] != card.CSRFingerprint || c["requesting_host"] != name || c["kind"] != "enrollment" {
+	if c["class"] != class || c["replaces"] != card.ReplacesExisting || c["key_fingerprint"] != card.CSRFingerprint || c["requesting_host"] != name || c["kind"] != "enrollment" {
 		e.t.Fatalf("enrollment canonical %v vs card %+v", c, card)
 	}
 	if st := e.decide("/api/ui/enrollments/"+er.ID, "decide", cr, nil); st != 200 {

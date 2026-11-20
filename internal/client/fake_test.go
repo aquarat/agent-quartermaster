@@ -173,6 +173,16 @@ func newFakeServer(t *testing.T) *fakeServer {
 	mux.HandleFunc("GET /v1/grants", f.handleGrants)
 	mux.HandleFunc("POST /v1/requests/{id}/cancel", f.handleCancel)
 	mux.HandleFunc("GET /v1/ssh-ca", f.handleSSHCA)
+	mux.HandleFunc("GET /v1/ssh-target", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := f.host(w, r); !ok {
+			return
+		}
+		name := r.URL.Query().Get("target")
+		if name == f.targetAddress || name == "db-alias" {
+			name = "db-1"
+		}
+		writeJSON(w, 200, api.ResolvedTarget{Name: name, Address: f.targetAddress, Port: f.targetPort, MaxSeconds: 28800})
+	})
 	f.setupCF(mux)
 	f.srv = httptest.NewUnstartedServer(mux)
 	f.srv.Config.ErrorLog = log.New(io.Discard, "", 0) // handshake failures are expected in some tests

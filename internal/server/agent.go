@@ -39,6 +39,7 @@ func (s *Server) AgentHandler() http.Handler {
 	mux.Handle("POST /v1/requests/{id}/cancel", s.requireHost(s.handleCancel))
 	mux.Handle("GET /v1/grants", s.requireHost(s.handleGrants))
 	mux.Handle("GET /v1/ssh-ca", s.requireHost(s.handleSSHCA))
+	mux.Handle("GET /v1/ssh-target", s.requireHost(s.handleResolveTarget))
 	// Milestone 2 (404 when cloudflare.enabled is false).
 	mux.Handle("GET /v1/cf/catalogue", s.requireHost(s.handleCFCatalogue))
 	mux.Handle("GET /v1/cf/snapshots", s.requireHost(s.handleCFSnapshots))
@@ -114,6 +115,13 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
+	if in.Class == "" {
+		in.Class = api.ClassAgent
+	}
+	if in.Class != api.ClassAgent && in.Class != api.ClassOwner {
+		s.writeErr(w, r, errBad("unknown enrollment class"))
+		return
+	}
 	if !config.ValidName(in.Hostname) {
 		s.writeErr(w, r, errBad("hostname must match [a-z0-9][a-z0-9-]{0,62}"))
 		return
@@ -143,6 +151,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	now := s.now()
 	e := &store.Enrollment{
+		Class:          in.Class,
 		ID:             ids.New(),
 		Hostname:       in.Hostname,
 		CSRPEM:         in.CSRPEM,
@@ -237,6 +246,26 @@ func (s *Server) handleEnrollStatus(w http.ResponseWriter, r *http.Request) {
 
 // ---- access requests ----
 
+func requireActiveIdentity(ctx context.Context, q *store.Q, id int64) error {
+	h, err := q.GetHost(ctx, id)
+	if err != nil {
+		return err
+	}
+	if h.RevokedAt != nil {
+		return errForbidden("host enrollment revoked")
+	}
+	return nil
+}
+
+func (s *Server) handleResolveTarget(w http.ResponseWriter, r *http.Request, h *store.Host) {
+	t, err := s.cfg.Resolve(r.URL.Query().Get("target"), r.URL.Query().Get("user"))
+	if err != nil {
+		s.writeErr(w, r, errBad(err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, api.ResolvedTarget{Name: t.Name, Address: t.Address, Port: t.Port, MaxSeconds: s.cfg.TTL.ForHost(h.Class).MaxSeconds})
+}
+
 func validRequester(rq api.Requester) error {
 	if len(rq.Tool) > 32 || len(rq.SessionID) > api.MaxSessionIDBytes || len(rq.CWD) > api.MaxCWDBytes || len(rq.User) > 64 || rq.PID < 0 {
 		return errBad("requester field too long")
@@ -271,13 +300,9 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		s.handleCreateCloudflare(w, r, h, &in)
 		return
 	}
-	tgt, ok := s.cfg.Target(in.SSH.TargetHost)
-	if !ok {
-		s.writeErr(w, r, errBad("unknown target_host"))
-		return
-	}
-	if !tgt.AllowsUser(in.SSH.LoginUser) {
-		s.writeErr(w, r, errBad("login_user not allowed on this target"))
+	tgt, err := s.cfg.Resolve(in.SSH.TargetHost, in.SSH.LoginUser)
+	if err != nil {
+		s.writeErr(w, r, errBad(err.Error()))
 		return
 	}
 	pub, err := sshcert.ParseEd25519(in.SSH.PublicKey)
@@ -286,11 +311,13 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		return
 	}
 	now := s.now()
-	ttl := policy.ClampTTL(in.TTLSeconds, s.cfg.TTL)
+	ttl := policy.ClampTTL(in.TTLSeconds, s.cfg.TTL.ForHost(h.Class))
 	if tgt.MaxTTLSeconds > 0 && ttl > tgt.MaxTTLSeconds {
 		ttl = tgt.MaxTTLSeconds // config validation keeps it >= ttl.min_seconds
 	}
 	req := &store.Request{
+		RequestedTarget: in.SSH.TargetHost, TargetAddress: tgt.Address, TargetPort: tgt.Port,
+		Principal:      tgt.Principal(in.SSH.LoginUser),
 		ID:             ids.New(),
 		HostID:         h.ID,
 		HostName:       h.Name,
@@ -313,6 +340,9 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 	}
 	ctx := r.Context()
 	err = s.store.Tx(ctx, func(q *store.Q) error {
+		if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
+			return err
+		}
 		rules, err := q.ActiveStanding(ctx, h.ID, now)
 		if err != nil {
 			return err
@@ -322,6 +352,13 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 			rule := policy.Rule{HostID: st.HostID, PeerAddress: st.PeerAddress, Kind: st.Kind, Target: st.TargetHost, LoginUser: st.LoginUser,
 				MaxTTL: st.MaxTTL, ExpiresAt: st.ExpiresAt, Revoked: st.RevokedAt != nil}
 			if !policy.Matches(rule, cand, now) {
+				continue
+			}
+			source, err := q.GetRequest(ctx, st.SourceRequestID)
+			if err != nil {
+				return err
+			}
+			if source.Principal != req.Principal || source.TargetAddress != tgt.Address || source.TargetPort != tgt.Port || s.highRisk(req) {
 				continue
 			}
 			req.Status = api.StatusApproved
@@ -420,6 +457,9 @@ func (s *Server) requestStatus(ctx context.Context, q *store.Q, req *store.Reque
 		return out, nil
 	}
 	tgt, _ := s.cfg.Target(g.TargetHost)
+	if req.TargetAddress != "" && (tgt.Address != req.TargetAddress || tgt.Port != req.TargetPort) {
+		return nil, errConflict("SSH destination changed; request again")
+	}
 	out.Grant = &api.Grant{
 		ID: g.ID, Kind: g.Kind, NotBefore: g.NotBefore, NotAfter: g.NotAfter,
 		SSH: &api.SSHGrant{

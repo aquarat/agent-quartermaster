@@ -50,6 +50,11 @@ import {
 import { CF_RISKS, cfScope, paramPairs, parseScopeParams, riskLabel, sentenceCase, unusualParams, type CFScopeDesc } from "./cfscopes";
 import { chevronIcon, cloudIcon, eventIcon, passkeyIcon, syncIcon } from "./icons";
 import type { AuditEntry, GrantSummary, PasskeyChange, PasskeyInfo, PendingCloudflare, PendingItem, RegisterResult, StandingApproval, UIState } from "./types";
+import { hostCard, type HostInfo } from './admin';
+import { helpPage, type HelpConfig } from './help';
+
+function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/help' ? 'help' : 'queue'; }
+function nav(label:string,hash:string,title:string) { const a=h('a',{title,'aria-label':title},label); a.href=hash; return a; }
 import { browserAuthenticator, type Authenticator } from "./webauthn";
 
 const POLL_MS = 5000;
@@ -74,6 +79,9 @@ export class App {
   private view: "loading" | "signin" | "main" = "loading";
   private pollTimer: number | undefined;
   private refreshing = false;
+  private page = route();
+  private hosts: HostInfo[]=[];
+  private help?: HelpConfig;
   private rendered = new Map<string, string>();
   private login: PreparedLogin | null = null;
   private loginTimer: number | undefined;
@@ -96,6 +104,10 @@ export class App {
   }
 
   start(): void {
+    window.addEventListener('hashchange',()=>{
+      this.sheet.close(true); this.focusId=/^#r=([A-Za-z0-9_-]{1,64})$/.exec(location.hash)?.[1] ?? null;
+      if(this.view==='main') void this.refresh();
+    });
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "visible") return;
       if (this.view === "main") void this.refresh();
@@ -121,12 +133,16 @@ export class App {
   async refresh(): Promise<void> {
     if (this.refreshing) return;
     this.refreshing = true;
+    const requested=route();
     try {
       const s = await this.api.state();
+      if(requested==='admin') this.hosts=await this.api.hosts();
+      if(requested==='help') this.help=await this.api.help();
+      if(requested!==route()) return;
       this.state = normalise(s);
       this.lastOk = Date.now();
       this.offline = false;
-      if (this.view !== "main") this.showMain();
+      if (this.view !== "main" || this.page!==requested) this.showMain();
       else this.renderSections();
     } catch (e) {
       if (e instanceof ApiError && e.code === "unauthenticated") {
@@ -140,6 +156,7 @@ export class App {
       }
     } finally {
       this.refreshing = false;
+      if(requested!==route()) void this.refresh();
     }
   }
 
@@ -160,6 +177,7 @@ export class App {
     const s = this.state;
     if (!s) return undefined;
     switch (t.object) {
+      case 'host':return this.hosts.some(h=>h.id===t.id && !h.revoked_at);
       case "request":
       case "enrollment":
         return (s.pending ?? []).some((p) => p.id === t.id);
@@ -336,6 +354,7 @@ export class App {
   }
 
   private showMain(): void {
+    this.page=route();
     this.view = "main";
     this.rendered.clear();
     this.loginStatus = this.signBtn = this.loginDetails = null;
@@ -358,8 +377,8 @@ export class App {
     );
     replace(
       this.root,
-      h("header", { class: "topbar" }, h("h1", { class: "brand" }, "aqmas"), h("p", { class: "status", id: "status" })),
-      h(
+      h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Request queue')), h("p", { class: "status", id: "status" }),h('nav',{'aria-label':'Pages'},nav('Help','#/help','Help'),nav('⚙','#/admin','Admin'))),
+      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('passkeys','Passkeys'),section('hosts','Enrolled hosts'),h('section',{class:'card'},h('h2',null,'Updates'),h('p',null,'Self-update is planned.'))) : h(
         "main",
         { class: "sections" },
         h("div", { class: "col col-queue" }, section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
@@ -368,7 +387,6 @@ export class App {
           { class: "col col-access" },
           section("grants", "Active access", "tiles"),
           section("standing", "Auto-approvals", "tiles"),
-          section("passkeys", "Passkeys"),
         ),
         h("aside", { class: "col col-activity", "aria-labelledby": "sec-recent-h" }, section("recent", "Recent activity", "", filters)),
       ),
@@ -380,6 +398,12 @@ export class App {
   private renderSections(): void {
     const s = this.state;
     if (!s || this.view !== "main") return;
+    if(this.page!=='queue'){
+      document.title=`${this.page==='admin'?'Admin':'Help'} · aqmas`;
+      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);}
+      else if(this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
+      this.updateStatus();return;
+    }
     const requests = s.pending!.filter((p) => p.kind !== "enrollment");
     const enrolls = s.pending!.filter((p) => p.kind === "enrollment");
     document.title = requests.length + enrolls.length > 0 ? `(${requests.length + enrolls.length}) aqmas` : "aqmas";
@@ -417,7 +441,6 @@ export class App {
     );
     const shown = this.shownIds();
     this.section("recent", [s.recent, this.filter, [...shown].sort()], () => this.activity(s.recent!, shown), false, false, 0);
-    this.section("passkeys", [s.owner, s.passkeys], () => this.passkeys(s), false, touching, 0);
     this.updateStatus();
     this.tick();
     if (this.focusId) {
@@ -438,7 +461,6 @@ export class App {
     for (const p of s.pending ?? []) out.add(p.id);
     for (const a of s.standing ?? []) out.add(a.id);
     for (const g of s.grants ?? []) if (g.status === "approved") out.add(g.id);
-    for (const p of s.passkeys ?? []) out.add(p.id);
     return out;
   }
 
@@ -672,6 +694,7 @@ export class App {
   }
 
   private renderSectionsIfDeferred(): void {
+    if(this.page!=='queue') return;
     const s = this.state;
     if (!s) return;
     const req = s.pending!.filter((p) => p.kind !== "enrollment");
@@ -680,8 +703,7 @@ export class App {
       this.rendered.get("pending") !== JSON.stringify(req) ||
       this.rendered.get("enroll") !== JSON.stringify(enr) ||
       this.rendered.get("standing") !== JSON.stringify(s.standing) ||
-      this.rendered.get("grants") !== (JSON.stringify(s.grants) ?? "undefined") ||
-      this.rendered.get("passkeys") !== JSON.stringify([s.owner, s.passkeys]);
+      this.rendered.get("grants") !== (JSON.stringify(s.grants) ?? "undefined");
     if (stale) this.renderSections();
   }
 
@@ -703,6 +725,8 @@ export class App {
         h("span", { class: "expires" }, "Expires in ", until(p.expires_at)),
       ),
       ssh ? targetLine(ssh.login_user, ssh.target_host) : h("h3", { class: "target" }, vt(p.kind)),
+      ssh ? h('p',null,'Certificate principal: ',h('bdi',null,vt(ssh.principal))) : null,
+      ssh ? h('p',null,'Address: ',h('bdi',null,vt(ssh.target_address)),` · port ${ssh.target_port}`,ssh.requested_target && ssh.requested_target!==ssh.target_host ? [' · requested as ',h('bdi',null,vt(ssh.requested_target))] : null) : null,
       odd ? h("p", { class: "warn" }, "A name here contains unusual characters. Check it letter by letter.") : null,
       h(
         "dl",
@@ -989,6 +1013,9 @@ function enrollFacts(p: PendingItem): HTMLElement {
   return h(
     "dl",
     { class: "facts" },
+    fact('Enrollment class',h('strong',{class:e?.class==='owner-device'?'warn':''},vt(e?.class))),
+    e?.class==='owner-device' ? fact('Owner policy',`SSH certificates up to ${duration(e.max_ssh_seconds)}; standing approvals up to ${hours(e.max_standing_hours)}.`) : null,
+    e?.replaces_existing ? fact('Replaces enrollment',h('bdi',null,vt(e.replaces_id))) : null,
     fact("Connecting from", h("span", { class: "addr" }, vt(p.requesting_address))),
     e?.csr_fingerprint ? fact("Client key", h("span", { class: "mono" }, vt(e.csr_fingerprint))) : null,
     e?.ssh_host_key_fingerprints?.length ? fact("SSH host keys (self-reported)", e.ssh_host_key_fingerprints.map((f) => h("span", { class: "mono block" }, vt(f)))) : null,
@@ -1210,7 +1237,7 @@ class Sheet {
       this.render(
         h("h2", { id: "sheet-title" }, "Let this host join?"),
         this.summary(p),
-        h("p", null, "It gets a client certificate and can then ask for access. Each request still needs your approval."),
+        h("p", null, "It gets a client certificate and can ask for access. Configured automatic scopes and matching standing approvals may grant access without another prompt."),
         h("div", { class: "actions" }, this.cancelButton(), go),
       );
       return;
@@ -1239,7 +1266,7 @@ class Sheet {
       "fieldset",
       { class: "chips" },
       h("legend", null, standLegend),
-      STANDING_PRESETS.map((n) =>
+      [...new Set([...STANDING_PRESETS,p.max_standing_hours ?? 8])].filter(n=>n<=(p.max_standing_hours ?? 8)).map((n) =>
         h("label", { class: "chip" }, h("input", { type: "radio", name: "standing", value: String(n), checked: n === 0 }), h("span", null, n === 0 ? "No" : `for ${hours(n)}`)),
       ),
     );

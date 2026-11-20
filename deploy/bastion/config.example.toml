@@ -5,6 +5,8 @@ listen_agent    = ":8443"                       # agent API, TLS 1.3 + client ce
 listen_web      = "127.0.0.1:8080"              # web UI/API, reached only via cloudflared
 data_dir        = "/var/lib/aqmas"
 public_base_url = "https://approvals.example.com" # approve links, WebAuthn RP ID and origin
+agent_api_url   = "https://192.0.2.10:8443"       # client-facing URL for the Help page; must match a TLS SAN
+# cli_download_base_url = "https://downloads.example.com/releases/current" # CLI binaries + SHA256SUMS
 owner_name      = "alice"
 # SANs of the agent-API server certificate (issued by the internal CA; clients pin that CA).
 tls_sans        = ["192.0.2.10", "bastion"]
@@ -17,6 +19,8 @@ min_seconds               = 60
 pending_expiry_seconds    = 600    # undecided requests expire after 10 min
 enrollment_expiry_seconds = 3600
 max_standing_hours        = 24     # "approve similar requests for N hours"
+owner_max_seconds         = 86400  # SSH only; target caps still apply
+owner_max_standing_hours  = 720    # only where standing approvals are allowed
 
 [ntfy]
 # Random topic name; leave empty to disable notifications.

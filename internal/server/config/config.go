@@ -7,10 +7,16 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/aquarat/agent-quartermaster/internal/api"
+	"github.com/aquarat/agent-quartermaster/internal/sshtarget"
 )
 
 // DefaultPath is where aqmasd looks for its configuration unless -config is given.
@@ -18,12 +24,14 @@ const DefaultPath = "/etc/aqmas/config.toml"
 
 // Config is the whole aqmasd configuration.
 type Config struct {
-	ListenAgent   string   `toml:"listen_agent"`    // agent API (mTLS), default ":8443"
-	ListenWeb     string   `toml:"listen_web"`      // web UI + API, default "127.0.0.1:8080"
-	DataDir       string   `toml:"data_dir"`        // default "/var/lib/aqmas"
-	PublicBaseURL string   `toml:"public_base_url"` // e.g. https://approvals.example.com
-	OwnerName     string   `toml:"owner_name"`      // display name of the owner
-	TLSSANs       []string `toml:"tls_sans"`        // SANs for the agent-API server certificate
+	AgentAPIURL        string   `toml:"agent_api_url"`
+	CLIDownloadBaseURL string   `toml:"cli_download_base_url"`
+	ListenAgent        string   `toml:"listen_agent"`    // agent API (mTLS), default ":8443"
+	ListenWeb          string   `toml:"listen_web"`      // web UI + API, default "127.0.0.1:8080"
+	DataDir            string   `toml:"data_dir"`        // default "/var/lib/aqmas"
+	PublicBaseURL      string   `toml:"public_base_url"` // e.g. https://approvals.example.com
+	OwnerName          string   `toml:"owner_name"`      // display name of the owner
+	TLSSANs            []string `toml:"tls_sans"`        // SANs for the agent-API server certificate
 	// ClientCertDays is the validity of host client certificates issued at enrollment.
 	ClientCertDays int `toml:"client_cert_days"`
 
@@ -38,6 +46,8 @@ type Config struct {
 
 // TTL is the grant lifetime policy.
 type TTL struct {
+	OwnerMaxSeconds         int `toml:"owner_max_seconds"`
+	OwnerMaxStandingHours   int `toml:"owner_max_standing_hours"`
 	DefaultSeconds          int `toml:"default_seconds"`           // 1800
 	MaxSeconds              int `toml:"max_seconds"`               // 28800
 	MinSeconds              int `toml:"min_seconds"`               // 60
@@ -64,6 +74,7 @@ func (a Access) Enabled() bool { return a.TeamDomain != "" && a.AUD != "" }
 
 // Target is a host (or service) aqmasd may issue SSH certificates for.
 type Target struct {
+	Aliases []string `toml:"aliases"`
 	Name    string   `toml:"name"`
 	Address string   `toml:"address"`
 	Port    int      `toml:"port"`
@@ -155,6 +166,7 @@ func Defaults() *Config {
 		OwnerName:      "owner",
 		ClientCertDays: 730,
 		TTL: TTL{
+			OwnerMaxSeconds: 86400, OwnerMaxStandingHours: 720,
 			DefaultSeconds:          1800,
 			MaxSeconds:              28800,
 			MinSeconds:              60,
@@ -167,6 +179,15 @@ func Defaults() *Config {
 
 // Validate checks the configuration for consistency.
 func (c *Config) Validate() error {
+	for key, v := range map[string]string{"agent_api_url": c.AgentAPIURL, "cli_download_base_url": c.CLIDownloadBaseURL} {
+		if v == "" {
+			continue
+		}
+		u, err := url.Parse(v)
+		if err != nil || u.Scheme != "https" || !sshtarget.ValidHost(u.Hostname()) || u.User != nil || strings.ContainsAny(v, "?#") || (key == "agent_api_url" && strings.Trim(u.Path, "/") != "") {
+			return fmt.Errorf("config: invalid HTTPS URL for %s", key)
+		}
+	}
 	u, err := url.Parse(c.PublicBaseURL)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.Port() != "" || (u.Path != "" && u.Path != "/") {
 		return fmt.Errorf("config: public_base_url must be https://<host> without port or path, got %q", c.PublicBaseURL)
@@ -176,6 +197,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: data_dir is required")
 	}
 	t := &c.TTL
+	if t.OwnerMaxSeconds < t.DefaultSeconds || t.OwnerMaxStandingHours < 0 || int64(t.OwnerMaxSeconds) > int64((1<<63-1)/time.Second) || int64(t.OwnerMaxStandingHours) > int64((1<<63-1)/time.Hour) {
+		return fmt.Errorf("config: invalid owner device limits")
+	}
 	if t.MinSeconds <= 0 || t.DefaultSeconds < t.MinSeconds || t.MaxSeconds < t.DefaultSeconds {
 		return fmt.Errorf("config: ttl must satisfy 0 < min_seconds <= default_seconds <= max_seconds")
 	}
@@ -216,7 +240,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("config: duplicate target %q", tg.Name)
 		}
 		seen[tg.Name] = true
-		if tg.Address == "" {
+		if !sshtarget.ValidHost(tg.Address) {
 			return fmt.Errorf("config: target %q needs an address", tg.Name)
 		}
 		if tg.Port == 0 {
@@ -262,5 +286,70 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	// Shared addresses are allowed; every other spelling must identify a single target.
+	reserved := map[string]string{}
+	for _, tg := range c.Targets {
+		reserved[sshtarget.Key(tg.Address)] = tg.Name
+	}
+	for _, tg := range c.Targets {
+		for _, other := range c.Targets {
+			if other.Name != tg.Name && sshtarget.Key(other.Address) == tg.Name {
+				return fmt.Errorf("config: name %s shadows target address", tg.Name)
+			}
+		}
+		reserved[tg.Name] = tg.Name
+	}
+	for _, tg := range c.Targets {
+		for _, alias := range tg.Aliases {
+			k := sshtarget.Key(alias)
+			if !sshtarget.ValidHost(alias) || reserved[k] != "" {
+				return fmt.Errorf("config: invalid or shadowing alias %q for %s", alias, tg.Name)
+			}
+			reserved[k] = tg.Name
+		}
+	}
 	return nil
+}
+
+func (p TTL) ForHost(class string) TTL {
+	if class == api.ClassOwner {
+		p.MaxSeconds = p.OwnerMaxSeconds
+		p.MaxStandingHours = p.OwnerMaxStandingHours
+	}
+	return p
+}
+
+func (c *Config) Resolve(selector, user string) (Target, error) {
+	key, port, err := sshtarget.Split(selector)
+	if err != nil {
+		return Target{}, err
+	}
+	var matches []Target
+	for _, t := range c.Targets {
+		if port != 0 && port != t.Port {
+			continue
+		}
+		if t.Name == key || sshtarget.Key(t.Address) == key || slices.ContainsFunc(t.Aliases, func(a string) bool { return sshtarget.Key(a) == key }) {
+			matches = append(matches, t)
+		}
+	}
+	if len(matches) == 0 {
+		return Target{}, fmt.Errorf("unknown target_host or port")
+	}
+	var names []string
+	var resolved Target
+	for _, t := range matches {
+		if t.AllowsUser(user) {
+			names = append(names, t.Name)
+			resolved = t
+		}
+	}
+	switch len(names) {
+	case 0:
+		return Target{}, fmt.Errorf("login_user not allowed on this target")
+	case 1:
+		return resolved, nil
+	}
+	sort.Strings(names)
+	return Target{}, fmt.Errorf("ambiguous target %q: %s; specify a target name or port", selector, strings.Join(names, ", "))
 }

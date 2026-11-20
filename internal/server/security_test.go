@@ -523,5 +523,7 @@ func TestEnrollmentReplacesBinding(t *testing.T) {
 	if c := uiCheck(t, cb2); c["replaces"] != true {
 		t.Fatal("replacement not flagged")
 	}
-	mustStatus(t, "approve b as replacement", e.decide("/api/ui/enrollments/"+b.ID, "decide", cb2, nil), 200)
+	e.enrollHost("dup") // replaces A; B's signed incumbent is no longer current
+	mustStatus(t, "stale incumbent", e.decide("/api/ui/enrollments/"+b.ID, "decide", cb2, nil), 409)
+	mustStatus(t, "approve replacement with fresh confirmation", e.approve("/api/ui/enrollments/"+b.ID, "decide", api.ChallengeRequest{Action: "approve"}), 200)
 }
