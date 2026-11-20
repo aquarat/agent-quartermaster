@@ -1,0 +1,121 @@
+// Fetch wrapper for the web UI API (docs/API.md section 2).
+// Every POST carries X-Aqmas: 1 and Content-Type: application/json (the server's CSRF check);
+// every call uses credentials: "same-origin" so only the HttpOnly session cookie travels.
+
+import type {
+  BeginResponse,
+  ChallengeRequest,
+  ChallengeResponse,
+  PendingItem,
+  UIState,
+} from "./types";
+
+export class ApiError extends Error {
+  override name = "ApiError";
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** Objects with a challenge endpoint, and the verb that applies the signed action. */
+export const OBJECT_PATHS = {
+  request: { path: "requests", apply: "decide" },
+  enrollment: { path: "enrollments", apply: "decide" },
+  standing: { path: "standing", apply: "revoke" },
+  grant: { path: "grants", apply: "revoke" },
+} as const;
+export type ObjectKind = keyof typeof OBJECT_PATHS | "passkey";
+
+export interface ApiOptions {
+  /** Base URL; "" (same origin) in the browser. */
+  base?: string;
+  fetch?: typeof fetch;
+}
+
+export interface Api {
+  state(): Promise<UIState>;
+  request(id: string): Promise<PendingItem>;
+  challenge(object: ObjectKind, id: string, body: ChallengeRequest): Promise<ChallengeResponse>;
+  apply(object: ObjectKind, id: string, challengeId: string, assertion: unknown): Promise<unknown>;
+  loginBegin(): Promise<BeginResponse>;
+  loginFinish(challengeId: string | undefined, assertion: unknown): Promise<unknown>;
+  registerBegin(body: { enroll_code?: string; challenge_id?: string; assertion?: unknown }): Promise<BeginResponse>;
+  registerFinish(challengeId: string | undefined, credential: unknown): Promise<unknown>;
+}
+
+const seg = encodeURIComponent;
+
+export function createApi(opts: ApiOptions = {}): Api {
+  const base = opts.base ?? "";
+  const doFetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
+
+  async function call<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+    const headers: Record<string, string> = { Accept: "application/json" };
+    const init: RequestInit = { method, headers, credentials: "same-origin", cache: "no-store", redirect: "manual" };
+    if (method === "POST") {
+      headers["X-Aqmas"] = "1";
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body ?? {});
+    }
+    let res: Response;
+    try {
+      res = await doFetch(base + path, init);
+    } catch (e) {
+      throw new ApiError(0, "network", `Could not reach aqmas (${(e as Error).message}).`);
+    }
+    if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+      // Cloudflare Access redirects to its login page when its own session ends.
+      throw new ApiError(res.status, "access", "Your Cloudflare Access session has ended. Reload the page to sign in again.");
+    }
+    const text = await res.text();
+    let json: unknown = undefined;
+    if (text) {
+      try {
+        json = JSON.parse(text);
+      } catch {
+        json = undefined;
+      }
+    }
+    if (!res.ok) {
+      const b = (json ?? {}) as { error?: unknown; message?: unknown };
+      const code = typeof b.error === "string" ? b.error : res.status === 401 ? "unauthenticated" : "http_" + res.status;
+      const msg = typeof b.message === "string" && b.message ? b.message : `${res.status} ${res.statusText}`.trim();
+      throw new ApiError(res.status, code, msg);
+    }
+    if (json === undefined && text) throw new ApiError(res.status, "bad_response", "The server sent a response that isn't JSON.");
+    return json as T;
+  }
+
+  function objectPath(object: ObjectKind): { path: string; apply: string } {
+    if (object === "passkey") return { path: "passkeys", apply: "" };
+    return OBJECT_PATHS[object];
+  }
+
+  return {
+    state: () => call<UIState>("GET", "/api/ui/state"),
+    request: (id) => call<PendingItem>("GET", `/api/ui/requests/${seg(id)}`),
+    challenge: (object, id, body) => {
+      if (object === "passkey") return call<ChallengeResponse>("POST", "/api/ui/passkeys/challenge", body);
+      return call<ChallengeResponse>("POST", `/api/ui/${objectPath(object).path}/${seg(id)}/challenge`, body);
+    },
+    apply: (object, id, challengeId, assertion) => {
+      if (object === "passkey") throw new Error("passkey actions are applied by registerBegin");
+      const p = objectPath(object);
+      return call<unknown>("POST", `/api/ui/${p.path}/${seg(id)}/${p.apply}`, { challenge_id: challengeId, assertion });
+    },
+    loginBegin: () => call<BeginResponse>("POST", "/api/ui/login/begin", {}),
+    loginFinish: (challengeId, assertion) =>
+      call<unknown>("POST", "/api/ui/login/finish", challengeId ? { challenge_id: challengeId, assertion } : { assertion }),
+    registerBegin: (body) => call<BeginResponse>("POST", "/api/ui/passkeys/register/begin", body),
+    registerFinish: (challengeId, credential) =>
+      call<unknown>(
+        "POST",
+        "/api/ui/passkeys/register/finish",
+        challengeId ? { challenge_id: challengeId, credential } : { credential },
+      ),
+  };
+}
