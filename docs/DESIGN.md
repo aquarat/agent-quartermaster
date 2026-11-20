@@ -1,6 +1,9 @@
-# agent-quartermaster (`aqmas`): design, milestone 1
+# agent-quartermaster (`aqmas`): design, milestones 1 and 2
 
-Status (2026-11-20): milestone 1 is built and tested (unit tests, `TestUIFlows`, and
+Status (2026-11-20): milestone 2 (Cloudflare API access through aqmasd: proxy with scoped,
+time-boxed grants, guard rails, snapshots, child tokens) is built and tested, not deployed:
+design `docs/CLOUDFLARE.md`, wire contract `docs/API.md` section 5, plans `docs/DEPLOY-M2.md`
+and `docs/MIGRATION-M2.md`. Milestone 1 is built and tested (unit tests, `TestUIFlows`, and
 `test/interop/run.sh` with the real binaries), not deployed. Deployment plan:
 `docs/DEPLOY-M1.md`. Wire contract: `docs/API.md`; host and Forgejo trust: `docs/HOSTS.md`.
 
@@ -119,10 +122,14 @@ cmd/aqmas/                     CLI main               (workstream: client)
 internal/client/...            client packages         (workstream: client)
 web/                           TS sources, Bun build -> web/dist (workstream: web)
 internal/webui/                go:embed of web/dist (`make build` copies it in)
+internal/server/cfscope/       M2: Cloudflare scope catalogue, routes, deny-list (workstream: cf-proxy)
+internal/server/cfproxy/       M2: Cloudflare proxy, guard rails, snapshots, minter (cf-proxy)
+internal/testutil/fakecf/      M2: fake Cloudflare API for tests and interop (client)
 deploy/bastion/                aqmasd.service, install.sh, cloudflared unit + config template
 deploy/hosts/                  10-aqmas.conf, install-host-trust.sh, forgejo-ca.md
 test/interop/                  run.sh (real binaries end to end), owner.ts, softauthn.ts
-docs/                          DESIGN.md, API.md, HOSTS.md, DEPLOY-M1.md
+docs/                          DESIGN.md, API.md, HOSTS.md, DEPLOY-M1.md, CLOUDFLARE.md,
+                               DEPLOY-M2.md, MIGRATION-M2.md
 ```
 
 Build and test: `make vet test build` (aqmasd linux/arm64; aqmas linux/arm64 and amd64, with
@@ -142,8 +149,10 @@ Build and test: `make vet test build` (aqmasd linux/arm64; aqmas linux/arm64 and
   expired, not revoked), which is accurate but makes the warning routine every 730 days.
 - **Forgejo TTL:** `max_ttl_seconds = 3600` is the only control while `source-address` is
   unenforced; consider 900.
-- **Cloudflare zone control** (residual above): narrow that token or move the UI to a
-  zone agents cannot edit. Owner's decision.
+- **Cloudflare zone control** (residual above): milestone 2 moves the token into aqmasd; after
+  the M2 cut-over agents can change the zone only through scoped grants the owner approves
+  (Workers/DNS/tunnel writes are not auto-approved), which narrows this residual to "an
+  approved grant for the zone serving the UI".
 - **Forgejo, untested:** whether the built-in server enforces `source-address` (believed not),
   and whether the principals UI accepts `alice@forgejo` with
   `SSH_AUTHORIZED_PRINCIPALS_ALLOW = anything` (alternative: `email` with an address on the
