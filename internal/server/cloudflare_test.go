@@ -1083,9 +1083,13 @@ func TestCFProxyLongUpload(t *testing.T) {
 	if got := e.proxy.bodies[len(e.proxy.bodies)-1]; got != 8*1024 {
 		t.Fatalf("proxy read %d bytes", got)
 	}
-	// The same slow body on the plain API runs into its 300 ms timeouts: the connection is cut.
-	if st, err := post("POST", "/v1/requests"); err == nil {
-		t.Fatalf("slow body on the plain API was not cut off (HTTP %d)", st)
+	// The same slow body on the plain API runs into its 300 ms timeouts: aqmasd gives up on it
+	// long before the 800 ms body ends (the connection is cut, or the 400 "unreadable body"
+	// gets out first: both deadlines expire together, so either can win).
+	start := time.Now()
+	st, err = post("POST", "/v1/requests")
+	if err == nil && (st != http.StatusBadRequest || time.Since(start) > 700*time.Millisecond) {
+		t.Fatalf("slow body on the plain API was not cut off (HTTP %d after %v)", st, time.Since(start))
 	}
 }
 
