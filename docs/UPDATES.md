@@ -82,6 +82,13 @@ Verified executables install by rename, preserving the old inode. A synced root-
 
 ### Trust limits
 
+**Organisation inventory and rollback:** The read-only `organisations-plan` preview
+([procedure](ORGANISATIONS.md#inventory-preview-in-this-branch)) leaves the live `user_version`
+at 5. v0.1.1 rejects versions above 5, so do not install catalogue DDL on binary startup,
+lower `user_version` by hand, or treat installing `.prev` as undoing a signed cutover. After
+a future activation, fix forward unless the matching pre-activation recovery point can be
+restored without losing an intervening revocation, enrollment, passkey or grant change.
+
 * A compromised **aqmasd** controls its DB/audit, spool, discovery and what its web UI displays. It can cause denial of service or deceive an owner into signing a real update. It cannot synthesize a valid assertion for a root-pinned key or choose unverified installer bytes. A passkey is not a trusted display. For high-risk changes, independently inspect the source and compare hashes outside the UI.
 * A compromised **Forgejo** can publish and mirror malicious **source/workflows**; GitHub can honestly rebuild it, so agreement is not an independent source review. Likewise, compromise of a runner with repository-write permission may extend from one forged artifact to changing future source releases. Restrict/protect main, tags, workflow edits and job tokens. The bastion rebuild plus exact owner approval protect against substitution by a single artifact producer.
 * A compromised **GitHub** alone, or a build-only runner alone, can withhold releases or supply mismatched bytes and block installation. Neither supplies the root WebAuthn key. Common compromised dependencies, a compromised toolchain or kernel, collusion, and the owner's approval of malicious source are outside this guarantee. Isolate the mirror key; it permits repository writes even though it cannot operate on other repositories.

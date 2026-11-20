@@ -96,6 +96,28 @@ Use session-protected `/api/ui/` read views and the existing `challenge` → `de
 
 ## Cutover and delivery order
 
+### Inventory preview in this branch
+
+`aqmasd -config CONFIG organisations-plan BACKUP` prints the proposed personal catalogue as JSON.
+Use a **standalone SQLite online backup** from v0.1.1 (schema 5), a matching validated config,
+and the installation's CA files. Run as the broker user. For example, in a private backup directory:
+
+```sh
+umask 077
+sqlite3 -readonly /var/lib/aqmas/aqmas.db ".backup 'before-organisations.sqlite'"
+aqmasd -config /etc/aqmas/config.toml organisations-plan before-organisations.sqlite > personal-plan.json
+```
+
+Keep the DB backup and plan private. Compare the enrollment IDs, classes and fingerprints (not
+just host names), SSH target bindings, named Cloudflare resources and which proxy scopes can be
+auto-approved. Check outstanding certificate expiries and resolve child-token provenance against
+the original issuer's records. An old grant ID, target name or scope alone proves no current
+service binding. Plans larger than 128 KiB (compact JSON) or 512 rows in any inventory are refused.
+The preview changes neither the backup nor the running catalogue. Re-run it after configuration,
+enrollment or grant changes. There is no live activation command in the preview.
+
+### Delivery sequence
+
 1. **Inventory and dry run, personal only.** Append migrations after the current `PRAGMA user_version` 4 (coordinate numbering with owner-device work). Generate a repeatable plan from a consistent backup and validated config: one personal org, one owner, live enrollment IDs admitted to personal only, `[[targets]]` → fleet sets, optional `[cloudflare]` → one service and its mode sets. Carry principal, users, host key, TTL/risk and all scope narrowing, named-ID bindings, IP conditions, deny/guard rules and snapshot settings forward. Disabled features stay disabled. Retain the SSH CA, global principal uniqueness, client TLS pins, enrollment certificates, RP ID and passkey handles. No [host trust](HOSTS.md) change.
 2. **Review then activate.** Stage schema and catalogue metadata without issuing new authority. Keep personal-only legacy operation until cutover. Before signing the final plan, pause mutations, fence and drain polls, mints, proxy calls and sweepers, and make a consistent recovery point. Recheck source versions and host inventory in the activation transaction; abort on drift. Initially leave CF parents behind fixed personal service handles using the existing loader. Pin the public config revision; changed role mappings, account or policy require signed review, never an unsigned live override. Operational settings like listeners stay in config.
 3. **Backfill and close old authority.** Preserve IDs, SSH serials and sequence high-water mark, validity and deletion records. The historic CF rows have no issuer/account ID; current config and a matching scope are not proof of origin. Use verified issuer inventory or operator records, and verify reused SSH target names too. Keep ambiguous records owner-only, inert and unassigned; report unresolved children through expiry, don't try another minter. Expire pending requests and v1 action challenges; revoke legacy standing approvals and active broker grants. Report delivered certs outstanding until expiry and reconcile verified children with the original minter. Index old snapshots only when service and original enrollment are proven from grant history; otherwise archive owner-only. Don't rewrite append-only audit rows: attribute legacy events via verified object-ID joins or show separately. An audited atomic activation marker selects the new path on restart.

@@ -3,19 +3,25 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/server"
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
+	"github.com/aquarat/agent-quartermaster/internal/server/organisations"
 	"github.com/aquarat/agent-quartermaster/internal/server/pki"
 	"github.com/aquarat/agent-quartermaster/internal/webui"
+	"golang.org/x/crypto/ssh"
 )
 
 // version is set with -ldflags "-X main.version=...".
@@ -25,6 +31,7 @@ const usage = `usage: aqmasd [-config PATH] <command>
 
 commands:
   serve                 run the agent API and the approval web UI
+  organisations-plan BACKUP   preview the personal cutover from a standalone SQLite online backup
   passkey-enroll-code   print a one-time code (15 min, single use) to register the first passkey
   print-ssh-ca          print the SSH user CA public key (for TrustedUserCAKeys)
   print-client-ca       print the internal CA certificate (PEM; signs the agent-API server cert too)
@@ -44,7 +51,8 @@ func main() {
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(2)
 	}
-	if fs.NArg() < 1 || (fs.Arg(0) == "revoke-host") != (fs.NArg() == 2) || fs.NArg() > 2 {
+	needsArg := fs.Arg(0) == "revoke-host" || fs.Arg(0) == "organisations-plan"
+	if fs.NArg() < 1 || needsArg != (fs.NArg() == 2) || fs.NArg() > 2 {
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -71,6 +79,21 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		return err
 	}
 	switch cmd {
+	case "organisations-plan":
+		if len(args) != 1 {
+			return fmt.Errorf("organisations-plan requires a standalone SQLite backup")
+		}
+		sshPin, tlsPin, err := inventoryPins(server.CADir(cfg.DataDir))
+		if err != nil {
+			return err
+		}
+		plan, err := organisations.InspectBackup(context.Background(), args[0], cfg, sshPin, tlsPin, time.Now())
+		if err != nil {
+			return err
+		}
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(plan)
 	case "serve":
 		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 		srv, err := server.New(server.Options{Config: cfg, Logger: log})
@@ -124,6 +147,31 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown command %q", cmd)
+}
+
+// Only public CA material is needed on the machine inspecting the backup.
+func inventoryPins(dir string) (string, string, error) {
+	b, err := os.ReadFile(filepath.Join(dir, pki.SSHCAPubFile))
+	if err != nil {
+		return "", "", err
+	}
+	key, _, _, rest, err := ssh.ParseAuthorizedKey(b)
+	if err != nil || len(rest) != 0 || key.Type() != ssh.KeyAlgoED25519 {
+		return "", "", fmt.Errorf("invalid SSH CA public key")
+	}
+	b, err = os.ReadFile(filepath.Join(dir, pki.ClientCACrtFile))
+	if err != nil {
+		return "", "", err
+	}
+	block, rest := pem.Decode(b)
+	if block == nil || block.Type != "CERTIFICATE" || len(rest) != 0 {
+		return "", "", fmt.Errorf("invalid TLS CA certificate")
+	}
+	crt, err := x509.ParseCertificate(block.Bytes)
+	if err != nil || !crt.IsCA {
+		return "", "", fmt.Errorf("invalid TLS CA certificate")
+	}
+	return ssh.FingerprintSHA256(key), "sha256:" + pki.CertFingerprint(crt.Raw), nil
 }
 
 // checkUser refuses to run as root when the data dir belongs to another user, so root never
