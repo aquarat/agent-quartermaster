@@ -10,6 +10,13 @@
 //	standing:   + requesting_host, kind, target, login_user, ttl_seconds, standing_hours
 //	grant:      + requesting_host, kind, target, login_user, ttl_seconds, standing_hours
 //	passkey:    common only
+//
+// For kind "cloudflare" (milestone 2) the request, standing and grant objects carry a different
+// set instead (docs/API.md 5.4); the set is chosen by (object, kind):
+//
+//	request:    + requesting_host, kind, scope, scope_params, mode, ip_condition, ttl_seconds, standing_hours
+//	standing:   + requesting_host, kind, scope, scope_params, mode, ttl_seconds, standing_hours
+//	grant:      + requesting_host, kind, scope, scope_params, mode, ttl_seconds, standing_hours
 package canon
 
 import (
@@ -55,6 +62,27 @@ var objectKeys = map[string][]string{
 	ObjectPasskey:    {},
 }
 
+// KindCloudflare is the request kind whose objects carry the Cloudflare key sets.
+const KindCloudflare = "cloudflare"
+
+// cloudflareKeys replace objectKeys for kind "cloudflare".
+var cloudflareKeys = map[string][]string{
+	ObjectRequest:  {"requesting_host", "kind", "scope", "scope_params", "mode", "ip_condition", "ttl_seconds", "standing_hours"},
+	ObjectStanding: {"requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"},
+	ObjectGrant:    {"requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"},
+}
+
+// keysFor returns the key set (besides the common keys) for an object of a kind.
+func keysFor(object, kind string) ([]string, bool) {
+	if kind == KindCloudflare {
+		if k, ok := cloudflareKeys[object]; ok {
+			return k, true
+		}
+	}
+	k, ok := objectKeys[object]
+	return k, ok
+}
+
 var objectActions = map[string][]string{
 	ObjectRequest:    {ActionApprove, ActionDeny},
 	ObjectEnrollment: {ActionApprove, ActionDeny},
@@ -76,6 +104,12 @@ type Action struct {
 	Replaces       bool   `json:"replaces"` // enrollment: approving revokes an existing host
 	TTLSeconds     int    `json:"ttl_seconds"`
 	StandingHours  int    `json:"standing_hours"`
+	// Kind "cloudflare": scope name, canonical scope_params ("k=v;k=v"), mode (proxy|token)
+	// and, on request objects, ip_condition (token mode: sorted CIDRs joined by ",").
+	Scope       string `json:"scope"`
+	ScopeParams string `json:"scope_params"`
+	Mode        string `json:"mode"`
+	IPCondition string `json:"ip_condition"`
 }
 
 // Signed is a parsed canonical text: the action plus the challenge metadata.
@@ -105,6 +139,10 @@ func (a Action) values() map[string]any {
 		"replaces":        a.Replaces,
 		"ttl_seconds":     a.TTLSeconds,
 		"standing_hours":  a.StandingHours,
+		"scope":           a.Scope,
+		"scope_params":    a.ScopeParams,
+		"mode":            a.Mode,
+		"ip_condition":    a.IPCondition,
 	}
 }
 
@@ -128,7 +166,7 @@ func Build(a Action, nonce string, issuedAt time.Time) (string, error) {
 	if a.Action == "" || a.ID == "" {
 		return "", errors.New("canon: action and id are required")
 	}
-	keys, ok := objectKeys[a.Object]
+	keys, ok := keysFor(a.Object, a.Kind)
 	if !ok {
 		return "", fmt.Errorf("canon: unknown object %q", a.Object)
 	}
@@ -182,7 +220,13 @@ func Parse(canonical string) (Signed, error) {
 	if err := json.Unmarshal(raw["object"], &obj); err != nil {
 		return Signed{}, errors.New("canon: no object")
 	}
-	keys, ok := objectKeys[obj]
+	// The key set depends on (object, kind); kind is absent on passkey objects. A kind that
+	// is not a string is caught by the strict decode below.
+	var kind string
+	if k, ok := raw["kind"]; ok {
+		_ = json.Unmarshal(k, &kind)
+	}
+	keys, ok := keysFor(obj, kind)
 	if !ok {
 		return Signed{}, fmt.Errorf("canon: unknown object %q", obj)
 	}

@@ -39,11 +39,20 @@ func (s *Server) AgentHandler() http.Handler {
 	mux.Handle("POST /v1/requests/{id}/cancel", s.requireHost(s.handleCancel))
 	mux.Handle("GET /v1/grants", s.requireHost(s.handleGrants))
 	mux.Handle("GET /v1/ssh-ca", s.requireHost(s.handleSSHCA))
+	// Milestone 2 (404 when cloudflare.enabled is false).
+	mux.Handle("GET /v1/cf/catalogue", s.requireHost(s.handleCFCatalogue))
+	mux.Handle("GET /v1/cf/snapshots", s.requireHost(s.handleCFSnapshots))
+	mux.Handle("GET /v1/cf/snapshots/{id}", s.requireHost(s.handleCFSnapshot))
+	proxy := s.requireHostCF(s.handleCFProxy)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		if r.TLS == nil {
 			s.writeErr(w, r, errForbidden("TLS required"))
+			return
+		}
+		if isCFProxyPath(r) {
+			proxy.ServeHTTP(w, r) // any method; the proxy validates path and method itself
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -246,8 +255,8 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		s.writeErr(w, r, err)
 		return
 	}
-	if in.Kind != api.KindSSH || in.SSH == nil {
-		s.writeErr(w, r, errBad(`kind must be "ssh" with an ssh object`))
+	if in.Kind != api.KindCloudflare && (in.Kind != api.KindSSH || in.SSH == nil || in.Cloudflare != nil) {
+		s.writeErr(w, r, errBad(`kind must be "ssh" with an ssh object, or "cloudflare" with a cloudflare object`))
 		return
 	}
 	if len(in.Reason) > MaxReasonLen || !utf8.ValidString(in.Reason) || hasControl(in.Reason, true) {
@@ -256,6 +265,10 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 	}
 	if err := validRequester(in.Requester); err != nil {
 		s.writeErr(w, r, err)
+		return
+	}
+	if in.Kind == api.KindCloudflare {
+		s.handleCreateCloudflare(w, r, h, &in)
 		return
 	}
 	tgt, ok := s.cfg.Target(in.SSH.TargetHost)
@@ -383,6 +396,11 @@ func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request, h *
 		s.writeErr(w, r, err)
 		return
 	}
+	// Token mode: the first poll after approval mints the child token and carries its value.
+	if err := s.deliverToken(w, r, h, out); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -396,6 +414,10 @@ func (s *Server) requestStatus(ctx context.Context, q *store.Q, req *store.Reque
 	g, err := q.GrantByRequest(ctx, req.ID)
 	if err != nil {
 		return nil, err
+	}
+	if g.Kind == api.KindCloudflare {
+		out.Grant = s.cfGrantView(g)
+		return out, nil
 	}
 	tgt, _ := s.cfg.Target(g.TargetHost)
 	out.Grant = &api.Grant{
@@ -461,7 +483,7 @@ func (s *Server) handleGrants(w http.ResponseWriter, r *http.Request, h *store.H
 	out := api.GrantList{Grants: []api.GrantSummary{}}
 	for _, g := range gs {
 		out.Grants = append(out.Grants, api.GrantSummary{ID: g.ID, Kind: g.Kind, Status: g.Status(now), TargetHost: g.TargetHost,
-			LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter})
+			LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter, Scope: g.Scope, ScopeParams: g.ScopeParams, Mode: g.Mode})
 	}
 	writeJSON(w, http.StatusOK, out)
 }

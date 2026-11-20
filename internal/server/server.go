@@ -21,6 +21,7 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/aquarat/agent-quartermaster/internal/server/cfaccess"
+	"github.com/aquarat/agent-quartermaster/internal/server/cfproxy"
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/notify"
@@ -55,6 +56,9 @@ type Options struct {
 	HTTPClient *http.Client
 	// AccessCertsURL overrides the Access JWKS URL (tests).
 	AccessCertsURL string
+
+	// newCFProxy replaces cfproxy.New (tests in this package inject a fake proxy).
+	newCFProxy func(cfproxy.Options) (cfProxy, error)
 }
 
 // Server is a running aqmasd instance.
@@ -70,6 +74,7 @@ type Server struct {
 	notify  *notify.Notifier
 	access  *cfaccess.Verifier
 	bcast   broadcaster
+	cf      cfState // milestone 2; zero when cloudflare.enabled is false
 }
 
 // DBPath returns the database path for a data dir.
@@ -159,6 +164,12 @@ func New(o Options) (*Server, error) {
 			s.access.Client = o.HTTPClient
 		}
 	}
+	if cfg.Cloudflare.Enabled {
+		if err := s.setupCloudflare(o); err != nil {
+			st.Close()
+			return nil, err
+		}
+	}
 	return s, nil
 }
 
@@ -234,6 +245,7 @@ func (s *Server) sweeper(ctx context.Context) {
 			} else if n > 0 {
 				s.bcast.notify()
 			}
+			s.cfSweep(ctx)
 		}
 	}
 }

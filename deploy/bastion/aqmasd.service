@@ -14,14 +14,27 @@ ExecStart=/usr/local/bin/aqmasd -config /etc/aqmas/config.toml serve
 Restart=on-failure
 RestartSec=5
 
-# /var/lib/aqmas (database + CA keys) and /etc/aqmas (config, root:aqmas 0640).
+# /var/lib/aqmas (database + CA keys + Cloudflare snapshots in /var/lib/aqmas/cf-snapshots) and
+# /etc/aqmas (config, root:aqmas 0640). StateDirectory= is writable despite ProtectSystem=strict;
+# a cloudflare.snapshot_dir outside /var/lib/aqmas would also need ReadWritePaths=.
 StateDirectory=aqmas
 StateDirectoryMode=0700
 ConfigurationDirectory=aqmas
 ConfigurationDirectoryMode=0750
 UMask=0077
 
-# Hardening.
+# Cloudflare parent tokens (milestone 2, docs/CLOUDFLARE.md section 6): root:root 0600 files in
+# /etc/aqmas, handed over by systemd and read once at start from $CREDENTIALS_DIRECTORY (never
+# logged, never in the database). Enable them in a drop-in so reinstalling this unit keeps them:
+#   /etc/systemd/system/aqmasd.service.d/cloudflare.conf:
+#     [Service]
+#     LoadCredential=cf-proxy-token:/etc/aqmas/cf-proxy-token
+#     LoadCredential=cf-minter-token:/etc/aqmas/cf-minter-token
+#LoadCredential=cf-proxy-token:/etc/aqmas/cf-proxy-token
+#LoadCredential=cf-minter-token:/etc/aqmas/cf-minter-token
+
+# Hardening. Outbound HTTPS (ntfy; api.cloudflare.com when [cloudflare] is enabled) needs
+# AF_INET/AF_INET6 and DNS: do not add IPAddressDeny= or drop those address families.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
