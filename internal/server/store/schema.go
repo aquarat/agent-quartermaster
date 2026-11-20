@@ -127,6 +127,7 @@ CREATE TABLE enroll_codes (
 CREATE TABLE web_sessions (
 	hash         TEXT PRIMARY KEY,
 	passkey_id   INTEGER NOT NULL REFERENCES passkeys(id),
+	access_sub   TEXT NOT NULL DEFAULT '',
 	created_at   INTEGER NOT NULL,
 	expires_at   INTEGER NOT NULL
 ) STRICT;

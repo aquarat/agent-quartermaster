@@ -65,7 +65,7 @@ func testConfig(dir string) *config.Config {
 	cfg.Targets = []config.Target{
 		{Name: "db-1", Address: "192.0.2.61", Port: 22, Users: []string{"alice"},
 			HostKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGilJAtWZP1K8q90h5+KBdPRC0+wBFVVtHkOZQLmI9jB"},
-		{Name: "forgejo", Address: "192.0.2.50", Port: 2222, Users: []string{"git"}, ForgejoUser: "alice"},
+		{Name: "forgejo", Address: "192.0.2.50", Port: 2222, Users: []string{"git"}, PrincipalOverride: "alice@forgejo"},
 	}
 	if err := cfg.Validate(); err != nil {
 		panic(err)

@@ -32,6 +32,7 @@ type Verifier struct {
 	mu        sync.Mutex
 	keys      map[string]*rsa.PublicKey
 	fetchedAt time.Time
+	lastTry   time.Time // last fetch attempt (successful or not): limits refetches
 }
 
 // New returns a verifier for team domain and application AUD.
@@ -101,7 +102,8 @@ func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 		return k, nil
 	}
 	// Unknown kid (rotation) or stale cache: refetch, at most once a minute.
-	if time.Since(v.fetchedAt) > time.Minute || v.keys == nil {
+	if time.Since(v.lastTry) > time.Minute || (v.keys == nil && time.Since(v.lastTry) > 5*time.Second) {
+		v.lastTry = time.Now()
 		if err := v.refresh(ctx); err != nil {
 			return nil, err
 		}
@@ -112,11 +114,16 @@ func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 	return nil, errors.New("cfaccess: unknown key id")
 }
 
+// Identity is who Cloudflare Access authenticated.
+type Identity struct {
+	Email string
+	Sub   string
+}
+
 // Verify validates a token: RS256 signature by a current team key, issuer, audience, expiry.
-// It returns the token's email claim (may be empty).
-func (v *Verifier) Verify(ctx context.Context, token string) (string, error) {
+func (v *Verifier) Verify(ctx context.Context, token string) (Identity, error) {
 	if token == "" {
-		return "", errors.New("cfaccess: missing token")
+		return Identity{}, errors.New("cfaccess: missing token")
 	}
 	claims := jwt.MapClaims{}
 	_, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (any, error) {
@@ -130,8 +137,10 @@ func (v *Verifier) Verify(ctx context.Context, token string) (string, error) {
 		jwt.WithLeeway(30*time.Second),
 	)
 	if err != nil {
-		return "", fmt.Errorf("cfaccess: %w", err)
+		return Identity{}, fmt.Errorf("cfaccess: %w", err)
 	}
-	email, _ := claims["email"].(string)
-	return email, nil
+	var id Identity
+	id.Email, _ = claims["email"].(string)
+	id.Sub, _ = claims["sub"].(string)
+	return id, nil
 }

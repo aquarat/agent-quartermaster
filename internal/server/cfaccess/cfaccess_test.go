@@ -48,7 +48,7 @@ func TestVerify(t *testing.T) {
 	v.CertsURL = ts.URL
 	ctx := context.Background()
 	good := ts.Token("https://team.example.com", "AUD1", time.Now().Add(time.Hour), ts.Key)
-	if email, err := v.Verify(ctx, good); err != nil || email != "owner@example.com" {
+	if id, err := v.Verify(ctx, good); err != nil || id.Email != "owner@example.com" {
 		t.Fatalf("good token: %v", err)
 	}
 	other, _ := rsa.GenerateKey(rand.Reader, 2048)

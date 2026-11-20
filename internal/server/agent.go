@@ -25,6 +25,7 @@ type ctxKey int
 const (
 	ctxHost ctxKey = iota
 	ctxSession
+	ctxAccessSub
 )
 
 // AgentHandler returns the agent API handler (serve it with PKI().TLSConfig()).
@@ -150,6 +151,11 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		if n >= MaxPendingEnrolls {
 			return &apiErr{http.StatusTooManyRequests, "conflict", "too many pending enrollments"}
 		}
+		if n, err := q.CountPendingEnrollmentsFrom(ctx, e.PeerAddress, now); err != nil {
+			return err
+		} else if n >= MaxPendingEnrollsPerIP {
+			return &apiErr{http.StatusTooManyRequests, "conflict", "too many pending enrollments from this address"}
+		}
 		if err := q.InsertEnrollment(ctx, e); err != nil {
 			return err
 		}
@@ -171,13 +177,14 @@ func (s *Server) handleEnrollStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var e *store.Enrollment
 	err := s.longPoll(ctx, parseWait(r.URL.Query().Get("wait")), func() (bool, error) {
-		if _, err := s.store.Q().ExpireStale(ctx, s.now()); err != nil {
-			return false, err
-		}
 		var err error
 		e, err = s.store.Q().GetEnrollment(ctx, id)
 		if err != nil {
 			return false, err
+		}
+		// Expiry is applied in memory here (the sweeper persists it): polling causes no writes.
+		if e.Status == api.StatusPending && !s.now().Before(e.ExpiresAt) {
+			e.Status = api.StatusExpired
 		}
 		return e.Status != api.StatusPending, nil
 	})
@@ -306,6 +313,11 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 			return q.Audit(ctx, now, "system", "auto_approve", "request:"+req.ID,
 				fmt.Sprintf("standing=%s grant=%s host=%s %s@%s ttl=%d key=%s from=%s", st.ID, g.ID, h.Name, req.LoginUser, req.TargetHost, ttl, req.KeyFingerprint, req.PeerAddress))
 		}
+		if n, err := q.CountPendingRequests(ctx, h.ID, now); err != nil {
+			return err
+		} else if n >= MaxPendingPerHost {
+			return &apiErr{http.StatusTooManyRequests, "conflict", "too many pending requests from this host"}
+		}
 		if err := q.InsertRequest(ctx, req); err != nil {
 			return err
 		}
@@ -329,9 +341,6 @@ func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request, h *
 	ctx := r.Context()
 	var req *store.Request
 	err := s.longPoll(ctx, parseWait(r.URL.Query().Get("wait")), func() (bool, error) {
-		if _, err := s.store.Q().ExpireStale(ctx, s.now()); err != nil {
-			return false, err
-		}
 		var err error
 		req, err = s.store.Q().GetRequest(ctx, id)
 		if err != nil {
@@ -340,6 +349,9 @@ func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request, h *
 		// Host isolation: another host's request is indistinguishable from a missing one.
 		if req.HostID != h.ID {
 			return false, store.ErrNotFound
+		}
+		if req.Status == api.StatusPending && !s.now().Before(req.ExpiresAt) {
+			req.Status = api.StatusExpired
 		}
 		return req.Status != api.StatusPending, nil
 	})

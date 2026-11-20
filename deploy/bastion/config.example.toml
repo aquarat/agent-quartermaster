@@ -27,6 +27,7 @@ topic_url = ""   # e.g. "https://ntfy.sh/<random-topic>"
 # valid Cf-Access-Jwt-Assertion are refused (defence in depth; passkeys are the boundary).
 team_domain = ""  # e.g. "<team>.cloudflareaccess.com"
 aud         = ""  # the Access application's AUD tag
+owner_email = ""  # if set, the Access identity's email must match; sessions are bound to its sub
 
 # Hosts aqmas may issue SSH certificates for. Principal: "<login_user>@<name>" (see docs/HOSTS.md).
 [[targets]]
@@ -42,12 +43,13 @@ address  = "192.0.2.62"
 users    = ["alice"]
 
 # Forgejo's built-in SSH server maps a certificate principal to the user account that registered
-# it ("Manage SSH Certificate Principals"), so the principal is set explicitly. It probably does
+# it ("Manage SSH Certificate Principals"), so the principal is set explicitly. It must contain
+# "@" so it can never double as a Unix login name on a host that trusts the CA. It probably does
 # not enforce source-address, so keep Forgejo grants short.
 [[targets]]
 name            = "forgejo"
 address         = "192.0.2.50"
 port            = 2222
 users           = ["git"]
-principal       = "alice"
+principal       = "alice@forgejo"  # register this exact string in Forgejo
 max_ttl_seconds = 3600

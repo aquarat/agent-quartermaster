@@ -37,6 +37,10 @@ const (
 	MaxWait           = 25 * time.Second
 	PollAfterMS       = 2000
 	MaxPendingEnrolls = 20
+	// MaxPendingEnrollsPerIP limits unauthenticated enrollments per peer address.
+	MaxPendingEnrollsPerIP = 3
+	// MaxPendingPerHost limits how many undecided requests one host may queue.
+	MaxPendingPerHost = 5
 	MaxReasonLen      = 500
 	sessionCookie     = "__Host-aqmas_session"
 	csrfHeader        = "X-Aqmas"
@@ -142,6 +146,9 @@ func New(o Options) (*Server, error) {
 		if t.HostKey == "" {
 			o.Logger.Warn("target has no host_key: grants carry no known_hosts line", "target", t.Name)
 		}
+	}
+	if !cfg.Access.Enabled() {
+		o.Logger.Warn("Cloudflare Access validation is OFF (access.team_domain/aud unset): only passkeys protect the web UI")
 	}
 	if cfg.Access.Enabled() {
 		s.access = cfaccess.New(cfg.Access.TeamDomain, cfg.Access.AUD)
@@ -325,6 +332,28 @@ func NewEnrollCode(dataDir string, now time.Time) (string, error) {
 		return q.Audit(ctx, now, "system", "passkey_enroll_code", "enroll_code", "one-time code created (valid 15 min)")
 	})
 	return code, err
+}
+
+// RevokeHost revokes the active identity of host name in the database at dataDir (its client
+// certificate stops working at once; its standing approvals and pending requests end too).
+// For the bastion operator: `aqmasd revoke-host <name>`.
+func RevokeHost(dataDir, name string, now time.Time) error {
+	st, err := store.Open(DBPath(dataDir))
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	ctx := context.Background()
+	return st.Tx(ctx, func(q *store.Q) error {
+		h, err := q.ActiveHostByName(ctx, name)
+		if err != nil {
+			return fmt.Errorf("no active host %q: %w", name, err)
+		}
+		if err := q.RevokeHost(ctx, h.ID, now); err != nil {
+			return err
+		}
+		return q.Audit(ctx, now, "system", "host_revoke", "host:"+name, fmt.Sprintf("host_id=%d via aqmasd revoke-host", h.ID))
+	})
 }
 
 func normalizeCode(c string) string {

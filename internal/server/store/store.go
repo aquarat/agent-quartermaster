@@ -309,6 +309,20 @@ func (q *Q) CountPendingEnrollments(ctx context.Context, now time.Time) (int, er
 	return n, err
 }
 
+// CountPendingEnrollmentsFrom counts undecided, unexpired enrollments from one peer address.
+func (q *Q) CountPendingEnrollmentsFrom(ctx context.Context, peer string, now time.Time) (int, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, "SELECT count(*) FROM enrollments WHERE status = 'pending' AND expires_at > ? AND peer_address = ?", ms(now), peer).Scan(&n)
+	return n, err
+}
+
+// CountPendingRequests counts undecided, unexpired requests of one host.
+func (q *Q) CountPendingRequests(ctx context.Context, hostID int64, now time.Time) (int, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, "SELECT count(*) FROM requests WHERE status = 'pending' AND expires_at > ? AND host_id = ?", ms(now), hostID).Scan(&n)
+	return n, err
+}
+
 // DecideEnrollment moves a pending, unexpired enrollment to approved/denied.
 func (q *Q) DecideEnrollment(ctx context.Context, id, status, note, certPEM string, now time.Time) error {
 	return one(q.q.ExecContext(ctx, `UPDATE enrollments SET status = ?, decision_note = ?, cert_pem = ?, decided_at = ?
@@ -381,7 +395,10 @@ func (q *Q) RevokeHost(ctx context.Context, id int64, now time.Time) error {
 	if err := one(q.q.ExecContext(ctx, "UPDATE hosts SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", ms(now), id)); err != nil {
 		return err
 	}
-	_, err := q.q.ExecContext(ctx, "UPDATE standing SET revoked_at = ? WHERE host_id = ? AND revoked_at IS NULL", ms(now), id)
+	if _, err := q.q.ExecContext(ctx, "UPDATE standing SET revoked_at = ? WHERE host_id = ? AND revoked_at IS NULL", ms(now), id); err != nil {
+		return err
+	}
+	_, err := q.q.ExecContext(ctx, "UPDATE requests SET status = 'expired', decision_note = 'host identity revoked', decided_at = ? WHERE host_id = ? AND status = 'pending'", ms(now), id)
 	return err
 }
 
@@ -683,6 +700,15 @@ func (q *Q) UseStanding(ctx context.Context, id string, now time.Time) error {
 	return one(q.q.ExecContext(ctx, "UPDATE standing SET uses = uses + 1 WHERE id = ? AND revoked_at IS NULL AND expires_at > ?", id, ms(now)))
 }
 
+// RevokeStandingFromRequest revokes active standing approvals created by approving requestID.
+func (q *Q) RevokeStandingFromRequest(ctx context.Context, requestID string, now time.Time) (int64, error) {
+	res, err := q.q.ExecContext(ctx, "UPDATE standing SET revoked_at = ? WHERE source_request_id = ? AND revoked_at IS NULL", ms(now), requestID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // RevokeStanding revokes a standing approval.
 func (q *Q) RevokeStanding(ctx context.Context, id string, now time.Time) error {
 	return one(q.q.ExecContext(ctx, "UPDATE standing SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", ms(now), id))
@@ -818,15 +844,16 @@ func (q *Q) ConsumeEnrollCode(ctx context.Context, hash string, now time.Time) e
 // ---- web sessions ----
 
 // InsertSession stores a session by the hash of its cookie value.
-func (q *Q) InsertSession(ctx context.Context, hash string, passkeyID int64, now, expires time.Time) error {
-	_, err := q.q.ExecContext(ctx, "INSERT INTO web_sessions(hash, passkey_id, created_at, expires_at) VALUES (?, ?, ?, ?)", hash, passkeyID, ms(now), ms(expires))
+func (q *Q) InsertSession(ctx context.Context, hash string, passkeyID int64, accessSub string, now, expires time.Time) error {
+	_, err := q.q.ExecContext(ctx, "INSERT INTO web_sessions(hash, passkey_id, access_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?)", hash, passkeyID, accessSub, ms(now), ms(expires))
 	return err
 }
 
-// SessionValid reports whether the session hash exists and is unexpired.
-func (q *Q) SessionValid(ctx context.Context, hash string, now time.Time) (bool, error) {
+// SessionValid reports whether the session hash exists, is unexpired and was created under the
+// same Cloudflare Access subject ("" when Access is not configured).
+func (q *Q) SessionValid(ctx context.Context, hash, accessSub string, now time.Time) (bool, error) {
 	var n int
-	err := q.q.QueryRowContext(ctx, "SELECT count(*) FROM web_sessions WHERE hash = ? AND expires_at > ?", hash, ms(now)).Scan(&n)
+	err := q.q.QueryRowContext(ctx, "SELECT count(*) FROM web_sessions WHERE hash = ? AND access_sub = ? AND expires_at > ?", hash, accessSub, ms(now)).Scan(&n)
 	return n == 1, err
 }
 

@@ -334,7 +334,7 @@ func TestRequestValidation(t *testing.T) {
 	rc, _, _ = e.request(c, "forgejo", "git", 0)
 	mustStatus(t, "approve forgejo", e.approve("/api/ui/requests/"+rc.ID, "decide", api.ChallengeRequest{Action: "approve"}), 200)
 	rs, _ := e.status(c, rc.ID, "")
-	if rs.Grant == nil || len(rs.Grant.SSH.Principals) != 1 || rs.Grant.SSH.Principals[0] != "alice" || rs.Grant.SSH.TargetPort != 2222 {
+	if rs.Grant == nil || len(rs.Grant.SSH.Principals) != 1 || rs.Grant.SSH.Principals[0] != "alice@forgejo" || rs.Grant.SSH.TargetPort != 2222 {
 		t.Fatalf("forgejo grant %+v", rs.Grant)
 	}
 }

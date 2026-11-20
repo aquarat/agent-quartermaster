@@ -23,7 +23,7 @@ name = "forgejo"
 address = "192.0.2.50"
 port = 2222
 users = ["git"]
-forgejo_user = "alice"
+principal = "alice@forgejo"
 `
 
 func TestParse(t *testing.T) {
@@ -36,17 +36,18 @@ func TestParse(t *testing.T) {
 	}
 	n, _ := c.Target("db-1")
 	f, _ := c.Target("forgejo")
-	if n.Port != 22 || n.Principal("alice") != "alice@db-1" || f.Principal("git") != "alice" {
+	if n.Port != 22 || n.Principal("alice") != "alice@db-1" || f.Principal("git") != "alice@forgejo" {
 		t.Fatal("targets")
 	}
 	for name, bad := range map[string]string{
-		"unknown key":  example + "\nbogus = 1\n",
-		"http base":    strings.Replace(example, "https://approvals", "http://approvals", 1),
-		"base path":    strings.Replace(example, "example.com\"", "example.com/x\"", 1),
-		"bad user":     strings.Replace(example, `users = ["git"]`, `users = ["Git;rm"]`, 1),
-		"access half":  example + "\n[access]\naud = \"x\"\n",
-		"ttl inverted": strings.Replace(example, "max_seconds = 14400", "max_seconds = 10", 1),
-		"dup target":   example + "\n[[targets]]\nname = \"db-1\"\naddress = \"x\"\nusers = [\"a\"]\n",
+		"unknown key":    example + "\nbogus = 1\n",
+		"http base":      strings.Replace(example, "https://approvals", "http://approvals", 1),
+		"base path":      strings.Replace(example, "example.com\"", "example.com/x\"", 1),
+		"bad user":       strings.Replace(example, `users = ["git"]`, `users = ["Git;rm"]`, 1),
+		"bare principal": strings.Replace(example, `principal = "alice@forgejo"`, `principal = "alice"`, 1),
+		"access half":    example + "\n[access]\naud = \"x\"\n",
+		"ttl inverted":   strings.Replace(example, "max_seconds = 14400", "max_seconds = 10", 1),
+		"dup target":     example + "\n[[targets]]\nname = \"db-1\"\naddress = \"x\"\nusers = [\"a\"]\n",
 	} {
 		if _, err := Parse([]byte(bad)); err == nil {
 			t.Errorf("%s: accepted", name)

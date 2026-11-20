@@ -52,6 +52,8 @@ type Ntfy struct {
 type Access struct {
 	TeamDomain string `toml:"team_domain"` // e.g. "example.cloudflareaccess.com"
 	AUD        string `toml:"aud"`
+	// OwnerEmail, when set, must equal the Access token's email claim.
+	OwnerEmail string `toml:"owner_email"`
 }
 
 // Enabled reports whether Access validation is configured.
@@ -230,11 +232,14 @@ func (c *Config) Validate() error {
 		if tg.PrincipalOverride != "" && tg.ForgejoUser != "" && tg.PrincipalOverride != tg.ForgejoUser {
 			return fmt.Errorf("config: target %q sets both principal and forgejo_user", tg.Name)
 		}
-		if p := tg.PrincipalOverride; p != "" && !principalRE.MatchString(p) {
-			return fmt.Errorf("config: target %q principal invalid", tg.Name)
+		// A bare principal equal to a Unix login name would also log in to any host whose sshd
+		// trusts the CA without an AuthorizedPrincipalsFile; require "<name>@<something>".
+		p := tg.PrincipalOverride
+		if p == "" {
+			p = tg.ForgejoUser
 		}
-		if tg.ForgejoUser != "" && !ValidUser(tg.ForgejoUser) {
-			return fmt.Errorf("config: target %q forgejo_user invalid", tg.Name)
+		if p != "" && (!principalRE.MatchString(p) || !strings.Contains(p, "@")) {
+			return fmt.Errorf("config: target %q principal must look like <name>@<service>, e.g. alice@forgejo", tg.Name)
 		}
 		if tg.HostKey != "" {
 			if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(tg.HostKey)); err != nil {

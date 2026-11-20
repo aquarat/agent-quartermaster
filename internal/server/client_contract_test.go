@@ -74,8 +74,8 @@ func TestCancelAndSSHCA(t *testing.T) {
 }
 
 func TestTargetPrincipalAndTTLCap(t *testing.T) {
-	tg := config.Target{Name: "forgejo", Users: []string{"git"}, PrincipalOverride: "alice"}
-	if tg.Principal("git") != "alice" {
+	tg := config.Target{Name: "forgejo", Users: []string{"git"}, PrincipalOverride: "alice@forgejo"}
+	if tg.Principal("git") != "alice@forgejo" {
 		t.Fatal("principal override")
 	}
 	e := newEnv(t)

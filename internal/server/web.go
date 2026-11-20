@@ -73,11 +73,16 @@ func (s *Server) WebHandler() http.Handler {
 		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), publickey-credentials-get=(self), publickey-credentials-create=(self)")
 		if r.URL.Path != "/healthz" && s.access != nil {
-			if _, err := s.access.Verify(r.Context(), r.Header.Get(cfaccess.Header)); err != nil {
+			id, err := s.access.Verify(r.Context(), r.Header.Get(cfaccess.Header))
+			if err == nil && s.cfg.Access.OwnerEmail != "" && !strings.EqualFold(id.Email, s.cfg.Access.OwnerEmail) {
+				err = errors.New("not the owner's Access identity")
+			}
+			if err != nil {
 				s.log.Warn("cloudflare access token rejected", "path", r.URL.Path, "error", err)
 				s.writeErr(w, r, errForbidden("Cloudflare Access token missing or invalid"))
 				return
 			}
+			r = r.WithContext(context.WithValue(r.Context(), ctxAccessSub, id.Sub))
 		}
 		root.ServeHTTP(w, r)
 	})
@@ -112,13 +117,19 @@ func (s *Server) apiGuard(next http.Handler) http.Handler {
 
 // ---- sessions ----
 
+func accessSub(ctx context.Context) string {
+	v, _ := ctx.Value(ctxAccessSub).(string)
+	return v
+}
+
 func (s *Server) sessionHash(r *http.Request) (string, bool) {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil || c.Value == "" || len(c.Value) > 128 {
 		return "", false
 	}
 	h := ids.Hash(c.Value)
-	ok, err := s.store.Q().SessionValid(r.Context(), h, s.now())
+	// With Access configured, a session only works with the Access identity it was created under.
+	ok, err := s.store.Q().SessionValid(r.Context(), h, accessSub(r.Context()), s.now())
 	if err != nil || !ok {
 		return "", false
 	}
@@ -239,7 +250,7 @@ func (s *Server) handleLoginFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	cookie := ids.Secret(32)
 	err = s.store.Tx(ctx, func(q *store.Q) error {
-		if err := q.InsertSession(ctx, ids.Hash(cookie), pkID, now, now.Add(SessionTTL)); err != nil {
+		if err := q.InsertSession(ctx, ids.Hash(cookie), pkID, accessSub(ctx), now, now.Add(SessionTTL)); err != nil {
 			return err
 		}
 		return q.Audit(ctx, now, "owner", "login", fmt.Sprintf("passkey:%d", pkID), "")
@@ -304,7 +315,7 @@ func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !ok {
-			_ = s.store.Q().Audit(ctx, now, "system", "passkey_enroll_code_rejected", "enroll_code", "")
+			s.log.Warn("passkey enroll code rejected", "from", r.Header.Get("Cf-Connecting-Ip"))
 			s.writeErr(w, r, errForbidden("enroll code invalid, used or expired"))
 			return
 		}
@@ -601,6 +612,31 @@ func (s *Server) handleEnrollmentItem(w http.ResponseWriter, r *http.Request, _ 
 	writeJSON(w, http.StatusOK, it)
 }
 
+// notifyDecision pushes what was just signed and applied, as an out-of-band check: if code on
+// the approval origin showed one action but had another signed, this push reveals it.
+func (s *Server) notifyDecision(sg canon.Signed) {
+	a := sg.Action
+	text := fmt.Sprintf("aqmas: %s %s %s", a.Action, a.Object, a.ID)
+	switch a.Object {
+	case canon.ObjectRequest:
+		text = fmt.Sprintf("aqmas: %s %s %s@%s for %s, ttl %ds, standing %dh", a.Action, a.Kind, a.LoginUser, a.Target, a.RequestingHost, a.TTLSeconds, a.StandingHours)
+	case canon.ObjectEnrollment:
+		text = fmt.Sprintf("aqmas: %s enrollment of %s (replaces existing: %t)", a.Action, a.RequestingHost, a.Replaces)
+	case canon.ObjectStanding, canon.ObjectGrant:
+		text = fmt.Sprintf("aqmas: %s %s %s@%s for %s", a.Action, a.Object, a.LoginUser, a.Target, a.RequestingHost)
+	}
+	text += fmt.Sprintf(" [ref %s]", ref(a.ID))
+	s.notify.Send("aqmas: decision", text, s.cfg.PublicBaseURL+"/")
+}
+
+// ref is the short reference the UI and CLI show: the last 6 characters of the id, upper-cased.
+func ref(id string) string {
+	if len(id) > 6 {
+		id = id[len(id)-6:]
+	}
+	return strings.ToUpper(id)
+}
+
 // ---- per-action challenge / decide ----
 
 func (s *Server) challengeHandler(object string) func(http.ResponseWriter, *http.Request, string) {
@@ -695,6 +731,7 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 			return
 		}
 		s.bcast.notify()
+		s.notifyDecision(sg)
 		switch object {
 		case canon.ObjectRequest:
 			rq, err := s.store.Q().GetRequest(ctx, id)

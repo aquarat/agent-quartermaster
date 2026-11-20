@@ -78,10 +78,33 @@ the Go test plays the fleet host. `AQMAS_WEB_DIR=<web checkout> go test ./intern
 
 ## Forgejo
 
-`[[targets]]` takes `principal = "alice"` (overrides `<login_user>@<target>`; the Forgejo user
-must register that principal under "Manage SSH Certificate Principals"); `forgejo_user` from
-HOSTS.md is accepted as an alias. `max_ttl_seconds` caps a target's TTL (example config: 1 h for
+`[[targets]]` takes `principal = "alice@forgejo"` (overrides `<login_user>@<target>`; the
+Forgejo user must register that exact string under "Manage SSH Certificate Principals");
+`forgejo_user` from HOSTS.md is an alias. **The principal must contain `@`**: a bare `alice`
+would also log in as `alice` on any host that trusts the CA without an
+`AuthorizedPrincipalsFile` (security review finding). HOSTS.md's `forgejo_user = "alice"`
+is therefore refused by config validation. `max_ttl_seconds` caps a target's TTL (example config: 1 h for
 Forgejo, whose built-in server probably ignores `source-address`).
+
+## Security review (independent sub-agent) and what changed
+
+- Accepted residual, wider than DESIGN.md says: whoever can change the Cloudflare zone (Workers,
+  Snippets, DNS, the tunnel) controls the approval page's code and can show one action while
+  having another signed. A Cloudflare token on another host is readable by the agents' user, not only
+  by root. Mitigation added: after every decision aqmasd pushes what was **applied**
+  (`aqmas: approve ssh alice@db-1 for hosta, ttl 300s, standing 1h [ref ABC123]`) to ntfy,
+  so a mismatch shows on the phone. Real fix: narrow that token or host the UI on a zone it
+  can't edit (owner's decision).
+- Fixed: bare Forgejo principal (above); requests of a revoked/replaced host can no longer be
+  approved and are expired on revoke; at most 5 pending requests per host and 3 pending
+  enrollments per address (429); revoking a grant also revokes the standing approval created
+  with it; `aqmasd revoke-host NAME` (bastion CLI; a web action needs a new canonical object the
+  UI doesn't know yet); Access: optional `owner_email` check, sessions bound to the Access `sub`,
+  loud warning when Access is off; long-polls no longer write to the DB; Access key fetch
+  failures back off; rejected enroll codes are logged, not audited.
+- Not changed: one CA for server and client certificates (EKU split; the CLI checks
+  `serverAuth`); cloudflared runs as root (packaged default); no outbound IP filter on aqmasd
+  (it needs ntfy and the Access certs).
 
 ## Proposed changes to `internal/api` / `docs/API.md` / `docs/DESIGN.md`
 

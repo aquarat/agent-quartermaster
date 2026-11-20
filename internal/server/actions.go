@@ -87,6 +87,9 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 		if r.Status != api.StatusPending {
 			return a, statusErr(r.Status)
 		}
+		if h, err := q.GetHost(ctx, r.HostID); err != nil || h.RevokedAt != nil {
+			return a, errConflict("the requesting host's identity was revoked")
+		}
 		a.RequestingHost, a.Kind, a.Target, a.LoginUser, a.KeyFingerprint = r.HostName, r.Kind, r.TargetHost, r.LoginUser, r.KeyFingerprint
 		if in.Action == canon.ActionApprove {
 			ttl, err := policy.ApproverTTL(r.TTLRequested, in.TTLSeconds, s.cfg.TTL)
@@ -187,6 +190,9 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 			if r.HostName != a.RequestingHost || r.Kind != a.Kind || r.TargetHost != a.Target ||
 				r.LoginUser != a.LoginUser || r.KeyFingerprint != a.KeyFingerprint {
 				return errConflict("request changed since the challenge was issued")
+			}
+			if h, err := q.GetHost(ctx, r.HostID); err != nil || h.RevokedAt != nil {
+				return errConflict("the requesting host's identity was revoked")
 			}
 			if a.Action == canon.ActionDeny {
 				if err := q.DecideRequest(ctx, r.ID, api.StatusDenied, "denied by owner", now); err != nil {
@@ -290,6 +296,13 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 			}
 			if err := q.MarkRequestRevoked(ctx, g.RequestID); err != nil {
 				return err
+			}
+			// "Stop this" also stops the standing approval created with this grant (only ever
+			// reduces access, so it needs no separate signature).
+			if n, err := q.RevokeStandingFromRequest(ctx, g.RequestID, now); err != nil {
+				return err
+			} else if n > 0 {
+				detail += fmt.Sprintf(" standing_revoked=%d", n)
 			}
 			return q.Audit(ctx, now, "owner", "grant_revoke", "grant:"+a.ID, "certificate stays valid until "+g.NotAfter.Format(time.RFC3339)+" "+detail)
 		}

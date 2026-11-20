@@ -29,6 +29,7 @@ commands:
   print-ssh-ca          print the SSH user CA public key (for TrustedUserCAKeys)
   print-client-ca       print the internal CA certificate (PEM; signs the agent-API server cert too)
   tls-fingerprint       print the CA pin for ` + "`aqmas enroll --ca-pin`" + ` (sha256:<hex>)
+  revoke-host NAME      revoke an enrolled host's identity (client certificate) at once
   version               print the version
 
 Run every command as the aqmas user (sudo -u aqmas aqmasd ...).
@@ -43,17 +44,17 @@ func main() {
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(2)
 	}
-	if fs.NArg() != 1 {
+	if fs.NArg() < 1 || (fs.Arg(0) == "revoke-host") != (fs.NArg() == 2) || fs.NArg() > 2 {
 		fs.Usage()
 		os.Exit(2)
 	}
-	if err := run(fs.Arg(0), *cfgPath, os.Stdout); err != nil {
+	if err := run(fs.Arg(0), *cfgPath, os.Stdout, fs.Args()[1:]...); err != nil {
 		fmt.Fprintln(os.Stderr, "aqmasd:", err)
 		os.Exit(1)
 	}
 }
 
-func run(cmd, cfgPath string, out io.Writer) error {
+func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 	if cmd == "version" {
 		ui := "embedded"
 		if webui.IsFallback() {
@@ -100,6 +101,12 @@ func run(cmd, cfgPath string, out io.Writer) error {
 			return err
 		}
 		fmt.Fprintln(out, p.SSHCAPublicLine())
+		return nil
+	case "revoke-host":
+		if err := server.RevokeHost(cfg.DataDir, args[0], time.Now()); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "revoked %s (restarting aqmasd is not needed)\n", args[0])
 		return nil
 	case "tls-fingerprint":
 		p, err := pki.LoadCAs(server.CADir(cfg.DataDir))
