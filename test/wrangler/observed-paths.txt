@@ -1,0 +1,83 @@
+# Cloudflare API calls wrangler 4.165.0 makes through `aqmas cf env` (test/wrangler, 2026-11-20).
+# Paths are below /client/v4, normalised: {acct} account id, {zone} zone id, {db} D1 uuid,
+# {db-name} D1 database NAME (wrangler looks a name-only binding up by name in the path),
+# {script} Worker name, {project} Pages project, {id} uuid/version/deployment id, {hash} asset hash.
+# "(fake answered 404)": wrangler probes for objects that do not exist yet; the proxy must allow the call.
+# [upload JWT] = the call carried the upload JWT as its credential (JWT passthrough);
+# [synthetic] = answered by aqmasd itself (CLOUDFLARE.md 3.2), never reaches Cloudflare.
+# Outside the shim: only wrangler's npm update check (CONNECT registry.npmjs.org:443), refused by
+# the test's HTTPS_PROXY guard; no Cloudflare host was contacted except through the shim.
+# Status per command:
+#   wrangler whoami                 ok
+#   wrangler deploy                 ok
+#   wrangler versions upload        ok
+#   wrangler secret put             ok
+#   wrangler d1 execute             ok
+#   wrangler d1 migrations apply    ok
+#   wrangler pages deploy           ok
+#   wrangler d1 execute (binding by name only) ok
+#   wrangler deploy (single-asset uploads) ok
+
+[wrangler whoami]
+GET /accounts    [synthetic, answered by aqmasd]
+GET /memberships    [synthetic, answered by aqmasd]
+GET /user    [synthetic, answered by aqmasd]
+GET /user/tokens/verify    [synthetic, answered by aqmasd]
+
+[wrangler deploy]
+GET /accounts/{acct}/workers/scripts/{script}/deployments    (fake answered 404)
+GET /accounts/{acct}/workers/scripts/{script}/secrets    (fake answered 404)
+GET /accounts/{acct}/workers/scripts/{script}/settings    (fake answered 404)
+GET /accounts/{acct}/workers/services/{script}    (fake answered 404)
+GET /accounts/{acct}/workers/subdomain
+GET /accounts/{acct}/workers/workers/{script}
+POST /accounts/{acct}/workers/assets/upload?base64=true    [upload JWT]
+POST /accounts/{acct}/workers/scripts/{script}/assets-upload-session
+POST /accounts/{acct}/workers/scripts/{script}/subdomain
+PUT /accounts/{acct}/workers/scripts/{script}/schedules
+PUT /accounts/{acct}/workers/scripts/{script}?excludeScript=true&bindings_inherit=strict
+
+[wrangler versions upload]
+GET /accounts/{acct}/workers/scripts/{script}/secrets
+GET /accounts/{acct}/workers/scripts/{script}/settings
+GET /accounts/{acct}/workers/services/{script}
+GET /accounts/{acct}/workers/workers/{script}
+POST /accounts/{acct}/workers/scripts/{script}/assets-upload-session
+POST /accounts/{acct}/workers/scripts/{script}/versions?bindings_inherit=strict
+
+[wrangler secret put]
+PUT /accounts/{acct}/workers/scripts/{script}/secrets
+
+[wrangler d1 execute]
+POST /accounts/{acct}/d1/database/{db}/query
+
+[wrangler d1 migrations apply]
+POST /accounts/{acct}/d1/database/{db}/query
+
+[wrangler pages deploy]
+GET /accounts/{acct}/pages/projects/{project}
+GET /accounts/{acct}/pages/projects/{project}/deployments/{id}
+GET /accounts/{acct}/pages/projects/{project}/upload-token
+POST /accounts/{acct}/pages/projects/{project}/deployments
+POST /pages/assets/check-missing    [upload JWT]
+POST /pages/assets/upload    [upload JWT]
+POST /pages/assets/upsert-hashes    [upload JWT]
+
+[wrangler d1 execute (binding by name only)]
+GET /accounts/{acct}/d1/database/{db-name}?fields=uuid%2Cname
+POST /accounts/{acct}/d1/database/{db}/query
+
+[wrangler deploy (single-asset uploads)]
+GET /accounts/{acct}/workers/scripts/{script}/deployments
+GET /accounts/{acct}/workers/scripts/{script}/secrets
+GET /accounts/{acct}/workers/scripts/{script}/settings
+GET /accounts/{acct}/workers/services/{script}
+GET /accounts/{acct}/workers/subdomain
+GET /accounts/{acct}/workers/workers/{script}
+PATCH /accounts/{acct}/workers/scripts/{script}/script-settings
+POST /accounts/{acct}/workers/assets/upload/{hash}    [upload JWT]
+POST /accounts/{acct}/workers/scripts/{script}/assets-upload-session
+POST /accounts/{acct}/workers/scripts/{script}/deployments
+POST /accounts/{acct}/workers/scripts/{script}/subdomain
+POST /accounts/{acct}/workers/scripts/{script}/versions?bindings_inherit=strict
+PUT /accounts/{acct}/workers/scripts/{script}/schedules

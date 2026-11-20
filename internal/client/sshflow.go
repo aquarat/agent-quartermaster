@@ -158,18 +158,40 @@ func (e *Env) stillGranted(ctx context.Context, c *APIClient, p *Prepared) bool 
 // cancelRequest withdraws a request after Ctrl-C so it leaves the owner's queue. It uses its
 // own short context: the command's context is already cancelled.
 func (e *Env) cancelRequest(c *APIClient, created *api.RequestCreated) {
+	e.cancelRequestNote(c, created, " (the key was not saved)")
+}
+
+// cancelRequestNote is cancelRequest with the note appended to each message.
+func (e *Env) cancelRequestNote(c *APIClient, created *api.RequestCreated, note string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	st, err := c.CancelRequest(ctx, created.ID)
 	switch {
 	case err == nil && st.Status == api.StatusCancelled:
-		e.logf("cancelled request %s (the key was not saved)", created.ID)
+		e.logf("cancelled request %s%s", created.ID, note)
 	case err == nil:
-		e.logf("request %s is already %s; nothing to cancel (the key was not saved)", created.ID, sanitize(st.Status))
+		e.logf("request %s is already %s; nothing to cancel%s", created.ID, sanitize(st.Status), note)
 	default:
-		e.logf("could not cancel request %s (%v); it stays pending until %s (the key was not saved)",
-			created.ID, err, created.ExpiresAt.Local().Format("15:04:05"))
+		e.logf("could not cancel request %s (%v); it stays pending until %s%s",
+			created.ID, err, created.ExpiresAt.Local().Format("15:04:05"), note)
 	}
+}
+
+// transient reports errors worth retrying while waiting: the server unreachable, or a
+// 502-504 (aqmasd answers 502 when minting a child token failed; polling again retries it).
+func transient(err error) bool {
+	var ue *UnreachableError
+	if errors.As(err, &ue) {
+		return true
+	}
+	var ae *APIError
+	if errors.As(err, &ae) {
+		switch ae.HTTPStatus {
+		case 502, 503, 504:
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.RequestCreated) (*api.RequestStatus, error) {
@@ -192,10 +214,9 @@ func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.Reques
 		start := time.Now()
 		st, err := c.RequestStatus(ctx, created.ID, wait)
 		if err != nil {
-			var ue *UnreachableError
-			if errors.As(err, &ue) && failures < 5 {
+			if transient(err) && failures < 5 {
 				failures++
-				if err := sleepCtx(ctx, time.Duration(failures)*2*time.Second); err != nil {
+				if err := sleepCtx(ctx, time.Duration(failures)*e.retryBase()); err != nil {
 					return nil, err
 				}
 				continue

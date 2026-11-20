@@ -19,14 +19,25 @@ type Env struct {
 	Stdout     io.Writer
 	Stderr     io.Writer
 	StdinIsTTY bool
-	Getenv     func(string) string
-	Environ    func() []string
-	Now        func() time.Time
-	Getwd      func() (string, error)
-	PID        int
-	User       string
+	// StdoutIsTTY: `cf token` prints a token only when stdout is not a terminal (or --print).
+	StdoutIsTTY bool
+	Getenv      func(string) string
+	Environ     func() []string
+	Now         func() time.Time
+	Getwd       func() (string, error)
+	PID         int
+	User        string
 	// PollMin is the minimum delay between polls when the server answers a long-poll at once.
 	PollMin time.Duration
+	// RetryDelay is the backoff unit for transient failures while waiting (default 2 s).
+	RetryDelay time.Duration
+}
+
+func (e *Env) retryBase() time.Duration {
+	if e.RetryDelay > 0 {
+		return e.RetryDelay
+	}
+	return 2 * time.Second
 }
 
 func (e *Env) now() time.Time {

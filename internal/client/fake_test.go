@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -95,6 +96,8 @@ type fakeReq struct {
 	granted   *api.Grant
 	cancelled bool
 	revoked   bool
+	auto      bool // approved at creation (cf.read / cf.cache.purge in proxy mode)
+	delivered bool // token mode: the token went out once
 }
 
 // fakeServer implements the agent API (docs/API.md section 1) from internal/api types.
@@ -127,6 +130,8 @@ type fakeServer struct {
 	requests        map[string]*fakeReq
 	created         int
 	unauthenticated int
+
+	cf fakeCF // milestone 2: Cloudflare (cf_fake_test.go)
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -168,6 +173,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 	mux.HandleFunc("GET /v1/grants", f.handleGrants)
 	mux.HandleFunc("POST /v1/requests/{id}/cancel", f.handleCancel)
 	mux.HandleFunc("GET /v1/ssh-ca", f.handleSSHCA)
+	f.setupCF(mux)
 	f.srv = httptest.NewUnstartedServer(mux)
 	f.srv.Config.ErrorLog = log.New(io.Discard, "", 0) // handshake failures are expected in some tests
 
@@ -278,7 +284,15 @@ func (f *fakeServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req api.AccessRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Kind != api.KindSSH || req.SSH == nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apiErr(w, 400, "bad_request", "bad request")
+		return
+	}
+	if req.Kind == api.KindCloudflare {
+		f.createCF(w, host, req)
+		return
+	}
+	if req.Kind != api.KindSSH || req.SSH == nil {
 		apiErr(w, 400, "bad_request", "bad request")
 		return
 	}
@@ -308,6 +322,10 @@ func (f *fakeServer) handleRequestStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	fr.polls++
+	if fr.req.Kind == api.KindCloudflare {
+		f.statusCF(w, id, fr)
+		return
+	}
 	if fr.cancelled {
 		writeJSON(w, 200, api.RequestStatus{ID: id, Kind: api.KindSSH, Status: api.StatusCancelled})
 		return
@@ -412,11 +430,20 @@ func (f *fakeServer) handleGrants(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	out := api.GrantList{Grants: []api.GrantSummary{}}
 	for _, fr := range f.requests {
+		if fr.host == host && fr.granted != nil && fr.req.Kind == api.KindCloudflare {
+			if !fr.revoked && time.Now().Before(fr.granted.NotAfter) {
+				cf := fr.granted.Cloudflare
+				out.Grants = append(out.Grants, api.GrantSummary{ID: fr.granted.ID, Kind: api.KindCloudflare, Status: api.StatusApproved,
+					NotBefore: fr.granted.NotBefore, NotAfter: fr.granted.NotAfter, Scope: cf.Scope, ScopeParams: cf.ScopeParams, Mode: cf.Mode})
+			}
+			continue
+		}
 		if fr.host == host && fr.granted != nil {
 			out.Grants = append(out.Grants, api.GrantSummary{ID: fr.granted.ID, Kind: api.KindSSH, Status: api.StatusApproved,
 				TargetHost: fr.req.SSH.TargetHost, LoginUser: fr.req.SSH.LoginUser, NotBefore: fr.granted.NotBefore, NotAfter: fr.granted.NotAfter})
 		}
 	}
+	sort.Slice(out.Grants, func(i, j int) bool { return out.Grants[i].ID < out.Grants[j].ID })
 	writeJSON(w, 200, out)
 }
 
