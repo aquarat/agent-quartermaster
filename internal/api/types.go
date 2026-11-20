@@ -28,10 +28,10 @@ const (
 // ---- Host enrollment (agent API, no client certificate) ----
 
 type EnrollRequest struct {
-	Hostname                string   `json:"hostname"`
-	CSRPEM                  string   `json:"csr_pem"`
-	SSHHostKeyFingerprints  []string `json:"ssh_host_key_fingerprints,omitempty"`
-	Note                    string   `json:"note,omitempty"`
+	Hostname               string   `json:"hostname"`
+	CSRPEM                 string   `json:"csr_pem"`
+	SSHHostKeyFingerprints []string `json:"ssh_host_key_fingerprints,omitempty"`
+	Note                   string   `json:"note,omitempty"`
 }
 
 type EnrollResponse struct {
