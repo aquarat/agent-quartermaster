@@ -33,3 +33,11 @@ Examples in this repository use placeholders: `example.com`, RFC 5737 addresses
 (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) and hosts such as `bastion`,
 `build-box`, `web-1` and `db-1`, with login user `alice`. Keep your own deployment notes,
 target lists and host keys in private ops documentation.
+
+## Licence
+
+agent-quartermaster is free software: you can redistribute it and/or modify it under the terms of
+the GNU Affero General Public License, version 3 (AGPL-3.0-only), as published by the Free
+Software Foundation. See [LICENSE](LICENSE). If you run a modified version as a network service,
+the AGPL requires you to offer its source to the service's users.
+
