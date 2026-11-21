@@ -52,9 +52,11 @@ import { chevronIcon, cloudIcon, eventIcon, passkeyIcon, syncIcon } from "./icon
 import type { AuditEntry, GrantSummary, PasskeyChange, PasskeyInfo, PendingCloudflare, PendingItem, RegisterResult, StandingApproval, UIState } from "./types";
 import { hostCard, updateCard, type UpdateView, type HostInfo } from './admin';
 import { helpPage, type HelpConfig } from './help';
+import {cataloguePage,type Catalogue} from './catalogue';
 
 function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/help' ? 'help' : 'queue'; }
 function nav(label:string,hash:string,title:string) { const a=h('a',{title,'aria-label':title},label); a.href=hash; return a; }
+function scopeHeading(f?:Record<string,string|number>){return f?h('h3',null,...['org_title','service_title','set_title'].map((k,i)=>h('span',null,i?' › ':'',h('bdi',null,vt(String(f[k]??'?')))))):null;}
 import { browserAuthenticator, type Authenticator } from "./webauthn";
 
 const POLL_MS = 5000;
@@ -82,6 +84,8 @@ export class App {
   private page = route();
   private hosts: HostInfo[]=[];
   private updates?: UpdateView;
+  private catalogue?: Catalogue|null;
+  private migration?:{id:string;plan:string;recovery_sha256:string}|null;
   private help?: HelpConfig;
   private rendered = new Map<string, string>();
   private login: PreparedLogin | null = null;
@@ -137,7 +141,9 @@ export class App {
     const requested=route();
     try {
       const s = await this.api.state();
+      this.migration=s.migration;
       if(requested==='admin') [this.hosts,this.updates]=await Promise.all([this.api.hosts(),this.api.updates()]);
+      if(requested==='admin')this.catalogue=s.catalogue_enabled?await this.api.catalogue?.():null;
       if(requested==='help') this.help=await this.api.help();
       if(requested!==route()) return;
       this.state = normalise(s);
@@ -379,7 +385,7 @@ export class App {
     replace(
       this.root,
       h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Request queue')), h("p", { class: "status", id: "status" }),h('nav',{'aria-label':'Pages'},nav('Help','#/help','Help'),nav('⚙','#/admin','Admin'))),
-      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('passkeys','Passkeys'),section('hosts','Enrolled hosts'),section('updates','Updates')) : h(
+      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('orgs','Organisations'),section('passkeys','Passkeys'),section('hosts','Enrolled hosts'),section('updates','Updates')) : h(
         "main",
         { class: "sections" },
         h("div", { class: "col col-queue" }, section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
@@ -401,8 +407,9 @@ export class App {
     if (!s || this.view !== "main") return;
     if(this.page!=='queue'){
       document.title=`${this.page==='admin'?'Admin':'Help'} · aqmas`;
-      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);if(this.updates)this.section('updates',this.updates,()=>[updateCard(this.updates!,t=>this.sheet.openUpdate(t))]);}
+      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);if(this.updates)this.section('updates',[this.updates,this.migration],()=>this.migration?[h('h3',null,'personal · Organisation cutover'),h('p',null,'Fleet access is paused. Compare the recovery digest and review each admission, credential set and authority retirement before signing.'),h('button',{type:'button',class:'btn approve',on:{click:()=>this.sheet.openMigration({object:'migration',id:this.migration!.id,facts:{plan:this.migration!.plan,recovery_sha256:this.migration!.recovery_sha256}})}},'Review personal activation…')]:[updateCard(this.updates!,t=>this.sheet.openUpdate(t))]);}
       else if(this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
+      if(this.page==='admin')this.section('orgs',this.catalogue,()=>this.catalogue?[cataloguePage(this.catalogue,(t,c)=>this.sheet.openCatalogue(t,c))]:['Available after personal activation.']);
       this.updateStatus();return;
     }
     const requests = s.pending!.filter((p) => p.kind !== "enrollment");
@@ -539,6 +546,7 @@ export class App {
       { class: "ev-toggle", type: "button", "aria-expanded": String(open), "aria-controls": moreId },
       h("span", { class: "ev-glyph" }, eventIcon(info.kind), info.cloudflare ? cloudIcon() : null),
       h("span", { class: "ev-label" }, vt(info.label)),
+      e.detail?.includes(' INDEFINITE ') && (e.action==='approve'||e.action==='standing_create') ? h('strong',null,'INDEFINITE') : null,
       h("span", { class: `actor actor-${who.kind}` }, who.kind === "host" ? [h("span", { class: "sr" }, "host "), h("bdi", null, vt(who.name))] : vt(who.name)),
       obj.short ? h("span", { class: "ev-obj" }, vt(obj.short)) : null,
       h("time", { class: "ev-time", datetime: e.at, title: absoluteTime(at), "data-ev-at": String(at) }, eventTime(at, now)),
@@ -718,6 +726,7 @@ export class App {
     return h(
       "article",
       { class: `card request${high ? " high" : ""}`, "data-id": p.id, "aria-label": `${kindLabel(p.kind)} request from ${vt(p.requesting_host)}` },
+      scopeHeading(p.scoped_facts),
       h(
         "div",
         { class: "card-top" },
@@ -764,6 +773,7 @@ export class App {
         "data-id": p.id,
         "aria-label": `${admin ? "Break-glass " : ""}Cloudflare request from ${vt(p.requesting_host)}`,
       },
+      scopeHeading(p.scoped_facts),
       h(
         "div",
         { class: "card-top" },
@@ -829,6 +839,7 @@ export class App {
       return h(
         "article",
         { class: "row cloudflare", "data-id": a.id },
+        scopeHeading(a.scoped_facts),a.indefinite?h('strong',null,'INDEFINITE standing approval — until revoked'):null,
         v.heading,
         v.problem ? h("p", { class: "warn" }, vt(v.problem)) : null,
         h(
@@ -839,7 +850,7 @@ export class App {
           fact("Mode", vt(modeWords(a.mode))),
           fact("For host", h("bdi", { class: "host-name" }, vt(a.requesting_host))),
           fact("Each grant", `up to ${duration(a.max_ttl_seconds)}`),
-          fact("Ends in", until(a.expires_at)),
+          a.indefinite?fact('Ends','On revocation'):fact("Ends in", until(a.expires_at)),
           fact("Used", a.uses === 1 ? "once" : `${a.uses} times`),
         ),
         h("div", { class: "actions" }, h("button", { class: "btn deny", type: "button", on: { click: () => this.sheet.openRevoke(targetForStanding(a)) } }, "Revoke…")),
@@ -868,6 +879,7 @@ export class App {
       return h(
         "article",
         { class: `row cloudflare${admin ? " cf-admin" : ""}`, "data-id": g.id },
+        scopeHeading(g.scoped_facts),g.indefinite?h('strong',null,'INDEFINITE access — until revoked'):null,
         admin ? h("p", { class: "breakglass", role: "note" }, "BREAK-GLASS access is active.") : null,
         v.heading,
         v.problem ? h("p", { class: "warn" }, vt(v.problem)) : null,
@@ -878,7 +890,7 @@ export class App {
           fact("Kind", "Cloudflare ", h("span", { class: "mono" }, vt(g.scope ?? "?"))),
           v.pairs.map(([label, val]) => fact(label, h("bdi", { class: "param" }, vt(val)))),
           fact("Mode", vt(modeWords(g.mode))),
-          fact("Ends in", until(g.not_after)),
+          g.indefinite?fact('Ends','On revocation'):fact("Ends in", until(g.not_after)),
         ),
         h("div", { class: "actions" }, h("button", { class: "btn deny", type: "button", on: { click: () => this.sheet.openRevoke(targetForGrant(g)) } }, "Revoke…")),
       );
@@ -1246,7 +1258,7 @@ class Sheet {
     const cf = p.kind === "cloudflare" ? p.cloudflare : undefined;
     const cfDesc = cf ? cfScope(cf.scope) : undefined;
     // Never offer more than the card's ttl_max, nor (Cloudflare) the scope's built-in maximum.
-    const maxTTL = cfDesc ? Math.min(p.ttl_max > 0 ? p.ttl_max : cfDesc.maxTTL, cfDesc.maxTTL) : p.ttl_max;
+    const maxTTL = cfDesc && !p.scoped_facts ? Math.min(p.ttl_max > 0 ? p.ttl_max : cfDesc.maxTTL, cfDesc.maxTTL) : p.ttl_max;
     const { options, def } = ttlChoices(p.ttl_requested, maxTTL);
     const ttlSet = h(
       "fieldset",
@@ -1259,7 +1271,7 @@ class Sheet {
     // SSH: aqmasd refuses standing approvals for high-risk requests (high_risk target, root,
     // > 4 h). Cloudflare: only when the server allows it for this scope AND this page's own
     // table does, and only in proxy mode (never cf.admin, never a token).
-    const offerStanding = cf ? cf.standing_allowed === true && cf.mode === "proxy" && cfDesc?.standing === true : p.risk !== "high";
+    const offerStanding = (p.scoped_facts?Boolean(p.scoped_facts.offers_standing):true) && (cf ? cf.standing_allowed === true && cf.mode === "proxy" && cfDesc?.standing === true : p.risk !== "high");
     const standLegend: Child[] = cf
       ? ["Also auto-approve the same Cloudflare request (", h("bdi", null, vt(p.requesting_host)), ", ", h("bdi", null, vt(cf.scope)), cf.scope_params ? [" ", h("bdi", null, vt(cf.scope_params))] : null, ")"]
       : ["Also auto-approve the same request (", h("bdi", null, vt(p.requesting_host)), " to ", h("bdi", null, vt(p.ssh?.login_user ?? "?")), "@", h("bdi", null, vt(p.ssh?.target_host ?? "?")), ")"];
@@ -1271,11 +1283,15 @@ class Sheet {
         h("label", { class: "chip" }, h("input", { type: "radio", name: "standing", value: String(n), checked: n === 0 }), h("span", null, n === 0 ? "No" : `for ${hours(n)}`)),
       ),
     );
+    if(p.scoped_facts?.offers_indefinite)ttlSet.append(h('label',null,h('input',{type:'radio',name:'ttl',value:'-1'}),' Indefinite — until revoked'));
+    const standard=Number(p.scoped_facts?.standing_default??0);if(standard>0&&standard<=(p.max_standing_hours??0)*3600)standSet?.append(h('label',null,h('input',{type:'radio',name:'standing',value:'default'}),` Policy default: ${duration(standard)}`));
+    if(p.scoped_facts?.offers_standing_indefinite)standSet?.append(h('label',null,h('input',{type:'radio',name:'standing',value:'-1'}),' Indefinite standing — until revoked'));
     const go = h("button", { class: "btn approve", type: "button", "data-autofocus": "" }, "Continue");
     go.addEventListener("click", () => {
       const ttl = Number(ttlSet.querySelector<HTMLInputElement>("input:checked")?.value ?? def);
-      const standing = Number(standSet?.querySelector<HTMLInputElement>("input:checked")?.value ?? 0);
-      void this.prepare(seq, target, { action: "approve", ttl_seconds: ttl, standing_hours: standing }, again);
+      const selected=standSet?.querySelector<HTMLInputElement>("input:checked")?.value;
+      const standing=selected==='default'?0:Number(selected??0);
+      void this.prepare(seq, target, { action: "approve", ttl_seconds: Math.max(0,ttl), standing_hours: Math.max(0,standing),standing_seconds:selected==='default'?standard:0,indefinite:ttl===-1,standing_indefinite:standing===-1 }, again);
     });
     this.render(h("h2", { id: "sheet-title" }, cf?.scope === "cf.admin" ? "Approve break-glass access" : "Approve access"), this.summary(p), ttlSet, standSet, h("div", { class: "actions" }, this.cancelButton(), go));
   }
@@ -1292,6 +1308,8 @@ class Sheet {
   openUpdate(target: ActionTarget): void {
     void this.prepare(this.begin(target),target,{action:'approve'});
   }
+  openMigration(target:ActionTarget):void{void this.prepare(this.begin(target),target,{action:'activate'});}
+  openCatalogue(target:ActionTarget,choice:ActionChoice):void{void this.prepare(this.begin(target),target,choice);}
 
   openAddPasskey(): void {
     const target: ActionTarget = { ...PASSKEY_TARGET };
@@ -1405,6 +1423,7 @@ class Sheet {
       d.details?.length ? h("ul", { class: "cf-details" }, d.details.map((line) => h("li", null, renderParts(line)))) : null,
       d.standingParts ? h("p", { class: "warn" }, renderParts(d.standingParts)) : null,
       d.warnings.map((w, i) => h("p", { class: loud && i === 0 ? "breakglass" : "warn" }, vt(w))),
+      p.canonical.plan ? h('dl',{class:'facts'},d.fields.map(([k,v])=>fact(vt(k),h('bdi',null,vt(v))))) : null,
       removingCurrent ? h("p", { class: "warn" }, "This is the passkey you signed in with: you will be signed out here.") : null,
       h(
         "details",

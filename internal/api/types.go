@@ -98,6 +98,7 @@ type SSHRequest struct {
 }
 
 type AccessRequest struct {
+	Indefinite bool               `json:"indefinite,omitempty"`
 	Kind       string             `json:"kind"`
 	SSH        *SSHRequest        `json:"ssh,omitempty"`
 	Cloudflare *CloudflareRequest `json:"cloudflare,omitempty"` // kind "cloudflare" (milestone 2)
@@ -125,11 +126,12 @@ type SSHGrant struct {
 }
 
 type Grant struct {
-	ID        string    `json:"id"`
-	Kind      string    `json:"kind"`
-	NotBefore time.Time `json:"not_before"`
-	NotAfter  time.Time `json:"not_after"`
-	SSH       *SSHGrant `json:"ssh,omitempty"`
+	Indefinite bool      `json:"indefinite,omitempty"`
+	ID         string    `json:"id"`
+	Kind       string    `json:"kind"`
+	NotBefore  time.Time `json:"not_before"`
+	NotAfter   time.Time `json:"not_after"`
+	SSH        *SSHGrant `json:"ssh,omitempty"`
 	// Cloudflare is set for kind "cloudflare" (milestone 2).
 	Cloudflare *CloudflareGrant `json:"cloudflare,omitempty"`
 }
@@ -144,13 +146,15 @@ type RequestStatus struct {
 }
 
 type GrantSummary struct {
-	ID         string    `json:"id"`
-	Kind       string    `json:"kind"`
-	Status     string    `json:"status"`
-	TargetHost string    `json:"target_host,omitempty"`
-	LoginUser  string    `json:"login_user,omitempty"`
-	NotBefore  time.Time `json:"not_before"`
-	NotAfter   time.Time `json:"not_after"`
+	Indefinite  bool           `json:"indefinite,omitempty"`
+	ScopedFacts map[string]any `json:"scoped_facts,omitempty"`
+	ID          string         `json:"id"`
+	Kind        string         `json:"kind"`
+	Status      string         `json:"status"`
+	TargetHost  string         `json:"target_host,omitempty"`
+	LoginUser   string         `json:"login_user,omitempty"`
+	NotBefore   time.Time      `json:"not_before"`
+	NotAfter    time.Time      `json:"not_after"`
 	// RequestingHost is set in the web UI's state (who holds the access); the agent API's
 	// GET /v1/grants omits it (always the calling host).
 	RequestingHost string `json:"requesting_host,omitempty"`
@@ -197,6 +201,7 @@ type PendingEnrollment struct {
 // web UI. For enrollments requesting_host is the proposed name, reason the enroll note, and
 // ttl_requested/ttl_max are 0.
 type PendingItem struct {
+	ScopedFacts       map[string]any     `json:"scoped_facts,omitempty"`
 	MaxStandingHours  int                `json:"max_standing_hours"`
 	ID                string             `json:"id"`
 	Kind              string             `json:"kind"` // ssh, enrollment, cloudflare
@@ -219,14 +224,16 @@ type PendingItem struct {
 }
 
 type StandingApproval struct {
-	ID             string    `json:"id"`
-	RequestingHost string    `json:"requesting_host"`
-	Kind           string    `json:"kind"`
-	TargetHost     string    `json:"target_host"`
-	LoginUser      string    `json:"login_user"`
-	MaxTTLSeconds  int       `json:"max_ttl_seconds"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	Uses           int       `json:"uses"`
+	Indefinite     bool           `json:"indefinite,omitempty"`
+	ScopedFacts    map[string]any `json:"scoped_facts,omitempty"`
+	ID             string         `json:"id"`
+	RequestingHost string         `json:"requesting_host"`
+	Kind           string         `json:"kind"`
+	TargetHost     string         `json:"target_host"`
+	LoginUser      string         `json:"login_user"`
+	MaxTTLSeconds  int            `json:"max_ttl_seconds"`
+	ExpiresAt      time.Time      `json:"expires_at"`
+	Uses           int            `json:"uses"`
 	// Kind "cloudflare" (milestone 2); TargetHost and LoginUser are empty then.
 	Scope       string `json:"scope,omitempty"`
 	ScopeParams string `json:"scope_params,omitempty"`
@@ -247,12 +254,13 @@ type UIOwner struct {
 }
 
 type UIState struct {
-	Owner    UIOwner            `json:"owner"`
-	Pending  []PendingItem      `json:"pending"`
-	Standing []StandingApproval `json:"standing"`
-	Grants   []GrantSummary     `json:"grants"` // active grants, newest first, with requesting_host
-	Recent   []AuditEntry       `json:"recent"`
-	Passkeys []PasskeyInfo      `json:"passkeys"` // the owner's passkeys, oldest first
+	CatalogueEnabled bool               `json:"catalogue_enabled,omitempty"`
+	Owner            UIOwner            `json:"owner"`
+	Pending          []PendingItem      `json:"pending"`
+	Standing         []StandingApproval `json:"standing"`
+	Grants           []GrantSummary     `json:"grants"` // active grants, newest first, with requesting_host
+	Recent           []AuditEntry       `json:"recent"`
+	Passkeys         []PasskeyInfo      `json:"passkeys"` // the owner's passkeys, oldest first
 }
 
 // Passkey icon keys (PasskeyInfo.Icon); the web UI draws one glyph per key.
@@ -364,10 +372,14 @@ type PasskeyChange struct {
 
 // ChallengeRequest asks for a WebAuthn challenge that commits to one exact action.
 type ChallengeRequest struct {
-	Action        string `json:"action"` // approve, deny (requests, enrollments); revoke (standing, grants); add, rename, remove (passkeys)
-	TTLSeconds    int    `json:"ttl_seconds,omitempty"`
-	StandingHours int    `json:"standing_hours,omitempty"`
-	Nickname      string `json:"nickname,omitempty"` // passkey rename: the new nickname
+	StandingSeconds    int    `json:"standing_seconds,omitempty"`
+	Plan               string `json:"plan,omitempty"`
+	Indefinite         bool   `json:"indefinite,omitempty"`
+	StandingIndefinite bool   `json:"standing_indefinite,omitempty"`
+	Action             string `json:"action"` // approve, deny (requests, enrollments); revoke (standing, grants); add, rename, remove (passkeys)
+	TTLSeconds         int    `json:"ttl_seconds,omitempty"`
+	StandingHours      int    `json:"standing_hours,omitempty"`
+	Nickname           string `json:"nickname,omitempty"` // passkey rename: the new nickname
 }
 
 // ChallengeResponse carries the WebAuthn PublicKeyCredentialRequestOptions as raw JSON so the

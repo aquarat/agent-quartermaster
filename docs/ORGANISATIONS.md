@@ -97,6 +97,63 @@ Use session-protected `/api/ui/` read views and the existing `challenge` → `de
 
 ## Cutover and delivery order
 
+### Inventory preview in this branch
+
+`aqmasd -config CONFIG organisations-plan BACKUP` prints the proposed personal catalogue as JSON.
+Use a **standalone SQLite online backup** from v0.1.1 (schema 5), a matching validated config,
+and the installation's CA files. Run as the broker user. For example, in a private backup directory:
+
+```sh
+umask 077
+sqlite3 -readonly /var/lib/aqmas/aqmas.db ".backup 'before-organisations.sqlite'"
+aqmasd -config /etc/aqmas/config.toml organisations-plan before-organisations.sqlite > personal-plan.json
+```
+
+Keep the DB backup and plan private. Compare the enrollment IDs, classes and fingerprints (not
+just host names), SSH target bindings, named Cloudflare resources and which proxy scopes can be
+auto-approved. Check outstanding certificate expiries and resolve child-token provenance against
+the original issuer's records. An old grant ID, target name or scope alone proves no current
+service binding. Plans larger than 128 KiB (compact JSON) or 512 rows in any inventory are refused.
+The preview changes neither the backup nor the running catalogue. Re-run it after configuration,
+enrollment or grant changes.
+
+**Supervised activation:** Disable the automatic updater and prevent service-manager restarts for
+the maintenance window. Stop the broker, drain traffic, and wait for the old process (including
+mints, proxy calls and sweepers) to exit. Keep the old binary, signed-in owner's passkeys, config,
+both CAs, credential files and retained snapshot directories with the installation's recovery
+materials. Reconcile any live child IDs with the original issuer; an orphan name is not proof.
+Run `aqmasd -config CONFIG organisations-cutover` as the broker user with its normal RP origin
+and listeners. This mode holds the data-directory lock and both ports, fences the agent API,
+runs no sweeper or update poller, and saves a private consistent `pre-organisations-*/aqmas.db`.
+Copy that recovery point to independently encrypted backup storage and compare its SHA-256 to
+the logged digest. Do not change config, keys or host records during review.
+
+Sign in at the normal approval origin, open **Admin**, review the full personal plan and recovery
+digest, then activate with a passkey. A changed host inventory, elapsed validity boundary, or
+changed recovery file invalidates the review: restart maintenance and review the new point.
+The backfill, retirement, activation marker, audit and version 6 commit together. Stop maintenance
+and restart `serve`; check the personal catalogue with an admitted host before re-enabling updates.
+Before activation an aborted run leaves schema 5 usable. After activation fix forward unless it
+is proven safe to restore the matching recovery point (never lower `user_version` by hand).
+
+Old CF snapshots stay owner-only. New snapshots have a dedicated service directory and are
+identified by the writer's enrollment row. **All current M2 child-token templates are disabled
+at cutover:** none enforces the complete resource and write restrictions independently of the
+proxy. Zone DNS tokens, for example, cannot enforce the DNS guard rails; account Worker tokens
+cannot enforce a script name. The plan lists the affected templates. Use proxy mode instead.
+No minter is opened and no legacy child is deleted by an unverified parent. Issued children
+can continue to work until provider expiry; verify/revoke them with the original issuing parent.
+
+**After activation:** Use **Admin → Organisations** to create an organisation, list its
+services and sets, edit grant/standing policy, and admit or remove a specific enrollment.
+An admission previews which accesses need no additional owner tap, or **none**. New
+organisations have no hosts. New application services and credential sets contain only
+public metadata. Env import and delivery are deferred until the separately designed
+passkey-unlocked sealed store exists. Current aqmasd still loads the CA files and CF
+proxy credential on startup; these phases do not provide a sealed or locked state.
+
+### Delivery sequence
+
 1. **Inventory and dry run, personal only.** Append migrations after the current `PRAGMA user_version` 4 (coordinate numbering with owner-device work). Generate a repeatable plan from a consistent backup and validated config: one personal org, one owner, live enrollment IDs admitted to personal only, `[[targets]]` → fleet sets, optional `[cloudflare]` → one service and its mode sets. Carry principal, users, host key, TTL/risk and all scope narrowing, named-ID bindings, IP conditions, deny/guard rules and snapshot settings forward. Disabled features stay disabled. Retain the SSH CA, global principal uniqueness, client TLS pins, enrollment certificates, RP ID and passkey handles. No [host trust](HOSTS.md) change.
 2. **Review then activate.** Stage schema and catalogue metadata without issuing new authority. Keep personal-only legacy operation until cutover. Before signing the final plan, pause mutations, fence and drain polls, mints, proxy calls and sweepers, and make a consistent recovery point. Recheck source versions and host inventory in the activation transaction; abort on drift. Initially leave CF parents behind fixed personal service handles using the existing loader. Pin the public config revision; changed role mappings, account or policy require signed review, never an unsigned live override. Operational settings like listeners stay in config.
 3. **Backfill and close old authority.** Preserve IDs, SSH serials and sequence high-water mark, validity and deletion records. The historic CF rows have no issuer/account ID; current config and a matching scope are not proof of origin. Use verified issuer inventory or operator records, and verify reused SSH target names too. Keep ambiguous records owner-only, inert and unassigned; report unresolved children through expiry, don't try another minter. Expire pending requests and v1 action challenges; revoke legacy standing approvals and active broker grants. Report delivered certs outstanding until expiry and reconcile verified children with the original minter. Index old snapshots only when service and original enrollment are proven from grant history; otherwise archive owner-only. Don't rewrite append-only audit rows: attribute legacy events via verified object-ID joins or show separately. An audited atomic activation marker selects the new path on restart.
@@ -113,6 +170,14 @@ Use session-protected `/api/ui/` read views and the existing `challenge` → `de
 **Rollback.** Restore an older binary only with its matching pre-activation recovery point and proof no intervening authority changes are lost. Otherwise fix forward. On disaster recovery reconcile issuer tokens, host revocations, passkeys and rotated secrets in isolation; expire sessions/challenges/rules/grants and review admissions before reopening. Preserve post-backup audit separately. Never serve a stale allow-list.
 
 ## Owner decisions (2026-11-20)
+
+**Cloudflare duration clarification (2026-11-21):** Migration preserves every
+existing limit. A signed policy can explicitly relax an ordinary **proxy**
+scope's duration, including offering indefinite as a separate choice. An
+explicitly configured per-scope ceiling always wins. `cf.admin` can never
+exceed one hour; `cf.read.private` can never exceed two hours. Neither can be
+indefinite. Indefinite access is expected to be rare: it is never the default
+and must not result from a policy-auto or standing match.
 
 1. **Durations are per-organisation policy, edited on the Admin page** (passkey-signed), for each
    organisation and optionally per service/set: a default, a **soft cap** and whether

@@ -49,9 +49,10 @@ const (
 
 // Options configures a Server.
 type Options struct {
-	Config *config.Config
-	Logger *slog.Logger
-	Now    func() time.Time // for tests; default time.Now
+	Maintenance bool // supervised, login and personal cutover only
+	Config      *config.Config
+	Logger      *slog.Logger
+	Now         func() time.Time // for tests; default time.Now
 	// HTTPClient is used for ntfy and Cloudflare Access certs (tests inject one).
 	HTTPClient *http.Client
 	// AccessCertsURL overrides the Access JWKS URL (tests).
@@ -63,19 +64,22 @@ type Options struct {
 
 // Server is a running aqmasd instance.
 type Server struct {
-	updates updateState
-	cfg     *config.Config
-	log     *slog.Logger
-	now     func() time.Time
-	store   *store.Store
-	pki     *pki.PKI
-	wa      *webauthn.WebAuthn
-	rpID    string
-	ownerID []byte
-	notify  *notify.Notifier
-	access  *cfaccess.Verifier
-	bcast   broadcaster
-	cf      cfState // milestone 2; zero when cloudflare.enabled is false
+	maintenance     bool
+	cutover         *cutoverReview // installed before opening the maintenance web listener
+	profileRevision string
+	updates         updateState
+	cfg             *config.Config
+	log             *slog.Logger
+	now             func() time.Time
+	store           *store.Store
+	pki             *pki.PKI
+	wa              *webauthn.WebAuthn
+	rpID            string
+	ownerID         []byte
+	notify          *notify.Notifier
+	access          *cfaccess.Verifier
+	bcast           broadcaster
+	cf              cfState // milestone 2; zero when cloudflare.enabled is false
 }
 
 // DBPath returns the database path for a data dir.
@@ -101,7 +105,12 @@ func New(o Options) (*Server, error) {
 	} else if st.Mode().Perm()&0o022 != 0 {
 		return nil, fmt.Errorf("data_dir %s is group/other writable (mode %v)", cfg.DataDir, st.Mode().Perm())
 	}
-	p, err := pki.Load(CADir(cfg.DataDir), cfg.TLSSANs, true)
+	if o.Maintenance {
+		if _, err := os.Stat(DBPath(cfg.DataDir)); err != nil {
+			return nil, fmt.Errorf("cutover requires an existing database: %w", err)
+		}
+	}
+	p, err := pki.Load(CADir(cfg.DataDir), cfg.TLSSANs, !o.Maintenance)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +154,7 @@ func New(o Options) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg: cfg, log: o.Logger, now: o.Now, store: st, pki: p, wa: wa, rpID: rpID, ownerID: ownerID,
+		cfg: cfg, log: o.Logger, now: o.Now, store: st, pki: p, wa: wa, rpID: rpID, ownerID: ownerID, maintenance: o.Maintenance,
 		notify: &notify.Notifier{TopicURL: cfg.Ntfy.TopicURL, Client: o.HTTPClient, Log: o.Logger},
 	}
 	for _, t := range cfg.Targets {
@@ -165,7 +174,11 @@ func New(o Options) (*Server, error) {
 			s.access.Client = o.HTTPClient
 		}
 	}
-	if cfg.Cloudflare.Enabled {
+	if err := s.verifyPersonalConfig(); err != nil {
+		st.Close()
+		return nil, err
+	}
+	if cfg.Cloudflare.Enabled && !s.maintenance {
 		if err := s.setupCloudflare(o); err != nil {
 			st.Close()
 			return nil, err
@@ -185,6 +198,11 @@ func (s *Server) Store() *store.Store { return s.store }
 
 // Run serves the agent API and the web UI until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	lock, err := s.lockService()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	agentLn, err := net.Listen("tcp", s.cfg.ListenAgent)
 	if err != nil {
 		return err
@@ -193,6 +211,13 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		agentLn.Close()
 		return err
+	}
+	if s.maintenance {
+		if err := s.prepareRecovery(ctx); err != nil {
+			webLn.Close()
+			agentLn.Close()
+			return err
+		}
 	}
 	agentSrv := &http.Server{
 		Handler:           s.AgentHandler(),
@@ -216,8 +241,10 @@ func (s *Server) Run(ctx context.Context) error {
 	errc := make(chan error, 2)
 	go func() { errc <- agentSrv.ServeTLS(agentLn, "", "") }()
 	go func() { errc <- webSrv.Serve(webLn) }()
-	go s.sweeper(ctx)
-	if s.cfg.Updates.Repo != "" {
+	if !s.maintenance {
+		go s.sweeper(ctx)
+	}
+	if !s.maintenance && s.cfg.Updates.Repo != "" {
 		go s.pollUpdates(ctx)
 	}
 	s.log.Info("aqmasd listening", "agent", agentLn.Addr().String(), "web", webLn.Addr().String())

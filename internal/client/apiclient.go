@@ -238,7 +238,11 @@ func (c *APIClient) EnrollStatus(ctx context.Context, id, pollToken string, wait
 // CreateRequest posts an access request.
 func (c *APIClient) CreateRequest(ctx context.Context, req *api.AccessRequest) (*api.RequestCreated, error) {
 	var out api.RequestCreated
-	if err := c.do(ctx, http.MethodPost, "/v1/requests", req, &out); err != nil {
+	path := "/v1/requests"
+	if req.Indefinite {
+		path = "/v2/personal/requests"
+	} // never downgrade an explicit indefinite request
+	if err := c.do(ctx, http.MethodPost, path, req, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

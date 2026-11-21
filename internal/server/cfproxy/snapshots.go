@@ -273,7 +273,7 @@ func (s *snapStore) prune(now time.Time, days int) (int, error) {
 	seen := map[string]bool{}
 	n := 0
 	for _, f := range all {
-		k := f.meta.ObjectKey
+		k := fmt.Sprintf("%s/%d/%s", f.meta.ServiceID, f.meta.HostID, f.meta.ObjectKey)
 		newest := !seen[k]
 		seen[k] = true
 		if newest || !f.meta.CreatedAt.Before(cutoff) {
@@ -313,12 +313,18 @@ var sensitiveSnapshots = map[string][]string{
 // snapReader decides which snapshots a host may read: only those taken for its own writes,
 // and the sensitive types only with a matching active grant.
 type snapReader struct {
-	host   string
-	scopes map[string]bool
+	service string
+	hostID  int64
+	host    string
+	scopes  map[string]bool
+}
+
+func (sr snapReader) owns(m api.CFSnapshot) bool {
+	return m.Host == sr.host && m.ServiceID == sr.service && (m.HostID == sr.hostID || sr.service == "" && m.HostID == 0)
 }
 
 func (sr snapReader) may(m api.CFSnapshot) bool {
-	if m.Host != sr.host {
+	if !sr.owns(m) {
 		return false
 	}
 	if need, ok := sensitiveSnapshots[m.ObjectType]; ok {
@@ -333,7 +339,7 @@ func (sr snapReader) may(m api.CFSnapshot) bool {
 }
 
 func (p *Proxy) snapReaderFor(ctx context.Context, c Caller) (snapReader, error) {
-	sr := snapReader{host: c.HostName, scopes: map[string]bool{}}
+	sr := snapReader{host: c.HostName, hostID: c.HostID, service: p.o.ServiceID, scopes: map[string]bool{}}
 	if sl, ok := p.o.Grants.(ScopeLister); ok {
 		scopes, err := sl.ActiveScopes(ctx, c.HostID, p.now())
 		if err != nil {
@@ -425,7 +431,7 @@ func (p *Proxy) ServeSnapshotGet(w http.ResponseWriter, r *http.Request, c Calle
 		return
 	}
 	m, err := p.snaps.get(id)
-	if err == nil && m.Host != c.HostName {
+	if err == nil && !sr.owns(*m) {
 		err = os.ErrNotExist // another host's snapshot: as if it did not exist
 	}
 	if err == nil && !sr.may(*m) {

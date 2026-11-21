@@ -53,7 +53,7 @@ describe("canonical", () => {
   });
 
   test("rejects wrong version, missing fields, bad numbers", () => {
-    expect(() => parseCanonical(canonicalJSON({ ...base, v: 2 }))).toThrow(/version/);
+    expect(() => parseCanonical(canonicalJSON({ ...base, v: 3 }))).toThrow(/version/);
     expect(() => parseCanonical(canonicalJSON({ ...base, id: "" }))).toThrow(/id/);
     expect(() => parseCanonical(canonicalJSON({ ...base, ttl_seconds: -5 }))).toThrow(/ttl_seconds/);
     expect(() => parseCanonical(canonicalJSON({ ...base, ttl_seconds: "1800" }))).toThrow(/ttl_seconds/);

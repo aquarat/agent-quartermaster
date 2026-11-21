@@ -286,4 +286,27 @@ wait $APID || RC=$?
 ((RC == 3)) || fail "after-revoke request exited $RC, want 3"
 ok "after the revoke, aqmas asked again instead of reusing the cached certificate"
 
+# Exercise the read-only v0.1.1 inventory on a consistent copy while the real
+# broker is still serving. A revoked SSH grant still means a valid issued cert.
+bun -e 'import {Database} from "bun:sqlite"; const db=new Database(process.argv[1],{readonly:true}); db.query("VACUUM INTO ?").run(process.argv[2]); db.close()' "$T/data/aqmas.db" "$T/pre-cutover.db"
+"$AQMASD" -config "$T/config.toml" organisations-plan "$T/pre-cutover.db" >"$T/plan.json"
+bun -e 'const p=await Bun.file(process.argv[1]).json(); const a=p.admit_to_personal_only;
+if(p.source_schema!==5 || p.organisation.slug!=="personal" || a.length!==1 || a[0].name!=="interop-host" || !a[0].certificate_sha256 || p.services[0].sets[0].slug!=="testhost" || !p.retire.outstanding_certificates_and_unverified_children.some(g=>g.grant_id===process.argv[2]))process.exit(1)' "$T/plan.json" "$GID" || fail "personal cutover inventory"
+"$AQMAS" list --json >/dev/null || fail "inventory interrupted legacy service"
+ok "personal dry run identified live enrollment, target and outstanding SSH certificate"
+
+source "$ROOT/test/interop/cutover.sh"
+personal_cutover "${PIDS[0]}"
+"$AQMAS" ssh testhost --fresh --why "post-cutover" -- echo ok </dev/null >"$T/scoped.out" 2>"$T/scoped.err" &
+RPID=$!; RID=$(owner wait ssh interop-host 20); owner approve "$RID" 300 >/dev/null 2>"$T/scoped-owner.err"
+wait "$RPID"; grep -qx ok "$T/scoped.out" && grep -q '"org_slug":"personal"' "$T/scoped-owner.err" || fail 'scoped SSH approval'
+ok 'signed activation and personal SSH approval from the legacy CLI'
+
+owner catalogue create
+owner catalogue remove
+if "$AQMAS" list >"$T/foreign.out" 2>&1; then fail 'client-a admission conferred personal access'; fi
+owner catalogue readmit
+"$AQMAS" list --json | bun -e 'if((await Bun.stdin.json()).grants.length)process.exit(1)' || fail 're-admission revived grants'
+ok 'signed catalogue creation, identical sibling paths and remove/re-admit isolation'
+
 echo "interop: ALL OK"

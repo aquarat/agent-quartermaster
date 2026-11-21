@@ -44,10 +44,18 @@ func (s *Server) WebHandler() http.Handler {
 	api.Handle("GET /api/ui/hosts", s.requireSession(s.handleHosts))
 	api.Handle("GET /api/ui/updates", s.requireSession(s.handleUpdates))
 	api.Handle("GET /api/ui/help", s.requireSession(s.handleHelp))
+	api.Handle("GET /api/ui/migration", s.requireSession(s.migrationPreview))
+	api.Handle("GET /api/ui/catalogue", s.requireSession(s.catalogueHandler))
+	for object := range canon.CatalogueActions {
+		base := "/api/ui/catalogue/" + object + "/{id}/"
+		api.Handle("POST "+base+"challenge", s.requireSession(s.challengeHandler(object)))
+		api.Handle("POST "+base+"decide", s.requireSession(s.decideHandler(object)))
+	}
 	api.Handle("GET /api/ui/requests/{id}", s.requireSession(s.handleRequestItem))
 	api.Handle("GET /api/ui/enrollments/{id}", s.requireSession(s.handleEnrollmentItem))
 	for _, o := range []struct{ path, object, verb string }{
 		{"requests", canon.ObjectRequest, "decide"},
+		{"migrations", canon.Migration, "activate"},
 		{"updates", "update", "decide"},
 		{"enrollments", canon.ObjectEnrollment, "decide"},
 		{"standing", canon.ObjectStanding, "revoke"},
@@ -105,6 +113,18 @@ func (s *Server) WebHandler() http.Handler {
 // type and (when the browser sends one) a same-origin Origin. SameSite=Strict cookies do the rest.
 func (s *Server) apiGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.maintenance && r.Method != "GET" {
+			p := r.URL.Path
+			allowed := p == "/api/ui/login/begin" || p == "/api/ui/login/finish" || p == "/api/ui/logout"
+			if s.cutover != nil {
+				prefix := "/api/ui/migrations/" + s.cutover.ID + "/"
+				allowed = allowed || p == prefix+"challenge" || p == prefix+"activate"
+			}
+			if !allowed {
+				s.writeErr(w, r, errConflict("broker fenced for personal cutover"))
+				return
+			}
+		}
 		w.Header().Set("Cache-Control", "no-store")
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			if r.Header.Get(csrfHeader) != "1" {
@@ -484,6 +504,13 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 // ---- state ----
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string) {
+	if s.maintenance {
+		writeJSON(w, 200, struct {
+			api.UIState
+			Migration *cutoverReview `json:"migration"`
+		}{api.UIState{Owner: api.UIOwner{Name: s.cfg.OwnerName}, Pending: []api.PendingItem{}, Grants: []api.GrantSummary{}, Standing: []api.StandingApproval{}}, s.cutover})
+		return
+	}
 	ctx := r.Context()
 	now := s.now()
 	q := s.store.Q()
@@ -498,6 +525,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 	}
 	out := api.UIState{Owner: api.UIOwner{Name: s.cfg.OwnerName, Passkeys: n}, Pending: []api.PendingItem{}, Standing: []api.StandingApproval{}, Grants: []api.GrantSummary{}}
 	reqs, err := q.PendingRequests(ctx, now)
+	out.CatalogueEnabled = q.Scoped()
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -524,7 +552,12 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 		return
 	}
 	for _, st := range sts {
-		out.Standing = append(out.Standing, api.StandingApproval{ID: st.ID, RequestingHost: st.HostName, Kind: st.Kind,
+		a, err := s.bindAction(ctx, q, canon.Action{Object: "standing", Action: "revoke", ID: st.ID, Kind: st.Kind})
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		out.Standing = append(out.Standing, api.StandingApproval{Indefinite: st.ExpiresAt.Equal(untilRevoked), ScopedFacts: a.CardFacts(), ID: st.ID, RequestingHost: st.HostName, Kind: st.Kind,
 			TargetHost: st.TargetHost, LoginUser: st.LoginUser, MaxTTLSeconds: st.MaxTTL, ExpiresAt: st.ExpiresAt, Uses: st.Uses,
 			Scope: st.Scope, ScopeParams: st.ScopeParams, Mode: st.Mode})
 	}
@@ -534,7 +567,12 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 		return
 	}
 	for _, g := range gs {
-		out.Grants = append(out.Grants, api.GrantSummary{ID: g.ID, Kind: g.Kind, Status: g.Status(now),
+		a, err := s.bindAction(ctx, q, canon.Action{Object: "grant", Action: "revoke", ID: g.ID, Kind: g.Kind})
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		out.Grants = append(out.Grants, api.GrantSummary{Indefinite: g.NotAfter.Equal(untilRevoked), ScopedFacts: a.CardFacts(), ID: g.ID, Kind: g.Kind, Status: g.Status(now),
 			TargetHost: g.TargetHost, LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter, RequestingHost: g.HostName,
 			Scope: g.Scope, ScopeParams: g.ScopeParams, Mode: g.Mode})
 	}
@@ -567,6 +605,10 @@ func (s *Server) highRisk(rq *store.Request) bool {
 }
 
 func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.PendingItem, error) {
+	a, err := s.bindAction(ctx, s.store.Q(), canon.Action{Object: "request", ID: rq.ID, Kind: rq.Kind})
+	if err != nil {
+		return nil, err
+	}
 	h, err := s.store.Q().GetHost(ctx, rq.HostID)
 	if err != nil {
 		return nil, err
@@ -576,10 +618,28 @@ func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.Pendi
 		it, err := s.cfRequestItem(ctx, rq)
 		if err == nil {
 			it.MaxStandingHours = maxHours
+			it.ScopedFacts = a.CardFacts()
+			if a.OrgID != "" {
+				it.Cloudflare.StandingAllowed = a.OffersStanding
+				if rq.TTLRequested == -1 {
+					l, err := s.decisionLimits(ctx, s.store.Q(), rq)
+					if err != nil {
+						return nil, err
+					}
+					it.TTLRequested = l.DefaultTTL
+					it.TTLMax = l.Hard
+				}
+			}
 		}
 		return it, err
 	}
-	similar, err := s.store.Q().CountSimilar(ctx, rq.HostID, rq.TargetHost, rq.LoginUser, s.now().Add(-7*24*time.Hour))
+	var similar int
+	since := s.now().Add(-7 * 24 * time.Hour)
+	if s.store.Q().Scoped() {
+		similar, err = s.store.Q().CountBoundSimilar(ctx, rq.ID, since)
+	} else {
+		similar, err = s.store.Q().CountSimilar(ctx, rq.HostID, rq.TargetHost, rq.LoginUser, since)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -588,7 +648,8 @@ func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.Pendi
 		risk = "high"
 	}
 	return &api.PendingItem{
-		ID: rq.ID, Kind: rq.Kind, CreatedAt: rq.CreatedAt, ExpiresAt: rq.ExpiresAt,
+		ScopedFacts: a.CardFacts(),
+		ID:          rq.ID, Kind: rq.Kind, CreatedAt: rq.CreatedAt, ExpiresAt: rq.ExpiresAt,
 		RequestingHost: rq.HostName, RequestingAddress: rq.PeerAddress, Requester: rq.Requester, Reason: rq.Reason,
 		MaxStandingHours: maxHours, SSH: &api.PendingSSH{Principal: rq.Principal, RequestedTarget: rq.RequestedTarget, TargetAddress: rq.TargetAddress, TargetPort: rq.TargetPort, TargetHost: rq.TargetHost, LoginUser: rq.LoginUser, KeyFingerprint: rq.KeyFingerprint},
 		TTLRequested: rq.TTLRequested, TTLMax: rq.TTLRequested, Risk: risk, SimilarRecent: similar,
@@ -597,7 +658,14 @@ func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.Pendi
 
 // cfRequestItem is the approval card of a Cloudflare request (docs/API.md 5.7).
 func (s *Server) cfRequestItem(ctx context.Context, rq *store.Request) (*api.PendingItem, error) {
-	similar, err := s.store.Q().CountSimilarScope(ctx, rq.HostID, rq.Scope, s.now().Add(-7*24*time.Hour))
+	var similar int
+	var err error
+	since := s.now().Add(-7 * 24 * time.Hour)
+	if s.store.Q().Scoped() {
+		similar, err = s.store.Q().CountBoundSimilar(ctx, rq.ID, since)
+	} else {
+		similar, err = s.store.Q().CountSimilarScope(ctx, rq.HostID, rq.Scope, since)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -704,6 +772,21 @@ func (s *Server) notifyDecision(sg canon.Signed) {
 		}
 	}
 	text += fmt.Sprintf(" [ref %s]", ref(a.ID))
+	if canon.CatalogueActions[a.Object] != nil {
+		var change api.CatalogueChange
+		if json.Unmarshal([]byte(a.Plan), &change) == nil {
+			text = change.Org.Slug + ": " + text
+		}
+	}
+	if a.Indefinite || a.StandingIndefinite {
+		text += " INDEFINITE until revoked"
+	}
+	if a.BeyondSoft || a.StandingBeyondSoft {
+		text += " (beyond soft cap)"
+	}
+	if a.OrgID != "" {
+		text = a.OrgSlug + "/" + a.ServiceSlug + "/" + a.SetSlug + ": " + text
+	}
 	s.notify.Send("aqmas: decision", text, s.cfg.PublicBaseURL+"/")
 }
 
@@ -729,10 +812,24 @@ func (s *Server) challengeHandler(object string) func(http.ResponseWriter, *http
 		if object == canon.ObjectPasskey && id == "" {
 			id = "new" // POST /api/ui/passkeys/challenge: adding a passkey
 		}
-		a, err := s.buildAction(ctx, object, id, in)
+		var a canon.Action
+		var err error
+		if canon.CatalogueActions[object] != nil {
+			a, err = s.catalogueChallenge(ctx, sess, object, id, in)
+		} else {
+			a, err = s.buildAction(ctx, object, id, in)
+		}
 		if err != nil {
 			s.writeErr(w, r, err)
 			return
+		}
+		if a.OrgID != "" {
+			q := s.store.Q()
+			key, err := q.SessionPasskeyID(ctx, sess)
+			if err != nil || q.IsOrgOwner(ctx, a.OrgID, sess, key, s.now()) != nil {
+				s.writeErr(w, r, errForbidden("not an organisation approver"))
+				return
+			}
 		}
 		now := s.now()
 		text, err := canon.Build(a, canon.NewNonce(), now)
@@ -805,7 +902,26 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 			s.queueUpdate(w, r, sg, in.Assertion, pkID)
 			return
 		}
-		if err := s.apply(ctx, sg, pkID); err != nil {
+		if canon.CatalogueActions[object] != nil {
+			if err := s.catalogueApply(ctx, sess, pkID, sg); err != nil {
+				s.writeErr(w, r, err)
+				return
+			}
+			s.bcast.notify()
+			s.notifyDecision(sg)
+			writeJSON(w, 200, api.OK{OK: true})
+			return
+		}
+		if object == canon.Migration {
+			if err := s.activate(ctx, sess, pkID, sg); err != nil {
+				s.writeErr(w, r, err)
+				return
+			}
+			s.notify.Send("aqmas: personal", "Activated personal catalogue [ref "+ref(id)+"]", s.cfg.PublicBaseURL+"/")
+			writeJSON(w, 200, api.OK{OK: true})
+			return
+		}
+		if err := s.apply(context.WithValue(ctx, sessionBindingKey{}, sess), sg, pkID); err != nil {
 			s.writeErr(w, r, err)
 			return
 		}
