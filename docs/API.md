@@ -615,3 +615,39 @@ with an explicitly signed approve-only intent instead. Unfinished enrollment
 is bounded, session-bound, expires after five minutes and is lost on restart.
 Existing keys can be tested without re-registering them. `unlock_tested_at`
 is for this credential and MK, not a guarantee about every synced device.
+# Batch and window profiles
+
+On a sealed installation, `/api/ui/seal/batch/{challenge,finish}` commits to
+1–10 complete scoped canonicals, max 32 KiB, same org, sorted by request ID.
+The flat v3 `batch/decide` profile adds `installation,epoch,org_id,org_title,
+count,items` to the common keys. `items` is a canonical JSON array of strings.
+Finish accepts only the challenge ID and UV assertion. Any stale member rolls
+back all changes (including serials/signatures); the outer assertion and each
+member and outcome are linked in audit. Only ordinary finite SSH and low-risk
+proxy requests qualify. Individual taps remain available.
+
+`/api/ui/seal/windows/policy/{challenge,finish}` signs a `window-policy/replace`
+profile with the org as id, `installation,epoch,old,new`; old is the complete
+reviewed profile and new the settings JSON. Limits: 5–60 minutes absolute,
+15 seconds to the absolute duration idle. Defaults: personal enabled for known
+ordinary sets, 10 minutes / 2 minutes idle, other orgs disabled. An open
+window signs the explicit eligible set/scope list, path and per-action ceiling
+(at most 30 minutes). No standing, root, high-risk, indefinite, token, env or
+beyond-soft-cap decision. See [SEALED.md](SEALED.md#window-delegate-clicks-not-signatures).
+
+Windows require verified Access. `windows/open/{challenge,finish}` uses
+`window/open`, `installation,epoch,terms` with a new public window ID. Only
+the chosen credential is offered. Combined `unlock-window` instead includes
+the complete `window` terms string in the HPKE-bound seal canonical and uses
+purpose `unlock-window`; finish includes `combined:true`. Neither mode can be
+exchanged for the other. The eligible personal combination is preselected.
+An open returns `{id,token,expires_at}`. The tab retains a non-extractable
+P-256 key and token only in memory. `windows/prepare` re-resolves an ordinary
+decision and returns a one-use proposal; `windows/confirm` requires a raw
+P1363 ECDSA-SHA256 proof over the suite-1 tuple `window-confirm`, installation,
+window ID and proposal ID (UTF-8 base64url), canonical digest (raw bytes).
+`presence` every 10s renews only the 30s presence lease; only applied decisions
+advance idle. Close/reload drops secrets, logout ends that session's windows,
+and a signed authority change fences old windows in SQLite. Admin can close
+from another live owner session. A forwarded HTTP request or issued grant is
+not recalled by closing a window. A window click is not a passkey signature.

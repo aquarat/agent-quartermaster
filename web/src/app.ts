@@ -55,6 +55,7 @@ import { helpPage, type HelpConfig } from './help';
 import {cataloguePage,type Catalogue} from './catalogue';
 import {sealPanel,type SealView} from './sealPanel';
 import {capabilityForm} from './capabilities';
+import {TabWindow,multiPanel,windowAdmin} from './approvals';
 
 function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/help' ? 'help' : 'queue'; }
 function nav(label:string,hash:string,title:string) { const a=h('a',{title,'aria-label':title},label); a.href=hash; return a; }
@@ -85,6 +86,7 @@ export class App {
   private refreshing = false;
   private page = route();
   private seal?: SealView;
+  private tab=new TabWindow();
   private hosts: HostInfo[]=[];
   private updates?: UpdateView;
   private catalogue?: Catalogue|null;
@@ -112,6 +114,7 @@ export class App {
   }
 
   start(): void {
+    window.addEventListener('pagehide',()=>this.tab.end());window.addEventListener('pageshow',ev=>{if(ev.persisted){this.tab.forget();location.reload()}});
     window.addEventListener('hashchange',()=>{
       this.sheet.close(true); this.focusId=/^#r=([A-Za-z0-9_-]{1,64})$/.exec(location.hash)?.[1] ?? null;
       if(this.view==='main') void this.refresh();
@@ -145,6 +148,7 @@ export class App {
     try {
       const s = await this.api.state();
       this.seal=s.seal_enabled?await this.api.sealStatus!():undefined;
+      if(this.tab.id()&&!this.seal?.active_windows?.some(w=>w.id===this.tab.id()))this.tab.forget();
       this.migration=s.migration;
       if(requested==='admin') [this.hosts,this.updates]=await Promise.all([this.api.hosts(),this.api.updates()]);
       if(requested==='admin')this.catalogue=s.catalogue_enabled?await this.api.catalogue?.():null;
@@ -255,6 +259,7 @@ export class App {
   }
 
   private showSignin(message?: string): void {
+    this.tab.end();
     this.view = "signin";
     this.state = null;
     this.login = null;
@@ -410,7 +415,7 @@ export class App {
   private renderSections(): void {
     const s = this.state;
     if (!s || this.view !== "main") return;
-    if(this.seal){if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));this.section('seal',this.seal,()=>[sealPanel(this.api,this.auth,this.seal!,()=>this.changed())]);}
+    if(this.seal){if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));this.section('seal',[this.seal,this.page,this.page==='admin'?s.passkeys:null,this.page==='queue'?s.pending:null],()=>[sealPanel(this.api,this.auth,this.seal!,()=>this.changed(),this.tab),this.seal!.mode==='unlocked'&&(this.page==='admin'?windowAdmin(this.api,this.auth,this.seal!,this.tab,s.passkeys??[],()=>this.changed()):this.page==='queue'&&multiPanel(this.api,this.auth,this.seal!,this.tab,s.pending??[],()=>this.changed()))]);}
     if(this.page!=='queue'){
       document.title=`${this.page==='admin'?'Admin':'Help'} · aqmas`;
       if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);if(this.updates)this.section('updates',[this.updates,this.migration],()=>this.migration?[h('h3',null,'personal · Organisation cutover'),h('p',null,'Fleet access is paused. Compare the recovery digest and review each admission, credential set and authority retirement before signing.'),h('button',{type:'button',class:'btn approve',on:{click:()=>this.sheet.openMigration({object:'migration',id:this.migration!.id,facts:{plan:this.migration!.plan,recovery_sha256:this.migration!.recovery_sha256}})}},'Review personal activation…')]:[updateCard(this.updates!,t=>this.sheet.openUpdate(t))]);}

@@ -193,6 +193,9 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess string) {
 	_ = s.store.Q().DeleteSession(r.Context(), sess)
+	if s.seal != nil {
+		s.seal.windows.logout(sess)
+	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 	writeJSON(w, http.StatusOK, api.OK{OK: true})
 }

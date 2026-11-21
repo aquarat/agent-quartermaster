@@ -80,7 +80,7 @@ func (a *Attempts) Begin(session, purpose, registration string, c Credential) (B
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.now()
-	if a.pending == nil || session == "" || !c.valid() || !(purpose == "unlock" && registration == "" || purpose == "wrap-enroll" && label(registration)) {
+	if a.pending == nil || session == "" || !c.valid() || !(purpose == "unlock" && registration == "" || purpose == "unlock-window" && len(registration) <= 16<<10 && json.Valid([]byte(registration)) || purpose == "wrap-enroll" && label(registration)) {
 		return Begin{}, errAttempt
 	}
 	a.recent = slices.DeleteFunc(a.recent, func(t time.Time) bool { return !now.Before(t.Add(time.Minute)) })
@@ -99,6 +99,9 @@ func (a *Attempts) Begin(session, purpose, registration string, c Credential) (B
 	m := map[string]any{"action": purpose, "credential_id": b64(c.RawID), "epoch": b64(a.epoch[:]), "id": s, "installation": b64(c.Installation[:]), "issued_at": now.UTC().Format(time.RFC3339), "mk_version": c.Version, "nonce": b64(nonce[:]), "object": "seal", "prf_salt": b64(c.Salt[:]), "recipient": b64(k.PublicKey().Bytes()), "rp_id": c.RPID, "suite": 1, "v": 3}
 	if purpose == "wrap-enroll" {
 		m["registration_id"] = registration
+	}
+	if purpose == "unlock-window" {
+		m["window"] = registration
 	}
 	canonical, err := json.Marshal(m)
 	if err != nil {

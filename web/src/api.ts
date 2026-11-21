@@ -44,7 +44,7 @@ export interface ApiOptions {
 
 export interface Api {
   sealStatus?(): Promise<import('./sealPanel').SealView>;
-  sealPost?<T>(path: 'unlock/challenge'|'unlock/finish'|'control/challenge'|'control/finish'|`passkeys/${'challenge'|'authorize'|'create'|'evaluate'|'finish'}`, body: unknown): Promise<T>;
+  sealPost?<T>(path: 'unlock/challenge'|'unlock/finish'|'control/challenge'|'control/finish'|`passkeys/${'challenge'|'authorize'|'create'|'evaluate'|'finish'}`|`batch/${'challenge'|'finish'}`|`windows/${'policy/challenge'|'policy/finish'|'open/challenge'|'open/finish'|'prepare'|'confirm'|'presence'|'close'}`, body: unknown): Promise<T>;
   catalogue?():Promise<import('./catalogue').Catalogue|null>;
   migration?():Promise<{id:string;plan:string;recovery_sha256:string}|null>;
   hosts(): Promise<HostInfo[]>;

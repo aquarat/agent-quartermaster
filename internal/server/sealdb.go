@@ -28,6 +28,7 @@ CREATE TABLE seal_wraps(passkey INTEGER PRIMARY KEY REFERENCES passkeys(id) ON D
 CREATE TRIGGER seal_keep_unlock BEFORE DELETE ON passkeys WHEN EXISTS(SELECT 1 FROM seal_wraps WHERE passkey=OLD.id) AND (SELECT count(*) FROM seal_wraps)<=1 BEGIN SELECT RAISE(ABORT,'last tested unlock credential'); END;`
 
 type sealRuntime struct {
+	windows      windowPool
 	capabilities capabilityStages
 	delayed      atomic.Int64
 	inv          seal.Inventory
@@ -156,7 +157,7 @@ func (s *Server) loadSeal() error {
 		return err
 	}
 	s.seal = &sealRuntime{inv: i, gate: g, attempts: seal.NewAttempts(s.now), stop: make(chan struct{})}
-	return nil
+	return s.store.InitWindows(context.Background())
 }
 func (s *Server) isLocked() bool {
 	if s.seal == nil {

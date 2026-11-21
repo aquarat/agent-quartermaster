@@ -33,7 +33,7 @@ function raw(s: unknown, min: number, max = min) {
   return b;
 }
 export interface Selection {
-  action: "unlock" | "wrap-enroll"; installation: string; mk_version: number; epoch: string;
+  action: "unlock" | "unlock-window" | "wrap-enroll"; window?:string; installation: string; mk_version: number; epoch: string;
   credential_id: string; prf_salt: string; rp_id: string; registration_id?: string;
 }
 export interface SealBegin { canonical: string; attempt_id: string; publicKey: unknown }
@@ -42,10 +42,11 @@ export async function prepareSeal(selection: Selection, begin: SealBegin, rpID: 
   const c = JSON.parse(begin.canonical);
   const keys = ["action", "credential_id", "epoch", "id", "installation", "issued_at", "mk_version", "nonce", "object", "prf_salt", "recipient", "rp_id", "suite", "v"];
   if (selection.action === "wrap-enroll") keys.push("registration_id");
-  if (c?.v !== 3 || c.object !== "seal" || c.suite !== 1 || !["unlock", "wrap-enroll"].includes(c.action) ||
+  if (selection.action === 'unlock-window') keys.push('window');
+  if (c?.v !== 3 || c.object !== "seal" || c.suite !== 1 || !["unlock", "wrap-enroll","unlock-window"].includes(c.action) ||
       c.action !== selection.action || c.id !== begin.attempt_id || c.rp_id !== rpID ||
       !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(c.issued_at) || JSON.stringify(c, keys.sort()) !== begin.canonical) throw Error("Invalid seal canonical");
-  for (const k of ["installation", "mk_version", "epoch", "credential_id", "prf_salt", "rp_id", "registration_id"] as const) {
+  for (const k of ["installation", "mk_version", "epoch", "credential_id", "prf_salt", "rp_id", "registration_id","window"] as const) {
     if (selection[k] !== c[k]) throw Error("Seal ceremony differs from selection");
   }
   if (c.action === "wrap-enroll" && !c.registration_id) throw Error("Missing registration binding");

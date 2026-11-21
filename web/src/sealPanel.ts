@@ -4,8 +4,9 @@ import { encode,decode } from './b64url';
 import { prepareSeal,type Selection,type SealBegin } from './seal';
 import { type Authenticator,decodeRequestOptions,encodeAssertion,unwrapPublicKey } from './webauthn';
 import { visibleText } from './format';
+import {eligible,makeOpening,type Profile,type TabWindow} from './approvals';
 
-export interface SealView { mode:'unsealed'|'setup'|'activated'|'locked'|'unlocked'; installation:string; epoch:string; choices:{id:string;name:string;selection:Selection}[]; manifest?:string }
+export interface SealView { mode:'unsealed'|'setup'|'activated'|'locked'|'unlocked'; installation:string; epoch:string; choices:{id:string;name:string;selection:Selection}[]; manifest?:string; verified_access?:boolean;profiles?:Profile[];active_windows?:{id:string;org:string;opener:string;expires_at:string}[] }
 type Control = {challenge_id:string;canonical:string;public_key:unknown};
 export async function prepareControl(v:SealView,action:'activate'|'lock',b:Control,rp:string) {
   const c=JSON.parse(b.canonical);
@@ -18,15 +19,19 @@ export async function prepareControl(v:SealView,action:'activate'|'lock',b:Contr
   return decodeRequestOptions(o);
 }
 
-export function sealPanel(api:Api,auth:Authenticator,v:SealView,refresh:()=>void) {
+export function sealPanel(api:Api,auth:Authenticator,v:SealView,refresh:()=>void,tab?:TabWindow) {
   const root=h('article',{class:'card'}), controls=h('div'), review=h('div',{role:'status'});
   const button=(s:string,f:()=>Promise<void>)=>h('button',{type:'button',class:'btn',on:{click:async ev=>{const btn=ev.currentTarget as HTMLButtonElement;btn.disabled=true;try{await f()}catch(e){replace(review,h('p',{class:'error'},visibleText((e as Error).message)))}finally{btn.disabled=false}}}},s);
   function confirm(title:string,detail:string,apply:()=>Promise<void>){replace(review,h('h3',null,title),h('pre',null,visibleText(detail)),button(title+' with passkey',async()=>{await apply();replace(review,'Applied.');refresh()}))}
+  for(const w of v.active_windows??[]){controls.append(h('div',{},'Approval window: '+visibleText(w.org)+' · ',h('span',{'data-until':String(Date.parse(w.expires_at))},w.expires_at),button('End now',async()=>{await api.sealPost!('windows/close',{window_id:w.id});if(tab?.id()===w.id)tab.forget();refresh()})))}
+  const profile=v.mode==='locked'&&tab?eligible(v):undefined,combine=h('input',{type:'checkbox',checked:true});if(profile)controls.append(h('label',null,combine,` Also open a window for ${visibleText(profile.title)} for ${profile.settings.max_seconds}s, idle ${profile.settings.idle_seconds}s`));
   if(v.mode==='locked'||v.mode==='setup')for(const key of v.choices){controls.append(button(visibleText(key.name)+' — review',async()=>{
-    const b=await api.sealPost!<SealBegin>('unlock/challenge',{credential:key.id,registration_id:key.selection.registration_id});
-    const p=await prepareSeal(key.selection,b,location.hostname);
-    const title=v.mode==='locked'?'Unlock broker':key.selection.registration_id?.endsWith('-test')?'Test wrap independently':'Create unlock wrap';
-    confirm(title,p.canonical,async()=>{await api.sealPost!('unlock/finish',await p.finish(auth))});
+    const op=profile&&combine.checked?await makeOpening(profile,key.selection.credential_id,profile.settings.max_seconds):undefined;
+    const b=await api.sealPost!<SealBegin>('unlock/challenge',{credential:key.id,registration_id:key.selection.registration_id,window:op?.input});
+    const id=op?JSON.parse(JSON.parse(b.canonical).window).id:'';const selection:Selection=op?{...key.selection,action:'unlock-window',window:op.terms(id)}:key.selection;
+    const p=await prepareSeal(selection,b,location.hostname);
+    const title=op?'Unlock and open approval window':v.mode==='locked'?'Unlock broker':key.selection.registration_id?.endsWith('-test')?'Test wrap independently':'Create unlock wrap';
+    confirm(title,(selection.window?JSON.stringify(JSON.parse(selection.window),null,2)+'\n':'')+p.canonical,async()=>{const packet=await p.finish(auth);if(op)tab!.start(api,op,await api.sealPost!('unlock/finish',{...packet,combined:true}),id,v.installation);else await api.sealPost!('unlock/finish',packet)});
   }))}
   if(v.mode==='unlocked'||v.mode==='setup'&&v.manifest){const action=v.mode==='unlocked'?'lock':'activate';const label=action==='lock'?'Lock now':'Activate sealed installation';controls.append(button(label+'…',async()=>{
     const b=await api.sealPost!<Control>('control/challenge',{action});const opts=await prepareControl(v,action,b,location.hostname);

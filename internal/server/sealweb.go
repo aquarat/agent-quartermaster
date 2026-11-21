@@ -25,6 +25,7 @@ import (
 
 func (s *Server) sealRoutes(m *http.ServeMux) {
 	s.capabilityRoutes(m)
+	s.approvalRoutes(m)
 	for path, f := range map[string]func(http.ResponseWriter, *http.Request, string){"GET /api/ui/seal/status": s.sealStatus, "POST /api/ui/seal/unlock/challenge": s.sealBegin, "POST /api/ui/seal/unlock/finish": s.sealFinish, "POST /api/ui/seal/control/challenge": s.sealControlBegin, "POST /api/ui/seal/control/finish": s.sealControlFinish} {
 		m.Handle(path, s.requireSession(f))
 	}
@@ -46,11 +47,14 @@ type sealChoice struct {
 	Selection map[string]any `json:"selection"`
 }
 type sealView struct {
-	Mode         string       `json:"mode"`
-	Epoch        seal.ID      `json:"epoch"`
-	Installation seal.ID      `json:"installation"`
-	Choices      []sealChoice `json:"choices"`
-	Manifest     string       `json:"manifest,omitempty"`
+	Profiles       []windowProfile `json:"profiles,omitempty"`
+	Active         []windowInfo    `json:"active_windows,omitempty"`
+	VerifiedAccess bool            `json:"verified_access,omitempty"`
+	Mode           string          `json:"mode"`
+	Epoch          seal.ID         `json:"epoch"`
+	Installation   seal.ID         `json:"installation"`
+	Choices        []sealChoice    `json:"choices"`
+	Manifest       string          `json:"manifest,omitempty"`
 }
 
 func (s *Server) sealStatus(w http.ResponseWriter, r *http.Request, sess string) {
@@ -74,7 +78,34 @@ func (s *Server) sealView(ctx context.Context, sess string) (sealView, error) {
 	}
 	if !s.isLocked() {
 		v.Mode = "unlocked"
-		return v, nil
+	}
+	if z.stage == nil {
+		q := s.store.Q()
+		row, err := q.SessionPasskeyID(ctx, sess)
+		if err != nil {
+			return v, err
+		}
+		v.VerifiedAccess = s.access != nil && accessSub(ctx) != ""
+		v.Profiles, err = s.windowProfiles(ctx, q, sess, row)
+		if err != nil {
+			return v, err
+		}
+		pool := &z.windows
+		pool.Lock()
+		gen, err := q.WindowEpoch(ctx)
+		if err == nil {
+			pool.prune(s.now(), gen)
+			for _, w := range pool.active {
+				v.Active = append(v.Active, windowInfo{w.terms.ID, w.terms.Title, w.opener, w.opened, w.absolute})
+			}
+		}
+		pool.Unlock()
+		if err != nil {
+			return v, err
+		}
+		if v.Mode == "unlocked" {
+			return v, nil
+		}
 	}
 	if st := z.stage; st != nil {
 		st.mu.Lock()
@@ -145,8 +176,9 @@ func (s *Server) credentialFor(ctx context.Context, sess string, pk *storedPassk
 }
 
 type sealRequest struct {
-	Credential   string `json:"credential"`
-	Registration string `json:"registration_id"`
+	Window       *windowOpen `json:"window,omitempty"`
+	Credential   string      `json:"credential"`
+	Registration string      `json:"registration_id"`
 }
 
 func (s *Server) sealBegin(w http.ResponseWriter, r *http.Request, sess string) {
@@ -187,6 +219,19 @@ func (s *Server) sealBegin(w http.ResponseWriter, r *http.Request, sess string) 
 	if reg != "" {
 		purpose = "wrap-enroll"
 	}
+	if in.Window != nil {
+		if reg != "" || in.Window.Credential != encodeID(pk.CredentialID) {
+			s.writeErr(w, r, errBad("wrong combined ceremony"))
+			return
+		}
+		terms, err := s.windowTerms(ctx, s.store.Q(), sess, pk.ID, ids.Secret(32), *in.Window)
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		purpose = "unlock-window"
+		reg, _ = reviewJSON(terms)
+	}
 	b, err := z.attempts.Begin(sess, purpose, reg, wrap.Credential)
 	if err != nil {
 		s.writeErr(w, r, errConflict("cannot begin seal ceremony; refresh and retry"))
@@ -209,9 +254,10 @@ func (s *Server) sealBegin(w http.ResponseWriter, r *http.Request, sess string) 
 }
 
 type sealPacket struct {
-	ID  string `json:"attempt_id"`
-	Enc string `json:"enc"`
-	CT  string `json:"ciphertext"`
+	Combined bool   `json:"combined,omitempty"`
+	ID       string `json:"attempt_id"`
+	Enc      string `json:"enc"`
+	CT       string `json:"ciphertext"`
 }
 
 func (s *Server) sealFinish(w http.ResponseWriter, r *http.Request, sess string) {
@@ -231,6 +277,10 @@ func (s *Server) sealFinish(w http.ResponseWriter, r *http.Request, sess string)
 	purpose := "unlock"
 	if z.stage != nil {
 		purpose = "wrap-enroll"
+	}
+	var receipt *windowReceipt
+	if in.Combined && z.stage == nil {
+		purpose = "unlock-window"
 	}
 	err := z.attempts.FinishBound(sess, purpose, in.ID, enc, ct, func(c seal.Credential, reg string, d [32]byte, assertion []byte, kek *seal.Key) error {
 		pk, _, err := findPasskey(ctx, s.store.Q(), passkeyID(c.RawID))
@@ -282,6 +332,16 @@ func (s *Server) sealFinish(w http.ResponseWriter, r *http.Request, sess string)
 		if err != nil {
 			return errForbidden("seal key check failed")
 		}
+		var t windowTerms
+		var pending *window
+		if in.Combined {
+			if json.Unmarshal([]byte(reg), &t) != nil {
+				mk.Destroy()
+				return errBad("invalid window terms")
+			}
+			z.windows.Lock()
+			defer z.windows.Unlock()
+		}
 		err = z.gate.Install(mk, func() error {
 			return s.store.Tx(ctx, func(q *store.Q) error {
 				if err := s.sealOwner(ctx, q, sess, row); err != nil {
@@ -290,11 +350,21 @@ func (s *Server) sealFinish(w http.ResponseWriter, r *http.Request, sess string)
 				if err := q.CheckSealWrap(ctx, row, c.Version, c.Salt[:], wrap.Wrapped); err != nil {
 					return err
 				}
+				if in.Combined {
+					var rec windowReceipt
+					pending, rec, err = s.stageWindow(ctx, q, sess, row, t, "combined unlock challenge="+encodeID(d[:])+" terms="+reg)
+					if err != nil {
+						return err
+					}
+					receipt = &rec
+				}
 				return q.Audit(ctx, s.now(), "owner", "seal_unlock", "seal:"+encodeID(c.Installation[:]), fmt.Sprintf("passkey=%s challenge=%s", pk.id, encodeID(d[:])))
 			})
 		})
 		if err != nil {
 			mk.Destroy()
+		} else if pending != nil {
+			z.windows.publish(pending)
 		}
 		return err
 	})
@@ -306,7 +376,11 @@ func (s *Server) sealFinish(w http.ResponseWriter, r *http.Request, sess string)
 	if z.stage == nil {
 		s.afterUnlock()
 	}
-	writeJSON(w, 200, api.OK{OK: true})
+	if receipt != nil {
+		writeJSON(w, 200, receipt)
+	} else {
+		writeJSON(w, 200, api.OK{OK: true})
+	}
 }
 
 func (s *Server) controlCanonical(ctx context.Context, sess, action, nonce, at string) (string, error) {

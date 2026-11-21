@@ -99,6 +99,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const [cmd, ...args] = process.argv.slice(2);
 try {
   switch (cmd) {
+    case 'batch': {const state=await api.state(),v=await api.sealStatus();const sel=args.map(id=>({item:state.pending.find((p:any)=>p.id===id),action:'approve',ttl_seconds:300}));const b=await (await import(`${web}/src/approvals.ts`)).batchReview(api,v,sel,new URL(origin).hostname);await b.tap(auth);break;}
     case 'seal-status': console.log((await api.sealStatus()).mode);break;
     case 'capability': {
       const [action,name,capability]=args, v=await api.sealStatus(), key=action==='register'?null:await findPasskey(name!);
