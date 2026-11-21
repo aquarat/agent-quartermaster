@@ -56,6 +56,7 @@ import {cataloguePage,type Catalogue} from './catalogue';
 import {sealPanel,type SealView} from './sealPanel';
 import {capabilityForm} from './capabilities';
 import {TabWindow,multiPanel,windowAdmin} from './approvals';
+import {envPanel,type EnvState} from './envsets';
 
 function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/help' ? 'help' : 'queue'; }
 function nav(label:string,hash:string,title:string) { const a=h('a',{title,'aria-label':title},label); a.href=hash; return a; }
@@ -87,6 +88,7 @@ export class App {
   private page = route();
   private seal?: SealView;
   private tab=new TabWindow();
+  private envState?:EnvState;
   private hosts: HostInfo[]=[];
   private updates?: UpdateView;
   private catalogue?: Catalogue|null;
@@ -148,6 +150,7 @@ export class App {
     try {
       const s = await this.api.state();
       this.seal=s.seal_enabled?await this.api.sealStatus!():undefined;
+      this.envState=this.seal&&['unlocked','locked'].includes(this.seal.mode)?await this.api.envState!():undefined;
       if(this.tab.id()&&!this.seal?.active_windows?.some(w=>w.id===this.tab.id()))this.tab.forget();
       this.migration=s.migration;
       if(requested==='admin') [this.hosts,this.updates]=await Promise.all([this.api.hosts(),this.api.updates()]);
@@ -415,6 +418,7 @@ export class App {
   private renderSections(): void {
     const s = this.state;
     if (!s || this.view !== "main") return;
+    if(this.seal&&this.envState&&this.page!=='help'){if(!this.root.querySelector('#sec-env'))this.root.insertBefore(section('env','Env credential sets'),this.root.querySelector('main'));this.section('env',[this.envState,this.page,this.catalogue,this.seal.mode],()=>[envPanel(this.api,this.auth,this.seal!,this.envState!,this.page==='admin'?this.catalogue:null,()=>this.changed())]);}
     if(this.seal){if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));this.section('seal',[this.seal,this.page,this.page==='admin'?s.passkeys:null,this.page==='queue'?s.pending:null],()=>[sealPanel(this.api,this.auth,this.seal!,()=>this.changed(),this.tab),this.seal!.mode==='unlocked'&&(this.page==='admin'?windowAdmin(this.api,this.auth,this.seal!,this.tab,s.passkeys??[],()=>this.changed()):this.page==='queue'&&multiPanel(this.api,this.auth,this.seal!,this.tab,s.pending??[],()=>this.changed()))]);}
     if(this.page!=='queue'){
       document.title=`${this.page==='admin'?'Admin':'Help'} · aqmas`;

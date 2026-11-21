@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -41,6 +42,11 @@ Usage:
   aqmas ssh-config [USER@]HOST...  print an opt-in ~/.ssh/config snippet (read its notes)
   aqmas cf scopes|request|api|env|curl|token|snapshot ...
       Cloudflare API access through aqmasd (aqmas cf help).
+  aqmas set import PATH --from FILE | set put PATH KEY | set unset PATH KEY
+      Enter the Admin upload ticket at the hidden prompt or via --ticket-fd FD.
+  aqmas run PATH --why REASON [--ttl 10m] -- COMMAND...
+  aqmas checkout|co PATH --why REASON [--file .env]; aqmas checkin|ci PATH
+  aqmas checkout-shell|cos PATH --why REASON; aqmas checkin-shell|cis PATH
   aqmas version | help
   aqmas upgrade | update [--check] [--yes --expect-sha256 HEX] [--allow-single-source]
 
@@ -71,6 +77,76 @@ func run(args []string) int {
 		env.UpdateNotice(ctx)
 	}
 	switch cmd {
+	case "_env-holder":
+		if len(rest) != 2 {
+			return 2
+		}
+		return fail(env.HoldEnv(ctx, rest[0], rest[1]))
+	case "set":
+		if len(rest) < 2 {
+			return fail(&client.UsageError{Msg: "set requires import, put or unset and a qualified set path"})
+		}
+		op := rest[0]
+		f, err := parseFlags(rest[1:], map[string]bool{"from": true, "ticket-fd": true})
+		if err != nil {
+			return fail(err)
+		}
+		if f.cmd != nil || !(op == "import" && len(f.pos) == 1 && f.str["from"] != "" || (op == "put" || op == "unset") && len(f.pos) == 2 && f.str["from"] == "") {
+			return fail(&client.UsageError{Msg: "invalid set edit arguments"})
+		}
+		fd := -1
+		if f.str["ticket-fd"] != "" {
+			fd, err = strconv.Atoi(f.str["ticket-fd"])
+			if err != nil || fd < 3 {
+				return fail(&client.UsageError{Msg: "ticket fd must be at least 3"})
+			}
+		}
+		key := ""
+		if len(f.pos) == 2 {
+			key = f.pos[1]
+		}
+		return fail(env.SetEdit(ctx, op, f.pos[0], key, f.str["from"], fd))
+	case "run", "checkout", "co", "checkout-shell", "cos":
+		f, err := parseFlags(rest, map[string]bool{"why": true, "ttl": true, "file": true})
+		if err != nil {
+			return fail(err)
+		}
+		if len(f.pos) != 1 || cmd != "run" && len(f.cmd) > 0 {
+			return fail(&client.UsageError{Msg: "expected qualified set path"})
+		}
+		mode := "process"
+		if cmd == "co" || cmd == "checkout" {
+			mode = "file"
+			_ = client.ReapEnv()
+		} else if cmd != "run" {
+			mode = "shell"
+		}
+		name := f.str["file"]
+		if name == "" {
+			name = ".env"
+		} else if mode != "file" {
+			return fail(&client.UsageError{Msg: "--file requires checkout"})
+		}
+		ttl := 0
+		if f.str["ttl"] == "indefinite" {
+			ttl = -1
+		} else if f.str["ttl"] != "" {
+			d, err := time.ParseDuration(f.str["ttl"])
+			if err != nil || d <= 0 || d%time.Second != 0 {
+				return fail(&client.UsageError{Msg: "invalid TTL"})
+			}
+			ttl = int(d / time.Second)
+		}
+		return fail(env.EnvUse(ctx, f.pos[0], mode, f.str["why"], name, ttl, f.cmd))
+	case "ci", "checkin", "cis", "checkin-shell":
+		if len(rest) != 1 {
+			return fail(&client.UsageError{Msg: "expected qualified set path"})
+		}
+		mode := "file"
+		if cmd == "cis" || cmd == "checkin-shell" {
+			mode = "shell"
+		}
+		return fail(env.EnvCheckin(ctx, rest[0], mode))
 	case "upgrade", "update":
 		f, err := parseFlags(rest, map[string]bool{"check": false, "yes": false, "expect-sha256": true, "allow-single-source": false})
 		if err != nil {

@@ -342,6 +342,11 @@ func (s *Server) sweeper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if s.seal != nil && s.seal.stage == nil {
+				if err := s.store.Q().SweepEnv(ctx, s.now()); err != nil {
+					s.log.Warn("env expiry sweep failed")
+				}
+			}
 			n, err := s.store.Q().ExpireStale(ctx, s.now())
 			if err != nil {
 				s.log.Warn("expiry sweep failed", "error", err)

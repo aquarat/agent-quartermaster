@@ -157,7 +157,10 @@ func (s *Server) loadSeal() error {
 		return err
 	}
 	s.seal = &sealRuntime{inv: i, gate: g, attempts: seal.NewAttempts(s.now), stop: make(chan struct{})}
-	return s.store.InitWindows(context.Background())
+	if err = s.store.InitWindows(context.Background()); err != nil {
+		return err
+	}
+	return s.store.InitEnv(context.Background())
 }
 func (s *Server) isLocked() bool {
 	if s.seal == nil {

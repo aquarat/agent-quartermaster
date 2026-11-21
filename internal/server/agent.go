@@ -37,6 +37,7 @@ func (s *Server) AgentHandler() http.Handler {
 		})
 	}
 	mux := http.NewServeMux()
+	s.envAgentRoutes(mux)
 	mux.Handle("GET /v1/releases/latest", s.requireHost(s.latestRelease))
 	mux.Handle("GET /v1/releases/{version}/{asset}", s.requireHost(s.releaseAsset))
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
@@ -452,7 +453,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 			return q.Audit(ctx, now, "system", "auto_approve", "request:"+req.ID,
 				fmt.Sprintf("standing=%s grant=%s host=%s %s@%s ttl=%d key=%s from=%s", st.ID, g.ID, h.Name, req.LoginUser, req.TargetHost, ttl, req.KeyFingerprint, req.PeerAddress))
 		}
-		if n, err := q.CountPendingRequests(ctx, h.ID, now); err != nil {
+		if n, err := s.allPending(ctx, q, h.ID, now); err != nil {
 			return err
 		} else if n >= MaxPendingPerHost {
 			return &apiErr{http.StatusTooManyRequests, api.ErrRateLimited, "too many pending requests from this host"}

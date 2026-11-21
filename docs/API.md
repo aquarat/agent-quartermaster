@@ -651,3 +651,56 @@ advance idle. Close/reload drops secrets, logout ends that session's windows,
 and a signed authority change fences old windows in SQLite. Admin can close
 from another live owner session. A forwarded HTTP request or issued grant is
 not recalled by closing a window. A window click is not a passkey signature.
+# Env sets: immutable revisions and collection
+
+The sealed runtime resolves `GET /v2/env/set?path=org/service/set` only for
+the authenticated host's current admission. Admin → Env credential sets
+issues a one-use, five-minute upload ticket bound to session, enrolled
+owner-device, operation, immutable path IDs and base revision. Enter the
+ticket at the CLI prompt (`--ticket-fd N` for a protected input stream).
+`aqmas set import PATH --from FILE` replaces the **entire** set. `set put PATH
+KEY` reads a hidden prompt or exact stdin bytes; `set unset PATH KEY` removes
+one key. Imports accept UTF-8 literal assignments, whole-line comments and
+blank lines; no quotes, interpolation, duplicate names or NUL. Compare the
+CLI's Ref and commitment to the card before signing. No value-read UI exists.
+
+Upload (`POST /v2/env/upload`) stores only metadata and a per-draft encrypted
+blob. SHA-256 commitment input is u32be-length-prefixed components: UTF-8
+`aqmas-env-edit-v1`, secret random 32-byte salt, org/service/set IDs, base
+revision as u64be, operation, then sorted triples of operation/name/exact
+value bytes. Commit recomputes the commitment and key changes before atomically
+publishing a fresh DEK-encrypted revision. SQLite free pages and earlier WAL
+or snapshots can retain recoverable old ciphertext and wraps.
+
+Session-only `/api/ui/seal/env/{state,ticket,challenge,finish}`. V3 `env`
+signs `action,id,installation,epoch,issued_at,nonce,metadata,ttl_seconds` and
+the common `v,object`. Metadata is the complete reviewed draft or release
+record (immutable IDs, path/title, revisions, admission, identity, manifest,
+mode, address and policy limits); the untrusted free-form reason is blank
+in the signed release. Releases need a fresh individual tap, including
+denials. No window, batch, standing or automatic env approval. Rotation
+means replacing the value at its provider as well as importing the new set.
+
+`POST /v2/env/requests`, `GET /v2/env/requests/{id}`, `POST .../{id}/cancel`,
+`GET /v2/env/grants/{id}`, `POST .../{id}/checkin` return metadata only.
+`POST /v2/grants/{id}/collect` returns values **once**, after commit, only to
+the live issuing enrollment and peer with matching mode, revision, admission
+and policy. A locked 423 does not consume the grant. A response lost after
+commit requires a new release. TTL bounds collection, not upstream validity.
+
+* `aqmas run PATH --why REASON -- COMMAND ...` resolves COMMAND first and
+  replaces aqmas with a process inheriting a small baseline environment and
+  the approved entries. Collisions and process-control names are refused.
+* `aqmas checkout PATH --why REASON [--file .env]` (`co`) uses a private
+  0700 Linux tmpfs `XDG_RUNTIME_DIR` and an exclusive link in the trusted
+  current directory. `checkin PATH` (`ci`) removes it and ends the grant.
+  File values must be portable literal tokens. A detached holder polls for
+  revocation, expires locally and cleans up on loss of contact. A killed
+  holder leaves its target until a subsequent checkout reaps it or the mount
+  disappears. Exclude that mount from backups; disable persistent swap,
+  hibernation and core dumps. macOS file mode refuses and points to `run`.
+* `eval "$(aqmas cos PATH --why REASON)"` exports shell-quoted values;
+  `eval "$(aqmas cis PATH)"` unsets them. Both refuse terminal stdout. Never
+  tee, log, trace or redirect these exports to disk. Every subsequent child
+  inherits them until checkin; same-uid processes may inspect them. Expiry
+  and revocation cannot remove environment variables from another process.

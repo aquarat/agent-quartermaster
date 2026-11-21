@@ -392,7 +392,7 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 					fmt.Sprintf("standing=%s grant=%s host=%s cloudflare %s mode=%s ttl=%d from=%s", st.ID, g.ID, h.Name, what, req.Mode, ttl, peer))
 			}
 		}
-		if n, err := q.CountPendingRequests(ctx, h.ID, now); err != nil {
+		if n, err := s.allPending(ctx, q, h.ID, now); err != nil {
 			return err
 		} else if n >= MaxPendingPerHost {
 			return &apiErr{http.StatusTooManyRequests, api.ErrRateLimited, "too many pending requests from this host"}
