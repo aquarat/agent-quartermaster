@@ -37,6 +37,7 @@ installation tokens; Forgejo API via Forgejo *authorized integrations* (aqmasd a
 Cloudflare policy proxy + minted expiring child tokens; generic header-injecting HTTP proxy;
 SSH `ProxyJump` through aqmasd to cut sessions at expiry; KRL-based revocation.
 See [Organisations, services and credential sets](ORGANISATIONS.md) for organisation-scoped approvals and CLI delivery of application secrets.
+See [Sealed mode and approval UX](SEALED.md) for the proposed locked startup, exact-action batches and optional per-organisation approval windows.
 
 ## Key decisions
 

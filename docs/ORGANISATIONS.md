@@ -60,6 +60,7 @@ Use a short-lived **edit draft** so `decide` cannot substitute a different value
 Bind each draft and upload ticket to the draft ID, session, admission generation and base revision as well as its path. Removing and re-adding the host must not make an old ticket work again. At commit, cancellation or timeout, delete the draft and its wrapped data key from the live catalogue. On superseding a revision, retain the manifest and delivery history but drop the old blob/key when no longer needed for issuer cleanup. This removes the broker's read path. It does not promise forensic erasure: SQLite free pages, WAL segments and earlier backups can retain both ciphertext and wrapped key, recoverable with the corresponding master key.
 
 ## Secrets on the bastion
+**Superseding proposal:** [Sealed mode and approval UX](SEALED.md) replaces the startup master-key credential and plaintext CA/parent storage below, and specifies offline recovery and org-scoped approval windows.
 
 Today the SQLite store has no bearer values. `setupCloudflare` reads two separate printable tokens at start from systemd `LoadCredential=` or the existing uid/mode-checked file option. M2 persists upstream child IDs, not child values. Keep CA private keys in their existing protected files. For env revisions, drafts and imported CF parents, encrypt **before SQLite** (including its WAL, journals and temp tables). Persist metadata such as names, recipients, reasons and timestamps in clear; treat the database and redacted CF snapshots as sensitive even without keys.
 
