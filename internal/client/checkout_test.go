@@ -3,10 +3,26 @@
 package client
 
 import (
+	"github.com/aquarat/agent-quartermaster/internal/envset"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+func TestShellSkipsAllExportsOnLocalAttributeCollision(t *testing.T) {
+	values := []envset.Entry{{Name: "APP_FIRST", Value: "a'b\nvalue"}, {Name: "APP_SECOND", Value: "37"}}
+	script := shellExports(values)
+	for _, attr := range []string{"declare -i APP_SECOND", "declare -n APP_SECOND=target", "readonly APP_SECOND=original"} {
+		cmd := exec.Command("bash", "--noprofile", "--norc", "-c", attr+"\n"+script+"\n[[ ! -v APP_FIRST && ! -v target ]]")
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("unsafe partial export: %s", attr)
+		}
+	}
+	if err := exec.Command("bash", "--noprofile", "--norc", "-c", script+"\n[[ $APP_FIRST == $'a\\'b\\nvalue' && $APP_SECOND == 37 ]]").Run(); err != nil {
+		t.Fatal("literal quoting failed")
+	}
+}
 
 func TestRefuseSymlinkAndPersistentStorage(t *testing.T) {
 	dir := t.TempDir()

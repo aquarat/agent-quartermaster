@@ -399,6 +399,12 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 	return s.store.Tx(ctx, func(q *store.Q) error { return s.applyQ(ctx, q, sg, passkeyID, "") })
 }
 func (s *Server) applyQ(ctx context.Context, q *store.Q, sg canon.Signed, passkeyID int64, attribution string) error {
+	if s.seal != nil {
+		sess, _ := ctx.Value(sessionBindingKey{}).(string)
+		if err := s.sealOwner(ctx, q, sess, passkeyID); err != nil {
+			return err
+		}
+	}
 	now := s.now()
 	a := sg.Action
 	if q.Scoped() {

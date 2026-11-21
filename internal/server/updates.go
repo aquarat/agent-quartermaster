@@ -226,10 +226,22 @@ func (s *Server) queueUpdate(w http.ResponseWriter, r *http.Request, sg canon.Si
 		e = f.Sync()
 	}
 	if e == nil {
-		e = s.store.Q().Audit(r.Context(), s.now(), "owner", "update_approve", "update:"+a.ID, fmt.Sprintf("passkey=%d %s", pkID, text))
-	}
-	if e == nil {
-		e = os.Link(f.Name(), filepath.Join(dir, "approved"))
+		sess, ok := s.sessionHash(r)
+		if !ok {
+			e = errUnauth("session ended")
+		} else {
+			e = s.store.Tx(r.Context(), func(q *store.Q) error {
+				if s.seal != nil {
+					if err := s.sealOwner(r.Context(), q, sess, pkID); err != nil {
+						return err
+					}
+				}
+				if err := q.Audit(r.Context(), s.now(), "owner", "update_approve", "update:"+a.ID, fmt.Sprintf("passkey=%d %s", pkID, text)); err != nil {
+					return err
+				}
+				return os.Link(f.Name(), filepath.Join(dir, "approved"))
+			})
+		}
 	}
 	if e != nil {
 		s.writeErr(w, r, e)

@@ -238,7 +238,10 @@ func (s *Server) checkStage(ctx context.Context, q *store.Q, sess string, st *ca
 	if st == nil || st.session != sess || !s.now().Before(st.expires) {
 		return errConflict("registration expired or changed")
 	}
-	if err := s.sealOwner(ctx, q, sess, st.signer); err != nil {
+	// A PRF evaluation may be signed by the target, not the credential
+	// that authorized adding it. Check the saved authorizer's exact raw ID
+	// below, independently of the current request's verified signer.
+	if err := s.sealOwner(context.WithValue(ctx, verifiedSignerKey{}, (*verifiedIdentity)(nil)), q, sess, st.signer); err != nil {
 		return err
 	}
 	list, err := q.Passkeys(ctx)

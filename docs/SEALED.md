@@ -1,8 +1,8 @@
 # Sealed mode and fewer approval taps
 
 For the existing-installation sealed import and cold-start protocol on
-`feat/sealed`, see the [operator procedure](SEAL-OPERATIONS.md). Batches,
-windows and env delivery below are designs until their implementing phases land.
+`feat/sealed`, see the [operator procedure](SEAL-OPERATIONS.md). The implemented
+batch, window and env delivery contracts are in [API.md](API.md).
 
 **Design for owner review · 2026-11-21.** After a restart, the bastion can **receive requests but cannot satisfy them** until the owner unlocks it. A stolen disk should not be enough to become the SSH CA or obtain a Cloudflare parent token. The price is availability: an unattended restart, including a successful update, interrupts issuance. Keep the owner's independent emergency SSH access.
 

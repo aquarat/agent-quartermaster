@@ -704,3 +704,14 @@ commit requires a new release. TTL bounds collection, not upstream validity.
   tee, log, trace or redirect these exports to disk. Every subsequent child
   inherits them until checkin; same-uid processes may inspect them. Expiry
   and revocation cannot remove environment variables from another process.
+
+Shell delivery is for Bash: the generated guard checks for **all** existing
+destination variables (including unset-but-declared integer, nameref and
+readonly attributes) before the first export. Disable command tracing. Use
+`aqmas reap-checkouts` on login to remove RAM-file remnants from a killed
+holder; checkout runs the same reaper and waits for holder readiness before
+reporting success. Combined-window audit stores the exact opening canonical
+and the public WebAuthn verification fields when signed authenticator data
+has no extensions. When it carries extensions, audit records that the opener
+was verified live; the assertion cannot later be independently reverified
+from the audit alone. No PRF/KEK or decrypted finish packet is persisted.

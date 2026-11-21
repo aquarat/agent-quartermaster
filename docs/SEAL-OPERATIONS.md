@@ -1,4 +1,4 @@
-# Sealed-store import and recovery drill (phase 1)
+# Sealed-store import and recovery
 
 This is a **supervised format transition**, not an automatic update or a
 fresh-install wizard. Use a compatible binary with the embedded UI. Rehearse
@@ -89,6 +89,75 @@ a wrap alone does not revoke material in a stolen backup. Never run a stale
 pre-revocation database as a rollback. On suspected compromise rebuild and
 reconcile independent host, grant, passkey, audit and issuer records before
 allowing fleet access. See [SEALED.md](SEALED.md#operations-and-recovery).
+
+### Post-import operational checks
+
+Record the original **effective** systemd credential name → absolute source
+path mappings in a root-owned JSON object before maintenance (`{}` for none).
+After retirement and unit reload run `seal-preflight.py CONFIG SOURCES.json`
+as root, before starting the unit. Verify old copies and disabled credentials
+against that inventory too. The daemon cannot discover previously removed
+root-only mappings. The system unit requires root-protected config ancestors;
+use `-require-root-config` for production maintenance commands as well.
+
+In Admin, add a second independently held unlock-capable key. Sign its
+nickname and capability, register, evaluate the new ID twice, then cold-test
+it. Approve-only credentials never unlock. Inspect the agent TLS leaf expiry
+on the broker card and sign renewal well before expiry. A failed or missing
+leaf leaves the web surface reachable: unlock, review the CA pin and SANs,
+sign **Renew leaf and restart locked**, then unlock again. If the old key is
+inaccessible, repair its ownership/mode or remove the retired leaf key in
+maintenance. Never remove a CA or disable TLS verification to repair a leaf.
+
+### Loss of all working owner credentials
+
+Rehearse **on an isolated restore**. Stop the broker, connector, updater and
+issuer traffic; verify the backup digest, host integrity, inventory, audit and
+serial high-water mark against independent owner records. Never restore a
+stale serial allocator to service; rotate the CA if continuity cannot be
+proven. Keep the complete backup untouched. Verify all expected env sets are
+present, not just that the database opens. Do not use this flow on a suspect
+host. The identity stays on a trusted Linux owner system. Over an independently
+verified, host-key-pinned private channel, with session recording disabled,
+pipe `aqmasd seal-transfer BUNDLE EXPECTED_SHA256 EXPECTED_RECIPIENT
+<identity.txt` directly into `aqmasd -require-root-config -config CONFIG
+seal-recover NEW_PRIVATE_DIRECTORY` as the service user. Never redirect the
+transfer output to a file. It is the MK. Prefer running both sides on one
+isolated trusted recovery system for the drill. Restore a **standalone** backup
+with no WAL/SHM/journal sidecars. Before invoking recovery, pin its full-file
+SHA-256 from the authenticated off-host inventory in `[seal]` as
+`recovery_backup_sha256`, and the independently established highest SSH serial
+ever allocated under this CA as `recovery_serial_high_water` (integer). Normal
+serve is fenced while either recovery setting is present. Do not derive the
+high-water mark from a potentially stale backup. If it is unknown, rotate
+the CA rather than reusing the allocator.
+
+Recovery verifies the MK/key-check, import inventory and each current env
+revision before accepting a replacement. Only a private Unix `broker.sock`
+is opened, with a one-use `ticket` file in the new 0700 directory. Expose the
+socket **only to the owner's isolated browser** at the configured HTTPS RP
+origin via a trusted local TLS bridge / private forwarding, without redirecting
+production traffic. Open `/` on this privately mapped origin; only the recovery
+listener serves the ticket-entry page. Enter the operator ticket, new nickname
+and the independently recorded manifest SHA-256. No ordinary owner login,
+public enroll code, Access JWKS fetch or recovery secret is needed in this
+browser. Complete registration, both fresh PRF evaluations and the separate UV
+signature on the replacement and retirement plan. Allow ten minutes; expired
+or interrupted uncommitted attempts require a fresh local session.
+
+Compare the signed backup digest and serial with the independent records. After
+commit the recovery process exits. Save `replacement-manifest.json` off-host,
+confirm the DB transition committed, replace the root `manifest_sha256` with
+the SHA-256 of that exact file and remove both recovery settings atomically.
+On interruption, compare the staged transition against the DB; a staged file
+alone is not proof of commit. Old sealed DB copies now fail the root pin. Restore the original listener
+configuration, cold start, sign in and unlock using the replacement key.
+All old login keys, wraps and sessions are retired; hosts must enroll again
+and receive new signed admissions. Review policies/admissions before restoring
+network access, reconcile outstanding children at their original issuers,
+and retire lost root updater pins separately. Recovery does not change the
+offline recipient or undo disclosure from earlier backups. A stolen key,
+recipient or running daemon requires rotation of underlying secrets as well.
 
 ### Lock alerts and memory
 

@@ -77,6 +77,8 @@ func run(args []string) int {
 		env.UpdateNotice(ctx)
 	}
 	switch cmd {
+	case "reap-checkouts":
+		return fail(client.ReapEnv())
 	case "_env-holder":
 		if len(rest) != 2 {
 			return 2
@@ -117,7 +119,9 @@ func run(args []string) int {
 		mode := "process"
 		if cmd == "co" || cmd == "checkout" {
 			mode = "file"
-			_ = client.ReapEnv()
+			if err := client.ReapEnv(); err != nil {
+				return fail(err)
+			}
 		} else if cmd != "run" {
 			mode = "shell"
 		}

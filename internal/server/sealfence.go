@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/server/pki"
 	"github.com/aquarat/agent-quartermaster/internal/server/seal"
@@ -73,6 +74,20 @@ func (s *Server) signer(ctx context.Context, role string) (*pki.PKI, error) {
 		s.stopSealed()
 	}
 	return p, err
+}
+
+// Wait for the deadline callback so it cannot outlive this handler.
+func boundDelivery(ctx context.Context, w http.ResponseWriter) func() {
+	if ctx.Value(leaseKey{}) == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { _ = http.NewResponseController(w).SetWriteDeadline(time.Now()); close(done) })
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}
 }
 
 func (s *Server) guardedWeb(next http.Handler) http.Handler {

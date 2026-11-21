@@ -25,6 +25,11 @@ type owner struct {
 	creds []webauthn.Credential
 	raw   map[string]string // credential ID (raw bytes as string) -> stored JSON, for CAS updates
 }
+type verifiedSignerKey struct{}
+type verifiedIdentity struct {
+	row int64
+	raw []byte
+}
 
 func (o *owner) WebAuthnID() []byte                         { return o.id }
 func (o *owner) WebAuthnName() string                       { return o.name }
@@ -112,6 +117,9 @@ func (s *Server) verifySelected(ctx context.Context, challenge []byte, assertion
 		return 0, err
 	}
 	id, err := s.store.Q().UpdatePasskeyAfterUse(ctx, cred.ID, o.raw[string(cred.ID)], string(newJSON), s.now())
+	if v, _ := ctx.Value(verifiedSignerKey{}).(*verifiedIdentity); v != nil && err == nil {
+		v.row, v.raw = id, cred.ID
+	}
 	if errors.Is(err, store.ErrConflict) {
 		return 0, errConflict("passkey used concurrently; retry")
 	}

@@ -906,7 +906,8 @@ func (s *Server) handleCFSnapshots(w http.ResponseWriter, r *http.Request, h *st
 			s.writeErr(w, r, lockedErr())
 			return
 		}
-		s.cf.proxy.ServeSnapshotList(w, r.WithContext(ctx), s.cfCaller(r, h))
+		defer boundDelivery(ctx, w)()
+		s.cf.proxy.ServeSnapshotList(s.deliveryWriter(ctx, w), r.WithContext(ctx), s.cfCaller(r, h))
 	})
 }
 
@@ -921,7 +922,8 @@ func (s *Server) handleCFSnapshot(w http.ResponseWriter, r *http.Request, h *sto
 			s.writeErr(w, r, lockedErr())
 			return
 		}
-		s.cf.proxy.ServeSnapshotGet(w, r.WithContext(ctx), s.cfCaller(r, h), r.PathValue("id"))
+		defer boundDelivery(ctx, w)()
+		s.cf.proxy.ServeSnapshotGet(s.deliveryWriter(ctx, w), r.WithContext(ctx), s.cfCaller(r, h), r.PathValue("id"))
 	})
 }
 
@@ -943,6 +945,7 @@ func (s *Server) requireHostCF(next func(http.ResponseWriter, *http.Request, *st
 					err = lockedErr()
 					return
 				}
+				defer boundDelivery(ctx, w)()
 				next(s.deliveryWriter(ctx, w), r.WithContext(ctx), h)
 			})
 			if err == nil {

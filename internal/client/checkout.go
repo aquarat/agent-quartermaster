@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/aquarat/agent-quartermaster/internal/envset"
 	"golang.org/x/sys/unix"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -216,10 +217,24 @@ func (e *Env) fileCheckout(slot, name string, r checkoutRecord, values []envset.
 		return err
 	}
 	cmd := exec.Command(self, "_env-holder", slot, r.Grant)
-	cmd.ExtraFiles = []*os.File{gd}
+	ready, ack, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer ready.Close()
+	defer ack.Close()
+	cmd.ExtraFiles = []*os.File{gd, ack}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err = cmd.Start(); err != nil {
 		return err
+	}
+	ack.Close()
+	_ = ready.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var signal [1]byte
+	if _, err = io.ReadFull(ready, signal[:]); err != nil || signal[0] != 1 {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return errors.New("checkout holder did not become ready")
 	}
 	_ = cmd.Process.Release()
 	ok = true
@@ -307,6 +322,15 @@ func (e *Env) HoldEnv(ctx context.Context, slot, grant string) error {
 	_, c, err := e.authedClient()
 	if err != nil {
 		return err
+	}
+	ack := os.NewFile(4, "holder-ready")
+	if ack == nil {
+		return errors.New("no holder handshake")
+	}
+	_, err = ack.Write([]byte{1})
+	ack.Close()
+	if err != nil {
+		return errors.New("holder parent disconnected")
 	}
 	deadline := time.Now().Add(time.Until(time.UnixMilli(r.Until)))
 	for {

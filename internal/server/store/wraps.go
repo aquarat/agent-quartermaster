@@ -19,6 +19,10 @@ func (q *Q) TestedWrap(ctx context.Context, row int64, version uint64) (*time.Ti
 	t := fromMS(v)
 	return &t, nil
 }
+func (q *Q) SameSigner(ctx context.Context, row int64, raw []byte) error {
+	var n int
+	return q.q.QueryRowContext(ctx, `SELECT 1 FROM passkeys WHERE id=? AND credential_id=?`, row, raw).Scan(&n)
+}
 func (q *Q) CanRemoveWrap(ctx context.Context, row int64, version uint64) (bool, error) {
 	var ok bool
 	err := q.q.QueryRowContext(ctx, `SELECT NOT EXISTS(SELECT 1 FROM seal_wraps WHERE generation=?1 AND passkey=?2) OR EXISTS(SELECT 1 FROM seal_wraps WHERE generation=?1 AND passkey!=?2)`, version, row).Scan(&ok)

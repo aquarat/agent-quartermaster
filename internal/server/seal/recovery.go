@@ -9,6 +9,14 @@ import (
 )
 
 func (i Inventory) OfflineProof(identity []byte) (string, error) {
+	mk, err := i.offlineKey(identity)
+	if err != nil {
+		return "", err
+	}
+	defer mk.Destroy()
+	return i.DrillProof(mk)
+}
+func (i Inventory) offlineKey(identity []byte) (*Key, error) {
 	var key *age.X25519Identity
 	for _, line := range strings.Split(string(identity), "\n") {
 		line = strings.TrimSpace(line)
@@ -16,20 +24,44 @@ func (i Inventory) OfflineProof(identity []byte) (string, error) {
 			continue
 		}
 		if key != nil {
-			return "", errRecord
+			return nil, errRecord
 		}
 		var err error
 		key, err = age.ParseX25519Identity(line)
 		if err != nil {
-			return "", errRecord
+			return nil, errRecord
 		}
 	}
-	mk, err := i.Recover(i.Recipient, key, i.Recovery, i.Check)
+	return i.Recover(i.Recipient, key, i.Recovery, i.Check)
+}
+
+// Transfer writes only to a protected pipe selected by the owner-side CLI.
+func (i Inventory) Transfer(identity []byte, w io.Writer) error {
+	k, err := i.offlineKey(identity)
 	if err != nil {
-		return "", err
+		return err
 	}
-	defer mk.Destroy()
-	return i.DrillProof(mk)
+	defer k.Destroy()
+	if err = i.VerifyInventory(k); err != nil {
+		return err
+	}
+	_, err = w.Write(k.page[:32])
+	return err
+}
+func (i Inventory) Receive(r io.Reader) (*Key, error) {
+	k, err := newKey()
+	if err != nil {
+		return nil, err
+	}
+	_, err = io.ReadFull(r, k.page[:32])
+	if err == nil {
+		err = i.VerifyInventory(k)
+	}
+	if err != nil {
+		k.Destroy()
+		return nil, err
+	}
+	return k, nil
 }
 
 // RecoveryPacket accepts only the canonical native X25519 public recipient.

@@ -292,9 +292,24 @@ func certSANs(c *x509.Certificate) []string {
 }
 
 func (p *PKI) loadServer(sans []string, create bool) error {
+	return p.writeServer(sans, create, false)
+}
+
+// RenewLeaf is only called on a temporary verified CA signer, after owner
+// approval. A restart reloads the validated pair into the agent listener.
+func (p *PKI) RenewLeaf(sans []string) error {
+	if p.CAKey == nil {
+		return errors.New("internal CA locked")
+	}
+	if err := p.writeServer(sans, true, true); err != nil {
+		return err
+	}
+	return p.LoadLeaf(sans)
+}
+func (p *PKI) writeServer(sans []string, create, force bool) error {
 	want := normSANs(sans)
 	kp, cp := p.path(ServerKeyFile), p.path(ServerCrtFile)
-	reissue := !exists(kp) || !exists(cp)
+	reissue := force || !exists(kp) || !exists(cp)
 	if !reissue {
 		cb, err := os.ReadFile(cp)
 		if err != nil {

@@ -49,6 +49,7 @@ const (
 
 // Options configures a Server.
 type Options struct {
+	Recovery    bool   // isolated Unix socket only, no agent or network workers
 	ConfigPath  string // reread frozen source configuration before supervised import commits
 	SealSetup   bool   // supervised seal import, never serve agents
 	Maintenance bool   // supervised, login and personal cutover only
@@ -66,6 +67,7 @@ type Options struct {
 
 // Server is a running aqmasd instance.
 type Server struct {
+	recovery        bool
 	configPath      string
 	seal            *sealRuntime
 	sealSetup       bool
@@ -96,6 +98,14 @@ func CADir(dataDir string) string { return filepath.Join(dataDir, "ca") }
 // New opens the store, loads or generates key material and prepares the handlers.
 func New(o Options) (*Server, error) {
 	cfg := o.Config
+	if !o.Recovery && (cfg.Seal.RecoverySerial != nil || cfg.Seal.RecoveryBackupSHA256 != "") {
+		return nil, errors.New("broker fenced for recovery; install the replacement transition pin before serving")
+	}
+	if o.Recovery {
+		if err := verifyRecoverySource(cfg); err != nil {
+			return nil, err
+		}
+	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
@@ -180,6 +190,7 @@ func New(o Options) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
+		recovery:   o.Recovery,
 		configPath: o.ConfigPath,
 		sealSetup:  o.SealSetup,
 		cfg:        cfg, log: o.Logger, now: o.Now, store: st, pki: p, wa: wa, rpID: rpID, ownerID: ownerID, maintenance: o.Maintenance,
@@ -216,7 +227,7 @@ func New(o Options) (*Server, error) {
 	if o.SealSetup {
 		s.notify = &notify.Notifier{}
 	}
-	if cfg.Cloudflare.Enabled && !s.maintenance && !o.SealSetup {
+	if cfg.Cloudflare.Enabled && !s.maintenance && !o.SealSetup && !o.Recovery {
 		if err := s.setupCloudflare(o); err != nil {
 			st.Close()
 			return nil, err
@@ -247,6 +258,9 @@ func (s *Server) Store() *store.Store { return s.store }
 
 // Run serves the agent API and the web UI until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	if s.recovery {
+		return errors.New("recovery must not start public listeners")
+	}
 	lock, err := s.lockService()
 	if err != nil {
 		return err

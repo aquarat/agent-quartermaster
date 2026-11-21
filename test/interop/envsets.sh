@@ -30,4 +30,19 @@ env_scenario() {
   # No diagnostic, audit or SQLite WAL (including free pages) contains the value.
   if grep -aFl "$sentinel" "$T/data/aqmas.db" "$T/data/aqmas.db-wal" "$T"/env-*.out "$T"/env-*.err "$T"/seal-*.log; then fail 'env value leaked'; fi
   rmdir "$ram/aqmas-env" "$ram"; ok 'env import, signed revision, child env, RAM checkout/checkin, revoke, shell export/unset, sentinel scan'
+  kill "$SEAL_PID"; wait "$SEAL_PID" || true; rm "$T/data/ca/server.crt"; seal_start serve; owner seal-eval; owner repair-leaf; wait "$SEAL_PID" || true; seal_start serve; "$AQMAS" list --json >/dev/null
+  kill "$SEAL_PID"; wait "$SEAL_PID" || true
+  local stage digest recipient pin recovery; stage=$(find "$T/data" -type d -name 'seal-stage-*'); digest=$(sha256sum "$stage/inventory.json"|cut -d' ' -f1); pin=$(sha256sum "$stage/manifest.json"|cut -d' ' -f1); recipient=$(sed -n 's/^recipient="\(.*\)"$/\1/p' "$T/config.toml")
+  # Private UDS path fits sockaddr_un regardless of TMPDIR length.
+  recovery=$(mktemp -d /dev/shm/aqmas-recovery.XXXXXXXX)
+  cp "$T/data/aqmas.db" "$T/before-recovery.sqlite"; local backup; backup=$(sha256sum "$T/before-recovery.sqlite"|cut -d' ' -f1)
+  printf 'recovery_backup_sha256="%s"\nrecovery_serial_high_water=1000000\n' "$backup" >>"$T/config.toml"
+  "$AQMASD" seal-transfer "$stage/inventory.json" "$digest" "$recipient" <"$T/offline.identity" | "$AQMASD" -config "$T/config.toml" seal-recover "$recovery/session" & pid=$!
+  for _ in $(seq 50); do [[ -f "$recovery/session/ticket" ]] && break; sleep .1; done
+  curl -fsS --unix-socket "$recovery/session/broker.sock" http://localhost/ | grep -qi 'isolated aqmas recovery' || fail 'private recovery UI not served'
+  rm "$OWNER_STATE"; owner recover "$recovery/session" "$pin"; wait "$pid"; local newpin; newpin=$(sha256sum "$recovery/session/replacement-manifest.json"|cut -d' ' -f1); sed -i -e '/^recovery_backup_sha256=/d' -e '/^recovery_serial_high_water=/d' -e "s/^manifest_sha256=.*/manifest_sha256=\"$newpin\"/" "$T/config.toml"
+  mv "$T/data/aqmas.db" "$T/recovered.sqlite"; cp "$T/before-recovery.sqlite" "$T/data/aqmas.db"; if timeout 5 "$AQMASD" -config "$T/config.toml" serve >"$T/rollback-refusal" 2>&1; then fail 'accepted rolled-back owner database'; fi; grep -q 'activation pin mismatch' "$T/rollback-refusal" || fail 'did not check recovery transition pin'; mv "$T/recovered.sqlite" "$T/data/aqmas.db"
+  rm "$recovery/session/replacement-manifest.json"; rmdir "$recovery/session" "$recovery"; seal_start serve; owner login; owner seal-eval; [[ $(owner seal-status) == unlocked ]] || fail 'disaster replacement did not unlock'
+  if "$AQMAS" list --json >/dev/null 2>&1; then fail 'old host remained admitted after recovery'; fi
+  ok 'leaf repair and zero surviving owner passkeys to cold unlock with replacement'
 }

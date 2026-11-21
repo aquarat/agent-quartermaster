@@ -125,7 +125,7 @@ func (s *Server) loadSeal() error {
 	// systemd credential copies remain. Never open a private CA to check this.
 	paths := []string{filepath.Join(CADir(s.cfg.DataDir), pki.ClientCAKeyFile), filepath.Join(CADir(s.cfg.DataDir), pki.SSHCAKeyFile)}
 	cf := s.cfg.Cloudflare
-	if cf.Enabled {
+	{
 		paths = append(paths, cf.ProxyTokenFile, cf.MinterTokenFile)
 		if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
 			for _, name := range []string{cf.ProxyTokenCredential, cf.MinterTokenCredential} {
@@ -337,6 +337,7 @@ func (s *Server) importSources(visit func(seal.Object, []byte) error) error {
 	}
 	cf := s.cfg.Cloudflare
 	if cf.Enabled {
+		var proxyHash [32]byte
 		for _, parent := range []struct{ role, kind, cred, file string }{{"cf-proxy", "cloudflare-proxy", cf.ProxyTokenCredential, cf.ProxyTokenFile}, {"cf-minter", "cloudflare-mint", cf.MinterTokenCredential, cf.MinterTokenFile}} {
 			if parent.cred == "" && parent.file == "" {
 				continue
@@ -353,6 +354,13 @@ func (s *Server) importSources(visit func(seal.Object, []byte) error) error {
 				return err
 			}
 			b := []byte(tok)
+			digest := sha256.Sum256(b)
+			if parent.role == "cf-proxy" {
+				proxyHash = digest
+			} else if digest == proxyHash {
+				clear(b)
+				return errors.New("proxy and minter must have distinct parent credentials")
+			}
 			err = visit(o, b)
 			clear(b)
 			if err != nil {

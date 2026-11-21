@@ -19,6 +19,7 @@ if (!result.success) {
   for (const log of result.logs) console.error(log);
   process.exit(1);
 }
+const recovery=await Bun.build({entrypoints:[join(root,'recovery/index.html')],outdir:join(outdir,'private'),minify:true,sourcemap:'none',target:'browser',publicPath:'/',naming:{entry:'[name].[ext]',chunk:'[name]-[hash].[ext]'}});if(!recovery.success)throw Error('Failed to build recovery-only entry');
 
 // The server sends CSP default-src 'self': fail the build if anything inline slipped in.
 const html = await readFile(join(outdir, "index.html"), "utf8");

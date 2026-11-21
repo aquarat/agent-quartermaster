@@ -9,14 +9,15 @@ import (
 
 var ErrLocked = errors.New("seal: waiting for owner unlock")
 
-// Publish serializes the start of a bounded response write with the fence.
-// Caller must already hold a lease; fn must not acquire another gate lock.
+// Publish admits one write atomically with the fence; slow socket I/O is
+// covered by the caller's active lease but cannot hold the admission mutex.
 func (g *Gate) Publish(fn func() error) error {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if g.closed || g.mk == nil {
+		g.mu.Unlock()
 		return ErrLocked
 	}
+	g.mu.Unlock()
 	return fn()
 }
 

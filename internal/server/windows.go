@@ -31,6 +31,27 @@ type windowSettings struct {
 	Idle     int      `json:"idle_seconds"`
 	Sets     []string `json:"sets"`
 }
+
+func openingEvidence(assertion []byte) string {
+	var a struct {
+		RawID    string `json:"rawId"`
+		Response struct {
+			Auth   string `json:"authenticatorData"`
+			Client string `json:"clientDataJSON"`
+			Sig    string `json:"signature"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(assertion, &a) != nil {
+		return "verified live; unavailable"
+	}
+	ad, err := strictB64(a.Response.Auth, 16384)
+	if err != nil || len(ad) != 37 || ad[32]&0x80 != 0 {
+		return "verified live; signed extension data withheld"
+	}
+	b, _ := json.Marshal(a)
+	return string(b)
+}
+
 type windowRule struct {
 	Set     string `json:"set"`
 	Path    string `json:"path"`

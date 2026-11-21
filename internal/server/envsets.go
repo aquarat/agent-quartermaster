@@ -10,6 +10,7 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
+	"io"
 	"net"
 	"net/http"
 	"reflect"
@@ -84,6 +85,16 @@ func (s *Server) envAgentRoutes(m *http.ServeMux) {
 			if s.seal == nil || s.seal.stage != nil {
 				s.writeErr(w, r, errNotFound())
 				return
+			}
+			// No network read inside a lease or BEGIN IMMEDIATE.
+			if r.Method == http.MethodPost {
+				b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+				if err != nil {
+					s.writeErr(w, r, errBad("body too large or unreadable"))
+					return
+				}
+				defer clear(b)
+				r.Body = io.NopCloser(bytes.NewReader(b))
 			}
 			s.optionalLease(r.Context(), func(ctx context.Context) {
 				var out any

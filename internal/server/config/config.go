@@ -50,9 +50,11 @@ type Config struct {
 // entire database was replaced with an older backup. Legacy binaries reject
 // the unknown TOML keys. A staged pin is valid in maintenance only.
 type Seal struct {
-	Required  bool   `toml:"required"`
-	Recipient string `toml:"recipient"`
-	Manifest  string `toml:"manifest_sha256"`
+	RecoveryBackupSHA256 string `toml:"recovery_backup_sha256"`
+	RecoverySerial       *int64 `toml:"recovery_serial_high_water"`
+	Required             bool   `toml:"required"`
+	Recipient            string `toml:"recipient"`
+	Manifest             string `toml:"manifest_sha256"`
 }
 
 // TTL is the grant lifetime policy.

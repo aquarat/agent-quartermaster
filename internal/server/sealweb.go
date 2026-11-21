@@ -32,6 +32,11 @@ func (s *Server) sealRoutes(m *http.ServeMux) {
 	}
 }
 func (s *Server) sealOwner(ctx context.Context, q *store.Q, sess string, pk int64) error {
+	if v, _ := ctx.Value(verifiedSignerKey{}).(*verifiedIdentity); v != nil && v.row != 0 {
+		if v.row != pk || q.SameSigner(ctx, pk, v.raw) != nil {
+			return errForbidden("actual signing credential no longer enrolled")
+		}
+	}
 	if _, err := q.GlobalOwner(ctx, sess, pk, s.now()); err != nil {
 		return errForbidden("owner session and credential required")
 	}
@@ -48,6 +53,8 @@ type sealChoice struct {
 	Selection map[string]any `json:"selection"`
 }
 type sealView struct {
+	LeafExpires    string          `json:"leaf_expires,omitempty"`
+	LeafRepair     string          `json:"leaf_repair,omitempty"`
 	Profiles       []windowProfile `json:"profiles,omitempty"`
 	Active         []windowInfo    `json:"active_windows,omitempty"`
 	VerifiedAccess bool            `json:"verified_access,omitempty"`
@@ -73,6 +80,10 @@ func (s *Server) sealStatus(w http.ResponseWriter, r *http.Request, sess string)
 func (s *Server) sealView(ctx context.Context, sess string) (sealView, error) {
 	z := s.seal
 	v := sealView{Mode: "locked", Installation: z.inv.Installation, Epoch: z.attempts.Epoch(), Choices: []sealChoice{}}
+	if s.pki.ServerLeaf != nil {
+		v.LeafExpires = s.pki.ServerLeaf.NotAfter.UTC().Format(time.RFC3339)
+	}
+	v.LeafRepair, _ = reviewJSON(map[string]any{"ca_pin": s.pki.CAPin(), "configured_sans": s.cfg.TLSSANs, "effect": "Renew the server-only agent TLS leaf, then restart locked"})
 	keys, err := loadPasskeys(ctx, s.store.Q())
 	if err != nil {
 		return v, err
@@ -283,7 +294,7 @@ func (s *Server) sealFinish(w http.ResponseWriter, r *http.Request, sess string)
 	if in.Combined && z.stage == nil {
 		purpose = "unlock-window"
 	}
-	err := z.attempts.FinishBound(sess, purpose, in.ID, enc, ct, func(c seal.Credential, reg string, d [32]byte, assertion []byte, kek *seal.Key) error {
+	err := z.attempts.FinishEvidence(sess, purpose, in.ID, enc, ct, func(c seal.Credential, reg string, d [32]byte, assertion []byte, kek *seal.Key, canonical string) error {
 		pk, _, err := findPasskey(ctx, s.store.Q(), passkeyID(c.RawID))
 		if err != nil {
 			return err
@@ -353,7 +364,7 @@ func (s *Server) sealFinish(w http.ResponseWriter, r *http.Request, sess string)
 				}
 				if in.Combined {
 					var rec windowReceipt
-					pending, rec, err = s.stageWindow(ctx, q, sess, row, t, "combined unlock challenge="+encodeID(d[:])+" terms="+reg)
+					pending, rec, err = s.stageWindow(ctx, q, sess, row, t, canonical+" evidence="+openingEvidence(assertion))
 					if err != nil {
 						return err
 					}
@@ -403,6 +414,11 @@ func (s *Server) controlCanonical(ctx context.Context, sess, action, nonce, at s
 		if v.Mode != "unlocked" {
 			return "", lockedErr()
 		}
+	case "renew-leaf":
+		if v.Mode != "unlocked" {
+			return "", lockedErr()
+		}
+		fields["repair"] = v.LeafRepair
 	default:
 		return "", errBad("invalid seal action")
 	}
@@ -473,6 +489,22 @@ func (s *Server) sealControlFinish(w http.ResponseWriter, r *http.Request, sess 
 	}
 	if c.ObjectID == "activate" {
 		err = s.activateSeal(ctx, sess, row, c.Canonical, in.Assertion)
+	} else if c.ObjectID == "renew-leaf" {
+		err = s.withLease(ctx, func(ctx context.Context) error {
+			return s.store.Tx(ctx, func(q *store.Q) error {
+				if err := s.sealOwner(ctx, q, sess, row); err != nil {
+					return err
+				}
+				p, err := s.signer(ctx, "internal-ca")
+				if err != nil {
+					return err
+				}
+				if err = p.RenewLeaf(s.cfg.TLSSANs); err != nil {
+					return err
+				}
+				return q.Audit(ctx, s.now(), "owner", "renew_tls_leaf", "seal", expected)
+			})
+		})
 	} else {
 		err = s.store.Tx(ctx, func(q *store.Q) error {
 			if err := s.sealOwner(ctx, q, sess, row); err != nil {

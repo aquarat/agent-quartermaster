@@ -71,7 +71,19 @@ func contentType(name string) string {
 // everything else revalidated), index.html with no-store for any extension-less path (client
 // routes such as /requests/<id>), 404 otherwise.
 func Handler() http.Handler {
-	root := FS()
+	return serve(FS())
+}
+
+// The private entry and its entire script graph are unreachable on the normal
+// origin. Only isolated maintenance selects this filesystem root.
+func RecoveryHandler() http.Handler {
+	root, err := fs.Sub(FS(), "private")
+	if err != nil {
+		return http.NotFoundHandler()
+	}
+	return serve(root)
+}
+func serve(root fs.FS) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
@@ -79,6 +91,10 @@ func Handler() http.Handler {
 			return
 		}
 		p := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		if p == "private" || strings.HasPrefix(p, "private/") {
+			http.NotFound(w, r)
+			return
+		}
 		for _, seg := range strings.Split(p, "/") {
 			if strings.HasPrefix(seg, ".") {
 				http.Error(w, "not found", http.StatusNotFound)

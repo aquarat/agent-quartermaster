@@ -17,6 +17,7 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
 	"github.com/aquarat/agent-quartermaster/internal/server/organisations"
 	"github.com/aquarat/agent-quartermaster/internal/server/pki"
+	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/webui"
 	"golang.org/x/crypto/ssh"
 )
@@ -29,6 +30,8 @@ const usage = `usage: aqmasd [-config PATH] <command>
 commands:
   seal-import           isolated signed import of an activated personal installation
   seal-drill BUNDLE SHA256 RECIPIENT   verify an offline bundle; reads age identity on stdin
+  seal-transfer BUNDLE SHA256 RECIPIENT  offline owner only; protected pipe to seal-recover
+  seal-recover DIRECTORY    isolated recovery socket and ticket; DIRECTORY must not exist
   serve                 run the agent API and the approval web UI
   organisations-plan BACKUP   preview the personal cutover from a standalone SQLite online backup
   organisations-cutover       fence fleet access, create a recovery point and serve owner review
@@ -47,12 +50,20 @@ func main() {
 	fs := flag.NewFlagSet("aqmasd", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	cfgPath := fs.String("config", config.DefaultPath, "configuration file")
+	protected := fs.Bool("require-root-config", false, "require a root-owned config and protected ancestor directories")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(2)
 	}
-	needsArg := fs.Arg(0) == "revoke-host" || fs.Arg(0) == "organisations-plan"
-	if !(fs.Arg(0) == "seal-drill" && fs.NArg() == 4) && (fs.NArg() < 1 || needsArg != (fs.NArg() == 2) || fs.NArg() > 2 || fs.Arg(0) == "seal-drill") {
+	if *protected {
+		if err := rootPin(*cfgPath); err != nil {
+			fmt.Fprintln(os.Stderr, "aqmasd:", err)
+			os.Exit(1)
+		}
+	}
+	needsArg := fs.Arg(0) == "revoke-host" || fs.Arg(0) == "organisations-plan" || fs.Arg(0) == "seal-recover"
+	offline := fs.Arg(0) == "seal-drill" || fs.Arg(0) == "seal-transfer"
+	if !(offline && fs.NArg() == 4) && (fs.NArg() < 1 || needsArg != (fs.NArg() == 2) || fs.NArg() > 2 || offline) {
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -63,7 +74,7 @@ func main() {
 }
 
 func run(cmd, cfgPath string, out io.Writer, args ...string) error {
-	if cmd == "seal-drill" {
+	if cmd == "seal-drill" || cmd == "seal-transfer" {
 		if len(args) != 3 {
 			return fmt.Errorf("bundle, owner-recorded digest and recipient required")
 		}
@@ -88,6 +99,21 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		if err != nil || len(b) > 524288 {
 			return fmt.Errorf("invalid bundle")
 		}
+		if cmd == "seal-transfer" {
+			dst, ok := out.(*os.File)
+			if !ok {
+				return fmt.Errorf("protected pipe required")
+			}
+			st, err := dst.Stat()
+			if err != nil || st.Mode()&os.ModeNamedPipe == 0 {
+				return fmt.Errorf("refusing to write MK to a terminal or file; use a private pipe")
+			}
+			var inv seal.Inventory
+			if seal.Digest(b) != args[1] || json.Unmarshal(b, &inv) != nil || inv.Recipient != args[2] {
+				return fmt.Errorf("offline bundle mismatch")
+			}
+			return inv.Transfer(id, dst)
+		}
 		proof, err := server.RecoveryDrill(b, args[1], args[2], id)
 		if err == nil {
 			_, err = fmt.Fprintln(out, proof)
@@ -110,6 +136,25 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		return err
 	}
 	switch cmd {
+	case "seal-recover":
+		if len(args) != 1 || !cfg.Seal.Required {
+			return fmt.Errorf("sealed recovery directory required")
+		}
+		if err = restrictDumps(); err != nil {
+			return err
+		}
+		fi, err := os.Stdin.Stat()
+		if err != nil || fi.Mode()&(os.ModeNamedPipe|os.ModeSocket) == 0 {
+			return fmt.Errorf("protected stdin pipe required")
+		}
+		s, err := server.New(server.Options{Config: cfg, ConfigPath: cfgPath, Recovery: true})
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return s.Recover(ctx, args[0], os.Stdin)
 	case "organisations-plan":
 		if len(args) != 1 {
 			return fmt.Errorf("organisations-plan requires a standalone SQLite backup")

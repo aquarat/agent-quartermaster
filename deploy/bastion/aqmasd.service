@@ -10,7 +10,7 @@ Wants=network-online.target
 Type=simple
 User=aqmas
 Group=aqmas
-ExecStart=/usr/local/bin/aqmasd -config /etc/aqmas/config.toml serve
+ExecStart=/usr/local/bin/aqmasd -require-root-config -config /etc/aqmas/config.toml serve
 Restart=on-failure
 RestartSec=5
 

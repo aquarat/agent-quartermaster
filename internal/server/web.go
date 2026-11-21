@@ -177,7 +177,7 @@ func (s *Server) requireSession(next func(http.ResponseWriter, *http.Request, st
 			s.writeErr(w, r, errUnauth("log in with your passkey"))
 			return
 		}
-		next(w, r, h)
+		next(w, r.WithContext(context.WithValue(r.Context(), verifiedSignerKey{}, new(verifiedIdentity))), h)
 	})
 }
 
@@ -192,7 +192,10 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess string) {
-	_ = s.store.Q().DeleteSession(r.Context(), sess)
+	if err := s.store.Q().DeleteSession(r.Context(), sess); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
 	if s.seal != nil {
 		s.seal.windows.logout(sess)
 	}

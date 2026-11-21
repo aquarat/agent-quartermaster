@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aquarat/agent-quartermaster/internal/envset"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 	"io"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -77,7 +79,7 @@ func (e *Env) SetEdit(ctx context.Context, op, path, key, from string, ticketFD 
 	rand.Read(edit.Salt)
 	switch op {
 	case "import":
-		f, err := os.Open(from)
+		f, err := openImport(from)
 		if err != nil {
 			return err
 		}
@@ -279,13 +281,49 @@ func (e *Env) EnvUse(ctx context.Context, path, mode, why, file string, ttl int,
 	if err = e.saveShell(slot, r); err != nil {
 		return err
 	}
+	_, err = io.WriteString(e.Stdout, shellExports(out.Entries))
+	if err == nil {
+		e.logf("shell-mode release: children inherit these values until checkin-shell; other processes of this user may read them")
+	}
+	return err
+}
+func shellExports(entries []envset.Entry) string {
 	var buf strings.Builder
-	for _, x := range out.Entries {
+	buf.WriteString("if [ -z \"${BASH_VERSION-}\" ]; then printf '%s\\n' 'aqmas: shell checkout requires Bash' >&2; false\nelif ")
+	for i, x := range entries {
+		if i > 0 {
+			buf.WriteString(" || ")
+		}
+		fmt.Fprintf(&buf, "builtin declare -p %s >/dev/null 2>&1", x.Name)
+	}
+	buf.WriteString("; then printf '%s\\n' 'aqmas: destination variable exists; no exports applied' >&2; false\nelse\n")
+	for _, x := range entries {
 		fmt.Fprintf(&buf, "export %s='%s'\n", x.Name, strings.ReplaceAll(x.Value, "'", "'\\''"))
 	}
-	e.logf("shell-mode release: children inherit these values until checkin-shell; other processes of this user may read them")
-	_, err = io.WriteString(e.Stdout, buf.String())
-	return err
+	buf.WriteString("fi\n")
+	return buf.String()
+}
+
+func openImport(path string) (*os.File, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := trustedDir(filepath.Dir(abs), false)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	fd, err := unix.Openat(int(dir.Fd()), filepath.Base(abs), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	var st unix.Stat_t
+	if unix.Fstat(fd, &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || int(st.Uid) != os.Geteuid() || st.Nlink != 1 || st.Mode&0022 != 0 {
+		unix.Close(fd)
+		return nil, errors.New("import requires a trusted owned regular file")
+	}
+	return os.NewFile(uintptr(fd), "env import"), nil
 }
 func (e *Env) saveShell(slot string, r checkoutRecord) error {
 	dir, err := trustedDir(e.Paths.ConfigDir, true)
@@ -331,10 +369,18 @@ func (e *Env) EnvCheckin(ctx context.Context, path, mode string) error {
 					return errors.New("unsafe shell record")
 				}
 			}
+			var b strings.Builder
+			b.WriteString("if [ -n \"${BASH_VERSION-}\" ]")
 			for _, n := range r.Names {
-				if _, err = fmt.Fprintln(e.Stdout, "unset "+n); err != nil {
-					return err
-				}
+				fmt.Fprintf(&b, " && { ! builtin declare -p %s >/dev/null 2>&1 || [[ $(builtin declare -p %s) == 'declare -x %s='* ]]; }", n, n, n)
+			}
+			b.WriteString("; then\n")
+			for _, n := range r.Names {
+				fmt.Fprintf(&b, "builtin unset -v %s\n", n)
+			}
+			b.WriteString("else printf '%s\\n' 'aqmas: changed shell variable attributes; inspect manually' >&2; false; fi\n")
+			if _, err = io.WriteString(e.Stdout, b.String()); err != nil {
+				return err
 			}
 			err = unlinkAt(d, slot)
 		}

@@ -22,6 +22,11 @@ var initialPolicy = api.DurationPolicy{Default: 3600, Soft: 86400, Indefinite: t
 
 func (s *Server) ownerCatalogue(ctx context.Context, q *store.Q, sess string, pk int64) (api.Catalogue, error) {
 	var empty api.Catalogue
+	if s.seal != nil {
+		if err := s.sealOwner(ctx, q, sess, pk); err != nil {
+			return empty, err
+		}
+	}
 	if !q.Scoped() || s.maintenance {
 		return empty, errNotFound()
 	}

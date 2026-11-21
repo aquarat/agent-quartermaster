@@ -42,6 +42,13 @@ func (s *Server) lockService() (*os.File, error) {
 		f.Close()
 		return nil, errors.New("database changed during startup; restart the broker")
 	}
+	if v == 8 {
+		var m string
+		if err := s.store.DB().QueryRow(`SELECT manifest FROM seal_active WHERE singleton=1 AND length(manifest)<=32768`).Scan(&m); err != nil || fmt.Sprintf("%x", sha256.Sum256([]byte(m))) != s.cfg.Seal.Manifest {
+			f.Close()
+			return nil, errors.New("activation pin changed during startup")
+		}
+	}
 	return f, nil
 }
 

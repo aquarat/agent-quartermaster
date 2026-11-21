@@ -31,6 +31,7 @@ type Attempts struct {
 	recent  []time.Time
 }
 type attempt struct {
+	canonical        string
 	key              hpke.PrivateKey
 	id               ID
 	session, purpose string
@@ -109,6 +110,7 @@ func (a *Attempts) Begin(session, purpose, registration string, c Credential) (B
 	}
 	digest := sha256.Sum256(canonical)
 	at := &attempt{key: k, id: id, session: session, purpose: purpose, registration: registration, credential: c, digest: digest, expires: now.Add(attemptTTL)}
+	at.canonical = string(canonical)
 	a.pending[s] = at
 	at.timer = time.AfterFunc(attemptTTL, func() { a.mu.Lock(); defer a.mu.Unlock(); delete(a.pending, s) })
 	return Begin{s, string(canonical), b64(digest[:])}, nil
@@ -119,6 +121,11 @@ func (a *Attempts) Begin(session, purpose, registration string, c Credential) (B
 // then unwrap/key-check. KEK and assertion are borrowed until apply returns.
 // Close is serialized with apply. Never call back into Attempts from apply.
 func (a *Attempts) FinishBound(session, purpose, id string, enc, ct []byte, apply func(Credential, string, [32]byte, []byte, *Key) error) error {
+	return a.FinishEvidence(session, purpose, id, enc, ct, func(c Credential, r string, d [32]byte, b []byte, k *Key, _ string) error {
+		return apply(c, r, d, b, k)
+	})
+}
+func (a *Attempts) FinishEvidence(session, purpose, id string, enc, ct []byte, apply func(Credential, string, [32]byte, []byte, *Key, string) error) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	at := a.pending[id]
@@ -150,5 +157,5 @@ func (a *Attempts) FinishBound(session, purpose, id string, enc, ct []byte, appl
 	}
 	defer kek.Destroy()
 	clear(b[4:36])
-	return apply(at.credential, at.registration, at.digest, b[40:], kek)
+	return apply(at.credential, at.registration, at.digest, b[40:], kek, at.canonical)
 }
