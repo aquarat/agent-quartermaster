@@ -54,6 +54,17 @@ func NewAttempts(now func() time.Time) *Attempts {
 	return &Attempts{epoch: RandomID(), now: now, pending: make(map[string]*attempt)}
 }
 func (a *Attempts) Epoch() ID { return a.epoch }
+
+// Invalidate outstanding recipients after a credential revocation. Keep the
+// rate limit and epoch (other credentials can start fresh ceremonies).
+func (a *Attempts) Invalidate() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, v := range a.pending {
+		v.timer.Stop()
+	}
+	clear(a.pending)
+}
 func (a *Attempts) Close() {
 	a.mu.Lock()
 	defer a.mu.Unlock()

@@ -597,3 +597,21 @@ public JSON transition manifest as a string. Finish (`control/finish`) takes
 the standard `challenge_id,assertion`. No PRF. There is no unsigned import or
 unlock on restart. Authorised but locked secret operations return 423 `locked`;
 request and enrollment polls may retry without resetting their deadlines.
+# Sealed passkey capabilities
+
+Admin on an unlocked installation uses session-only POSTs under
+`/api/ui/seal/passkeys/`. `challenge` accepts `action` (`register`, `enable`,
+`disable`), `nickname`, `capability` (`unlock` or `approve-only`) and the
+full base64url `credential_id` (empty only for register). Canonical v3 object
+`passkey-capability` signs these four scalars, the new registration `id`,
+`installation`, `epoch`, `mk_version`, `nonce` and `issued_at`. `authorize`
+consumes only that challenge and a UV assertion. Registration `create`
+submits the attestation against this signed intent. For an unlock credential,
+`evaluate`/`finish` run two independent single-ID PRF gets and encrypted
+finishes: first wrap the live MK, then unwrap it and verify the key-check.
+Neither a new credential nor its wrap is active before the second test.
+There is no implicit downgrade on cancellation or provider failure. Repeat
+with an explicitly signed approve-only intent instead. Unfinished enrollment
+is bounded, session-bound, expires after five minutes and is lost on restart.
+Existing keys can be tested without re-registering them. `unlock_tested_at`
+is for this credential and MK, not a guarantee about every synced device.

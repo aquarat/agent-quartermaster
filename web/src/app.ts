@@ -54,6 +54,7 @@ import { hostCard, updateCard, type UpdateView, type HostInfo } from './admin';
 import { helpPage, type HelpConfig } from './help';
 import {cataloguePage,type Catalogue} from './catalogue';
 import {sealPanel,type SealView} from './sealPanel';
+import {capabilityForm} from './capabilities';
 
 function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/help' ? 'help' : 'queue'; }
 function nav(label:string,hash:string,title:string) { const a=h('a',{title,'aria-label':title},label); a.href=hash; return a; }
@@ -600,7 +601,7 @@ export class App {
     return [
       h("div", { class: "tiles" }, list.map((p) => this.passkeyTile(p, only))),
       only ? h("p", { class: "muted" }, "Add a second passkey (another password manager or a hardware key) so you can still get in if you lose this one.") : null,
-      h("div", { class: "pk-foot" }, add, signedIn),
+      h("div", { class: "pk-foot" }, this.seal ? this.seal.mode==='unlocked'?capabilityForm(this.api,this.auth,this.seal,list,()=>this.changed()):'Unlock to manage capabilities.' : add, signedIn),
     ];
   }
 
@@ -634,6 +635,7 @@ export class App {
           synced ? "Synced" : "Device-bound",
         ),
         p.current ? h("span", { class: "badge this", title: "You signed in with this passkey" }, "This device") : null,
+        p.raw_id ? h('span',{class:'badge'},p.unlock_tested_at?'Can unlock · tested '+absoluteTime(p.unlock_tested_at):'Approve only'):null,
       ),
       h(
         "dl",

@@ -100,6 +100,12 @@ const [cmd, ...args] = process.argv.slice(2);
 try {
   switch (cmd) {
     case 'seal-status': console.log((await api.sealStatus()).mode);break;
+    case 'capability': {
+      const [action,name,capability]=args, v=await api.sealStatus(), key=action==='register'?null:await findPasskey(name!);
+      const flow=await (await import(`${web}/src/capabilities.ts`)).startCapability(api,v,{action,nickname:name,credential_id:key?.raw_id??'',capability},new URL(origin).hostname);
+      let step=await flow.approve(auth);const device=action==='register'?await softAuthenticator(origin):await softAuthenticator(origin,keys[name!]);
+      while(step)step=await step.tap(device);if(action!=='disable')keys[name!]=await device.save();break;
+    }
     case 'seal-eval': {
       const v=await api.sealStatus();const choice=v.choices.find((c:any)=>c.name===active);if(!choice)throw Error('no choice for active credential');
       const b=await api.sealPost('unlock/challenge',{credential:choice.id,registration_id:choice.selection.registration_id});

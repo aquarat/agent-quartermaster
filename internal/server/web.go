@@ -291,6 +291,10 @@ func (s *Server) consume(ctx context.Context, id, purpose string, now time.Time)
 // ---- passkey registration ----
 
 func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
+	if s.seal != nil {
+		s.writeErr(w, r, errConflict("sealed enrollment requires an explicit signed capability"))
+		return
+	}
 	ctx := r.Context()
 	var in api.RegisterBegin
 	if err := decode(r, &in); err != nil {
@@ -375,6 +379,10 @@ func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
+	if s.seal != nil {
+		s.writeErr(w, r, errConflict("sealed enrollment requires an explicit signed capability"))
+		return
+	}
 	ctx := r.Context()
 	var in api.RegisterFinish
 	if err := decode(r, &in); err != nil {
@@ -602,7 +610,16 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 	}
 	out.Passkeys = make([]api.PasskeyInfo, 0, len(pks))
 	for i := range pks {
-		out.Passkeys = append(out.Passkeys, pks[i].info(cur))
+		p := pks[i].info(cur)
+		if s.seal != nil {
+			p.RawID = encodeID(pks[i].CredentialID)
+			p.TestedAt, err = q.TestedWrap(ctx, pks[i].ID, s.seal.inv.Version)
+			if err != nil {
+				s.writeErr(w, r, err)
+				return
+			}
+		}
+		out.Passkeys = append(out.Passkeys, p)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -998,13 +1015,20 @@ func (s *Server) passkeyChangeHandler(verb string) func(http.ResponseWriter, *ht
 			s.writeErr(w, r, errBad("the signed action is "+sg.Action.Action+", not "+verb))
 			return
 		}
-		if err := s.apply(ctx, sg, pkID); err != nil {
+		if err := s.apply(context.WithValue(ctx, sessionBindingKey{}, sess), sg, pkID); err != nil {
 			s.writeErr(w, r, err)
 			return
 		}
 		s.bcast.notify()
 		s.notifyDecision(sg)
 		out := api.PasskeyChange{OK: true, ID: id, Action: verb, Nickname: sg.Nickname}
+		if verb == canon.ActionRemove && s.seal != nil {
+			s.seal.attempts.Invalidate()
+			pool := &s.seal.capabilities
+			pool.Lock()
+			clear(pool.entries)
+			pool.Unlock()
+		}
 		if verb == canon.ActionRename {
 			out.Nickname = sg.NewNickname
 		}

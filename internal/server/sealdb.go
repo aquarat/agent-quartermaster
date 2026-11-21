@@ -28,13 +28,14 @@ CREATE TABLE seal_wraps(passkey INTEGER PRIMARY KEY REFERENCES passkeys(id) ON D
 CREATE TRIGGER seal_keep_unlock BEFORE DELETE ON passkeys WHEN EXISTS(SELECT 1 FROM seal_wraps WHERE passkey=OLD.id) AND (SELECT count(*) FROM seal_wraps)<=1 BEGIN SELECT RAISE(ABORT,'last tested unlock credential'); END;`
 
 type sealRuntime struct {
-	delayed  atomic.Int64
-	inv      seal.Inventory
-	gate     *seal.Gate
-	attempts *seal.Attempts
-	stop     chan struct{}
-	once     sync.Once
-	stage    *sealStage
+	capabilities capabilityStages
+	delayed      atomic.Int64
+	inv          seal.Inventory
+	gate         *seal.Gate
+	attempts     *seal.Attempts
+	stop         chan struct{}
+	once         sync.Once
+	stage        *sealStage
 }
 
 func (s *Server) setupSealedNotices(client *http.Client) {

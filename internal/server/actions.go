@@ -236,6 +236,9 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 		}
 		switch in.Action {
 		case canon.ActionAdd:
+			if s.seal != nil {
+				return a, errConflict("select the intended passkey capability")
+			}
 			if id != "new" {
 				return a, errBad(`adding a passkey: POST /api/ui/passkeys/challenge {"action":"add"}`)
 			}
@@ -262,6 +265,9 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 			}
 			a.Nickname = p.Name
 			if in.Action == canon.ActionRemove {
+				if err = s.keepUnlock(ctx, q, p.ID); err != nil {
+					return a, err
+				}
 				if in.Nickname != "" {
 					return a, errBad("remove takes no nickname")
 				}
@@ -649,6 +655,15 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 			// enroll code on the bastion could recover (enforced here, inside the transaction).
 			if len(all) <= 1 {
 				return errConflict("refusing to remove the last passkey: add another one first")
+			}
+			if err = s.keepUnlock(ctx, q, p.ID); err != nil {
+				return err
+			}
+			if s.seal != nil {
+				sess, _ := ctx.Value(sessionBindingKey{}).(string)
+				if err = s.sealOwner(ctx, q, sess, passkeyID); err != nil {
+					return err
+				}
 			}
 			ended, err := q.DeletePasskey(ctx, p.ID)
 			if err != nil {

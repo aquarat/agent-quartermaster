@@ -130,6 +130,7 @@ export type PasskeyIcon =
 
 /** One registered owner passkey (api.PasskeyInfo). */
 export interface PasskeyInfo {
+  raw_id?:string; unlock_tested_at?:string;
   /** Hex of the first 16 bytes of SHA-256(credential ID); the canonical "passkey" id. */
   id: string;
   nickname: string;

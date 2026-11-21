@@ -281,6 +281,8 @@ const (
 
 // PasskeyInfo is one registered owner passkey as the web UI lists it (public data only).
 type PasskeyInfo struct {
+	RawID    string     `json:"raw_id,omitempty"`
+	TestedAt *time.Time `json:"unlock_tested_at,omitempty"`
 	// ID is the hex of the first 16 bytes of SHA-256(credential ID): the passkey's id in
 	// /api/ui/passkeys/{id}/... and in the canonical "passkey" object.
 	ID            string `json:"id"`
