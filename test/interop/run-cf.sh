@@ -400,4 +400,19 @@ cfapi GET /zones --why 'post-cutover read' >/dev/null || fail 'post-cutover pers
 "$AQMAS" cf snapshot list --json | bun -e 'if ((await Bun.stdin.json()).snapshots.length) process.exit(1)' || fail 'legacy snapshots visible'
 ok 'signed activation, scoped proxy, archived legacy snapshots and provider template gate'
 
+owner catalogue relax
+"$AQMAS" cf scopes --json | bun -e 'const {scopes:s}=await Bun.stdin.json();const f=n=>s.find(x=>x.name===n);if(!f("cf.read").indefinite_available||f("cf.admin").max_ttl_seconds>3600||f("cf.read.private").max_ttl_seconds>7200)process.exit(1)' || fail 'effective scope duration bounds'
+"$AQMAS" cf request cf.read --ttl indefinite --why 'explicit indefinite test' --json >"$T/indefinite.out" 2>"$T/indefinite.err" &
+RPID=$!; RID=$(owner wait cloudflare interop-host 20); owner approve "$RID" indefinite > /dev/null 2>"$T/indefinite-owner.err"; wait "$RPID"
+grep -q '"beyond_soft_cap":true' "$T/indefinite-owner.err" && grep -q '"indefinite":true' "$T/indefinite-owner.err" || fail 'unsigned indefinite duration'
+GID=$(owner state | bun -e 'const s=await Bun.stdin.json();let g=s.grants.find(x=>x.indefinite);if(!g)process.exit(1);console.log(g.id)')
+owner revoke-grant "$GID" >/dev/null
+if cfapi GET /zones --grant "$GID" > /dev/null 2>&1; then fail 'revoked indefinite grant allowed'; fi
+if "$AQMAS" cf request cf.admin --ttl indefinite --why 'must refuse' </dev/null >"$T/admin-denied.out" 2>&1; then fail 'indefinite sensitive scope'; fi
+"$AQMAS" cf request cf.dns.edit zone=example.com --ttl 15m --why 'explicit standing window' --json >"$T/standing.out" 2>"$T/standing.err" &
+RPID=$!; RID=$(owner wait cloudflare interop-host 20); owner approve "$RID" 900 indefinite >/dev/null 2>"$T/standing-owner.err"; wait "$RPID"
+grep -q '"standing_indefinite":true' "$T/standing-owner.err" && grep -q '"standing_beyond_soft_cap":true' "$T/standing-owner.err" || fail 'standing exception missing from signed decision'
+owner state | bun -e 'if(!(await Bun.stdin.json()).standing.some(x=>x.indefinite)) process.exit(1)' || fail 'standing duration missing from active list'
+ok 'stale policy refused, explicit indefinite scope approval, sensitive cap and immediate revoke'
+
 echo "interop-cf: ALL OK"

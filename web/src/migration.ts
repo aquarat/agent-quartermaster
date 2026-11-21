@@ -15,6 +15,16 @@ const plan={source_schema:'n',organisation:named,owner_approver:named,owner_weba
 
 export function planRows(text:string,id:string):Array<[string,string]>{
  if(new TextEncoder().encode(text).length>131072)throw Error('oversize cutover plan');const p=JSON.parse(text);if(p.source_schema!==5||p.organisation?.id!==id||p.organisation?.slug!=='personal')throw Error('unexpected cutover');
+ return typedRows(text,plan);
+}
+const node={id:'s',slug:'s',title:'s',revision:'n'};
+const pol={default_seconds:'n',soft_cap_seconds:'n',indefinite:'b',standing_default_seconds:'n',standing_soft_cap_seconds:'n',standing_indefinite:'b'};
+defs.adminService={...node,provider:'s',sets:'[adminSet]'};defs.adminSet={...node,kind:'s',archived:'b'};
+defs.rule={set_id:'s',scope:'s',auto:'b',standing:'b',relax_proxy_duration:'b'};
+defs.auto={set_id:'s',scope:'s',mode:'s',restrictions:'s',max_seconds:'n'};
+const changeShapes:Record<string,Shape>={organisation:{owner_id:'s',organisation:node,new_policy:pol,result_revision:'n'},service:{owner_id:'s',organisation:node,service:node,kind:'s',result_revision:'n'},credential_set:{owner_id:'s',organisation:node,service:node,set:node,kind:'s',result_revision:'n'},org_policy:{owner_id:'s',organisation:node,old_policy:pol,new_policy:pol,old_rules:'[rule]',new_rules:'[rule]',result_revision:'n'},org_host:{owner_id:'s',organisation:node,host:{row_id:'n',enrollment:'s',name:'s',fingerprint:'s',class:'s',active:'b',generation:'n'},result_revision:'n',auto_access:'[auto]'}};
+export function catalogueRows(text:string,object:string){if(!Object.hasOwn(changeShapes,object))throw Error('unknown catalogue object');return typedRows(text,object==='org_host'?{...(changeShapes.org_host as Record<string,Shape>),admitted_services:'[adminService]'}:changeShapes[object]!);}
+function typedRows(text:string,shape:Shape):Array<[string,string]>{const p=JSON.parse(text);
  const rows:Array<[string,string]>=[];function walk(v:unknown,shape:Shape,path:string){const bad=()=>{throw Error(`unrecognised migration field at ${path}`)};
   if(typeof shape==='string'){
     if(shape==='overrides'){if(v===null)return;if(!v||typeof v!=='object'||Array.isArray(v))return bad();const keys=Object.keys(v);if(keys.join()!==keys.slice().sort().join())return bad();for(const k of keys){if(!/^cf\.[a-z0-9.-]+$/.test(k))return bad();walk((v as Record<string,unknown>)[k],defs.override!,`${path}.${k}`)}return}
@@ -24,5 +34,5 @@ export function planRows(text:string,id:string):Array<[string,string]>{
   }
   if(v===null||typeof v!=='object'||Array.isArray(v))return bad();const fields=Object.keys(shape).filter(k=>!k.endsWith('?')||Object.hasOwn(v,k.slice(0,-1)));if(JSON.stringify(fields.map(k=>k.replace(/\?$/,'')))!==JSON.stringify(Object.keys(v)))return bad();for(const key of fields){const k=key.replace(/\?$/,'');walk((v as Record<string,unknown>)[k],shape[key]!,path?`${path} › ${k}`:k)}
  }
- walk(p,plan,'');const encoded=JSON.stringify(p).replace(/[<>&\u2028\u2029]/g,c=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0'));if(text!==encoded)throw Error('noncanonical migration plan');return rows;
+ walk(p,shape,'');const encoded=JSON.stringify(p).replace(/[<>&\u2028\u2029]/g,c=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0'));if(text!==encoded)throw Error('noncanonical plan');return rows;
 }

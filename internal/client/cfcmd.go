@@ -218,9 +218,13 @@ func (e *Env) CFRequestCmd(ctx context.Context, spec CFRequestSpec, ttl time.Dur
 		return enc.Encode(st)
 	}
 	g := st.Grant
+	end := g.NotAfter.Local().Format(time.RFC3339)
+	if g.Indefinite {
+		end = "INDEFINITE (until revoked)"
+	}
 	fmt.Fprintf(e.Stdout, "grant    %s\nscope    %s\nmode     %s\naccount  %s\nvalid    %s .. %s\n", sanitize(g.ID),
 		describeCFGrant(g.Cloudflare.Scope, g.Cloudflare.ScopeParams, ""), sanitize(g.Cloudflare.Mode), sanitize(g.Cloudflare.AccountID),
-		g.NotBefore.Local().Format(time.RFC3339), g.NotAfter.Local().Format(time.RFC3339))
+		g.NotBefore.Local().Format(time.RFC3339), end)
 	if g.Cloudflare.Mode == api.CFModeToken {
 		fmt.Fprintf(e.Stdout, "token    cached for this user (use: aqmas cf token %s ... -- CMD)\n", sanitize(g.Cloudflare.Scope))
 	} else {

@@ -8,7 +8,7 @@
 // So what is shown is exactly what is signed, and what is signed is what was asked for.
 
 import { bytesEqual, decode, encode } from "./b64url";
-import { planRows } from './migration';
+import { planRows,catalogueRows } from './migration';
 import {
   ScopeParamsError,
   cfScope,
@@ -81,6 +81,9 @@ const ALLOWED_ACTIONS: Record<string, string[]> = {
   grant: ["revoke"],
   passkey: ["add", "rename", "remove"],
 };
+export const catalogueVerbs={organisation:['create'],service:['create'],credential_set:['create'],org_policy:['replace'],org_host:['admit','remove']};
+for(const [k,v] of Object.entries(catalogueVerbs)){ALLOWED_KEYS[k]=[...COMMON_KEYS,'plan'];ALLOWED_ACTIONS[k]=v;}
+const durationFlags=['indefinite','standing_indefinite','beyond_soft_cap','standing_beyond_soft_cap'];
 
 export class CanonicalError extends Error {
   override name = "CanonicalError";
@@ -134,7 +137,8 @@ export function parseCanonical(text: string): Canonical {
   const cf = c.kind === "cloudflare" && CF_KEYS[c.object] !== undefined;
   let allowed = cf ? CF_KEYS[c.object]! : ALLOWED_KEYS[c.object]!;
   if(c.object==='migration'){if(typeof c.recovery_sha256!=='string' || !/^[0-9a-f]{64}$/.test(c.recovery_sha256) || typeof c.plan!=='string')throw new CanonicalError('invalid migration');planRows(c.plan,c.id);}
-  else if(c.v===2){if(!['request','standing','grant'].includes(c.object)|| !['ssh','cloudflare'].includes(c.kind??''))throw new CanonicalError('unsupported scoped action');allowed=[...new Set([...allowed,...bindingKeys(c.kind)])];validateBinding(c);}
+  else if(Object.hasOwn(catalogueVerbs,c.object)){if(c.v!==2||typeof c.plan!=='string')throw new CanonicalError('invalid catalogue change');catalogueRows(c.plan,c.object);}
+  else if(c.v===2){if(!['request','standing','grant'].includes(c.object)|| !['ssh','cloudflare'].includes(c.kind??''))throw new CanonicalError('unsupported scoped action');allowed=[...new Set([...allowed,...bindingKeys(c.kind),...durationFlags,'standing_seconds'])];validateBinding(c);}
   if (!ALLOWED_ACTIONS[c.object]!.includes(c.action)) throw new CanonicalError(`unknown action ${JSON.stringify(c.action)} for ${c.object}`);
   const extra = Object.keys(c).filter((k) => !allowed.includes(k));
   if (extra.length) throw new CanonicalError(`canonical action has fields this page can't show (${extra.join(", ")})`);
@@ -197,7 +201,7 @@ function checkCloudflare(c: Canonical, keys: string[]): void {
     if (!scope.standing) throw new CanonicalError(`${scope.name} never allows auto-approval (standing_hours must be 0)`);
     if (c.mode !== "proxy") throw new CanonicalError("token grants are never auto-approved (standing_hours must be 0)");
   }
-  if (c.object === "request" && c.action === "approve" && (c.ttl_seconds ?? 0) > scope.maxTTL) {
+  if (c.object === "request" && c.action === "approve" && (c.ttl_seconds ?? 0) > ((c.v===1||c.scope==='cf.admin'||c.scope==='cf.read.private')?scope.maxTTL:Number(c.hard_cap))) {
     throw new CanonicalError(`${scope.name} lasts at most ${duration(scope.maxTTL)}`);
   }
 }
@@ -225,7 +229,9 @@ export async function challengeCommitsTo(canonical: string, challengeB64url: str
 
 /** What the owner chose plus the facts on the card. Unset fields are not checked. */
 export interface Expectation extends UpdateFields {
-  scoped_facts?: Record<string,string|number>;
+  standing_seconds?:number;
+  scoped_facts?: Record<string,string|number|boolean>;
+  indefinite?:boolean;standing_indefinite?:boolean;
   plan?: string; recovery_sha256?:string;
   principal?: string; replaces_id?: string;
   class?: string; address?: string; target_address?: string; target_port?: number;
@@ -260,8 +266,10 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
   cmp("action", c.action, e.action);
   cmp("object", c.object, e.object);
   cmp("id", c.id, e.id);
+  if(e.scoped_facts)cmp('standing_seconds',c.standing_seconds,e.standing_seconds??0);
   if(c.object==='migration'){cmp('plan',c.plan,e.plan??'');cmp('recovery_sha256',c.recovery_sha256,e.recovery_sha256??'');}
-  else if(e.scoped_facts || c.v===2){cmp('v',c.v,2);for(const k of bindingKeys(c.kind)){if(!e.scoped_facts || !Object.hasOwn(e.scoped_facts,k))out.push(`card lacks ${k}`);else cmp(k,c[k],e.scoped_facts[k]);}}
+  else if(Object.hasOwn(catalogueVerbs,c.object))cmp('plan',c.plan,e.plan??'');
+  else if(e.scoped_facts || c.v===2){cmp('v',c.v,2);cmp('indefinite',c.indefinite,e.indefinite??false);cmp('standing_indefinite',c.standing_indefinite,e.standing_indefinite??false);for(const k of bindingKeys(c.kind)){if(!e.scoped_facts || !Object.hasOwn(e.scoped_facts,k))out.push(`card lacks ${k}`);else cmp(k,c[k],e.scoped_facts[k]);}}
   if (e.object==='update') for (const k of UPDATE_KEYS) cmp(k,c[k],e[k]??'');
   cmp("requesting_host", c.requesting_host, e.requesting_host);
   cmp("kind", c.kind, e.kind);
@@ -378,8 +386,9 @@ function who(c: Canonical): Part[] {
 
 /** Describe the canonical action in plain words. Built only from canonical's own fields. */
 export function describe(c: Canonical): Description {
+  if(Object.hasOwn(catalogueVerbs,c.object)){const p=JSON.parse(String(c.plan));const headline=`${p.organisation.title}: ${c.action} ${c.object.replace('_',' ')}.`;return {headline,headlineParts:[{value:p.organisation.title},`: ${c.action} ${c.object.replace('_',' ')}.`],warnings:c.object==='org_policy'||c.action==='remove'?['Affected pending work expires; broker grants and standing approvals end. Issued SSH certificates can still work until expiry, and sessions can continue.']:[],fields:catalogueRows(String(c.plan),c.object)};}
   if(c.object==='migration'){const headline='personal: activate organisation admissions and retire previous authority.';return {headline,headlineParts:[headline],warnings:['Pending requests expire; standing approvals and broker grants end. Issued SSH certificates and unverified children can still work until their original expiry.'],fields:[['Recovery SHA-256',String(c.recovery_sha256)],...planRows(String(c.plan),c.id)]};}
-  if(c.v===2){const d=describe({...c,v:1});const path=[c.org_title,c.service_title,c.set_title].map(String).join(' › ');d.headline=`${path}: ${d.headline}`;d.headlineParts=[{value:path},': ',...d.headlineParts];d.fields=fieldList(c);return d;}
+  if(c.v===2){const d=describe({...c,v:1});const path=[c.org_title,c.service_title,c.set_title].map(String).join(' › ');d.headline=`${path}: ${d.headline}`;d.headlineParts=[{value:path},': ',...d.headlineParts];if(c.indefinite||c.standing_indefinite)d.warnings.push(`INDEFINITE ${c.indefinite?'grant':'standing approval'} — active until revoked.`);if(Number(c.standing_seconds)>0)d.warnings.push(`Also auto-approve matching requests for ${duration(Number(c.standing_seconds))}.`);if(c.beyond_soft_cap||c.standing_beyond_soft_cap)d.warnings.push('Beyond soft cap: check the duration before approving.');d.fields=fieldList(c);return d;}
   if (c.kind === "cloudflare" && CF_KEYS[c.object]) return describeCloudflare(c);
   const kind = kindLabel(c.kind ?? "ssh");
   const host = c.requesting_host ?? "?";
@@ -454,8 +463,11 @@ export function describe(c: Canonical): Description {
 }
 
 const revisions=['set_revision','service_revision','policy_revision','admission_generation'];
-function bindingKeys(kind:unknown):string[]{return ['org_id','org_slug','org_title','service_id','service_slug','service_title','set_id','set_slug','set_title',...revisions,'host_id','class','address','profile_revision','max_standing_hours',...(kind==='ssh'?['ssh_ca','host_key','cert_profile','principal','target_address','target_port','key_fingerprint']:['account_id','resource_ids','ip_condition'])];}
-function validateBinding(c:Canonical){for(const k of bindingKeys(c.kind)){const x=c[k];if(revisions.includes(k)||k==='max_standing_hours'||k==='target_port'){if(typeof x!=='number'||!Number.isSafeInteger(x)||x<(k==='max_standing_hours'?0:1))throw new CanonicalError(`invalid ${k}`);}else if(typeof x!=='string'||(!x && k!=='resource_ids'&&k!=='ip_condition'))throw new CanonicalError(`invalid ${k}`);}
+const offerFlags=['offers_indefinite','offers_standing','offers_standing_indefinite'];const policyNumbers=['soft_cap','hard_cap','standing_soft_cap','standing_default','max_standing_hours'];
+function bindingKeys(kind:unknown):string[]{return ['org_id','org_slug','org_title','service_id','service_slug','service_title','set_id','set_slug','set_title',...revisions,'host_id','class','address','profile_revision',...policyNumbers,...offerFlags,...(kind==='ssh'?['ssh_ca','host_key','cert_profile','principal','target_address','target_port','key_fingerprint']:['account_id','resource_ids','ip_condition'])];}
+function validateBinding(c:Canonical){for(const k of [...bindingKeys(c.kind),...durationFlags]){const x=c[k];if(offerFlags.includes(k)||durationFlags.includes(k)){if(typeof x!=='boolean')throw new CanonicalError(`invalid ${k}`);}else if(revisions.includes(k)||policyNumbers.includes(k)||k==='target_port'){if(typeof x!=='number'||!Number.isSafeInteger(x)||x<(policyNumbers.includes(k)?0:1))throw new CanonicalError(`invalid ${k}`);}else if(typeof x!=='string'||(!x && k!=='resource_ids'&&k!=='ip_condition'))throw new CanonicalError(`invalid ${k}`);}
+ const seconds=c.standing_seconds;if(typeof seconds!=='number'||!Number.isSafeInteger(seconds)||seconds<0||seconds>0&&(c.standing_hours!==0||!c.offers_standing||c.standing_indefinite||c.indefinite||c.object!=='request'||c.action!=='approve'||seconds>Number(c.max_standing_hours)*3600))throw new CanonicalError('invalid standing seconds');
+ if(c.indefinite && (!c.offers_indefinite||c.kind==='ssh'||c.scope==='cf.admin'||c.scope==='cf.read.private'||c.ttl_seconds!==0) || c.standing_indefinite && (!c.offers_standing_indefinite||!c.offers_standing||c.standing_hours!==0) || c.beyond_soft_cap!==(c.indefinite||Number(c.ttl_seconds)>Number(c.soft_cap)) || c.standing_beyond_soft_cap!==(c.standing_indefinite||Math.max(seconds,Number(c.standing_hours)*3600)>Number(c.standing_soft_cap)))throw new CanonicalError('inconsistent duration policy');
  if(c.kind==='cloudflare' && (c.mode!=='proxy'|| c.ip_condition!=='' || !/^[0-9a-f]{32}$/.test(String(c.account_id))))throw new CanonicalError('unverified Cloudflare template');if(!['agent','owner-device'].includes(c.class??''))throw new CanonicalError('unknown host class');if(c.kind==='ssh'&&c.cert_profile!=='source-address;permit-pty;permit-port-forwarding')throw new CanonicalError('unknown certificate profile');}
 
 function fieldList(c: Canonical): Array<[string, string]> {

@@ -302,4 +302,11 @@ RPID=$!; RID=$(owner wait ssh interop-host 20); owner approve "$RID" 300 >/dev/n
 wait "$RPID"; grep -qx ok "$T/scoped.out" && grep -q '"org_slug":"personal"' "$T/scoped-owner.err" || fail 'scoped SSH approval'
 ok 'signed activation and personal SSH approval from the legacy CLI'
 
+owner catalogue create
+owner catalogue remove
+if "$AQMAS" list >"$T/foreign.out" 2>&1; then fail 'client-a admission conferred personal access'; fi
+owner catalogue readmit
+"$AQMAS" list --json | bun -e 'if((await Bun.stdin.json()).grants.length)process.exit(1)' || fail 're-admission revived grants'
+ok 'signed catalogue creation, identical sibling paths and remove/re-admit isolation'
+
 echo "interop: ALL OK"

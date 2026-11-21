@@ -342,6 +342,7 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 	what := cfDesc(req.Scope, req.ScopeParams)
 	ctx := r.Context()
 	err = s.store.Tx(ctx, func(q *store.Q) error {
+		auto, standing := res.Scope.AutoApprove, res.Scope.StandingAllowed
 		if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
 			return err
 		}
@@ -350,9 +351,23 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 			if req.Mode == api.CFModeToken {
 				kind, alias = "cloudflare-mint", "mint"
 			}
-			if _, err := q.PersonalResource(ctx, h.ID, kind, alias, s.now()); err != nil {
+			b, err := q.PersonalResource(ctx, h.ID, kind, alias, s.now())
+			if err != nil {
 				return mapNotFound(err)
 			}
+			l, err := s.limits(ctx, q, b, req.Scope)
+			if err != nil {
+				return err
+			}
+			ttl, err = l.requestTTL(in.TTLSeconds, s.cfg.TTL.MinSeconds, in.Indefinite)
+			if err != nil {
+				return err
+			}
+			req.TTLRequested = ttl
+			auto = l.Auto && ttl > 0 && ttl <= l.Soft
+			standing = l.Standing && ttl > 0
+		} else if in.Indefinite {
+			return errBad("indefinite requires activated organisation policy")
 		}
 		approve := func(note string) (*store.Grant, error) {
 			req.Status, req.DecidedAt, req.DecisionNote = api.StatusApproved, &now, note
@@ -362,7 +377,7 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 			return s.issueCFGrant(ctx, q, req, ttl, now)
 		}
 		// cf.read and cf.cache.purge in proxy mode need no approval.
-		if res.Scope.AutoApprove && res.Mode == api.CFModeProxy {
+		if auto && res.Mode == api.CFModeProxy {
 			// Auto-approval needs no owner, so cap how many identical grants a host may hold:
 			// the CLI reuses an active grant; a flood is a sign of a loop or a compromise.
 			if n, err := q.CountActiveCFGrantsLike(ctx, h.ID, req.Scope, req.ScopeParams, req.Mode, now); err != nil {
@@ -378,7 +393,7 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 			return q.Audit(ctx, now, "system", "cf_auto_approve", "request:"+req.ID,
 				fmt.Sprintf("grant=%s host=%s %s mode=%s ttl=%d from=%s", g.ID, h.Name, what, req.Mode, ttl, peer))
 		}
-		if res.Scope.StandingAllowed && res.Mode == api.CFModeProxy {
+		if standing && res.Mode == api.CFModeProxy {
 			rules, err := q.ActiveStanding(ctx, h.ID, now)
 			if err != nil {
 				return err
@@ -499,6 +514,9 @@ func (s *Server) issueCFGrant(ctx context.Context, q *store.Q, req *store.Reques
 		Mode:        req.Mode,
 		IPCondition: req.IPCondition,
 	}
+	if ttl == 0 && q.Scoped() && req.TTLRequested == -1 {
+		g.NotAfter = untilRevoked
+	}
 	serial, err := q.InsertGrant(ctx, g)
 	if err != nil {
 		return nil, err
@@ -527,7 +545,7 @@ func (s *Server) cfGrantView(g *store.Grant) *api.Grant {
 			cg.Permissions = res.Permissions
 		}
 	}
-	return &api.Grant{ID: g.ID, Kind: g.Kind, NotBefore: g.NotBefore, NotAfter: g.NotAfter, Cloudflare: cg}
+	return &api.Grant{Indefinite: g.NotAfter.Equal(untilRevoked), ID: g.ID, Kind: g.Kind, NotBefore: g.NotBefore, NotAfter: g.NotAfter, Cloudflare: cg}
 }
 
 // tokenName is the upstream name of a grant's child token.
@@ -852,20 +870,36 @@ func (s *Server) handleCFProxy(w http.ResponseWriter, r *http.Request, h *store.
 }
 
 func (s *Server) handleCFCatalogue(w http.ResponseWriter, r *http.Request, h *store.Host) {
-	if s.store.Q().Scoped() {
-		if _, err := s.store.Q().PersonalResource(r.Context(), h.ID, "cloudflare-proxy", "proxy", s.now()); err != nil {
-			s.writeErr(w, r, mapNotFound(err))
-			return
-		}
-	}
 	if s.cf.cat == nil {
 		s.writeErr(w, r, errNotFound())
 		return
 	}
 	cat := s.cf.cat.API()
 	if s.store.Q().Scoped() {
-		for i := range cat.Scopes {
-			cat.Scopes[i].Modes = []string{api.CFModeProxy}
+		ctx := r.Context()
+		err := s.store.Tx(ctx, func(q *store.Q) error {
+			b, err := q.PersonalResource(ctx, h.ID, "cloudflare-proxy", "proxy", s.now())
+			if err != nil {
+				return mapNotFound(err)
+			}
+			for i := range cat.Scopes {
+				sc := &cat.Scopes[i]
+				l, err := s.limits(ctx, q, b, sc.Name)
+				if err != nil {
+					return err
+				}
+				sc.Modes = []string{api.CFModeProxy}
+				sc.AutoApprove = l.Auto
+				sc.StandingAllowed = l.Standing
+				sc.DefaultTTL = l.DefaultTTL
+				sc.MaxTTL = l.Hard
+				sc.IndefiniteAvailable = l.Forever
+			}
+			return nil
+		})
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
 		}
 	}
 	writeJSON(w, http.StatusOK, cat)

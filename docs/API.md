@@ -300,6 +300,61 @@ Positive interop vectors: the signed `migration:activate` followed by `request:a
 cases include rewriting `v` alone, stripping any signed binding, adding an unknown plan field,
 or changing an enrollment generation between review and apply. None is a v2 approval.
 
+### Organisation Admin and duration choices
+
+After activation, `GET /api/ui/catalogue` returns the owner's organisations, services,
+sets, effective policy rules, eligible enrollments (including current generation), and
+the exact auto-approved accesses. It requires an owner session. Create operations only
+add public metadata: application services and empty revision-zero sets have no issuer.
+
+`POST /api/ui/catalogue/{object}/{id}/challenge` takes `{action,plan}`; `.../decide`
+takes `{challenge_id,assertion}`. `plan` is one scalar JSON string, encoded in the
+declaration order of `api.CatalogueChange` and its typed records, using compact Go JSON
+escaping. The browser constructs its expectation from the form and current catalogue,
+validates the exact nested schema and displays decoded rows. All actions are canonical
+v2: the common keys plus exactly `plan` (no unsigned replacements at decide).
+
+| Object : action | Plan fields in order (besides the leading `owner_id`) |
+|---|---|
+| `organisation:create` | `organisation,new_policy,result_revision` |
+| `service:create` | `organisation,service,kind,result_revision` |
+| `credential_set:create` | `organisation,service,set,kind,result_revision` |
+| `org_policy:replace` | `organisation,old_policy,new_policy,old_rules,new_rules,result_revision` |
+| `org_host:admit` / `remove` | `organisation,host,result_revision,auto_access,admitted_services` |
+
+A node contains `id,slug,title,revision`. For create, the new node has expected revision
+zero and an allocated random ID. The owner becomes the initial approver in the creation
+transaction. Host row ID, enrollment, name, fingerprint, class, prior membership and
+generation are signed. `result_revision` on host actions means the next admission
+generation. `auto_access:[]` means **none**. Policy rules are sorted by `(set_id,scope)`;
+they bind policy-auto, standing eligibility, and explicit proxy-duration relaxation.
+A policy replacement expires pending work and ends active grants/standing in that org.
+Removal does so for that enrollment only. Re-admission never resurrects old bindings.
+See `test/interop/catalogue.ts` for cross-language vectors including a stale signed replace.
+
+Scoped access canonicals also carry `soft_cap,hard_cap,standing_soft_cap,standing_default`
+(seconds), `offers_indefinite,offers_standing,offers_standing_indefinite`, and the signed
+choices/consequences `indefinite,standing_indefinite,beyond_soft_cap,standing_beyond_soft_cap`.
+`standing_seconds` is an exact sub-hour-capable alternative to `standing_hours`; at most
+one can be nonzero, neither for indefinite standing. Both are checked against the host class.
+Indefinite is a boolean, not a user-entered TTL of zero. An agent can explicitly ask for
+it with `aqmas cf request SCOPE ... --ttl indefinite` (`POST /v2/personal/requests`,
+`indefinite:true`, zero/absent `ttl_seconds`). The approval card defaults to a finite
+duration. Only an explicitly signed indefinite choice uses the reserved UTC deadline
+`9999-12-31T23:59:59Z`; active summaries also carry `indefinite:true`. All uses still
+check admission, policy revision, peer and revocation. No indefinite auto-grant, no
+indefinite minted token, and no indefinite SSH certificate. Every affected standing
+exception ends on revocation or policy change regardless of duration.
+
+The migrated proxy ceilings remain binding unless that exact ordinary scope has signed
+`relax_proxy_duration:true`. Even then a configured `max_ttl_seconds` remains a hard
+ceiling and prevents indefinite. `cf.admin` is capped at 3600 seconds and `cf.read.private`
+at 7200 seconds, or less if configured. Neither admits relaxation or standing. Finite
+duration inputs are bounded to ten years; SSH always intersects class, target and org
+soft caps. Policy-auto never approves beyond the soft cap; standing matches only within
+the original signed finite grant TTL. An indefinite standing rule is a separate explicit
+proxy choice and does not make the grants it issues indefinite.
+
 - Config `~/.config/aqmas/config.toml` (`server`, `server_ca` + `server_ca_sha256` pin,
   `host_name`, `client_cert`, `client_key`, `client_ca`, `default_ttl`); key and certificate
   in the same directory (0600, directory 0700). Overrides: `AQMAS_CONFIG_DIR`,

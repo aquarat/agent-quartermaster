@@ -15,10 +15,17 @@ import (
 
 const Migration = "migration"
 
-func init() { objectActions[Migration] = []string{"activate"} }
+var CatalogueActions = map[string][]string{"organisation": {"create"}, "service": {"create"}, "credential_set": {"create"}, "org_host": {"admit", "remove"}, "org_policy": {"replace"}}
+
+func init() {
+	objectActions[Migration] = []string{"activate"}
+	for k, v := range CatalogueActions {
+		objectActions[k] = v
+	}
+}
 
 func (a Action) version() int {
-	if a.Object == Migration || a.OrgID != "" {
+	if a.Object == Migration || a.OrgID != "" || CatalogueActions[a.Object] != nil {
 		return 2
 	}
 	return Version
@@ -29,6 +36,9 @@ func actionKeys(v int, object, kind string) ([]string, bool) {
 	}
 	if v != 2 {
 		return nil, false
+	}
+	if CatalogueActions[object] != nil {
+		return []string{"plan"}, kind == ""
 	}
 	if object == Migration {
 		return []string{"plan", "recovery_sha256"}, true
@@ -41,6 +51,7 @@ func actionKeys(v int, object, kind string) ([]string, bool) {
 		return nil, false
 	}
 	keys = slices.Clone(keys)
+	keys = append(keys, "indefinite", "standing_indefinite", "beyond_soft_cap", "standing_beyond_soft_cap", "standing_seconds")
 	for _, k := range scopeKeys(kind) {
 		if !slices.Contains(keys, k) {
 			keys = append(keys, k)
@@ -51,6 +62,7 @@ func actionKeys(v int, object, kind string) ([]string, bool) {
 
 func scopeKeys(kind string) []string {
 	keys := []string{"org_id", "org_slug", "org_title", "service_id", "service_slug", "service_title", "set_id", "set_slug", "set_title", "set_revision", "service_revision", "policy_revision", "admission_generation", "host_id", "class", "address", "profile_revision", "max_standing_hours"}
+	keys = append(keys, "soft_cap", "hard_cap", "standing_soft_cap", "standing_default", "offers_indefinite", "offers_standing", "offers_standing_indefinite")
 	if kind == "ssh" {
 		return append(keys, "ssh_ca", "host_key", "cert_profile", "principal", "target_address", "target_port", "key_fingerprint")
 	}
@@ -61,6 +73,17 @@ func validateV2(a Action, nonce string) error {
 	b, err := base64.RawURLEncoding.Strict().DecodeString(nonce)
 	if err != nil || len(b) != 32 {
 		return errors.New("invalid v2 nonce")
+	}
+	if CatalogueActions[a.Object] != nil {
+		var c api.CatalogueChange
+		if len(a.Plan) > 60<<10 || json.Unmarshal([]byte(a.Plan), &c) != nil {
+			return errors.New("invalid catalogue change")
+		}
+		b, err := json.Marshal(c)
+		if err != nil || string(b) != a.Plan || !lowerHex(c.Org.ID, 32) || !lowerHex(c.Owner, 32) || !validChangeShape(a, c) {
+			return errors.New("noncanonical catalogue change")
+		}
+		return nil
 	}
 	if a.Object == Migration {
 		var p organisations.Plan
@@ -82,7 +105,54 @@ func validateV2(a Action, nonce string) error {
 	if a.Kind == KindCloudflare && (!lowerHex(a.AccountID, 32) || a.Mode != "proxy") {
 		return errors.New("invalid Cloudflare authority")
 	}
+	if a.StandingSeconds < 0 || a.StandingSeconds != 0 && (a.StandingHours != 0 || a.StandingIndefinite || a.Indefinite || !a.OffersStanding || a.Action != ActionApprove || a.Object != ObjectRequest) {
+		return errors.New("invalid standing duration")
+	}
+	if a.SoftCap <= 0 || a.HardCap <= 0 || a.StandingDefault < 0 || a.StandingDefault > a.StandingSoftCap || a.BeyondSoft != (a.Indefinite || a.TTLSeconds > a.SoftCap) || a.StandingBeyondSoft != (a.StandingIndefinite || a.StandingHours > a.StandingSoftCap/3600 || a.StandingSeconds > a.StandingSoftCap) {
+		return errors.New("invalid duration risk binding")
+	}
+	if a.Indefinite && (a.Kind != KindCloudflare || a.Scope == api.CFScopeAdmin || a.Scope == api.CFScopeReadPrivate || !a.OffersIndefinite || a.TTLSeconds != 0) || a.StandingIndefinite && (!a.OffersStanding || !a.OffersStandingIndefinite || a.StandingHours != 0) {
+		return errors.New("ineligible indefinite choice")
+	}
 	return nil
+}
+
+// A canonical must not silently accept fields that are irrelevant for the
+// verb. Database-dependent checks (e.g. auto-access and the old policy) are
+// performed separately at challenge and inside the apply transaction.
+func validChangeShape(a Action, c api.CatalogueChange) bool {
+	var fields api.CatalogueChange
+	fields.Owner, fields.Org, fields.ResultRevision = c.Owner, c.Org, c.ResultRevision
+	switch a.Object {
+	case "organisation":
+		if c.Org.ID != a.ID || c.Org.Revision != 0 || c.Policy == nil || c.ResultRevision != 1 {
+			return false
+		}
+		fields.Policy = c.Policy
+	case "service":
+		if c.Service == nil || c.Service.ID != a.ID || c.Service.Revision != 0 || c.Kind != "application" || c.ResultRevision != 1 {
+			return false
+		}
+		fields.Service, fields.Kind = c.Service, c.Kind
+	case "credential_set":
+		if c.Service == nil || c.Set == nil || c.Set.ID != a.ID || c.Set.Revision != 0 || c.Kind != "env-set" || c.ResultRevision != 0 {
+			return false
+		}
+		fields.Service, fields.Set, fields.Kind = c.Service, c.Set, c.Kind
+	case "org_policy":
+		if c.Org.ID != a.ID || c.Policy == nil || c.OldPolicy == nil || c.Rules == nil || c.OldRules == nil || c.ResultRevision != c.Org.Revision+1 {
+			return false
+		}
+		fields.Policy, fields.OldPolicy, fields.Rules, fields.OldRules = c.Policy, c.OldPolicy, c.Rules, c.OldRules
+	case "org_host":
+		if c.Host == nil || c.Host.Enrollment != a.ID || c.Host.Active != (a.Action == "remove") || c.Auto == nil || c.Resources == nil || c.ResultRevision != c.Host.Generation+1 {
+			return false
+		}
+		fields.Host, fields.Auto, fields.Resources = c.Host, c.Auto, c.Resources
+	default:
+		return false
+	}
+	return fields == c
 }
 
 func lowerHex(s string, n int) bool {

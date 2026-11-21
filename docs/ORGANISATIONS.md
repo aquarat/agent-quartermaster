@@ -143,6 +143,14 @@ cannot enforce a script name. The plan lists the affected templates. Use proxy m
 No minter is opened and no legacy child is deleted by an unverified parent. Issued children
 can continue to work until provider expiry; verify/revoke them with the original issuing parent.
 
+**After activation:** Use **Admin → Organisations** to create an organisation, list its
+services and sets, edit grant/standing policy, and admit or remove a specific enrollment.
+An admission previews which accesses need no additional owner tap, or **none**. New
+organisations have no hosts. New application services and credential sets contain only
+public metadata. Env import and delivery are deferred until the separately designed
+passkey-unlocked sealed store exists. Current aqmasd still loads the CA files and CF
+proxy credential on startup; these phases do not provide a sealed or locked state.
+
 ### Delivery sequence
 
 1. **Inventory and dry run, personal only.** Append migrations after the current `PRAGMA user_version` 4 (coordinate numbering with owner-device work). Generate a repeatable plan from a consistent backup and validated config: one personal org, one owner, live enrollment IDs admitted to personal only, `[[targets]]` → fleet sets, optional `[cloudflare]` → one service and its mode sets. Carry principal, users, host key, TTL/risk and all scope narrowing, named-ID bindings, IP conditions, deny/guard rules and snapshot settings forward. Disabled features stay disabled. Retain the SSH CA, global principal uniqueness, client TLS pins, enrollment certificates, RP ID and passkey handles. No [host trust](HOSTS.md) change.
@@ -161,6 +169,14 @@ can continue to work until provider expiry; verify/revoke them with the original
 **Rollback.** Restore an older binary only with its matching pre-activation recovery point and proof no intervening authority changes are lost. Otherwise fix forward. On disaster recovery reconcile issuer tokens, host revocations, passkeys and rotated secrets in isolation; expire sessions/challenges/rules/grants and review admissions before reopening. Preserve post-backup audit separately. Never serve a stale allow-list.
 
 ## Owner decisions (2026-11-20)
+
+**Cloudflare duration clarification (2026-11-21):** Migration preserves every
+existing limit. A signed policy can explicitly relax an ordinary **proxy**
+scope's duration, including offering indefinite as a separate choice. An
+explicitly configured per-scope ceiling always wins. `cf.admin` can never
+exceed one hour; `cf.read.private` can never exceed two hours. Neither can be
+indefinite. Indefinite access is expected to be rare: it is never the default
+and must not result from a policy-auto or standing match.
 
 1. **Durations are per-organisation policy, edited on the Admin page** (passkey-signed), for each
    organisation and optionally per service/set: a default, a **soft cap** and whether

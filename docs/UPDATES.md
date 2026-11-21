@@ -89,6 +89,11 @@ lower `user_version` by hand, or treat installing `.prev` as undoing a signed cu
 a future activation, fix forward unless the matching pre-activation recovery point can be
 restored without losing an intervening revocation, enrollment, passkey or grant change.
 
+Opening an already activated (schema 6) store stages an additive, empty relaxation table.
+The first signed catalogue change sets `user_version=7` in the same transaction: an
+older daemon that does not enforce signed duration policies must refuse to serve that DB.
+Ordinary installation/restart alone does not advance the version.
+
 * A compromised **aqmasd** controls its DB/audit, spool, discovery and what its web UI displays. It can cause denial of service or deceive an owner into signing a real update. It cannot synthesize a valid assertion for a root-pinned key or choose unverified installer bytes. A passkey is not a trusted display. For high-risk changes, independently inspect the source and compare hashes outside the UI.
 * A compromised **Forgejo** can publish and mirror malicious **source/workflows**; GitHub can honestly rebuild it, so agreement is not an independent source review. Likewise, compromise of a runner with repository-write permission may extend from one forged artifact to changing future source releases. Restrict/protect main, tags, workflow edits and job tokens. The bastion rebuild plus exact owner approval protect against substitution by a single artifact producer.
 * A compromised **GitHub** alone, or a build-only runner alone, can withhold releases or supply mismatched bytes and block installation. Neither supplies the root WebAuthn key. Common compromised dependencies, a compromised toolchain or kernel, collusion, and the owner's approval of malicious source are outside this guarantee. Isolate the mirror key; it permits repository writes even though it cannot operate on other repositories.

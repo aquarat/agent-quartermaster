@@ -112,10 +112,16 @@ func parseArgs(args []string, spec map[string]int) (*cfFlags, error) {
 }
 
 func parseTTL(s string) (time.Duration, error) {
+	if s == "indefinite" {
+		return client.CFIndefinite, nil
+	}
 	if s == "" {
 		return 0, nil
 	}
 	d, err := time.ParseDuration(s)
+	if err == nil && d < 0 {
+		return 0, &client.UsageError{Msg: "negative TTL is not supported"}
+	}
 	if err != nil {
 		return 0, &client.UsageError{Msg: "--ttl: " + err.Error()}
 	}

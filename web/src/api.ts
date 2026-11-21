@@ -25,6 +25,7 @@ export class ApiError extends Error {
 
 /** Objects with a challenge endpoint, and the verb that applies the signed action. */
 export const OBJECT_PATHS = {
+  organisation:{path:'catalogue/organisation',apply:'decide'},service:{path:'catalogue/service',apply:'decide'},credential_set:{path:'catalogue/credential_set',apply:'decide'},org_host:{path:'catalogue/org_host',apply:'decide'},org_policy:{path:'catalogue/org_policy',apply:'decide'},
   migration:{path:'migrations',apply:'activate'},
   host: {path:'hosts', apply:'revoke'},
   update: {path:'updates', apply:'decide'},
@@ -42,6 +43,7 @@ export interface ApiOptions {
 }
 
 export interface Api {
+  catalogue?():Promise<import('./catalogue').Catalogue|null>;
   migration?():Promise<{id:string;plan:string;recovery_sha256:string}|null>;
   hosts(): Promise<HostInfo[]>;
   updates(): Promise<import('./admin').UpdateView>;
@@ -111,6 +113,7 @@ export function createApi(opts: ApiOptions = {}): Api {
     hosts: () => call('GET','/api/ui/hosts'),
     updates: () => call('GET','/api/ui/updates'),
     migration: () => call('GET','/api/ui/migration'),
+    catalogue: () => call('GET','/api/ui/catalogue'),
     help: () => call('GET','/api/ui/help'),
     state: () => call<UIState>("GET", "/api/ui/state"),
     request: (id) => call<PendingItem>("GET", `/api/ui/requests/${seg(id)}`),

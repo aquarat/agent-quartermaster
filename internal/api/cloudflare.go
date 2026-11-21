@@ -179,16 +179,17 @@ type CFNamedID struct {
 
 // CFScopeInfo is one catalogue entry.
 type CFScopeInfo struct {
-	Name            string        `json:"name"`
-	Title           string        `json:"title"`
-	Description     string        `json:"description"`
-	Params          []CFParamInfo `json:"params"`
-	Risk            string        `json:"risk"`
-	AutoApprove     bool          `json:"auto_approve"`     // proxy mode only
-	StandingAllowed bool          `json:"standing_allowed"` // proxy mode only
-	Modes           []string      `json:"modes"`            // ["proxy"] or ["proxy","token"]
-	DefaultTTL      int           `json:"default_ttl_seconds"`
-	MaxTTL          int           `json:"max_ttl_seconds"`
+	IndefiniteAvailable bool          `json:"indefinite_available,omitempty"`
+	Name                string        `json:"name"`
+	Title               string        `json:"title"`
+	Description         string        `json:"description"`
+	Params              []CFParamInfo `json:"params"`
+	Risk                string        `json:"risk"`
+	AutoApprove         bool          `json:"auto_approve"`     // proxy mode only
+	StandingAllowed     bool          `json:"standing_allowed"` // proxy mode only
+	Modes               []string      `json:"modes"`            // ["proxy"] or ["proxy","token"]
+	DefaultTTL          int           `json:"default_ttl_seconds"`
+	MaxTTL              int           `json:"max_ttl_seconds"`
 }
 
 // CFParamInfo describes one scope parameter.

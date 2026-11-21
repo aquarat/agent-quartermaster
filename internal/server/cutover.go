@@ -38,7 +38,7 @@ func (s *Server) lockService() (*os.File, error) {
 		return nil, errors.New("another broker holds the data directory; stop and drain it first")
 	}
 	var v int
-	if err := s.store.DB().QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 5 && v != 6 || (v == 6) != s.store.Q().Scoped() {
+	if err := s.store.DB().QueryRow("PRAGMA user_version").Scan(&v); err != nil || v < 5 || v > 7 || (v >= 6) != s.store.Q().Scoped() {
 		f.Close()
 		return nil, errors.New("database changed during startup; restart the broker")
 	}

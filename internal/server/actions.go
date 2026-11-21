@@ -80,6 +80,15 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 		return canon.Action{}, err
 	}
 	a := canon.Action{Action: in.Action, Object: object, ID: id}
+	if in.StandingSeconds != 0 {
+		if !q.Scoped() || object != "request" || in.Action != "approve" || in.StandingSeconds < 0 || in.StandingSeconds > maxFinite || in.StandingHours != 0 || in.Indefinite || in.StandingIndefinite {
+			return a, errBad("invalid standing_seconds choice")
+		}
+		a.StandingSeconds = in.StandingSeconds
+	}
+	if (in.Indefinite || in.StandingIndefinite) && (!q.Scoped() || object != "request" || in.Action != "approve") {
+		return a, errBad("unexpected indefinite choice")
+	}
 	switch object {
 	case "update":
 		if in.Action != "approve" || in.TTLSeconds != 0 || in.StandingHours != 0 || in.Nickname != "" {
@@ -102,6 +111,24 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 			return a, errConflict("the requesting host's identity was revoked")
 		}
 		if r.Kind == api.KindCloudflare {
+			if q.Scoped() && in.Action == "approve" {
+				l, err := s.decisionLimits(ctx, q, r)
+				if err != nil {
+					return a, err
+				}
+				a.RequestingHost, a.Kind, a.Scope, a.ScopeParams, a.Mode, a.IPCondition = r.HostName, r.Kind, r.Scope, r.ScopeParams, r.Mode, r.IPCondition
+				a.TTLSeconds, a.StandingHours, a.Indefinite, a.StandingIndefinite = in.TTLSeconds, in.StandingHours, in.Indefinite, in.StandingIndefinite
+				if a.TTLSeconds == 0 && !a.Indefinite {
+					a.TTLSeconds = r.TTLRequested
+					if a.TTLSeconds < 0 {
+						a.TTLSeconds = l.DefaultTTL
+					}
+				}
+				if err := s.checkCFChoice(r, a, l); err != nil {
+					return a, err
+				}
+				return s.bindAction(ctx, q, a)
+			}
 			a, err = s.buildCFRequestAction(a, r, in, s.cfg.TTL.ForHost(h.Class).MaxStandingHours)
 			if err != nil {
 				return a, err
@@ -109,6 +136,18 @@ func (s *Server) buildAction(ctx context.Context, object, id string, in api.Chal
 			return s.bindAction(ctx, q, a)
 		}
 		a.TargetAddress, a.TargetPort = r.TargetAddress, r.TargetPort
+		if in.Indefinite || in.StandingIndefinite {
+			return a, errBad("indefinite SSH is unavailable")
+		}
+		if q.Scoped() && in.StandingHours > 0 {
+			l, err := s.decisionLimits(ctx, q, r)
+			if err != nil {
+				return a, err
+			}
+			if !l.Standing {
+				return a, errBad("standing approval disabled")
+			}
+		}
 		a.Address, a.Principal = r.PeerAddress, r.Principal
 		a.RequestingHost, a.Kind, a.Target, a.LoginUser, a.KeyFingerprint = r.HostName, r.Kind, r.TargetHost, r.LoginUser, r.KeyFingerprint
 		if in.Action == canon.ActionApprove {
@@ -283,7 +322,15 @@ func (s *Server) applyCFApprove(ctx context.Context, q *store.Q, r *store.Reques
 	if err != nil {
 		return err
 	}
-	if a.TTLSeconds <= 0 || a.TTLSeconds > r.TTLRequested || a.TTLSeconds > res.Scope.MaxTTL || a.TTLSeconds > s.cfg.TTL.MaxSeconds {
+	if q.Scoped() {
+		l, err := s.decisionLimits(ctx, q, r)
+		if err != nil {
+			return err
+		}
+		if err := s.checkCFChoice(r, a, l); err != nil {
+			return errConflict("signed duration outside policy")
+		}
+	} else if a.TTLSeconds <= 0 || a.TTLSeconds > r.TTLRequested || a.TTLSeconds > res.Scope.MaxTTL || a.TTLSeconds > s.cfg.TTL.MaxSeconds {
 		return errConflict("signed ttl outside policy")
 	}
 	if a.StandingHours > 0 && (a.StandingHours > maxStanding || !res.Scope.StandingAllowed || r.Mode != api.CFModeProxy) {
@@ -301,13 +348,18 @@ func (s *Server) applyCFApprove(ctx context.Context, q *store.Q, r *store.Reques
 		fmt.Sprintf("grant=%s cloudflare %s mode=%s for %s ttl=%d ip=%s src=%s %s", g.ID, what, r.Mode, r.HostName, a.TTLSeconds, r.IPCondition, r.PeerAddress, detail)); err != nil {
 		return err
 	}
-	if a.StandingHours == 0 {
+	if a.StandingHours == 0 && a.StandingSeconds == 0 && !a.StandingIndefinite {
 		return nil
 	}
 	st := &store.Standing{
 		ID: ids.New(), HostID: r.HostID, HostName: r.HostName, Kind: r.Kind, MaxTTL: a.TTLSeconds, CreatedAt: now,
 		ExpiresAt: now.Add(time.Duration(a.StandingHours) * time.Hour), SourceRequestID: r.ID, PeerAddress: r.PeerAddress,
 		Scope: r.Scope, ScopeParams: r.ScopeParams, Mode: r.Mode,
+	}
+	if a.StandingIndefinite {
+		st.ExpiresAt = untilRevoked
+	} else if a.StandingSeconds > 0 {
+		st.ExpiresAt = now.Add(secs(a.StandingSeconds))
 	}
 	if err := q.InsertStanding(ctx, st); err != nil {
 		return err
@@ -352,6 +404,18 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 		}
 		// Which passkey signed (resolved before a remove deletes it) and the nonce prefix.
 		detail := fmt.Sprintf("signed by %s nonce=%s", s.passkeyRef(ctx, q, passkeyID), sg.Nonce[:8])
+		if a.Indefinite {
+			detail += " INDEFINITE grant until revoked"
+		}
+		if a.StandingSeconds > 0 {
+			detail += fmt.Sprintf(" standing_seconds=%d", a.StandingSeconds)
+		}
+		if a.StandingIndefinite {
+			detail += " INDEFINITE standing until revoked"
+		}
+		if a.BeyondSoft || a.StandingBeyondSoft {
+			detail += " beyond soft cap"
+		}
 		if _, err := q.ExpireStale(ctx, now); err != nil {
 			return err
 		}
@@ -402,7 +466,7 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 				fmt.Sprintf("grant=%s %s@%s for %s ttl=%d key=%s src=%s %s", g.ID, r.LoginUser, r.TargetHost, r.HostName, a.TTLSeconds, r.KeyFingerprint, r.PeerAddress, detail)); err != nil {
 				return err
 			}
-			if a.StandingHours > 0 {
+			if a.StandingHours > 0 || a.StandingSeconds > 0 {
 				if a.StandingHours > p.MaxStandingHours || s.highRisk(r) {
 					return errConflict("signed standing_hours outside policy")
 				}
@@ -411,6 +475,9 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 					LoginUser: r.LoginUser, MaxTTL: a.TTLSeconds, CreatedAt: now,
 					ExpiresAt: now.Add(time.Duration(a.StandingHours) * time.Hour), SourceRequestID: r.ID,
 					PeerAddress: r.PeerAddress,
+				}
+				if a.StandingSeconds > 0 {
+					st.ExpiresAt = now.Add(secs(a.StandingSeconds))
 				}
 				if err := q.InsertStanding(ctx, st); err != nil {
 					return err

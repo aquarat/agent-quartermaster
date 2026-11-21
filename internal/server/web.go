@@ -45,6 +45,12 @@ func (s *Server) WebHandler() http.Handler {
 	api.Handle("GET /api/ui/updates", s.requireSession(s.handleUpdates))
 	api.Handle("GET /api/ui/help", s.requireSession(s.handleHelp))
 	api.Handle("GET /api/ui/migration", s.requireSession(s.migrationPreview))
+	api.Handle("GET /api/ui/catalogue", s.requireSession(s.catalogueHandler))
+	for object := range canon.CatalogueActions {
+		base := "/api/ui/catalogue/" + object + "/{id}/"
+		api.Handle("POST "+base+"challenge", s.requireSession(s.challengeHandler(object)))
+		api.Handle("POST "+base+"decide", s.requireSession(s.decideHandler(object)))
+	}
 	api.Handle("GET /api/ui/requests/{id}", s.requireSession(s.handleRequestItem))
 	api.Handle("GET /api/ui/enrollments/{id}", s.requireSession(s.handleEnrollmentItem))
 	for _, o := range []struct{ path, object, verb string }{
@@ -519,6 +525,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 	}
 	out := api.UIState{Owner: api.UIOwner{Name: s.cfg.OwnerName, Passkeys: n}, Pending: []api.PendingItem{}, Standing: []api.StandingApproval{}, Grants: []api.GrantSummary{}}
 	reqs, err := q.PendingRequests(ctx, now)
+	out.CatalogueEnabled = q.Scoped()
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -550,7 +557,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 			s.writeErr(w, r, err)
 			return
 		}
-		out.Standing = append(out.Standing, api.StandingApproval{ScopedFacts: a.CardFacts(), ID: st.ID, RequestingHost: st.HostName, Kind: st.Kind,
+		out.Standing = append(out.Standing, api.StandingApproval{Indefinite: st.ExpiresAt.Equal(untilRevoked), ScopedFacts: a.CardFacts(), ID: st.ID, RequestingHost: st.HostName, Kind: st.Kind,
 			TargetHost: st.TargetHost, LoginUser: st.LoginUser, MaxTTLSeconds: st.MaxTTL, ExpiresAt: st.ExpiresAt, Uses: st.Uses,
 			Scope: st.Scope, ScopeParams: st.ScopeParams, Mode: st.Mode})
 	}
@@ -565,7 +572,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 			s.writeErr(w, r, err)
 			return
 		}
-		out.Grants = append(out.Grants, api.GrantSummary{ScopedFacts: a.CardFacts(), ID: g.ID, Kind: g.Kind, Status: g.Status(now),
+		out.Grants = append(out.Grants, api.GrantSummary{Indefinite: g.NotAfter.Equal(untilRevoked), ScopedFacts: a.CardFacts(), ID: g.ID, Kind: g.Kind, Status: g.Status(now),
 			TargetHost: g.TargetHost, LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter, RequestingHost: g.HostName,
 			Scope: g.Scope, ScopeParams: g.ScopeParams, Mode: g.Mode})
 	}
@@ -612,6 +619,17 @@ func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.Pendi
 		if err == nil {
 			it.MaxStandingHours = maxHours
 			it.ScopedFacts = a.CardFacts()
+			if a.OrgID != "" {
+				it.Cloudflare.StandingAllowed = a.OffersStanding
+				if rq.TTLRequested == -1 {
+					l, err := s.decisionLimits(ctx, s.store.Q(), rq)
+					if err != nil {
+						return nil, err
+					}
+					it.TTLRequested = l.DefaultTTL
+					it.TTLMax = l.Hard
+				}
+			}
 		}
 		return it, err
 	}
@@ -754,6 +772,18 @@ func (s *Server) notifyDecision(sg canon.Signed) {
 		}
 	}
 	text += fmt.Sprintf(" [ref %s]", ref(a.ID))
+	if canon.CatalogueActions[a.Object] != nil {
+		var change api.CatalogueChange
+		if json.Unmarshal([]byte(a.Plan), &change) == nil {
+			text = change.Org.Slug + ": " + text
+		}
+	}
+	if a.Indefinite || a.StandingIndefinite {
+		text += " INDEFINITE until revoked"
+	}
+	if a.BeyondSoft || a.StandingBeyondSoft {
+		text += " (beyond soft cap)"
+	}
 	if a.OrgID != "" {
 		text = a.OrgSlug + "/" + a.ServiceSlug + "/" + a.SetSlug + ": " + text
 	}
@@ -782,7 +812,13 @@ func (s *Server) challengeHandler(object string) func(http.ResponseWriter, *http
 		if object == canon.ObjectPasskey && id == "" {
 			id = "new" // POST /api/ui/passkeys/challenge: adding a passkey
 		}
-		a, err := s.buildAction(ctx, object, id, in)
+		var a canon.Action
+		var err error
+		if canon.CatalogueActions[object] != nil {
+			a, err = s.catalogueChallenge(ctx, sess, object, id, in)
+		} else {
+			a, err = s.buildAction(ctx, object, id, in)
+		}
 		if err != nil {
 			s.writeErr(w, r, err)
 			return
@@ -864,6 +900,16 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 		}
 		if object == "update" {
 			s.queueUpdate(w, r, sg, in.Assertion, pkID)
+			return
+		}
+		if canon.CatalogueActions[object] != nil {
+			if err := s.catalogueApply(ctx, sess, pkID, sg); err != nil {
+				s.writeErr(w, r, err)
+				return
+			}
+			s.bcast.notify()
+			s.notifyDecision(sg)
+			writeJSON(w, 200, api.OK{OK: true})
 			return
 		}
 		if object == canon.Migration {

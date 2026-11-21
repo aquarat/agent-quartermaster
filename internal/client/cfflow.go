@@ -74,11 +74,13 @@ func (e *Env) checkWhy(why string) (string, error) {
 }
 
 func checkCFTTL(ttl time.Duration) error {
-	if ttl != 0 && (ttl < time.Minute || ttl > MaxTTL) {
-		return &UsageError{Msg: fmt.Sprintf("--ttl must be between 1m and %s (or omitted for the scope's default)", MaxTTL)}
+	if ttl != 0 && ttl != CFIndefinite && (ttl < time.Minute || ttl > 315360000*time.Second) {
+		return &UsageError{Msg: "--ttl must be a positive supported duration or indefinite"}
 	}
 	return nil
 }
+
+const CFIndefinite time.Duration = -1
 
 // pendingCF is a created Cloudflare request being waited for.
 type pendingCF struct {
@@ -98,6 +100,13 @@ func (e *Env) createCF(ctx context.Context, c *APIClient, cfg *Config, spec CFRe
 	if len(req.Cloudflare.Params) == 0 {
 		req.Cloudflare.Params = nil
 	}
+	if ttl == CFIndefinite {
+		if spec.Mode == api.CFModeToken {
+			return nil, &UsageError{Msg: "token mode never offers indefinite grants"}
+		}
+		req.Indefinite = true
+		req.TTLSeconds = 0
+	}
 	created, err := c.CreateRequest(ctx, req)
 	if err != nil {
 		return nil, err
@@ -106,6 +115,9 @@ func (e *Env) createCF(ctx context.Context, c *APIClient, cfg *Config, spec CFRe
 		return nil, fmt.Errorf("server returned an invalid request id %q", sanitize(created.ID))
 	}
 	shownWhy, shownTTL := why, "scope default ttl"
+	if ttl == CFIndefinite {
+		shownTTL = "INDEFINITE (until revoked)"
+	}
 	if shownWhy == "" {
 		shownWhy = "(no reason given)"
 	}
@@ -154,6 +166,26 @@ func (e *Env) RequestCF(ctx context.Context, c *APIClient, cfg *Config, specs []
 	why, err := e.checkWhy(why)
 	if err != nil {
 		return nil, err
+	}
+	// The legacy CLI ceiling can be exceeded only when the live catalogue
+	// explicitly offers that duration for every requested proxy scope.
+	if ttl > MaxTTL || ttl == CFIndefinite {
+		cat, err := c.CFCatalogue(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, spec := range specs {
+			allowed := false
+			for _, sc := range cat.Scopes {
+				if sc.Name == spec.Scope && spec.Mode != api.CFModeToken && (ttl == CFIndefinite && sc.IndefiniteAvailable || ttl > 0 && ttl/time.Second <= time.Duration(sc.MaxTTL)) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return nil, &UsageError{Msg: "requested duration is not offered for " + sanitize(spec.Scope)}
+			}
+		}
 	}
 	var pend []*pendingCF
 	cancelAll := func(from int) {

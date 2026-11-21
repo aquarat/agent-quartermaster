@@ -99,6 +99,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const [cmd, ...args] = process.argv.slice(2);
 try {
   switch (cmd) {
+    case 'catalogue':{const {exerciseCatalogue}=await import('./catalogue');await exerciseCatalogue(api,auth,args[0]??'create');break;}
     case 'activate-personal': {
       const m=await api.migration!(); if(!m)throw Error('no fenced cutover'); const p=await flows.prepareAction(api,{object:'migration',id:m.id,facts:{plan:m.plan,recovery_sha256:m.recovery_sha256}},{action:'activate'});
       await flows.completeAction(api,auth,p);await persist();break;
@@ -154,10 +155,10 @@ try {
     case "deny": {
       const [id, ttl, standing] = args;
       const it = await findPending(id!);
-      const choice: { action: "approve" | "deny"; ttl_seconds?: number; standing_hours?: number } = { action: cmd };
+      const choice: { action: "approve" | "deny"; ttl_seconds?: number; standing_hours?: number;indefinite?:boolean;standing_indefinite?:boolean } = { action: cmd };
       if (cmd === "approve" && it.kind !== "enrollment") {
-        choice.ttl_seconds = Number(ttl ?? it.ttl_max);
-        if (standing) choice.standing_hours = Number(standing);
+        choice.ttl_seconds = ttl==='indefinite'?0:Number(ttl ?? it.ttl_max);choice.indefinite=ttl==='indefinite';
+        if (standing==='indefinite')choice.standing_indefinite=true;else if(standing)choice.standing_hours=Number(standing);
       }
       const p = await flows.prepareAction(api, flows.targetForPending(it), choice);
       console.error("owner: signing " + p.canonicalText);

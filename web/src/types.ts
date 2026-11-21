@@ -68,6 +68,7 @@ export interface PendingItem {
 }
 
 export interface StandingApproval {
+  indefinite?:boolean;
   scoped_facts?: Record<string,string|number>;
   id: string;
   requesting_host: string;
@@ -84,6 +85,7 @@ export interface StandingApproval {
 }
 
 export interface GrantSummary {
+  indefinite?:boolean;
   scoped_facts?: Record<string,string|number>;
   id: string;
   kind: string;
@@ -147,6 +149,7 @@ export interface PasskeyInfo {
 }
 
 export interface UIState {
+  catalogue_enabled?:boolean;
   migration?:{id:string;plan:string;recovery_sha256:string};
   owner: UIOwner;
   pending: PendingItem[] | null;
@@ -156,9 +159,11 @@ export interface UIState {
   passkeys?: PasskeyInfo[] | null; // api.UIState.passkeys (absent on an older server)
 }
 
-export type Action = "approve" | "deny" | "revoke" | "add" | "rename" | "remove" | 'activate';
+export type Action = "approve" | "deny" | "revoke" | "add" | "rename" | "remove" | 'activate' | 'create' | 'replace' | 'admit';
 
 export interface ChallengeRequest {
+  standing_seconds?:number;
+  plan?:string;indefinite?:boolean;standing_indefinite?:boolean;
   action: Action;
   ttl_seconds?: number;
   standing_hours?: number;

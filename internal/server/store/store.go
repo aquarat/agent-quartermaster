@@ -85,13 +85,14 @@ func (s *Store) migrate(ctx context.Context) error {
 	if ver > len(migrations) {
 		// Version 6 is applied exclusively by the supervised signed cutover.
 		// Opening a schema-5 store must never select it (self-update rollback).
-		if ver == 6 && len(migrations) == 5 {
+		if (ver == 6 || ver == 7) && len(migrations) == 5 {
 			var marker int
 			if err := s.db.QueryRowContext(ctx, `SELECT singleton FROM personal_cutover WHERE singleton=1`).Scan(&marker); err != nil {
 				return fmt.Errorf("store: incomplete personal cutover: %w", err)
 			}
 			s.scoped = true
-			return nil
+			_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS relaxed_proxy_scopes(set_id TEXT NOT NULL REFERENCES credential_sets(id),scope TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(set_id,scope,revision)) STRICT`)
+			return err
 		}
 		return fmt.Errorf("store: database schema version %d is newer than this binary (%d)", ver, len(migrations))
 	}

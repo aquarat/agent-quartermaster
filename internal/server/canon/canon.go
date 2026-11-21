@@ -107,6 +107,11 @@ var objectActions = map[string][]string{
 
 // Action is everything the owner approves with one passkey assertion.
 type Action struct {
+	StandingSeconds    int  `json:"standing_seconds"`
+	Indefinite         bool `json:"indefinite"`
+	StandingIndefinite bool `json:"standing_indefinite"`
+	BeyondSoft         bool `json:"beyond_soft_cap"`
+	StandingBeyondSoft bool `json:"standing_beyond_soft_cap"`
 	api.ScopeBinding
 	Update
 	Plan           string `json:"plan"`
@@ -177,6 +182,11 @@ func (a Action) values() map[string]any {
 		"new_nickname":    a.NewNickname,
 	}
 	bindingValues(a.ScopeBinding, m)
+	m["standing_seconds"] = a.StandingSeconds
+	m["indefinite"] = a.Indefinite
+	m["standing_indefinite"] = a.StandingIndefinite
+	m["beyond_soft_cap"] = a.BeyondSoft
+	m["standing_beyond_soft_cap"] = a.StandingBeyondSoft
 	return m
 }
 

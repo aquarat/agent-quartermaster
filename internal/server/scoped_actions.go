@@ -25,12 +25,14 @@ func (s *Server) bindAction(ctx context.Context, q *store.Q, a canon.Action) (ca
 			return a, err
 		}
 		source = g.RequestID
+		a.Indefinite = g.NotAfter.Equal(untilRevoked)
 	case canon.ObjectStanding:
 		rule, err := q.GetStanding(ctx, a.ID)
 		if err != nil {
 			return a, err
 		}
 		source = rule.SourceRequestID
+		a.StandingIndefinite = rule.ExpiresAt.Equal(untilRevoked)
 	default:
 		return a, nil
 	}
@@ -48,6 +50,22 @@ func (s *Server) bindAction(ctx context.Context, q *store.Q, a canon.Action) (ca
 	a.ScopeBinding = api.ScopeBinding{OrgID: b.OrgID, OrgSlug: b.OrgSlug, OrgTitle: b.OrgTitle, ServiceID: b.ServiceID, ServiceSlug: b.ServiceSlug, ServiceTitle: b.ServiceTitle, SetID: b.SetID, SetSlug: b.SetSlug, SetTitle: b.SetTitle, SetRevision: b.SetRevision, ServiceRevision: b.ServiceRevision, PolicyRevision: b.PolicyRevision, AdmissionGeneration: b.Generation, HostID: b.Enrollment, ProfileRevision: s.profileRevision, MaxStandingHours: s.cfg.TTL.ForHost(b.Class).MaxStandingHours}
 	a.Class = b.Class
 	a.Address = r.PeerAddress
+	l, err := s.limits(ctx, q, b, r.Scope)
+	if err != nil {
+		return a, err
+	}
+	a.SoftCap = l.Soft
+	a.HardCap = l.Hard
+	a.StandingSoftCap = l.StandingSoft
+	a.StandingDefault = l.StandingDefault
+	a.OffersIndefinite = l.Forever && r.TTLRequested == -1
+	a.OffersStanding = l.Standing && (r.Kind != api.KindSSH || !s.highRisk(r))
+	a.OffersStandingIndefinite = l.StandingForever
+	a.BeyondSoft = a.Indefinite || a.TTLSeconds > l.Soft
+	a.StandingBeyondSoft = a.StandingIndefinite || a.StandingHours > l.StandingSoft/3600 || a.StandingSeconds > l.StandingSoft
+	if a.StandingSeconds > 0 && (!a.OffersStanding || a.StandingSeconds > l.StandingMax*3600) {
+		return a, errBad("standing choice exceeds current policy")
+	}
 	switch r.Kind {
 	case api.KindSSH:
 		t, ok := s.cfg.Target(r.TargetHost)

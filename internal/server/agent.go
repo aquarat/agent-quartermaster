@@ -42,6 +42,9 @@ func (s *Server) AgentHandler() http.Handler {
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
 	mux.HandleFunc("GET /v1/enroll/{id}", s.handleEnrollStatus)
 	mux.Handle("POST /v1/requests", s.requirePersonal(s.handleCreateRequest))
+	if s.store.Q().Scoped() {
+		mux.Handle("POST /v2/personal/requests", s.requirePersonal(s.handleCreateRequest))
+	}
 	mux.Handle("GET /v1/requests/{id}", s.requirePersonal(s.handleRequestStatus))
 	mux.Handle("POST /v1/requests/{id}/cancel", s.requirePersonal(s.handleCancel))
 	mux.Handle("GET /v1/grants", s.requirePersonal(s.handleGrants))
@@ -284,13 +287,21 @@ func (s *Server) handleResolveTarget(w http.ResponseWriter, r *http.Request, h *
 		s.writeErr(w, r, errBad(err.Error()))
 		return
 	}
+	cap := s.cfg.TTL.ForHost(h.Class).MaxSeconds
 	if s.store.Q().Scoped() {
-		if _, err := s.store.Q().PersonalResource(r.Context(), h.ID, "ssh-ca", t.Name, s.now()); err != nil {
+		b, err := s.store.Q().PersonalResource(r.Context(), h.ID, "ssh-ca", t.Name, s.now())
+		if err != nil {
 			s.writeErr(w, r, mapNotFound(err))
 			return
 		}
+		l, err := s.limits(r.Context(), s.store.Q(), b, "")
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		cap = l.Hard
 	}
-	writeJSON(w, http.StatusOK, api.ResolvedTarget{Name: t.Name, Address: t.Address, Port: t.Port, MaxSeconds: s.cfg.TTL.ForHost(h.Class).MaxSeconds})
+	writeJSON(w, http.StatusOK, api.ResolvedTarget{Name: t.Name, Address: t.Address, Port: t.Port, MaxSeconds: cap})
 }
 
 func validRequester(rq api.Requester) error {
@@ -325,6 +336,10 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 	}
 	if in.Kind == api.KindCloudflare {
 		s.handleCreateCloudflare(w, r, h, &in)
+		return
+	}
+	if in.Indefinite {
+		s.writeErr(w, r, errBad("indefinite SSH requires KRL distribution"))
 		return
 	}
 	tgt, err := s.cfg.Resolve(in.SSH.TargetHost, in.SSH.LoginUser)
@@ -375,9 +390,19 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 			return err
 		}
 		if q.Scoped() {
-			if _, err := q.PersonalResource(ctx, h.ID, "ssh-ca", tgt.Name, s.now()); err != nil {
+			b, err := q.PersonalResource(ctx, h.ID, "ssh-ca", tgt.Name, s.now())
+			if err != nil {
 				return mapNotFound(err)
 			}
+			l, err := s.limits(ctx, q, b, "")
+			if err != nil {
+				return err
+			}
+			ttl, err = l.requestTTL(in.TTLSeconds, s.cfg.TTL.MinSeconds, false)
+			if err != nil {
+				return err
+			}
+			req.TTLRequested = ttl
 		}
 		rules, err := q.ActiveStanding(ctx, h.ID, now)
 		if err != nil {
@@ -569,7 +594,7 @@ func (s *Server) handleGrants(w http.ResponseWriter, r *http.Request, h *store.H
 	}
 	out := api.GrantList{Grants: []api.GrantSummary{}}
 	for _, g := range gs {
-		out.Grants = append(out.Grants, api.GrantSummary{ID: g.ID, Kind: g.Kind, Status: g.Status(now), TargetHost: g.TargetHost,
+		out.Grants = append(out.Grants, api.GrantSummary{Indefinite: g.NotAfter.Equal(untilRevoked), ID: g.ID, Kind: g.Kind, Status: g.Status(now), TargetHost: g.TargetHost,
 			LoginUser: g.LoginUser, NotBefore: g.NotBefore, NotAfter: g.NotAfter, Scope: g.Scope, ScopeParams: g.ScopeParams, Mode: g.Mode})
 	}
 	writeJSON(w, http.StatusOK, out)
