@@ -165,7 +165,26 @@ Evidence reviewed **21 November 2026**; these are published results, not tests o
 
 **Release gates.** Round-trip a test wrap twice with independent UV assertions per supported device/browser/transport. Include cancellation, missing PRF on `create` and `get`, differing results across sync, lost last PRF key and recovery without *any* login key. Run Go/TS vectors for context encoding, wrong salts, swapped wraps/roles/versions, tampered HPKE public key/packets, check failures, stale epochs and replay. Test crash at each cutover/rotation boundary, locked update/rollback, expired TLS leaf, cold lock push, no private-key reads on boot, no raw PRF in either ceremony JSON, logs or DB/WAL. Race lock against auto/standing, proxy, sweep, mint and one-shot delivery. Race batch vs cancel and window vs close, logout, idle, policy revision, opener removal and excluded actions on legacy and scoped routes. Verify every denied path leaves authority unchanged.
 
-## Open questions for the owner
+## Owner decisions (2026-11-21)
+
+1. **Any single enrolled, unlock-capable passkey unlocks** — Apple, a password-manager passkey or
+   a hardware authenticator; no two-person or two-device rule ("we don't need an extreme level of
+   security"). A passkey is unlock-capable only if its provider returns a stable PRF result
+   (tested at enrollment, shown on the Admin passkey list); a passkey without PRF still signs in
+   and approves. Recovery: a dedicated offline recovery key held by the owner. Before sealing goes
+   live, a drill: unlock with one tested passkey and recover with the recovery key alone.
+2. **Unlocking through the Cloudflare-served approval page is acceptable**, with the per-attempt
+   encryption described above. An off-edge unlock origin is optional later work.
+3. **Accepted exceptions:** the agent-API TLS leaf key stays a protected service-readable file,
+   and a separate lock-alert publisher keeps its own ntfy credential.
+4. **Build and enable both now:** exact-action batches **and** approval windows. Windows are on by
+   default for the owner's own organisation with conservative defaults (configurable on the Admin
+   page: duration and idle timeout), with the always-tap exclusions in this document; client and
+   club organisations default to off but are configurable per organisation.
+5. **One tap may unlock and open a window, and that combination is on by default** (the unlock
+   screen shows the window that will open and lets the owner untick it).
+
+## Open questions for the owner (answered above, kept for the record)
 
 1. Which two independent credential/device paths should pass the first unlock drill? Is a dedicated offline age identity with a separately held spare acceptable?
 2. Is the Cloudflare-served unlock page acceptable given active-edge PRF theft, or is an independently trusted approval path a prerequisite?
