@@ -415,4 +415,13 @@ grep -q '"standing_indefinite":true' "$T/standing-owner.err" && grep -q '"standi
 owner state | bun -e 'if(!(await Bun.stdin.json()).standing.some(x=>x.indefinite)) process.exit(1)' || fail 'standing duration missing from active list'
 ok 'stale policy refused, explicit indefinite scope approval, sensitive cap and immediate revoke'
 
+source "$ROOT/test/interop/seal.sh"
+seal_cutover
+"$AQMAS" cf scopes --json >/dev/null || fail 'locked public catalogue'
+"$AQMAS" cf request cf.read --ttl 5m --why 'queue while locked' --json >"$T/locked-cf.out" 2>"$T/locked-cf.err" &
+RPID=$!; RID=$(owner wait cloudflare interop-host 20); owner seal-eval; owner approve "$RID" 300 >/dev/null; wait "$RPID"
+cfapi GET /zones --why 'sealed proxy parent' >/dev/null || fail 'sealed proxy forward'
+for token in "$PROXY_TOK" "$MINTER_TOK"; do
+  if grep -aFl "$token" "$T/data/aqmas.db" "$T/data/aqmas.db-wal" "$T"/seal-*.log "$T"/locked-cf.* "$T/data"/seal-stage-*/inventory.json 2>/dev/null | grep -q .; then fail 'sealed parent leaked'; fi
+done
 echo "interop-cf: ALL OK"

@@ -149,6 +149,7 @@ export interface PasskeyInfo {
 }
 
 export interface UIState {
+  seal_enabled?: boolean;
   catalogue_enabled?:boolean;
   migration?:{id:string;plan:string;recovery_sha256:string};
   owner: UIOwner;

@@ -49,7 +49,9 @@ const (
 
 // Options configures a Server.
 type Options struct {
-	Maintenance bool // supervised, login and personal cutover only
+	ConfigPath  string // reread frozen source configuration before supervised import commits
+	SealSetup   bool   // supervised seal import, never serve agents
+	Maintenance bool   // supervised, login and personal cutover only
 	Config      *config.Config
 	Logger      *slog.Logger
 	Now         func() time.Time // for tests; default time.Now
@@ -64,6 +66,9 @@ type Options struct {
 
 // Server is a running aqmasd instance.
 type Server struct {
+	configPath      string
+	seal            *sealRuntime
+	sealSetup       bool
 	maintenance     bool
 	cutover         *cutoverReview // installed before opening the maintenance web listener
 	profileRevision string
@@ -105,17 +110,38 @@ func New(o Options) (*Server, error) {
 	} else if st.Mode().Perm()&0o022 != 0 {
 		return nil, fmt.Errorf("data_dir %s is group/other writable (mode %v)", cfg.DataDir, st.Mode().Perm())
 	}
-	if o.Maintenance {
+	if o.Maintenance || cfg.Seal.Required || o.SealSetup {
 		if _, err := os.Stat(DBPath(cfg.DataDir)); err != nil {
 			return nil, fmt.Errorf("cutover requires an existing database: %w", err)
 		}
 	}
-	p, err := pki.Load(CADir(cfg.DataDir), cfg.TLSSANs, !o.Maintenance)
+	if o.Maintenance && cfg.Seal.Required {
+		return nil, errors.New("personal cutover is unavailable on a seal-required installation")
+	}
+	// Check the format gate first. In particular a rejected (newer) DB must
+	// not create replacement CAs before failing closed.
+	st, err := store.Open(DBPath(cfg.DataDir))
 	if err != nil {
 		return nil, err
 	}
-	st, err := store.Open(DBPath(cfg.DataDir))
+	sealed, err := sealBoot(cfg, st, o.SealSetup)
 	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	var p *pki.PKI
+	if sealed || o.SealSetup {
+		p, err = pki.LoadPublic(CADir(cfg.DataDir))
+		if err == nil && !o.SealSetup {
+			if leafErr := p.LoadLeaf(cfg.TLSSANs); leafErr != nil {
+				o.Logger.Error("agent TLS leaf unavailable: agent listener disabled; unlock remains reachable")
+			}
+		}
+	} else {
+		p, err = pki.Load(CADir(cfg.DataDir), cfg.TLSSANs, !o.Maintenance)
+	}
+	if err != nil {
+		st.Close()
 		return nil, err
 	}
 	// The DB holds no secrets but is the authority for who may approve: keep it private.
@@ -154,7 +180,9 @@ func New(o Options) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg: cfg, log: o.Logger, now: o.Now, store: st, pki: p, wa: wa, rpID: rpID, ownerID: ownerID, maintenance: o.Maintenance,
+		configPath: o.ConfigPath,
+		sealSetup:  o.SealSetup,
+		cfg:        cfg, log: o.Logger, now: o.Now, store: st, pki: p, wa: wa, rpID: rpID, ownerID: ownerID, maintenance: o.Maintenance,
 		notify: &notify.Notifier{TopicURL: cfg.Ntfy.TopicURL, Client: o.HTTPClient, Log: o.Logger},
 	}
 	for _, t := range cfg.Targets {
@@ -178,7 +206,17 @@ func New(o Options) (*Server, error) {
 		st.Close()
 		return nil, err
 	}
-	if cfg.Cloudflare.Enabled && !s.maintenance {
+	if sealed {
+		if err = s.loadSeal(); err != nil {
+			st.Close()
+			return nil, err
+		}
+		s.setupSealedNotices(o.HTTPClient)
+	}
+	if o.SealSetup {
+		s.notify = &notify.Notifier{}
+	}
+	if cfg.Cloudflare.Enabled && !s.maintenance && !o.SealSetup {
 		if err := s.setupCloudflare(o); err != nil {
 			st.Close()
 			return nil, err
@@ -188,7 +226,18 @@ func New(o Options) (*Server, error) {
 }
 
 // Close releases the store.
-func (s *Server) Close() error { return s.store.Close() }
+func (s *Server) Close() error {
+	if z := s.seal; z != nil {
+		z.attempts.Close()
+		if z.gate != nil {
+			z.gate.Drain()
+		}
+		if z.stage != nil {
+			z.stage.mk.Destroy()
+		}
+	}
+	return s.store.Close()
+}
 
 // PKI exposes the loaded key material (for tests and print commands).
 func (s *Server) PKI() *pki.PKI { return s.pki }
@@ -203,6 +252,12 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	defer lock.Close()
+	if s.seal != nil {
+		if _, err := s.store.DB().ExecContext(ctx, `DELETE FROM challenges`); err != nil {
+			return err
+		}
+		s.publishLockStatus("locked")
+	}
 	agentLn, err := net.Listen("tcp", s.cfg.ListenAgent)
 	if err != nil {
 		return err
@@ -216,6 +271,13 @@ func (s *Server) Run(ctx context.Context) error {
 		if err := s.prepareRecovery(ctx); err != nil {
 			webLn.Close()
 			agentLn.Close()
+			return err
+		}
+	}
+	if s.sealSetup {
+		if err = s.newStage(); err != nil {
+			agentLn.Close()
+			webLn.Close()
 			return err
 		}
 	}
@@ -239,16 +301,26 @@ func (s *Server) Run(ctx context.Context) error {
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
 	}
 	errc := make(chan error, 2)
-	go func() { errc <- agentSrv.ServeTLS(agentLn, "", "") }()
+	if s.sealSetup || s.pki.ServerLeaf == nil {
+		agentLn.Close()
+	} else {
+		go func() { errc <- agentSrv.ServeTLS(agentLn, "", "") }()
+	}
 	go func() { errc <- webSrv.Serve(webLn) }()
-	if !s.maintenance {
+	if !s.maintenance && !s.sealSetup {
 		go s.sweeper(ctx)
 	}
-	if !s.maintenance && s.cfg.Updates.Repo != "" {
+	if !s.maintenance && !s.sealSetup && s.cfg.Updates.Repo != "" {
 		go s.pollUpdates(ctx)
 	}
 	s.log.Info("aqmasd listening", "agent", agentLn.Addr().String(), "web", webLn.Addr().String())
+	var lockStop <-chan struct{}
+	if s.seal != nil {
+		lockStop = s.seal.stop
+	}
 	select {
+	case <-lockStop:
+		err = errors.New("broker relocking; restart required")
 	case <-ctx.Done():
 	case err = <-errc:
 	}
@@ -276,7 +348,11 @@ func (s *Server) sweeper(ctx context.Context) {
 			} else if n > 0 {
 				s.bcast.notify()
 			}
-			s.cfSweep(ctx)
+			s.optionalLease(ctx, func(ctx context.Context) {
+				if s.authorisedWork(ctx) {
+					s.cfSweep(ctx)
+				}
+			})
 		}
 	}
 }

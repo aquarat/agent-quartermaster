@@ -48,7 +48,11 @@ func (s *Server) issueGrant(ctx context.Context, q *store.Q, req *store.Request,
 		return nil, err
 	}
 	g.Serial = serial
-	cert, err := sshcert.Sign(s.pki.SSHSigner, sshcert.Params{
+	p, err := s.signer(ctx, "ssh-ca")
+	if err != nil {
+		return nil, err
+	}
+	cert, err := sshcert.Sign(p.SSHSigner, sshcert.Params{
 		Serial:        uint64(serial),
 		KeyID:         fmt.Sprintf("aqmas:%s:%s:%s", g.ID, req.HostName, tgt.Name),
 		Principals:    g.Principals,
@@ -523,7 +527,11 @@ func (s *Server) apply(ctx context.Context, sg canon.Signed, passkeyID int64) er
 					return err
 				}
 			}
-			der, err := s.pki.IssueClientCert(csr, e.Hostname, now, s.cfg.ClientCertDays)
+			p, err := s.signer(ctx, "internal-ca")
+			if err != nil {
+				return err
+			}
+			der, err := p.IssueClientCert(csr, e.Hostname, now, s.cfg.ClientCertDays)
 			if err != nil {
 				return err
 			}

@@ -43,6 +43,8 @@ export interface ApiOptions {
 }
 
 export interface Api {
+  sealStatus?(): Promise<import('./sealPanel').SealView>;
+  sealPost?<T>(path: 'unlock/challenge'|'unlock/finish'|'control/challenge'|'control/finish', body: unknown): Promise<T>;
   catalogue?():Promise<import('./catalogue').Catalogue|null>;
   migration?():Promise<{id:string;plan:string;recovery_sha256:string}|null>;
   hosts(): Promise<HostInfo[]>;
@@ -110,6 +112,8 @@ export function createApi(opts: ApiOptions = {}): Api {
   }
 
   return {
+    sealStatus: () => call('GET','/api/ui/seal/status'),
+    sealPost: (path,body) => call('POST',`/api/ui/seal/${path}`,body),
     hosts: () => call('GET','/api/ui/hosts'),
     updates: () => call('GET','/api/ui/updates'),
     migration: () => call('GET','/api/ui/migration'),

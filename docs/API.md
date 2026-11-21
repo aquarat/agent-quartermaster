@@ -563,3 +563,37 @@ On the agent API listener (`:8443`, mTLS client certificate required).
   `aqmas: approve cloudflare cf.dns.edit zone=example.com (proxy) for hosta, ttl 7200s, standing 0h [ref ABC123]`.
 - Audit entries for Cloudflare: `cf_auto_approve`, `cf_write`, `cf_refused`, `cf_token_mint`,
   `cf_token_delete`, `cf_token_orphan` (object `grant:<id>` or `request:<id>`).
+# Sealed ceremony profile (schema 8)
+
+See [the supervised procedure](SEAL-OPERATIONS.md). Session/CSRF/Access
+requirements are unchanged. `GET /api/ui/seal/status` returns the mode,
+boot/lock epoch, installation and session-visible unlock selections.
+`POST /api/ui/seal/unlock/challenge` takes `credential` (the public passkey
+row identifier) and, for supervised wrap setup, `registration_id`. The response
+is `{attempt_id,canonical,publicKey}`. For canonical `v=3,object="seal"` the
+exact sorted fields are `action,credential_id,epoch,id,installation,issued_at,
+mk_version,nonce,object,prf_salt,recipient,rp_id,suite,v` plus `registration_id`
+for `wrap-enroll` only. Binary fields are unpadded base64url, UTC time at
+second precision; generation, suite and version are integers. The selected
+raw credential and its salt must match the sole allowed ID and `prf.eval.first`.
+Never evaluate PRF for an ordinary assertion or send extension results.
+
+Suite 1 uses Appendix A length-prefixed tuples with **version uint64(1)**.
+At-rest records are one suite byte `01` || 24-byte random nonce || XChaCha
+ciphertext and tag. The key-check marker is `aqmas installation master key
+check`. Recovery uses `filippo.io/age`, with the canonical `age1…` recipient
+string in the recovery tuple. For RFC 9180 base mode use SEC1 uncompressed
+P-256 / HKDF-SHA256 / AES-128-GCM. `info` role `hpke-finish`: installation,
+purpose; AAD role `hpke-aad`: raw attempt ID, epoch, SHA-256(canonical).
+Plaintext is u32be(32), KEK, u32be(assertion length), UTF-8 assertion JSON
+(≤16 KiB). Finish takes only `{attempt_id,enc,ciphertext}`; packet fields are
+unpadded base64url. An attempt is consumed before packet verification. An
+assertion is still required inside the packet; HPKE is not authentication.
+
+`POST /api/ui/seal/control/challenge` accepts `action=lock|activate`.
+`object="seal-control",v=3` fields are `action,epoch,id,issued_at,nonce,object,v`
+where id is installation. Activate additionally signs `manifest`, the complete
+public JSON transition manifest as a string. Finish (`control/finish`) takes
+the standard `challenge_id,assertion`. No PRF. There is no unsigned import or
+unlock on restart. Authorised but locked secret operations return 423 `locked`;
+request and enrollment polls may retry without resetting their deadlines.

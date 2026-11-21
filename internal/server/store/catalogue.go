@@ -9,8 +9,20 @@ import (
 )
 
 func (q *Q) MarkPolicySchema(ctx context.Context) error {
+	var version int
+	if err := q.q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	if version >= 7 {
+		return nil
+	}
 	_, err := q.q.ExecContext(ctx, `PRAGMA user_version=7`)
 	return err
+}
+
+func (q *Q) CheckSealWrap(ctx context.Context, row int64, v uint64, salt, wrap []byte) error {
+	var ok int
+	return q.q.QueryRowContext(ctx, `SELECT 1 FROM seal_wraps WHERE passkey=? AND generation=? AND salt=? AND wrap=?`, row, v, salt, wrap).Scan(&ok)
 }
 
 func (q *Q) rows(ctx context.Context, query string, visit func(*sql.Rows) error, args ...any) error {

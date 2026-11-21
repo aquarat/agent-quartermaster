@@ -26,6 +26,8 @@ import (
 	"slices"
 	"time"
 
+	"github.com/aquarat/agent-quartermaster/internal/server/secretfile"
+
 	"golang.org/x/crypto/ssh"
 )
 
@@ -46,6 +48,7 @@ var ErrNotInitialised = errors.New("pki: key material not found (start `aqmasd s
 type PKI struct {
 	Dir        string
 	SSHSigner  ssh.Signer
+	SSHPublic  ssh.PublicKey // trust metadata; available without the signer
 	CACert     *x509.Certificate
 	CAKey      *ecdsa.PrivateKey
 	CAPEM      []byte
@@ -109,14 +112,7 @@ func LoadCAs(dir string) (*PKI, error) {
 
 // readSecret reads a private key file, refusing it when group/other have any access.
 func readSecret(path string) ([]byte, error) {
-	st, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if st.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("pki: refusing %s: mode %v is group/other accessible (want 0600)", path, st.Mode().Perm())
-	}
-	return os.ReadFile(path)
+	return secretfile.Read(path, false, 64<<10)
 }
 
 // writeFile writes atomically with the given mode.
@@ -186,12 +182,13 @@ func (p *PKI) loadSSHCA(create bool) error {
 		return errors.New("pki: ssh ca key is not ed25519")
 	}
 	p.SSHSigner = signer
+	p.SSHPublic = signer.PublicKey()
 	return nil
 }
 
 // SSHCAPublicLine returns the SSH user CA public key in authorized_keys format (one line).
 func (p *PKI) SSHCAPublicLine() string {
-	return string(bytes.TrimSpace(ssh.MarshalAuthorizedKey(p.SSHSigner.PublicKey()))) + " aqmas-user-ca"
+	return string(bytes.TrimSpace(ssh.MarshalAuthorizedKey(p.SSHPublic))) + " aqmas-user-ca"
 }
 
 func randSerial() *big.Int {
@@ -266,7 +263,8 @@ func (p *PKI) loadClientCA(create bool) error {
 	if err != nil {
 		return err
 	}
-	if !cert.PublicKey.(*ecdsa.PublicKey).Equal(&ek.PublicKey) {
+	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok || !pub.Equal(&ek.PublicKey) {
 		return errors.New("pki: client CA cert does not match key")
 	}
 	p.CAKey, p.CACert = ek, cert

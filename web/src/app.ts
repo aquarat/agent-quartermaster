@@ -53,6 +53,7 @@ import type { AuditEntry, GrantSummary, PasskeyChange, PasskeyInfo, PendingCloud
 import { hostCard, updateCard, type UpdateView, type HostInfo } from './admin';
 import { helpPage, type HelpConfig } from './help';
 import {cataloguePage,type Catalogue} from './catalogue';
+import {sealPanel,type SealView} from './sealPanel';
 
 function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/help' ? 'help' : 'queue'; }
 function nav(label:string,hash:string,title:string) { const a=h('a',{title,'aria-label':title},label); a.href=hash; return a; }
@@ -82,6 +83,7 @@ export class App {
   private pollTimer: number | undefined;
   private refreshing = false;
   private page = route();
+  private seal?: SealView;
   private hosts: HostInfo[]=[];
   private updates?: UpdateView;
   private catalogue?: Catalogue|null;
@@ -141,6 +143,7 @@ export class App {
     const requested=route();
     try {
       const s = await this.api.state();
+      this.seal=s.seal_enabled?await this.api.sealStatus!():undefined;
       this.migration=s.migration;
       if(requested==='admin') [this.hosts,this.updates]=await Promise.all([this.api.hosts(),this.api.updates()]);
       if(requested==='admin')this.catalogue=s.catalogue_enabled?await this.api.catalogue?.():null;
@@ -398,6 +401,7 @@ export class App {
         h("aside", { class: "col col-activity", "aria-labelledby": "sec-recent-h" }, section("recent", "Recent activity", "", filters)),
       ),
     );
+    if(this.seal)this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));
     this.renderSections();
     this.schedulePoll();
   }
@@ -405,6 +409,7 @@ export class App {
   private renderSections(): void {
     const s = this.state;
     if (!s || this.view !== "main") return;
+    if(this.seal){if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));this.section('seal',this.seal,()=>[sealPanel(this.api,this.auth,this.seal!,()=>this.changed())]);}
     if(this.page!=='queue'){
       document.title=`${this.page==='admin'?'Admin':'Help'} · aqmas`;
       if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);if(this.updates)this.section('updates',[this.updates,this.migration],()=>this.migration?[h('h3',null,'personal · Organisation cutover'),h('p',null,'Fleet access is paused. Compare the recovery digest and review each admission, credential set and authority retirement before signing.'),h('button',{type:'button',class:'btn approve',on:{click:()=>this.sheet.openMigration({object:'migration',id:this.migration!.id,facts:{plan:this.migration!.plan,recovery_sha256:this.migration!.recovery_sha256}})}},'Review personal activation…')]:[updateCard(this.updates!,t=>this.sheet.openUpdate(t))]);}

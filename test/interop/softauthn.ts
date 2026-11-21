@@ -20,7 +20,7 @@ const cat = (...parts: Uint8Array[]) => {
   return out;
 };
 const ab = (u: Uint8Array) => u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength) as ArrayBuffer;
-const sha256 = async (b: Uint8Array) => new Uint8Array(await crypto.subtle.digest("SHA-256", b));
+const sha256 = async (b: Uint8Array) => new Uint8Array(await crypto.subtle.digest("SHA-256", ab(b)));
 const be32 = (n: number) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
 
 export function b64url(b: ArrayBuffer | ArrayBufferView): string {
@@ -55,6 +55,7 @@ function der(sig: Uint8Array): Uint8Array {
 }
 
 export interface SavedAuthenticator {
+  prfSecret?: string;
   privateJwk: JsonWebKey;
   publicJwk: JsonWebKey;
   credId: string;
@@ -71,10 +72,11 @@ export interface SoftAuthenticator {
 
 export async function softAuthenticator(origin: string, saved?: SavedAuthenticator): Promise<SoftAuthenticator> {
   let key: CryptoKeyPair | undefined;
-  let credId = new Uint8Array();
-  let userHandle = new Uint8Array();
+  let credId: Uint8Array = new Uint8Array();
+  let userHandle: Uint8Array = new Uint8Array();
   let rpId = "";
   let counter = 0;
+  let prfSecret: Uint8Array | undefined;
   if (saved) {
     key = {
       privateKey: await crypto.subtle.importKey("jwk", saved.privateJwk, { name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]),
@@ -84,6 +86,7 @@ export async function softAuthenticator(origin: string, saved?: SavedAuthenticat
     userHandle = unb64url(saved.userHandle);
     rpId = saved.rpId;
     counter = saved.counter;
+    prfSecret = saved.prfSecret ? unb64url(saved.prfSecret) : undefined;
   }
   return {
     async create(o) {
@@ -92,6 +95,7 @@ export async function softAuthenticator(origin: string, saved?: SavedAuthenticat
       key = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
       const raw = new Uint8Array(await crypto.subtle.exportKey("raw", key.publicKey));
       credId = crypto.getRandomValues(new Uint8Array(32));
+      prfSecret = o.extensions?.prf ? crypto.getRandomValues(new Uint8Array(32)) : undefined;
       userHandle = u8(o.user.id as ArrayBuffer);
       rpId = o.rp.id!;
       const cose = cMap([[cInt(1), cInt(2)], [cInt(3), cInt(-7)], [cInt(-1), cInt(1)], [cInt(-2), cBytes(raw.slice(1, 33))], [cInt(-3), cBytes(raw.slice(33))]]);
@@ -103,12 +107,22 @@ export async function softAuthenticator(origin: string, saved?: SavedAuthenticat
         rawId: ab(credId),
         type: "public-key",
         authenticatorAttachment: "platform",
-        getClientExtensionResults: () => (o.extensions && (o.extensions as Record<string, unknown>).credProps ? { credProps: { rk: true } } : {}),
+        getClientExtensionResults: () => ({ ...(o.extensions?.credProps ? { credProps: { rk: true } } : {}), ...(prfSecret ? {prf:{enabled:true}} : {}) }),
         response: { clientDataJSON: ab(cd), attestationObject: ab(att), getTransports: () => ["internal", "hybrid"] },
       };
     },
     async get(o) {
       if (!key) throw new Error("no credential");
+      if (o.rpId && o.rpId !== rpId) throw new Error("credential belongs to another RP");
+      if (o.allowCredentials?.length && !o.allowCredentials.some(d => b64url(d.id as ArrayBuffer) === b64url(credId))) throw new Error("credential not allowed");
+      const salt = o.extensions?.prf?.eval?.first;
+      // Model the authenticator's credential-specific UV hmac-secret. The
+      // PRF extension hashes its domain prefix and input before evaluation.
+      let first: ArrayBuffer | undefined;
+      if (salt && prfSecret) {
+        const secret = await crypto.subtle.importKey("raw", ab(prfSecret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        first = await crypto.subtle.sign("HMAC", secret, ab(await sha256(cat(te.encode("WebAuthn PRF\0"), u8(salt as ArrayBuffer)))));
+      }
       if (o.userVerification !== "required") throw new Error("UI did not require UV");
       counter++;
       const authData = cat(await sha256(te.encode(o.rpId ?? rpId)), new Uint8Array([0x05]), be32(counter));
@@ -119,7 +133,7 @@ export async function softAuthenticator(origin: string, saved?: SavedAuthenticat
         rawId: ab(credId),
         type: "public-key",
         authenticatorAttachment: "platform",
-        getClientExtensionResults: () => ({}),
+        getClientExtensionResults: () => first ? {prf:{results:{first}}} : {},
         response: { clientDataJSON: ab(cd), authenticatorData: ab(authData), signature: ab(der(p1363)), userHandle: ab(userHandle) },
       };
     },
@@ -132,6 +146,7 @@ export async function softAuthenticator(origin: string, saved?: SavedAuthenticat
         userHandle: b64url(userHandle),
         rpId,
         counter,
+        ...(prfSecret ? {prfSecret:b64url(prfSecret)} : {}),
       };
     },
   };

@@ -1,0 +1,35 @@
+[Unit]
+Description=Publish fixed broker cold-lock and unavailable alerts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+User=aqmas-lock-alert
+StateDirectory=aqmas-lock-alert
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/aqmas-lock-alert.py
+LoadCredential=publish-token:/etc/aqmas-alert/publish-token
+LoadCredential=topic-url:/etc/aqmas-alert/topic-url
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+InaccessiblePaths=-/var/lib/aqmas -/etc/aqmas
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

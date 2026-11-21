@@ -3,16 +3,13 @@ package main
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -30,6 +27,8 @@ var version = "dev"
 const usage = `usage: aqmasd [-config PATH] <command>
 
 commands:
+  seal-import           isolated signed import of an activated personal installation
+  seal-drill BUNDLE SHA256 RECIPIENT   verify an offline bundle; reads age identity on stdin
   serve                 run the agent API and the approval web UI
   organisations-plan BACKUP   preview the personal cutover from a standalone SQLite online backup
   organisations-cutover       fence fleet access, create a recovery point and serve owner review
@@ -53,7 +52,7 @@ func main() {
 		os.Exit(2)
 	}
 	needsArg := fs.Arg(0) == "revoke-host" || fs.Arg(0) == "organisations-plan"
-	if fs.NArg() < 1 || needsArg != (fs.NArg() == 2) || fs.NArg() > 2 {
+	if !(fs.Arg(0) == "seal-drill" && fs.NArg() == 4) && (fs.NArg() < 1 || needsArg != (fs.NArg() == 2) || fs.NArg() > 2 || fs.Arg(0) == "seal-drill") {
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -64,6 +63,37 @@ func main() {
 }
 
 func run(cmd, cfgPath string, out io.Writer, args ...string) error {
+	if cmd == "seal-drill" {
+		if len(args) != 3 {
+			return fmt.Errorf("bundle, owner-recorded digest and recipient required")
+		}
+		if err := restrictDumps(); err != nil {
+			return err
+		}
+		st, err := os.Stdin.Stat()
+		if err != nil || st.Mode()&os.ModeCharDevice != 0 {
+			return fmt.Errorf("redirect offline identity on stdin")
+		}
+		id, err := io.ReadAll(io.LimitReader(os.Stdin, 4097))
+		defer clear(id)
+		if err != nil || len(id) > 4096 {
+			return fmt.Errorf("invalid identity input")
+		}
+		f, err := os.Open(args[0])
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		b, err := io.ReadAll(io.LimitReader(f, 524289))
+		if err != nil || len(b) > 524288 {
+			return fmt.Errorf("invalid bundle")
+		}
+		proof, err := server.RecoveryDrill(b, args[1], args[2], id)
+		if err == nil {
+			_, err = fmt.Fprintln(out, proof)
+		}
+		return err
+	}
 	if cmd == "version" {
 		ui := "embedded"
 		if webui.IsFallback() {
@@ -95,9 +125,12 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(plan)
-	case "serve", "organisations-cutover":
+	case "serve", "organisations-cutover", "seal-import":
+		if err := restrictDumps(); err != nil {
+			return fmt.Errorf("disable process dumps: %w", err)
+		}
 		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-		srv, err := server.New(server.Options{Config: cfg, Logger: log, Maintenance: cmd == "organisations-cutover"})
+		srv, err := server.New(server.Options{Config: cfg, ConfigPath: cfgPath, Logger: log, Maintenance: cmd == "organisations-cutover", SealSetup: cmd == "seal-import"})
 		if err != nil {
 			return err
 		}
@@ -120,7 +153,7 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		fmt.Fprintf(out, "%s\n\nOne-time passkey enroll code, valid 15 minutes, single use.\nOpen %s and register a passkey with it.\n", code, cfg.PublicBaseURL)
 		return nil
 	case "print-ssh-ca":
-		p, err := pki.LoadCAs(server.CADir(cfg.DataDir))
+		p, err := pki.LoadPublic(server.CADir(cfg.DataDir))
 		if err != nil {
 			return err
 		}
@@ -133,14 +166,14 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		fmt.Fprintf(out, "revoked %s (restarting aqmasd is not needed)\n", args[0])
 		return nil
 	case "tls-fingerprint":
-		p, err := pki.LoadCAs(server.CADir(cfg.DataDir))
+		p, err := pki.LoadPublic(server.CADir(cfg.DataDir))
 		if err != nil {
 			return err
 		}
 		fmt.Fprintln(out, p.CAPin())
 		return nil
 	case "print-client-ca":
-		p, err := pki.LoadCAs(server.CADir(cfg.DataDir))
+		p, err := pki.LoadPublic(server.CADir(cfg.DataDir))
 		if err != nil {
 			return err
 		}
@@ -152,27 +185,11 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 
 // Only public CA material is needed on the machine inspecting the backup.
 func inventoryPins(dir string) (string, string, error) {
-	b, err := os.ReadFile(filepath.Join(dir, pki.SSHCAPubFile))
+	p, err := pki.LoadPublic(dir)
 	if err != nil {
 		return "", "", err
 	}
-	key, _, _, rest, err := ssh.ParseAuthorizedKey(b)
-	if err != nil || len(rest) != 0 || key.Type() != ssh.KeyAlgoED25519 {
-		return "", "", fmt.Errorf("invalid SSH CA public key")
-	}
-	b, err = os.ReadFile(filepath.Join(dir, pki.ClientCACrtFile))
-	if err != nil {
-		return "", "", err
-	}
-	block, rest := pem.Decode(b)
-	if block == nil || block.Type != "CERTIFICATE" || len(rest) != 0 {
-		return "", "", fmt.Errorf("invalid TLS CA certificate")
-	}
-	crt, err := x509.ParseCertificate(block.Bytes)
-	if err != nil || !crt.IsCA {
-		return "", "", fmt.Errorf("invalid TLS CA certificate")
-	}
-	return ssh.FingerprintSHA256(key), "sha256:" + pki.CertFingerprint(crt.Raw), nil
+	return ssh.FingerprintSHA256(p.SSHPublic), p.CAPin(), nil
 }
 
 // checkUser refuses to run as root when the data dir belongs to another user, so root never

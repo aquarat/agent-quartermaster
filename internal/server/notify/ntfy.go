@@ -12,6 +12,9 @@ import (
 
 // Notifier sends notifications; the zero value (empty TopicURL) does nothing.
 type Notifier struct {
+	// Dispatch is used by the sealed broker. It takes responsibility for the
+	// operation lease, including the HTTP response, or coalesces a cold notice.
+	Dispatch func(title, text, clickURL string)
 	TopicURL string
 	Client   *http.Client
 	Log      *slog.Logger
@@ -19,6 +22,10 @@ type Notifier struct {
 
 // Send publishes asynchronously.
 func (n *Notifier) Send(title, text, clickURL string) {
+	if n != nil && n.Dispatch != nil {
+		n.Dispatch(title, text, clickURL)
+		return
+	}
 	if n == nil || n.TopicURL == "" {
 		return
 	}
@@ -39,11 +46,16 @@ func clean(s string, max int) string {
 }
 
 func (n *Notifier) send(title, text, clickURL string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	n.Publish(context.Background(), title, text, clickURL)
+}
+
+// Publish runs synchronously within the caller's lease.
+func (n *Notifier) Publish(parent context.Context, title, text, clickURL string) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.TopicURL, strings.NewReader(clean(text, 300)+"\n"+clickURL))
 	if err != nil {
-		n.logErr(err)
+		n.logErr()
 		return
 	}
 	req.Header.Set("Title", clean(title, 120))
@@ -54,9 +66,11 @@ func (n *Notifier) send(title, text, clickURL string) {
 	if c == nil {
 		c = &http.Client{Timeout: 10 * time.Second}
 	}
-	resp, err := c.Do(req)
+	client := *c
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
 	if err != nil {
-		n.logErr(err)
+		n.logErr()
 		return
 	}
 	resp.Body.Close()
@@ -67,9 +81,9 @@ func (n *Notifier) send(title, text, clickURL string) {
 	}
 }
 
-func (n *Notifier) logErr(err error) {
+func (n *Notifier) logErr() {
 	if n.Log != nil {
 		// The topic URL is a capability; don't log it (url.Error includes it).
-		n.Log.Warn("ntfy publish failed", "error", strings.ReplaceAll(err.Error(), n.TopicURL, "<topic>"))
+		n.Log.Warn("ntfy publish failed")
 	}
 }

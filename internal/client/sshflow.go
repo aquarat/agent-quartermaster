@@ -227,6 +227,7 @@ func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.Reques
 	}
 	failures := 0
 	first := true
+	lockNotice := false
 	for {
 		wait := 25 * time.Second
 		if first && created.Status != api.StatusPending {
@@ -236,6 +237,20 @@ func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.Reques
 		start := time.Now()
 		st, err := c.RequestStatus(ctx, created.ID, wait)
 		if err != nil {
+			var ae *APIError
+			if errors.As(err, &ae) && ae.HTTPStatus == 423 && ae.Code == "locked" {
+				if !lockNotice {
+					e.logf("waiting for owner unlock")
+					lockNotice = true
+				}
+				if !deadline.IsZero() && time.Now().After(deadline) {
+					return nil, &DecisionError{Status: api.StatusExpired, What: what, Note: "deadline passed while locked"}
+				}
+				if err = sleepCtx(ctx, 2*time.Second); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			if transient(err) && failures < 5 {
 				failures++
 				if err := sleepCtx(ctx, time.Duration(failures)*e.retryBase()); err != nil {

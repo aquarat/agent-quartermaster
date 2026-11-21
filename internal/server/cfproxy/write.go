@@ -118,7 +118,7 @@ func (p *Proxy) serveWrite(w http.ResponseWriter, r *http.Request, c Caller, cal
 	refuseW := func(rf *refusal, audit bool) { p.refused(ctx, w, c, call, gid, rf, audit, false) }
 
 	// The upload JWT (J routes) replaces the parent token.
-	auth := "Bearer " + p.o.ProxyToken
+	auth := "" // empty selects the parent only in do(), at dispatch
 	if route.JWTPassthrough {
 		a := r.Header.Get("Authorization")
 		if !strings.HasPrefix(a, "Bearer ") || len(a) < 8 || strings.ContainsAny(a, "\r\n") {

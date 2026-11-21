@@ -24,6 +24,7 @@ const DefaultPath = "/etc/aqmas/config.toml"
 
 // Config is the whole aqmasd configuration.
 type Config struct {
+	Seal               Seal     `toml:"seal"`
 	Updates            Updates  `toml:"updates"`
 	AgentAPIURL        string   `toml:"agent_api_url"`
 	CLIDownloadBaseURL string   `toml:"cli_download_base_url"`
@@ -43,6 +44,15 @@ type Config struct {
 	// Cloudflare configures milestone 2 (docs/CLOUDFLARE.md section 6). Absent or
 	// enabled=false: kind "cloudflare" requests are refused and /cf/ is not served.
 	Cloudflare Cloudflare `toml:"cloudflare"`
+}
+
+// Seal is an operator pin. Its presence fences legacy serving even if the
+// entire database was replaced with an older backup. Legacy binaries reject
+// the unknown TOML keys. A staged pin is valid in maintenance only.
+type Seal struct {
+	Required  bool   `toml:"required"`
+	Recipient string `toml:"recipient"`
+	Manifest  string `toml:"manifest_sha256"`
 }
 
 // TTL is the grant lifetime policy.
@@ -180,6 +190,9 @@ func Defaults() *Config {
 
 // Validate checks the configuration for consistency.
 func (c *Config) Validate() error {
+	if c.Seal != (Seal{}) && (!c.Seal.Required || c.Seal.Recipient == "" || c.Seal.Manifest != "" && !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(c.Seal.Manifest)) {
+		return fmt.Errorf("config: invalid seal pin")
+	}
 	for key, v := range map[string]string{"agent_api_url": c.AgentAPIURL, "cli_download_base_url": c.CLIDownloadBaseURL} {
 		if v == "" {
 			continue

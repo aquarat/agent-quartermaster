@@ -99,6 +99,20 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const [cmd, ...args] = process.argv.slice(2);
 try {
   switch (cmd) {
+    case 'seal-status': console.log((await api.sealStatus()).mode);break;
+    case 'seal-eval': {
+      const v=await api.sealStatus();const choice=v.choices.find((c:any)=>c.name===active);if(!choice)throw Error('no choice for active credential');
+      const b=await api.sealPost('unlock/challenge',{credential:choice.id,registration_id:choice.selection.registration_id});
+      const prepared=await (await import(`${web}/src/seal.ts`)).prepareSeal(choice.selection,b,new URL(origin).hostname);
+      const packet=await prepared.finish(auth);await api.sealPost('unlock/finish',packet);
+      let refused=false;try{await api.sealPost('unlock/finish',packet)}catch{refused=true}if(!refused)throw Error('replayed seal packet');break;
+    }
+    case 'seal-lock':case 'seal-activate': {
+      const action=cmd==='seal-lock'?'lock':'activate',v=await api.sealStatus();const b=await api.sealPost('control/challenge',{action});
+      const opts=await (await import(`${web}/src/sealPanel.ts`)).prepareControl(v,action,b,new URL(origin).hostname);
+      const {encodeAssertion}=await import(`${web}/src/webauthn.ts`);
+      await api.sealPost('control/finish',{challenge_id:b.challenge_id,assertion:encodeAssertion(await auth.get(opts))});break;
+    }
     case 'catalogue':{const {exerciseCatalogue}=await import('./catalogue');await exerciseCatalogue(api,auth,args[0]??'create');break;}
     case 'activate-personal': {
       const m=await api.migration!(); if(!m)throw Error('no fenced cutover'); const p=await flows.prepareAction(api,{object:'migration',id:m.id,facts:{plan:m.plan,recovery_sha256:m.recovery_sha256}},{action:'activate'});

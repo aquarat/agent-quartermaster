@@ -31,7 +31,7 @@ const (
 
 // AgentHandler returns the agent API handler (serve it with PKI().TLSConfig()).
 func (s *Server) AgentHandler() http.Handler {
-	if s.maintenance {
+	if s.maintenance || s.sealSetup {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "organisation cutover: fleet access paused", http.StatusServiceUnavailable)
 		})
@@ -41,9 +41,12 @@ func (s *Server) AgentHandler() http.Handler {
 	mux.Handle("GET /v1/releases/{version}/{asset}", s.requireHost(s.releaseAsset))
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
 	mux.HandleFunc("GET /v1/enroll/{id}", s.handleEnrollStatus)
-	mux.Handle("POST /v1/requests", s.requirePersonal(s.handleCreateRequest))
+	create := func(w http.ResponseWriter, r *http.Request, h *store.Host) {
+		s.optionalLease(r.Context(), func(ctx context.Context) { s.handleCreateRequest(w, r.WithContext(ctx), h) })
+	}
+	mux.Handle("POST /v1/requests", s.requirePersonal(create))
 	if s.store.Q().Scoped() {
-		mux.Handle("POST /v2/personal/requests", s.requirePersonal(s.handleCreateRequest))
+		mux.Handle("POST /v2/personal/requests", s.requirePersonal(create))
 	}
 	mux.Handle("GET /v1/requests/{id}", s.requirePersonal(s.handleRequestStatus))
 	mux.Handle("POST /v1/requests/{id}/cancel", s.requirePersonal(s.handleCancel))
@@ -249,19 +252,26 @@ func (s *Server) handleEnrollStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
-	out := api.EnrollStatus{ID: e.ID, Status: e.Status}
-	if e.Status == api.StatusApproved && !e.CertDelivered {
-		ok, err := s.store.Q().MarkCertDelivered(ctx, e.ID)
-		if err != nil {
-			s.writeErr(w, r, err)
-			return
+	s.optionalLease(ctx, func(ctx context.Context) {
+		w := s.deliveryWriter(ctx, w)
+		out := api.EnrollStatus{ID: e.ID, Status: e.Status}
+		if e.Status == api.StatusApproved && !e.CertDelivered {
+			if !s.authorisedWork(ctx) {
+				s.writeErr(w, r, lockedErr())
+				return
+			}
+			ok, err := s.store.Q().MarkCertDelivered(ctx, e.ID)
+			if err != nil {
+				s.writeErr(w, r, err)
+				return
+			}
+			if ok {
+				out.ClientCertPEM = e.CertPEM
+				out.CACertPEM = string(s.pki.CAPEM)
+			}
 		}
-		if ok {
-			out.ClientCertPEM = e.CertPEM
-			out.CACertPEM = string(s.pki.CAPEM)
-		}
-	}
-	writeJSON(w, http.StatusOK, out)
+		writeJSON(w, http.StatusOK, out)
+	})
 }
 
 // ---- access requests ----
@@ -410,6 +420,9 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		}
 		cand := policy.Candidate{HostID: h.ID, PeerAddress: req.PeerAddress, Kind: req.Kind, Target: req.TargetHost, LoginUser: req.LoginUser, TTL: ttl}
 		for _, st := range rules {
+			if !s.authorisedWork(ctx) {
+				break
+			}
 			rule := policy.Rule{HostID: st.HostID, PeerAddress: st.PeerAddress, Kind: st.Kind, Target: st.TargetHost, LoginUser: st.LoginUser,
 				MaxTTL: st.MaxTTL, ExpiresAt: st.ExpiresAt, Revoked: st.RevokedAt != nil}
 			if !policy.Matches(rule, cand, now) {
@@ -492,25 +505,29 @@ func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request, h *
 	if ctx.Err() != nil {
 		return
 	}
-	var out *api.RequestStatus
-	err = s.store.Tx(ctx, func(q *store.Q) error {
-		req, err := q.PersonalStatus(ctx, id, h.ID, s.now())
+	s.optionalLease(ctx, func(ctx context.Context) {
+		w := s.deliveryWriter(ctx, w)
+		r := r.WithContext(ctx)
+		var out *api.RequestStatus
+		err = s.store.Tx(ctx, func(q *store.Q) error {
+			req, err := q.PersonalStatus(ctx, id, h.ID, s.now())
+			if err != nil {
+				return mapNotFound(err)
+			}
+			out, err = s.requestStatus(ctx, q, req)
+			return err
+		})
 		if err != nil {
-			return mapNotFound(err)
+			s.writeErr(w, r, err)
+			return
 		}
-		out, err = s.requestStatus(ctx, q, req)
-		return err
+		// Token mode: the first poll after approval mints the child token and carries its value.
+		if err := s.deliverToken(w, r, h, out); err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
 	})
-	if err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	// Token mode: the first poll after approval mints the child token and carries its value.
-	if err := s.deliverToken(w, r, h, out); err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 // requestStatus builds the agent-facing status; the grant (with certificate) is included only
@@ -519,6 +536,9 @@ func (s *Server) requestStatus(ctx context.Context, q *store.Q, req *store.Reque
 	out := &api.RequestStatus{ID: req.ID, Kind: req.Kind, Status: req.Status, DecidedAt: req.DecidedAt, DecisionNote: req.DecisionNote}
 	if req.Status != api.StatusApproved {
 		return out, nil
+	}
+	if !s.authorisedWork(ctx) {
+		return nil, lockedErr()
 	}
 	g, err := q.GrantByRequest(ctx, req.ID)
 	if err != nil {
@@ -580,7 +600,7 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request, h *store.H
 func (s *Server) handleSSHCA(w http.ResponseWriter, r *http.Request, _ *store.Host) {
 	writeJSON(w, http.StatusOK, api.SSHCA{
 		PublicKey:   s.pki.SSHCAPublicLine(),
-		Fingerprint: ssh.FingerprintSHA256(s.pki.SSHSigner.PublicKey()),
+		Fingerprint: s.sshPin(),
 	})
 }
 

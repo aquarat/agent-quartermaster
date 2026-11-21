@@ -19,6 +19,8 @@ RestartSec=5
 # a cloudflare.snapshot_dir outside /var/lib/aqmas would also need ReadWritePaths=.
 StateDirectory=aqmas
 StateDirectoryMode=0700
+RuntimeDirectory=aqmas-lock
+RuntimeDirectoryMode=0755
 ConfigurationDirectory=aqmas
 ConfigurationDirectoryMode=0750
 UMask=0077
@@ -63,8 +65,13 @@ KeyringMode=private
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
+# These two calls on dedicated pages do not require IPC_LOCK within the
+# unit's memlock limit. Keep the rest of @privileged denied.
+SystemCallFilter=mlock munlock
 SystemCallErrorNumber=EPERM
 LimitNOFILE=4096
+LimitCORE=0
+LimitMEMLOCK=2M
 TasksMax=256
 
 [Install]

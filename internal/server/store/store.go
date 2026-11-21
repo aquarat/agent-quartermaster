@@ -85,7 +85,13 @@ func (s *Store) migrate(ctx context.Context) error {
 	if ver > len(migrations) {
 		// Version 6 is applied exclusively by the supervised signed cutover.
 		// Opening a schema-5 store must never select it (self-update rollback).
-		if (ver == 6 || ver == 7) && len(migrations) == 5 {
+		if (ver == 6 || ver == 7 || ver == 8) && len(migrations) == 5 {
+			if ver == 8 {
+				var marker int
+				if err := s.db.QueryRowContext(ctx, `SELECT singleton FROM seal_active WHERE singleton=1`).Scan(&marker); err != nil {
+					return fmt.Errorf("store: incomplete sealed activation: %w", err)
+				}
+			}
 			var marker int
 			if err := s.db.QueryRowContext(ctx, `SELECT singleton FROM personal_cutover WHERE singleton=1`).Scan(&marker); err != nil {
 				return fmt.Errorf("store: incomplete personal cutover: %w", err)

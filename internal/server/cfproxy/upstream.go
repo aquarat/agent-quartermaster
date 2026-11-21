@@ -56,6 +56,19 @@ func (p *Proxy) do(ctx context.Context, method, escPath, rawQuery string, body i
 			req.Header[h] = append([]string(nil), v...)
 		}
 	}
+	if auth == "" {
+		token := p.o.ProxyToken
+		if p.o.Parent != nil {
+			token, err = p.o.Parent(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if token == "" {
+			return nil, errors.New("cloudflare parent unavailable")
+		}
+		auth = "Bearer " + token
+	}
 	req.Header.Set("Authorization", auth)
 	req.Header.Set("User-Agent", userAgent)
 	resp, err := p.client.Do(req)
@@ -86,7 +99,7 @@ type apiResult struct {
 // get makes an aqmasd-internal GET with the parent token (snapshots, guard-rail lookups).
 func (p *Proxy) get(ctx context.Context, pathAndQuery string) (*apiResult, error) {
 	path, query, _ := strings.Cut(pathAndQuery, "?")
-	resp, err := p.do(ctx, http.MethodGet, path, query, nil, 0, http.Header{"Accept": {"application/json"}}, "Bearer "+p.o.ProxyToken)
+	resp, err := p.do(ctx, http.MethodGet, path, query, nil, 0, http.Header{"Accept": {"application/json"}}, "")
 	if err != nil {
 		return nil, err
 	}

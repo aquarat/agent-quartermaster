@@ -252,11 +252,23 @@ func csrFingerprint(pub any) string {
 
 func (e *Env) waitEnrollment(ctx context.Context, c *APIClient, created *api.EnrollResponse, pollToken string) (*api.EnrollStatus, error) {
 	pollAfter := created.PollAfterMS
+	lockNotice := false
 	failures := 0
 	for {
 		start := time.Now()
 		st, err := c.EnrollStatus(ctx, created.ID, pollToken, 25*time.Second)
 		if err != nil {
+			var ae *APIError
+			if errors.As(err, &ae) && ae.HTTPStatus == 423 && ae.Code == "locked" {
+				if !lockNotice {
+					e.logf("waiting for owner unlock")
+					lockNotice = true
+				}
+				if err = sleepCtx(ctx, 2*time.Second); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			var ue *UnreachableError
 			if errors.As(err, &ue) && failures < 5 {
 				failures++

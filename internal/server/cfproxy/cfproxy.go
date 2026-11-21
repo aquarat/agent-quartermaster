@@ -71,7 +71,8 @@ type Options struct {
 	Config     *config.Cloudflare
 	Catalogue  *cfscope.Catalogue
 	Grants     GrantSource
-	ProxyToken string // the proxy parent token (never logged)
+	ProxyToken string                                // the proxy parent token (never logged)
+	Parent     func(context.Context) (string, error) // sealed: decrypt only for an authorised upstream call
 	// SnapshotDir is where snapshots live (core resolves the default <data_dir>/cf-snapshots).
 	SnapshotDir string
 	Notify      func(title, text string) // ntfy push (may be nil)
@@ -110,7 +111,7 @@ func New(o Options) (*Proxy, error) {
 	if o.Config == nil || o.Catalogue == nil || o.Grants == nil {
 		return nil, errors.New("cfproxy: Config, Catalogue and Grants are required")
 	}
-	if o.ProxyToken == "" {
+	if o.ProxyToken == "" && o.Parent == nil {
 		return nil, errors.New("cfproxy: no proxy parent token")
 	}
 	cfg := o.Config
@@ -382,7 +383,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, c Caller) {
 func (p *Proxy) serveRead(w http.ResponseWriter, r *http.Request, c Caller, call cfscope.Call, cd *candidate, route cfscope.Route) {
 	ctx := r.Context()
 	t0 := time.Now()
-	resp, err := p.do(ctx, call.Method, call.Path, call.Query, nil, 0, r.Header, "Bearer "+p.o.ProxyToken)
+	resp, err := p.do(ctx, call.Method, call.Path, call.Query, nil, 0, r.Header, "")
 	if err != nil {
 		p.log.Warn("cf proxy: upstream", "error", err, "path", call.Path)
 		p.refused(ctx, w, c, call, cd.g.ID, refuse(http.StatusBadGateway, api.CFErrUpstream, "Cloudflare unreachable"), false, false)

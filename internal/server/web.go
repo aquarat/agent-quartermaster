@@ -80,7 +80,8 @@ func (s *Server) WebHandler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte("ok\n"))
 	})
-	root.Handle("/api/", s.apiGuard(api))
+	s.sealRoutes(api)
+	root.Handle("/api/", s.apiGuard(s.guardedWeb(api)))
 	root.Handle("/", static)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -350,7 +351,7 @@ func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
 		webauthn.WithExclusions(excl),
 		webauthn.WithConveyancePreference(protocol.PreferNoAttestation),
 		// The web UI always asks for credProps; requesting it here makes that output solicited.
-		webauthn.WithExtensions(webauthn.WithExtensionCredProps()),
+		webauthn.WithExtensions(webauthn.WithExtensionCredProps(), webauthn.WithExtensionPRFSupport()),
 		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
 			ResidentKey:        protocol.ResidentKeyRequirementRequired,
 			RequireResidentKey: protocol.ResidentKeyRequired(),
@@ -412,6 +413,10 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parsed, err := protocol.ParseCredentialCreationResponseBytes(payload)
+	if !publicExtensionsOnly(payload, true) {
+		s.writeErr(w, r, errBad("unexpected client extension output"))
+		return
+	}
 	if err != nil {
 		s.writeErr(w, r, errBad("credential could not be parsed"))
 		return
@@ -504,6 +509,10 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request) {
 // ---- state ----
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string) {
+	if s.sealSetup {
+		writeJSON(w, 200, api.UIState{SealEnabled: true, Owner: api.UIOwner{Name: s.cfg.OwnerName}})
+		return
+	}
 	if s.maintenance {
 		writeJSON(w, 200, struct {
 			api.UIState
@@ -525,7 +534,8 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 	}
 	out := api.UIState{Owner: api.UIOwner{Name: s.cfg.OwnerName, Passkeys: n}, Pending: []api.PendingItem{}, Standing: []api.StandingApproval{}, Grants: []api.GrantSummary{}}
 	reqs, err := q.PendingRequests(ctx, now)
-	out.CatalogueEnabled = q.Scoped()
+	out.CatalogueEnabled = q.Scoped() && !s.isLocked()
+	out.SealEnabled = s.seal != nil
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -831,6 +841,10 @@ func (s *Server) challengeHandler(object string) func(http.ResponseWriter, *http
 				return
 			}
 		}
+		if !s.authorisedWork(ctx) && !lockedDecision(object, in.Action) {
+			s.writeErr(w, r, lockedErr())
+			return
+		}
 		now := s.now()
 		text, err := canon.Build(a, canon.NewNonce(), now)
 		if err != nil {
@@ -899,6 +913,10 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 			return
 		}
 		if object == "update" {
+			if !s.authorisedWork(ctx) {
+				s.writeErr(w, r, lockedErr())
+				return
+			}
 			s.queueUpdate(w, r, sg, in.Assertion, pkID)
 			return
 		}
@@ -919,6 +937,10 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 			}
 			s.notify.Send("aqmas: personal", "Activated personal catalogue [ref "+ref(id)+"]", s.cfg.PublicBaseURL+"/")
 			writeJSON(w, 200, api.OK{OK: true})
+			return
+		}
+		if !s.authorisedWork(ctx) && !lockedDecision(object, sg.Action.Action) {
+			s.writeErr(w, r, lockedErr())
 			return
 		}
 		if err := s.apply(context.WithValue(ctx, sessionBindingKey{}, sess), sg, pkID); err != nil {

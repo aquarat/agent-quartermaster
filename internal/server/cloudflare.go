@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -17,7 +16,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
@@ -25,6 +23,7 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/server/cfscope"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/policy"
+	"github.com/aquarat/agent-quartermaster/internal/server/secretfile"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
 )
 
@@ -80,7 +79,17 @@ func (s *Server) setupCloudflare(o Options) error {
 	if err != nil {
 		return err
 	}
-	proxyTok, err := loadParentToken("proxy", cf.ProxyTokenCredential, cf.ProxyTokenFile)
+	var proxyTok string
+	var provider func(context.Context) (string, error)
+	if s.seal != nil {
+		provider = func(ctx context.Context) (string, error) {
+			b, err := s.secret(ctx, "cf-proxy")
+			defer clear(b)
+			return string(b), err
+		}
+	} else {
+		proxyTok, err = loadParentToken("proxy", cf.ProxyTokenCredential, cf.ProxyTokenFile)
+	}
 	if err != nil {
 		return err
 	}
@@ -110,6 +119,7 @@ func (s *Server) setupCloudflare(o Options) error {
 		Catalogue:   cat,
 		Grants:      cfGrantSource{s},
 		ProxyToken:  proxyTok,
+		Parent:      provider,
 		SnapshotDir: snapDir,
 		ServiceID:   serviceID,
 		Notify:      func(title, text string) { s.notify.Send(title, text, s.cfg.PublicBaseURL+"/") },
@@ -177,42 +187,7 @@ func loadParentToken(what, cred, file string) (string, error) {
 // readSecretFile reads a small regular file. strict additionally requires it to be owned by
 // the running uid with mode 0600 or 0400 (a token file outside systemd's credential store).
 func readSecretFile(path string, strict bool) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err // *PathError: path and errno only
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", path)
-	}
-	if strict {
-		if perm := st.Mode().Perm(); perm != 0o600 && perm != 0o400 {
-			return nil, fmt.Errorf("%s has mode %04o: it must be 0600 or 0400", path, perm)
-		}
-		sys, ok := st.Sys().(*syscall.Stat_t)
-		if !ok {
-			return nil, fmt.Errorf("%s: cannot read the file owner", path)
-		}
-		if int(sys.Uid) != os.Getuid() {
-			return nil, fmt.Errorf("%s is owned by uid %d: it must belong to aqmasd's user (uid %d)", path, sys.Uid, os.Getuid())
-		}
-	}
-	if st.Size() > maxParentTokenBytes {
-		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxParentTokenBytes)
-	}
-	b, err := io.ReadAll(io.LimitReader(f, maxParentTokenBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("reading %s failed", path)
-	}
-	if len(b) > maxParentTokenBytes {
-		clear(b)
-		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxParentTokenBytes)
-	}
-	return b, nil
+	return secretfile.Read(path, !strict, maxParentTokenBytes)
 }
 
 // ---- GrantSource for the proxy ----
@@ -377,7 +352,7 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 			return s.issueCFGrant(ctx, q, req, ttl, now)
 		}
 		// cf.read and cf.cache.purge in proxy mode need no approval.
-		if auto && res.Mode == api.CFModeProxy {
+		if s.authorisedWork(ctx) && auto && res.Mode == api.CFModeProxy {
 			// Auto-approval needs no owner, so cap how many identical grants a host may hold:
 			// the CLI reuses an active grant; a flood is a sign of a loop or a compromise.
 			if n, err := q.CountActiveCFGrantsLike(ctx, h.ID, req.Scope, req.ScopeParams, req.Mode, now); err != nil {
@@ -393,7 +368,7 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 			return q.Audit(ctx, now, "system", "cf_auto_approve", "request:"+req.ID,
 				fmt.Sprintf("grant=%s host=%s %s mode=%s ttl=%d from=%s", g.ID, h.Name, what, req.Mode, ttl, peer))
 		}
-		if standing && res.Mode == api.CFModeProxy {
+		if s.authorisedWork(ctx) && standing && res.Mode == api.CFModeProxy {
 			rules, err := q.ActiveStanding(ctx, h.ID, now)
 			if err != nil {
 				return err
@@ -926,7 +901,13 @@ func (s *Server) handleCFSnapshots(w http.ResponseWriter, r *http.Request, h *st
 		s.writeErr(w, r, err)
 		return
 	}
-	s.cf.proxy.ServeSnapshotList(w, r, s.cfCaller(r, h))
+	s.optionalLease(r.Context(), func(ctx context.Context) {
+		if !s.authorisedWork(ctx) {
+			s.writeErr(w, r, lockedErr())
+			return
+		}
+		s.cf.proxy.ServeSnapshotList(w, r.WithContext(ctx), s.cfCaller(r, h))
+	})
 }
 
 func (s *Server) handleCFSnapshot(w http.ResponseWriter, r *http.Request, h *store.Host) {
@@ -935,7 +916,13 @@ func (s *Server) handleCFSnapshot(w http.ResponseWriter, r *http.Request, h *sto
 		s.writeErr(w, r, err)
 		return
 	}
-	s.cf.proxy.ServeSnapshotGet(w, r, s.cfCaller(r, h), r.PathValue("id"))
+	s.optionalLease(r.Context(), func(ctx context.Context) {
+		if !s.authorisedWork(ctx) {
+			s.writeErr(w, r, lockedErr())
+			return
+		}
+		s.cf.proxy.ServeSnapshotGet(w, r.WithContext(ctx), s.cfCaller(r, h), r.PathValue("id"))
+	})
 }
 
 // requireHostCF is requireHost for the proxy: refusals get a Cloudflare-shaped body so tools
@@ -949,6 +936,18 @@ func (s *Server) requireHostCF(next func(http.ResponseWriter, *http.Request, *st
 		if err == nil && s.store.Q().Scoped() {
 			_, err = s.store.Q().PersonalResource(r.Context(), h.ID, "cloudflare-proxy", "proxy", s.now())
 			err = mapNotFound(err)
+		}
+		if err == nil {
+			s.optionalLease(r.Context(), func(ctx context.Context) {
+				if !s.authorisedWork(ctx) {
+					err = lockedErr()
+					return
+				}
+				next(s.deliveryWriter(ctx, w), r.WithContext(ctx), h)
+			})
+			if err == nil {
+				return
+			}
 		}
 		if err != nil {
 			var ae *apiErr
@@ -967,7 +966,6 @@ func (s *Server) requireHostCF(next func(http.ResponseWriter, *http.Request, *st
 			w.Write(body)
 			return
 		}
-		next(w, r, h)
 	})
 }
 

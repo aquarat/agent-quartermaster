@@ -254,6 +254,7 @@ type UIOwner struct {
 }
 
 type UIState struct {
+	SealEnabled      bool               `json:"seal_enabled,omitempty"`
 	CatalogueEnabled bool               `json:"catalogue_enabled,omitempty"`
 	Owner            UIOwner            `json:"owner"`
 	Pending          []PendingItem      `json:"pending"`

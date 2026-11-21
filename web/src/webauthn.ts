@@ -111,7 +111,9 @@ export function decodeCreationOptions(json: unknown): PublicKeyCredentialCreatio
   // Login is discoverable and every approval needs user verification: insist on both.
   const sel = isObject(pk["authenticatorSelection"]) ? pk["authenticatorSelection"] : {};
   out["authenticatorSelection"] = { ...sel, residentKey: "required", requireResidentKey: true, userVerification: "required" };
-  out["extensions"] = { credProps: true };
+  const requested = pk["extensions"];
+  const probe = isObject(requested) && isObject(requested.prf) && Object.keys(requested.prf).length === 0;
+  out["extensions"] = { credProps: true, ...(probe ? {prf:{}} : {}) };
   const exclude = descriptors(pk["excludeCredentials"], "publicKey.excludeCredentials");
   if (exclude && exclude.length > 0) out["excludeCredentials"] = exclude;
   return out as unknown as PublicKeyCredentialCreationOptions;
@@ -174,10 +176,15 @@ export interface AttestationJSON {
   };
 }
 
-function extResults(c: { getClientExtensionResults?: () => unknown }): unknown {
+function registrationProperties(c: { getClientExtensionResults?: () => unknown }): unknown {
   try {
     const r = c.getClientExtensionResults?.();
-    return isObject(r) ? r : {};
+    // Copy only the boolean. Never spread an extension object: PRF results
+    // (including unknown future fields) are reusable key material.
+    if (isObject(r) && isObject(r.credProps) && typeof r.credProps.rk === "boolean") {
+      return { credProps: { rk: r.credProps.rk } };
+    }
+    return {};
   } catch {
     return {};
   }
@@ -189,7 +196,7 @@ export function encodeAssertion(c: AssertionCredentialLike): AssertionJSON {
     id: c.id,
     rawId: encode(c.rawId),
     type: c.type,
-    clientExtensionResults: extResults(c),
+    clientExtensionResults: {},
     response: {
       clientDataJSON: encode(r.clientDataJSON),
       authenticatorData: encode(r.authenticatorData),
@@ -213,7 +220,7 @@ export function encodeAttestation(c: AttestationCredentialLike): AttestationJSON
     id: c.id,
     rawId: encode(c.rawId),
     type: c.type,
-    clientExtensionResults: extResults(c),
+    clientExtensionResults: registrationProperties(c),
     response: {
       clientDataJSON: encode(r.clientDataJSON),
       attestationObject: encode(r.attestationObject),

@@ -66,8 +66,14 @@ func (s *Server) requestOptions(o *owner, challenge []byte) (protocol.PublicKeyC
 // registered owner passkey, user verification, origin, RP ID, and a non-regressing sign count.
 // On success the stored credential is updated and its passkey row id returned.
 func (s *Server) verifyAssertion(ctx context.Context, challenge []byte, assertion json.RawMessage) (int64, error) {
+	return s.verifySelected(ctx, challenge, assertion, nil, protocol.AuthenticationExtensions{})
+}
+func (s *Server) verifySelected(ctx context.Context, challenge []byte, assertion json.RawMessage, allowed [][]byte, ext protocol.AuthenticationExtensions) (int64, error) {
 	if len(assertion) == 0 || string(assertion) == "null" {
 		return 0, errBad("assertion required")
+	}
+	if !publicExtensionsOnly(assertion, false) {
+		return 0, errForbidden("unexpected client extension output")
 	}
 	parsed, err := protocol.ParseCredentialRequestResponseBytes(assertion)
 	if err != nil {
@@ -81,6 +87,7 @@ func (s *Server) verifyAssertion(ctx context.Context, challenge []byte, assertio
 		return 0, errForbidden("no passkey registered")
 	}
 	session := webauthn.SessionData{
+		AllowedCredentialIDs: allowed, Extensions: ext.Session(),
 		Challenge:        base64.RawURLEncoding.EncodeToString(challenge),
 		RelyingPartyID:   s.rpID,
 		Origin:           s.cfg.PublicBaseURL,
@@ -109,6 +116,29 @@ func (s *Server) verifyAssertion(ctx context.Context, challenge []byte, assertio
 		return 0, errConflict("passkey used concurrently; retry")
 	}
 	return id, err
+}
+
+// Never let extension values travel into passkey storage, update proofs or
+// activation audit. Signed authenticator data is not decoded or rewritten.
+func publicExtensionsOnly(raw []byte, registration bool) bool {
+	var c struct {
+		Ext map[string]json.RawMessage `json:"clientExtensionResults"`
+	}
+	if json.Unmarshal(raw, &c) != nil {
+		return false
+	}
+	if len(c.Ext) == 0 {
+		return true
+	}
+	if !registration || len(c.Ext) != 1 {
+		return false
+	}
+	var props map[string]any
+	if json.Unmarshal(c.Ext["credProps"], &props) != nil || len(props) != 1 {
+		return false
+	}
+	_, ok := props["rk"].(bool)
+	return ok
 }
 
 // passkeyID is a passkey's public id: hex of the first 16 bytes of SHA-256(credential ID). It
