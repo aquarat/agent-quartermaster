@@ -46,7 +46,7 @@ cleanup() {
 	if [[ ${KEEP:-0} == 1 ]]; then echo "setup-interop: kept $T"; else rm -rf "$T"; fi
 }
 trap cleanup EXIT
-trap 'echo "setup-interop: failed at line $LINENO; logs in $T (KEEP=1 keeps them)" >&2; KEEP=1' ERR
+trap 'echo "setup-interop: failed at line $LINENO; logs in $T (KEEP=1 keeps them)" >&2; KEEP=1; for f in "$T"/maint.log "$T"/aqmasd-*.log; do [ -f "$f" ] && { echo "--- tail $f" >&2; tail -25 "$f" >&2; }; done' ERR  # test logs hold no real secrets
 
 free_port() { bun -e 'const s = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } }); console.log(s.port); s.stop(true);'; }
 PA=$(free_port) PW=$(free_port) PS=$(free_port) PF=$(free_port) PG=$(free_port)
@@ -96,7 +96,7 @@ set -u
 pidfile=$T/aqmasd.pid
 running() { [[ -f \$pidfile ]] && kill -0 "\$(cat \$pidfile)" 2>/dev/null; }
 case \$1 in
-stop) if running; then kill "\$(cat \$pidfile)"; for _ in \$(seq 100); do running || break; sleep 0.05; done; fi; ! running ;;
+stop) if running; then kill "\$(cat \$pidfile)"; for _ in \$(seq 600); do running || break; sleep 0.05; done; fi; ! running ;;  # up to 30 s: CI is slow
 start) running && exit 1
   setsid "$AQMASD" -config "$L/etc/config.toml" "\$2" >>"$T/aqmasd-\$2.log" 2>&1 </dev/null &
   echo \$! >\$pidfile ;;
