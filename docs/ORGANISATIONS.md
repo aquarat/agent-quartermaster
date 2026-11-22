@@ -117,6 +117,11 @@ service binding. Plans larger than 128 KiB (compact JSON) or 512 rows in any inv
 The preview changes neither the backup nor the running catalogue. Re-run it after configuration,
 enrollment or grant changes.
 
+**From the approval page:** **Admin → Setup → Switch to organisations** ([SETUP.md](SETUP.md))
+performs the supervised activation below with one approval plus the activation signature:
+backup, fenced review mode, restart, and a restore of the backup if the broker is unhealthy
+afterwards.
+
 **Supervised activation:** Disable the automatic updater and prevent service-manager restarts for
 the maintenance window. Stop the broker, drain traffic, and wait for the old process (including
 mints, proxy calls and sweepers) to exit. Keep the old binary, signed-in owner's passkeys, config,

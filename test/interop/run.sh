@@ -180,7 +180,9 @@ for port in "$PF" "$PG"; do
   bun "$ROOT/test/interop/release-source.ts" "$port" "$v" "$T/releases/$v/SHA256SUMS" & PIDS+=($!)
   for _ in {1..50}; do curl -fsS "http://127.0.0.1:$port/releases/tags/v$v" >/dev/null 2>&1 && break; sleep 0.1; done
 done
-(cd "$ROOT" && go run ./cmd/aqmas-update-verify bootstrap "$v" "$(git rev-parse HEAD)" "$T/config.toml") > "$T/releases/latest.json"
+# Both sources must serve the same manifest before it becomes the cached release identity.
+bun -e 'const [v,commit,...ports]=process.argv.slice(1);const sums=[];for(const p of ports){const r=await (await fetch(`http://127.0.0.1:${p}/releases/tags/v${v}`)).json();const a=r.assets.find(a=>a.name==="SHA256SUMS");sums.push(await (await fetch(`http://127.0.0.1:${p}/releases/assets/${a.id}`)).text())}
+if(sums[0]!==sums[1])process.exit(1);const m=Object.fromEntries(sums[0].trim().split("\n").map(l=>l.split("  ").reverse()));console.log(JSON.stringify({version:v,commit,forgejo:m,github:m}))' "$v" "$(git -C "$ROOT" rev-parse HEAD)" "$PF" "$PG" > "$T/releases/latest.json"
 (cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags '-X github.com/aquarat/agent-quartermaster/internal/client.Version=0.0.0' -o "$T/upgrade/aqmas" ./cmd/aqmas)
 printf '\n[github]\napi = "http://127.0.0.1:%s"\n' "$PG" >> "$AQMAS_CONFIG_DIR/config.toml"
 want=$(awk -v n="aqmas-linux-$ARCH" '$2==n {print $1}' "$T/releases/$v/SHA256SUMS")

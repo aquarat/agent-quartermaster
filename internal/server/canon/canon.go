@@ -59,12 +59,18 @@ const (
 	ObjectStanding   = "standing"
 	ObjectGrant      = "grant"
 	ObjectPasskey    = "passkey"
+	// ObjectSetup is a maintenance task for the root runner (docs/SETUP.md). id names the
+	// task; params is that task's canonical typed parameters; secrets_sha256 commits to an
+	// HPKE packet only the runner can open ("" when the task takes no secrets).
+	ObjectSetup = "setup"
+	ActionRun   = "run"
 )
 
 var commonKeys = []string{"v", "action", "object", "id", "nonce", "issued_at"}
 
 // objectKeys are the keys each object carries besides the common ones.
 var objectKeys = map[string][]string{
+	ObjectSetup:      {"params", "secrets_sha256"},
 	"update":         {"from_version", "from_commit", "to_version", "to_commit", "daemon_sha256", "linux_arm64_sha256", "linux_amd64_sha256", "darwin_arm64_sha256"},
 	ObjectRequest:    {"address", "principal", "requesting_host", "kind", "target", "target_address", "target_port", "login_user", "key_fingerprint", "ttl_seconds", "standing_hours"},
 	ObjectEnrollment: {"replaces_id", "class", "address", "requesting_host", "kind", "key_fingerprint", "replaces", "ttl_seconds", "standing_hours"},
@@ -97,6 +103,7 @@ func keysFor(object, kind string) ([]string, bool) {
 
 var objectActions = map[string][]string{
 	"update":         {ActionApprove},
+	ObjectSetup:      {ActionRun},
 	ObjectHost:       {ActionRevoke},
 	ObjectRequest:    {ActionApprove, ActionDeny},
 	ObjectEnrollment: {ActionApprove, ActionDeny},
@@ -114,6 +121,8 @@ type Action struct {
 	StandingBeyondSoft bool `json:"standing_beyond_soft_cap"`
 	api.ScopeBinding
 	Update
+	Params         string `json:"params"`         // setup: canonical task parameters (JSON)
+	SecretsHash    string `json:"secrets_sha256"` // setup: SHA-256 of the sealed secrets packet
 	Plan           string `json:"plan"`
 	RecoveryHash   string `json:"recovery_sha256"`
 	Principal      string `json:"principal"`
@@ -162,7 +171,7 @@ func NewNonce() string {
 
 func (a Action) values() map[string]any {
 	m := map[string]any{
-		"plan": a.Plan, "recovery_sha256": a.RecoveryHash,
+		"plan": a.Plan, "recovery_sha256": a.RecoveryHash, "params": a.Params, "secrets_sha256": a.SecretsHash,
 		"from_version": a.FromVersion, "to_version": a.ToVersion, "from_commit": a.FromCommit, "to_commit": a.ToCommit, "daemon_sha256": a.DaemonHash, "linux_arm64_sha256": a.LinuxARM, "linux_amd64_sha256": a.LinuxAMD, "darwin_arm64_sha256": a.DarwinARM,
 		"principal": a.Principal, "replaces_id": a.ReplacesID,
 		"class": a.Class, "address": a.Address, "target_address": a.TargetAddress, "target_port": a.TargetPort,
@@ -209,6 +218,9 @@ func isZero(v any) bool {
 func Build(a Action, nonce string, issuedAt time.Time) (string, error) {
 	if a.Object == "update" && (!release.Newer(a.ToVersion, a.FromVersion) || !release.ValidCommit(a.FromCommit) || !release.ValidCommit(a.ToCommit) || a.ID != a.ToCommit || a.ToCommit == a.FromCommit || !a.Sums().Valid()) {
 		return "", errors.New("invalid update fields")
+	}
+	if a.Object == ObjectSetup && (len(a.Params) > 16<<10 || !json.Valid([]byte(a.Params)) || a.SecretsHash != "" && !release.ValidHash(a.SecretsHash)) {
+		return "", errors.New("invalid setup fields")
 	}
 	if a.Action == "" || a.ID == "" {
 		return "", errors.New("canon: action and id are required")

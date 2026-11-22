@@ -27,13 +27,32 @@ Verify GitHub's SSH host key at the forge. Check mirror status after syncing. Th
 
 ## Bastion: one-time setup by the owner
 
-Start on a known-good bastion with an enrolled owner passkey. Keep a tested database backup (SQLite online backup) and a manual recovery path. The first release-enabled daemon is installed manually. Do not run the candidate Makefile, tests, Bun or git checkout as root.
+Start on a known-good bastion with an enrolled owner passkey, a merged-`/usr` Linux/arm64
+host and the maintenance runner installed (`sudo aqmasd maint-init`, [SETUP.md](SETUP.md)).
+Then use **Admin → Setup → Enable self-update**. One approval does all of this as root, with
+nothing taken from the request but the typed values you see and sign:
 
-1. Install systemd, bubblewrap (unprivileged user namespaces), util-linux, coreutils, git, OpenSSH, curl, unzip, make, jq, SQLite, a C compiler for Go tests, and distro CA roots. Use a merged-`/usr` Linux/arm64 host. Install the pinned toolchains under `/opt/aqmas-tools` using the verified bootstrap script above. Toolchains, installer, units and all their parent directories must be root-owned and not writable by `aqmas` or the builder. Create the dedicated locked `aqmas-build` account (no login, no other services). The scratch tree and module cache are fresh for every update; allow several GiB of temporary space, preferably with a filesystem quota.
-
-2. Generate a dedicated SSH key and register its public half as a **read-only** Forgejo deploy key for this repository. Install its private half as `/etc/aqmas/repo-key`, readable by `aqmas`, not writable by it (root:aqmas 0440). Pin the independently verified host key in `/etc/ssh/ssh_known_hosts` (use `[host]:port` for nonstandard ports). For a private release API install repository-read-only tokens in files as root:aqmas 0440; the SSH key cannot read HTTP release attachments. Arrange an HTTPS route from the bastion to Forgejo that satisfies Access (e.g. trusted private routing with normal TLS hostname verification). While GitHub is private, use a fine-grained token with **Contents: read** for this repository only; remove it once public.
-
-   Add to `/etc/aqmas/config.toml` (root-owned, parent not service-writable):
+1. Installs the build tools (bubblewrap, git, jq, make, a C compiler for the Go tests, unzip,
+   curl, OpenSSH client; `dnf` on Fedora) and the pinned toolchains under `/opt/aqmas-tools`
+   with the digest-checking `ci/toolchains.sh` that ships inside the release. Creates the
+   locked `aqmas-build` account. Allow several GiB of temporary space for a rebuild.
+2. Creates the dedicated SSH key `/etc/aqmas/repo-key` (root:aqmas 0440) if `maint-init` has
+   not already. Its public half is shown on the page: register it as a **read-only** deploy
+   key of the repository on the forge. Appends the forge host key lines you signed to
+   `/etc/ssh/ssh_known_hosts`; the page can fetch them for you to compare first.
+3. Stores the release-reading tokens you pasted as `/etc/aqmas/forgejo-read-token` and
+   `/etc/aqmas/github-read-token` (root:aqmas 0440: the broker reads them to discover
+   releases). They travel sealed to the runner. While GitHub is private use a fine-grained
+   token with **Contents: read** for this repository only; remove it once public. The bastion
+   needs an HTTPS route to the forge API that satisfies any Access policy in front of it.
+4. **Seeds the installed identity.** Downloads both `SHA256SUMS` of the running version,
+   requires them to agree and to match the SHA-256 of the installed `/usr/local/bin/aqmasd`,
+   downloads the three CLI binaries, checks each against both manifests, and fills
+   `/var/lib/aqmas-releases/VERSION/` and `latest.json`. A broker that is not the published
+   binary is refused: self-update never starts from a PR build or a single source.
+5. Writes `[updates]` into `/etc/aqmas/config.toml` and restarts the broker (a sealed broker
+   comes back locked). If the broker does not come back, the previous configuration is
+   restored.
 
    ```toml
    [updates]
@@ -47,36 +66,25 @@ Start on a known-good bastion with an enrolled owner passkey. Keep a tested data
    token_file = "/etc/aqmas/github-read-token" # omit for public releases
    ```
 
-3. Install the root verifier built **from the trusted setup revision** (`go build -trimpath -o aqmas-update-verify ./cmd/aqmas-update-verify`) and `deploy/bastion/aqmas-updater.sh` in `/usr/local/libexec/` as root:root 0755. Install the `.service` and `.path` therefrom in `/etc/systemd/system/` as root:root 0644. Set `/etc/aqmas/updater.env` (root:root 0600) with `REPO=...` and `DEPLOY_KEY=/etc/aqmas/repo-key` as above; optional `HEALTH_URL=http://127.0.0.1:8080/healthz`. These helpers and pins are **never self-updated**. Apply reviewed changes to them manually.
+The passkeys that may approve updates are the maintenance pins
+(`/etc/aqmas/update-passkeys.json`, root 0600). `maint-init` takes the first set from the
+passkeys registered at that moment; afterwards they change only by the signed **Sync
+maintenance passkeys** task or `maint-init --repin` on the machine. **Rotation/removal is
+two operations:** update the broker's passkeys, then sync the pins. A compromised broker
+can ignore its own credential revocation; it cannot change the pins.
 
-   Pin only owner credentials explicitly trusted for **bastion updates**. On a known-good initial enrollment, export the public credential records, selecting the intended row(s); compare the credential IDs with your trusted enrollment records. Never refresh pins automatically from the running broker. As root, for example:
-
-   ```sh
-   umask 077
-   sudo -u aqmas sqlite3 -readonly /var/lib/aqmas/aqmas.db \
-     'SELECT credential_json FROM passkeys ORDER BY id' | jq -s 'map({id,publicKey})' > /etc/aqmas/update-passkeys.json
-   ```
-
-   Inspect and remove unwanted entries before enabling the unit. Keep this file root-owned 0600. **Rotation/removal is two operations:** update the broker's passkeys and remove/add the root pins out of band. A compromised broker can ignore its own credential revocation.
-
-4. Prepare separate writable domains (do not put the cache, pins or helpers under the broker's state directory):
-
-   ```sh
-   install -d -o root -g root -m 0755 /var/lib/aqmas-releases
-   install -d -o root -g aqmas -m 0730 /var/spool/aqmas-update
-   ```
-
-   Alternatively install `aqmas-update.tmpfiles.conf` in `/etc/tmpfiles.d/` and use `systemd-tmpfiles --create`. Install the updated `aqmasd.service`, which grants the narrow spool write exception. Leave the existing broker hardening, database and CA permissions in place. Only root may modify `/usr/local/bin/aqmasd`, `/usr/local/bin/aqmasd.prev` or the release cache. Use the shipped fixed spool/cache paths with the root units (alternate paths are for test servers). Give `/var/lib/aqmas/update.git` its own size-limited filesystem or project quota so remote git objects cannot fill the credential database volume.
-
-5. **Seed the installed identity and cache.** In a reviewed clean checkout on the bastion, resolve `refs/tags/v$version^{commit}`, confirm its `VERSION` and expected history, build all four binaries as an ordinary owner user. Run the trusted helper `aqmas-update-verify bootstrap VERSION COMMIT` (root, absolute helper path) to a private temporary JSON file. It independently downloads both manifests but does **not** approve/install anything. Compare its complete digest map to the local build, e.g. `jq -r '.forgejo|to_entries[]|"\(.value)  \(.key)"' /path/to/verified.json | sort -k2 | cmp - dist/SHA256SUMS`. Only after a match, install the verified server and copy the three verified CLI binaries + `SHA256SUMS` into `/var/lib/aqmas-releases/VERSION/`. Install the verified JSON as `/var/lib/aqmas-releases/latest.json`. Use trusted owner staging, root ownership, 0755 directories, 0644 cache files. Confirm `aqmasd version`, restart and check `/healthz`. Do not bootstrap from a PR binary, from aqmasd's writable git cache or from a single release.
-
-6. `systemctl daemon-reload && systemctl restart aqmasd && systemctl enable --now aqmas-updater.path`. Check **Admin → Updates** and `journalctl -u aqmas-updater.service`. A failed build/check needs fresh approval. For repeated invalid requests systemd rate-limits the trigger: investigate the spool and reset the failed unit before re-enabling the path. Rehearse an update and rollback on a disposable bastion before enabling unattended triggering on the production machine.
+Only root may modify `/usr/local/bin/aqmasd`, `/usr/local/bin/aqmasd.prev`, the release
+cache or the pins. Give `/var/lib/aqmas/update.git` its own size-limited filesystem or
+project quota so remote git objects cannot fill the credential database volume. Rehearse an
+update and rollback on a disposable bastion before relying on it. A failed build or check
+needs a fresh approval; `journalctl -u aqmas-maint.service` has the detail. A pinned
+toolchain bump or a changed unit file is still a manual change on the machine.
 
 ## Approval, install and recovery
 
 Every 15 minutes the daemon fetches main and tag refs using strict SSH host checking, verifies fetched object integrity, resolves the latest version tag to a full commit, checks `VERSION` at both refs, and checks ancestry from the running commit through the tag to main. These are **content/ancestry checks, not a maintainer signature**. It computes stat and patch from local objects; a patch too large to show completely blocks approval. The signed `update` binds both versions, both commits and four digests ([API.md](API.md)). Only a matching verified release is offered. The audit records the signed description; the spool carries that description and the original assertion.
 
-The root helper independently verifies the WebAuthn signature against its pins, UV, RP/origin, signed issuance time, replay record and installed identity, then re-fetches **both** manifests. The installer checks the running binary against the root-owned installed record. Git fetch is sandboxed with only the read-only deploy key; it independently checks the latest stable tag, main VERSION, both ancestry relationships and exact target commit. Module fetch uses the Go proxy/checksum database, `-mod=readonly`, no `GONOSUMDB`, and checks that dependency files did not change. Build and tests have **no external network**, broker sockets, keys or writable host paths beyond their private workspace. Only bounded copies of four fixed outputs are extracted, unprivileged, for hashing in root-owned staging.
+The maintenance runner (`aqmasd maint-run` as root, [SETUP.md](SETUP.md)) independently verifies the WebAuthn signature against its pins, UV, RP/origin, signed issuance time, replay record and installed identity, then re-fetches **both** manifests and hands them to the installer embedded in the release. The installer checks the running binary against the root-owned installed record. Git fetch is sandboxed with only the read-only deploy key; it independently checks the latest stable tag, main VERSION, both ancestry relationships and exact target commit. Module fetch uses the Go proxy/checksum database, `-mod=readonly`, no `GONOSUMDB`, and checks that dependency files did not change. Build and tests have **no external network**, broker sockets, keys or writable host paths beyond their private workspace. Only bounded copies of four fixed outputs are extracted, unprivileged, for hashing in root-owned staging.
 
 Verified executables install by rename, preserving the old inode. A synced root-owned rollback journal precedes activation. An unhealthy restart restores `aqmasd.prev`; the path unit also recovers an interrupted activation after boot. Cache publication follows process-identity and database health checks. Binary rollback does not reverse database migrations: require backwards-compatible migrations for self-update. For a breaking migration, take a consistent SQLite backup and perform a supervised manual upgrade. If recovery fails, stop the path unit, inspect the journal and hashes, and restore the compatible database backup if necessary before re-enabling.
 
@@ -94,6 +102,7 @@ The first signed catalogue change sets `user_version=7` in the same transaction:
 older daemon that does not enforce signed duration policies must refuse to serve that DB.
 Ordinary installation/restart alone does not advance the version.
 
+* The runner and its installer are part of `aqmasd`: an approved release replaces the code that will verify later approvals (before v0.3.0 the verifier was installed once and never updated). The pins, units and toolchains are not touched by an update.
 * A compromised **aqmasd** controls its DB/audit, spool, discovery and what its web UI displays. It can cause denial of service or deceive an owner into signing a real update. It cannot synthesize a valid assertion for a root-pinned key or choose unverified installer bytes. A passkey is not a trusted display. For high-risk changes, independently inspect the source and compare hashes outside the UI.
 * A compromised **Forgejo** can publish and mirror malicious **source/workflows**; GitHub can honestly rebuild it, so agreement is not an independent source review. Likewise, compromise of a runner with repository-write permission may extend from one forged artifact to changing future source releases. Restrict/protect main, tags, workflow edits and job tokens. The bastion rebuild plus exact owner approval protect against substitution by a single artifact producer.
 * A compromised **GitHub** alone, or a build-only runner alone, can withhold releases or supply mismatched bytes and block installation. Neither supplies the root WebAuthn key. Common compromised dependencies, a compromised toolchain or kernel, collusion, and the owner's approval of malicious source are outside this guarantee. Isolate the mirror key; it permits repository writes even though it cannot operate on other repositories.

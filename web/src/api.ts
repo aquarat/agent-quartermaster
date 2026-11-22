@@ -46,7 +46,10 @@ export interface Api {
   envState?():Promise<import('./envsets').EnvState>;
   envPost?<T>(path:'ticket'|'challenge'|'finish',body:unknown):Promise<T>;
   sealStatus?(): Promise<import('./sealPanel').SealView>;
-  sealPost?<T>(path: 'unlock/challenge'|'unlock/finish'|'control/challenge'|'control/finish'|`passkeys/${'challenge'|'authorize'|'create'|'evaluate'|'finish'}`|`batch/${'challenge'|'finish'}`|`windows/${'policy/challenge'|'policy/finish'|'open/challenge'|'open/finish'|'prepare'|'confirm'|'presence'|'close'}`, body: unknown): Promise<T>;
+  sealPost?<T>(path: 'unlock/challenge'|'unlock/finish'|'control/challenge'|'control/finish'|`passkeys/${'challenge'|'authorize'|'create'|'evaluate'|'finish'}`|`batch/${'challenge'|'finish'}`|'drill'|`windows/${'policy/challenge'|'policy/finish'|'open/challenge'|'open/finish'|'prepare'|'confirm'|'presence'|'close'}`, body: unknown): Promise<T>;
+  /** Admin → Setup (docs/SETUP.md); `path` is relative to /api/ui/setup. */
+  setupGet?<T>(path: string): Promise<T>;
+  setupPost?<T>(path: string, body: unknown): Promise<T>;
   catalogue?():Promise<import('./catalogue').Catalogue|null>;
   migration?():Promise<{id:string;plan:string;recovery_sha256:string}|null>;
   hosts(): Promise<HostInfo[]>;
@@ -117,6 +120,8 @@ export function createApi(opts: ApiOptions = {}): Api {
     envState:()=>call('GET','/api/ui/seal/env/state'),envPost:(path,body)=>call('POST',`/api/ui/seal/env/${path}`,body),
     sealStatus: () => call('GET','/api/ui/seal/status'),
     sealPost: (path,body) => call('POST',`/api/ui/seal/${path}`,body),
+    setupGet: (path) => call('GET',`/api/ui/setup${path}`),
+    setupPost: (path,body) => call('POST',`/api/ui/setup${path}`,body),
     hosts: () => call('GET','/api/ui/hosts'),
     updates: () => call('GET','/api/ui/updates'),
     migration: () => call('GET','/api/ui/migration'),

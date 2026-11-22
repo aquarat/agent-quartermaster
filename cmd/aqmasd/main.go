@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aquarat/agent-quartermaster/internal/maint"
 	"github.com/aquarat/agent-quartermaster/internal/server"
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
 	"github.com/aquarat/agent-quartermaster/internal/server/organisations"
@@ -40,13 +41,25 @@ commands:
   print-client-ca       print the internal CA certificate (PEM; signs the agent-API server cert too)
   tls-fingerprint       print the CA pin for ` + "`aqmas enroll --ca-pin`" + ` (sha256:<hex>)
   revoke-host NAME      revoke an enrolled host's identity (client certificate) at once
+  setup-facts           print the schema version and public passkey records (JSON) for the runner
   version               print the version
+
+as root (docs/SETUP.md):
+  maint-init [--repin]  install the maintenance runner: units, spool, keys and passkey pins
+  maint-run             run one owner-approved maintenance request (started by aqmas-maint.path)
 
 Run every command as the aqmas user (sudo -u aqmas aqmasd ...).
 `
 
 func main() {
 	syscall.Umask(0o077)
+	if len(os.Args) > 1 && (os.Args[1] == "maint-run" || os.Args[1] == "maint-init") {
+		if err := maintenance(os.Args[1], os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "aqmasd:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	fs := flag.NewFlagSet("aqmasd", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	cfgPath := fs.String("config", config.DefaultPath, "configuration file")
@@ -136,6 +149,12 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		return err
 	}
 	switch cmd {
+	case "setup-facts":
+		f, err := server.SetupFacts(cfg.DataDir)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(out).Encode(f)
 	case "seal-recover":
 		if len(args) != 1 || !cfg.Seal.Required {
 			return fmt.Errorf("sealed recovery directory required")
@@ -226,6 +245,44 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown command %q", cmd)
+}
+
+// maintenance is the root side of Admin → Setup. It takes no path or command from its
+// arguments: production always uses the fixed layout and the root-protected configuration.
+// "--test-layout DIR HOOK" relocates everything for the interop suite and is refused for root.
+func maintenance(cmd string, args []string) error {
+	layout := maint.Production()
+	repin := false
+	switch {
+	case len(args) == 0:
+	case len(args) == 1 && args[0] == "--repin" && cmd == "maint-init":
+		repin = true
+	case len(args) == 3 && args[0] == "--test-layout":
+		exe, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		if layout, err = maint.TestLayout(args[1], exe, args[2]); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("usage: aqmasd maint-run | aqmasd maint-init [--repin]")
+	}
+	if os.Geteuid() == 0 {
+		if err := rootPin(layout.Config); err != nil {
+			return err
+		}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if cmd == "maint-init" {
+		return maint.Init(ctx, layout, repin, os.Stdout)
+	}
+	r, err := maint.New(layout, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	if err != nil {
+		return err
+	}
+	return r.Run(ctx)
 }
 
 // Only public CA material is needed on the machine inspecting the backup.

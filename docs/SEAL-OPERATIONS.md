@@ -1,5 +1,11 @@
 # Sealed-store import and recovery
 
+> **Admin → Setup → Seal the store** ([SETUP.md](SETUP.md)) performs steps 1 to 8 below from
+> the approval page: the runner does the root-owned parts, and the recovery drill runs on the
+> bastion with a key you may generate in the browser. That is the convenient path the owner
+> chose. The manual procedure here remains the stricter one (recovery key never on the
+> bastion, drill on an isolated machine) and the reference for recovery.
+
 This is a **supervised format transition**, not an automatic update or a
 fresh-install wizard. Use a compatible binary with the embedded UI. Rehearse
 on an isolated installation first. The input is an existing, activated

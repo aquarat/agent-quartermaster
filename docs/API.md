@@ -401,6 +401,11 @@ proxy choice and does not make the grants it issues indefinite.
 certificate at once; also available on Admin), `version`.
 
 
+`setup-facts` prints the schema version and the public passkey records as JSON for the
+maintenance runner. As **root**: `aqmasd maint-init [--repin]` installs the runner and
+`aqmasd maint-run` (started by `aqmas-maint.path`) runs one owner-approved request. The
+Setup web API and the canonical `setup` object are in [SETUP.md](SETUP.md).
+
 ## 5. Cloudflare (milestone 2 contract)
 
 Design, scope catalogue, deny-list, guard rails, snapshots and config: `docs/CLOUDFLARE.md`.

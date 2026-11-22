@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aquarat/agent-quartermaster/internal/maint"
 	"github.com/aquarat/agent-quartermaster/internal/release"
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
@@ -209,38 +210,12 @@ func (s *Server) queueUpdate(w http.ResponseWriter, r *http.Request, sg canon.Si
 		return
 	}
 	text, e := canon.Build(a, sg.Nonce, sg.IssuedAt)
-	if e != nil {
-		s.writeErr(w, r, e)
-		return
-	}
-	dir := s.cfg.Updates.Spool()
-	f, e := os.CreateTemp(dir, ".approval-")
-	if e != nil {
-		s.writeErr(w, r, e)
-		return
-	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	e = json.NewEncoder(f).Encode(map[string]any{"canonical": text, "assertion": assertion})
-	if e == nil {
-		e = f.Sync()
-	}
 	if e == nil {
 		sess, ok := s.sessionHash(r)
 		if !ok {
 			e = errUnauth("session ended")
 		} else {
-			e = s.store.Tx(r.Context(), func(q *store.Q) error {
-				if s.seal != nil {
-					if err := s.sealOwner(r.Context(), q, sess, pkID); err != nil {
-						return err
-					}
-				}
-				if err := q.Audit(r.Context(), s.now(), "owner", "update_approve", "update:"+a.ID, fmt.Sprintf("passkey=%d %s", pkID, text)); err != nil {
-					return err
-				}
-				return os.Link(f.Name(), filepath.Join(dir, "approved"))
-			})
+			e = s.spool(r, sess, pkID, "update_approve", "update:"+a.ID, maint.Request{Canonical: text, Assertion: assertion})
 		}
 	}
 	if e != nil {

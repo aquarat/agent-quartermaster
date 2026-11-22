@@ -1,0 +1,22 @@
+# Root maintenance runner behind Admin → Setup (docs/SETUP.md). It runs only tasks compiled
+# into aqmasd, each one requested by a passkey-signed approval that it verifies itself against
+# /etc/aqmas/update-passkeys.json. Installed by `aqmasd maint-init`.
+[Unit]
+Description=aqmas maintenance runner (owner-approved setup tasks and upgrades)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/local/bin/aqmasd maint-run
+# A task may wait for the owner (cutover, sealing) or rebuild a release.
+TimeoutStartSec=2h
+PrivateTmp=yes
+ProtectHome=yes
+PrivateDevices=yes
+TasksMax=512
+MemoryMax=4G

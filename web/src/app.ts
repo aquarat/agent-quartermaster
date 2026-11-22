@@ -50,7 +50,9 @@ import {
 import { CF_RISKS, cfScope, paramPairs, parseScopeParams, riskLabel, sentenceCase, unusualParams, type CFScopeDesc } from "./cfscopes";
 import { chevronIcon, cloudIcon, eventIcon, passkeyIcon, syncIcon } from "./icons";
 import type { AuditEntry, GrantSummary, PasskeyChange, PasskeyInfo, PendingCloudflare, PendingItem, RegisterResult, StandingApproval, UIState } from "./types";
-import { hostCard, updateCard, type UpdateView, type HostInfo } from './admin';
+import { hostCard, type HostInfo } from './admin';
+import { SetupPage, setupSummary } from './setupPage';
+import type { SetupView } from './setup';
 import { helpPage, type HelpConfig } from './help';
 import {cataloguePage,type Catalogue} from './catalogue';
 import {sealPanel,type SealView} from './sealPanel';
@@ -58,7 +60,7 @@ import {capabilityForm} from './capabilities';
 import {TabWindow,multiPanel,windowAdmin} from './approvals';
 import {envPanel,type EnvState} from './envsets';
 
-function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/help' ? 'help' : 'queue'; }
+function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/setup' ? 'setup' : location.hash === '#/help' ? 'help' : 'queue'; }
 function nav(label:string,hash:string,title:string) { const a=h('a',{title,'aria-label':title},label); a.href=hash; return a; }
 function scopeHeading(f?:Record<string,string|number>){return f?h('h3',null,...['org_title','service_title','set_title'].map((k,i)=>h('span',null,i?' › ':'',h('bdi',null,vt(String(f[k]??'?')))))):null;}
 import { browserAuthenticator, type Authenticator } from "./webauthn";
@@ -90,7 +92,10 @@ export class App {
   private tab=new TabWindow();
   private envState?:EnvState;
   private hosts: HostInfo[]=[];
-  private updates?: UpdateView;
+  /** Admin: a one-line summary of Admin → Setup (null = this server has none). */
+  private setupView?: SetupView | null;
+  /** The Setup page polls and redraws by itself while it is open. */
+  private setupPage?: SetupPage;
   private catalogue?: Catalogue|null;
   private migration?:{id:string;plan:string;recovery_sha256:string}|null;
   private help?: HelpConfig;
@@ -153,7 +158,7 @@ export class App {
       this.envState=this.seal&&['unlocked','locked'].includes(this.seal.mode)?await this.api.envState!():undefined;
       if(this.tab.id()&&!this.seal?.active_windows?.some(w=>w.id===this.tab.id()))this.tab.forget();
       this.migration=s.migration;
-      if(requested==='admin') [this.hosts,this.updates]=await Promise.all([this.api.hosts(),this.api.updates()]);
+      if(requested==='admin') [this.hosts,this.setupView]=await Promise.all([this.api.hosts(),this.api.setupGet?this.api.setupGet<SetupView>('').catch(()=>null):null]);
       if(requested==='admin')this.catalogue=s.catalogue_enabled?await this.api.catalogue?.():null;
       if(requested==='help') this.help=await this.api.help();
       if(requested!==route()) return;
@@ -222,8 +227,11 @@ export class App {
         h("h1", { class: "brand" }, "aqmas"),
         h("p", { class: "error", role: "alert" }, vt(explainError(e))),
         h("button", { class: "btn primary big", type: "button", on: { click: () => void this.refresh() } }, "Try again"),
+        route() === "setup" ? h("p", { class: "muted", role: "status" }, "The broker may be restarting. This page keeps trying by itself.") : null,
       ),
     );
+    // Setup tasks restart the broker: a reload in that window must not end on a dead page.
+    if (route() === "setup") window.setTimeout(() => { if (this.view === "loading") void this.refresh(); }, 2000);
   }
 
   private loginStatus: HTMLElement | null = null;
@@ -263,6 +271,8 @@ export class App {
 
   private showSignin(message?: string): void {
     this.tab.end();
+    this.setupPage?.stop();
+    this.setupPage = undefined;
     this.view = "signin";
     this.state = null;
     this.login = null;
@@ -377,6 +387,8 @@ export class App {
     this.view = "main";
     this.rendered.clear();
     this.loginStatus = this.signBtn = this.loginDetails = null;
+    this.setupPage?.stop();
+    this.setupPage = undefined;
     const filters = h(
       "div",
       { class: "filters", role: "group", "aria-label": "Show activity" },
@@ -397,7 +409,7 @@ export class App {
     replace(
       this.root,
       h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Request queue')), h("p", { class: "status", id: "status" }),h('nav',{'aria-label':'Pages'},nav('Help','#/help','Help'),nav('⚙','#/admin','Admin'))),
-      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('orgs','Organisations'),section('passkeys','Passkeys'),section('hosts','Enrolled hosts'),section('updates','Updates')) : h(
+      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='setup' ? h('main',{class:'subpage'},h('p',{class:'crumb'},nav('‹ Admin','#/admin','Back to Admin')),h('h2',null,'Setup'),h('p',{class:'muted'},'Each step is one passkey approval. A small root program on this machine checks your signature itself and does the work.'),h('div',{id:'setup-root',class:'setup'})) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('setup','Setup and upgrades'),section('orgs','Organisations'),section('passkeys','Passkeys'),section('hosts','Enrolled hosts')) : h(
         "main",
         { class: "sections" },
         h("div", { class: "col col-queue" }, section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
@@ -410,20 +422,36 @@ export class App {
         h("aside", { class: "col col-activity", "aria-labelledby": "sec-recent-h" }, section("recent", "Recent activity", "", filters)),
       ),
     );
-    if(this.seal)this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));
+    if(this.sealOnTop())this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));
+    if(this.page==='setup'){
+      this.setupPage=new SetupPage($('#setup-root',this.root),this.api,this.auth,{
+        openMigration:t=>this.sheet.openMigration(t),
+        openUpdate:t=>this.sheet.openUpdate(t),
+        signedOut:()=>this.signedOut('Your session ended. Sign in again to continue the setup.'),
+        changed:()=>this.changed(),
+      });
+      this.setupPage.start();
+    }
     this.renderSections();
     this.schedulePoll();
+  }
+
+  /** The seal panel sits above every page, except that Setup shows the supervised import as
+   * its own checklist. */
+  private sealOnTop(): boolean {
+    return !!this.seal && !(this.page === "setup" && this.seal.mode === "setup");
   }
 
   private renderSections(): void {
     const s = this.state;
     if (!s || this.view !== "main") return;
     if(this.seal&&this.envState&&this.page!=='help'){if(!this.root.querySelector('#sec-env'))this.root.insertBefore(section('env','Env credential sets'),this.root.querySelector('main'));this.section('env',[this.envState,this.page,this.catalogue,this.seal.mode],()=>[envPanel(this.api,this.auth,this.seal!,this.envState!,this.page==='admin'?this.catalogue:null,()=>this.changed())]);}
-    if(this.seal){if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));this.section('seal',[this.seal,this.page,this.page==='admin'?s.passkeys:null,this.page==='queue'?s.pending:null],()=>[sealPanel(this.api,this.auth,this.seal!,()=>this.changed(),this.tab),this.seal!.mode==='unlocked'&&(this.page==='admin'?windowAdmin(this.api,this.auth,this.seal!,this.tab,s.passkeys??[],()=>this.changed()):this.page==='queue'&&multiPanel(this.api,this.auth,this.seal!,this.tab,s.pending??[],()=>this.changed()))]);}
+    if(!this.sealOnTop()){this.root.querySelector('#sec-seal')?.remove();this.rendered.delete('seal');}
+    else{if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));this.section('seal',[this.seal,this.page,this.page==='admin'?s.passkeys:null,this.page==='queue'?s.pending:null],()=>[sealPanel(this.api,this.auth,this.seal!,()=>this.changed(),this.tab),this.seal!.mode==='unlocked'&&(this.page==='admin'?windowAdmin(this.api,this.auth,this.seal!,this.tab,s.passkeys??[],()=>this.changed()):this.page==='queue'&&multiPanel(this.api,this.auth,this.seal!,this.tab,s.pending??[],()=>this.changed()))]);}
     if(this.page!=='queue'){
-      document.title=`${this.page==='admin'?'Admin':'Help'} · aqmas`;
-      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);if(this.updates)this.section('updates',[this.updates,this.migration],()=>this.migration?[h('h3',null,'personal · Organisation cutover'),h('p',null,'Fleet access is paused. Compare the recovery digest and review each admission, credential set and authority retirement before signing.'),h('button',{type:'button',class:'btn approve',on:{click:()=>this.sheet.openMigration({object:'migration',id:this.migration!.id,facts:{plan:this.migration!.plan,recovery_sha256:this.migration!.recovery_sha256}})}},'Review personal activation…')]:[updateCard(this.updates!,t=>this.sheet.openUpdate(t))]);}
-      else if(this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
+      document.title=`${this.page==='admin'?'Admin':this.page==='setup'?'Setup':'Help'} · aqmas`;
+      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);}
+      else if(this.page==='help'&&this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
       if(this.page==='admin')this.section('orgs',this.catalogue,()=>this.catalogue?[cataloguePage(this.catalogue,(t,c)=>this.sheet.openCatalogue(t,c))]:['Available after personal activation.']);
       this.updateStatus();return;
     }

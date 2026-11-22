@@ -10,11 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
+	"github.com/aquarat/agent-quartermaster/internal/maint"
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
@@ -27,7 +29,7 @@ func (s *Server) sealRoutes(m *http.ServeMux) {
 	s.capabilityRoutes(m)
 	s.approvalRoutes(m)
 	s.envWebRoutes(m)
-	for path, f := range map[string]func(http.ResponseWriter, *http.Request, string){"GET /api/ui/seal/status": s.sealStatus, "POST /api/ui/seal/unlock/challenge": s.sealBegin, "POST /api/ui/seal/unlock/finish": s.sealFinish, "POST /api/ui/seal/control/challenge": s.sealControlBegin, "POST /api/ui/seal/control/finish": s.sealControlFinish} {
+	for path, f := range map[string]func(http.ResponseWriter, *http.Request, string){"GET /api/ui/seal/status": s.sealStatus, "POST /api/ui/seal/unlock/challenge": s.sealBegin, "POST /api/ui/seal/unlock/finish": s.sealFinish, "POST /api/ui/seal/control/challenge": s.sealControlBegin, "POST /api/ui/seal/control/finish": s.sealControlFinish, "POST /api/ui/seal/drill": s.sealDrill} {
 		m.Handle(path, s.requireSession(f))
 	}
 }
@@ -63,6 +65,73 @@ type sealView struct {
 	Installation   seal.ID         `json:"installation"`
 	Choices        []sealChoice    `json:"choices"`
 	Manifest       string          `json:"manifest,omitempty"`
+	// Setup mode: the key the browser seals the recovery identity to for the on-box drill,
+	// and whether that drill has passed.
+	DrillKey string `json:"drill_key,omitempty"`
+	Drilled  bool   `json:"drilled,omitempty"`
+}
+
+// DrillInfo is the HPKE info string for the recovery-drill packet of one staged installation.
+func DrillInfo(installation seal.ID) []byte {
+	return append([]byte("aqmas-seal-drill-v1\x00"), installation[:]...)
+}
+
+// sealDrill runs the offline recovery drill on the bastion itself (an owner
+// decision, docs/SETUP.md): the browser seals the pasted age identity to this import process, which
+// opens the staged recovery packet with it, authenticates every staged payload and leaves
+// only the acknowledgement that activation requires. The identity is cleared at once; it is
+// never written, logged or kept. This proves the saved key works; it does not prove the
+// machine never saw it.
+func (s *Server) sealDrill(w http.ResponseWriter, r *http.Request, sess string) {
+	z := s.seal
+	if z == nil || z.stage == nil {
+		s.writeErr(w, r, errConflict("no seal import is staged"))
+		return
+	}
+	var in struct {
+		Packet string `json:"packet"`
+	}
+	if err := decode(r, &in); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	ctx := r.Context()
+	row, err := s.store.Q().SessionPasskeyID(ctx, sess)
+	if err == nil {
+		err = s.sealOwner(ctx, s.store.Q(), sess, row)
+	}
+	if err != nil {
+		s.writeErr(w, r, errForbidden("owner session required"))
+		return
+	}
+	st := z.stage
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.activated {
+		s.writeErr(w, r, errConflict("already activated"))
+		return
+	}
+	identity, err := maint.OpenPacket(st.drill, DrillInfo(z.inv.Installation), in.Packet)
+	if err != nil {
+		s.writeErr(w, r, errBad("the recovery key packet could not be opened; reload the page and try again"))
+		return
+	}
+	proof, err := z.inv.OfflineProof(identity)
+	clear(identity)
+	sum := sha256.Sum256([]byte(proof))
+	if err != nil || subtle.ConstantTimeCompare(sum[:], st.expectedProof[:]) != 1 {
+		s.writeErr(w, r, errConflict("this is not the recovery key for the public key you gave: nothing was changed"))
+		return
+	}
+	path := filepath.Join(st.dir, "recovery.proof")
+	_ = os.Remove(path)
+	if err = writeExclusive(path, []byte(proof+"\n")); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	st.drilled = true
+	s.log.Info("recovery drill passed on this machine")
+	writeJSON(w, 200, api.OK{OK: true})
 }
 
 func (s *Server) sealStatus(w http.ResponseWriter, r *http.Request, sess string) {
@@ -123,6 +192,7 @@ func (s *Server) sealView(ctx context.Context, sess string) (sealView, error) {
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		v.Mode = "setup"
+		v.DrillKey, v.Drilled = maint.PublicKey(st.drill), st.drilled
 		if st.activated {
 			v.Mode = "activated"
 			return v, nil

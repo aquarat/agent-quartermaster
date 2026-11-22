@@ -14,12 +14,13 @@ import (
 func TestUpdateCeremony(t *testing.T) {
 	e := newEnv(t)
 	e.cfg.Updates.Repo = "ssh://git@example.com/example/aqmas.git"
-	e.cfg.Updates.SpoolDir = t.TempDir()
+	e.cfg.Updates.SpoolDir, e.cfg.Updates.CacheDir = t.TempDir(), t.TempDir()
 	oldV, oldC := release.Version, release.Commit
 	release.Version, release.Commit = "1.0.0", strings.Repeat("0", 40)
 	defer func() { release.Version, release.Commit = oldV, oldC }()
 	mustStatus(t, "private updates", e.webDo("GET", "/api/ui/updates", nil, nil), 401)
 	e.setupOwner()
+	e.installRunner()
 	s := release.Sums{}
 	for _, a := range release.Assets {
 		s[a] = strings.Repeat("a", 64)

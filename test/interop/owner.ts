@@ -105,6 +105,35 @@ try {
     case 'env-decide':{const [action,mode]=args;for(let n=0;;n++){const state=await api.envState();const item=action==='commit'?state.drafts[0]:state.releases.find((r:any)=>r.mode===mode&&r.status===(action==='revoke'?'approved':'pending'));if(item){const review=await (await import(`${web}/src/envsets.ts`)).envReview(api,await api.sealStatus(),item,action,action==='approve'?300:0,new URL(origin).hostname);await review.tap(auth);break}if(n>=150)throw Error('no env decision queued');await Bun.sleep(100)}break}
     case 'batch': {const state=await api.state(),v=await api.sealStatus();const sel=args.map(id=>({item:state.pending.find((p:any)=>p.id===id),action:'approve',ttl_seconds:300}));const b=await (await import(`${web}/src/approvals.ts`)).batchReview(api,v,sel,new URL(origin).hostname);await b.tap(auth);break;}
     case 'seal-status': console.log((await api.sealStatus()).mode);break;
+    // ---- Admin → Setup (docs/SETUP.md), through the web UI's own setup module ----
+    case 'setup': console.log(JSON.stringify(await api.setupGet!('')));break;
+    case 'setup-state': {const v:any=await api.setupGet!('');const t=v.tasks.find((t:any)=>t.id===args[0]);console.log(t.state+(t.blocked_by?': '+t.blocked_by:''));break;}
+    case 'setup-wait': {
+      // The broker restarts during tasks: connection errors and a dropped session are expected.
+      const [task,want,seconds]=args;let last='';
+      for(let n=0;n<Number(seconds??60)*5;n++){
+        try{const v:any=await api.setupGet!('');const t=v.tasks.find((t:any)=>t.id===task);last=t.state+' '+(t.last?.step??'')+' '+(t.last?.message??'');if(t.state===want){console.log(JSON.stringify(t.last??{}));last='';break}}catch(e){last=String((e as Error).message)}
+        await sleep(200);
+      }
+      if(last)throw Error(`setup task ${task} did not reach ${want}: ${last}`);break;
+    }
+    case 'setup-run': {
+      const [task,params,secrets]=args;const setup=await import(`${web}/src/setup.ts`);const v:any=await api.setupGet!('');
+      let p=JSON.parse(params??'{}');
+      if(task==='sync-passkeys')p={pins:v.passkeys.map((k:any)=>({id:k.credential,key_sha256:k.key_sha256}))};
+      await setup.runSetupTask(api,auth,v,task!,p,secrets?JSON.parse(secrets):undefined);break;
+    }
+    case 'setup-cancel': await api.setupPost!('/cancel',{});break;
+    case 'updates': console.log(JSON.stringify(await api.updates()));break;
+    case 'approve-update': { // "Upgrade aqmas": the update approval, exactly as the card builds it
+      const v=await api.updates(),c=v.candidate,f=c.forgejo??{};if(v.error||!c.version)throw Error('no verified update: '+v.error);
+      const p=await flows.prepareAction(api,{object:'update',id:c.commit,facts:{from_version:v.current,from_commit:v.commit,to_version:c.version,to_commit:c.commit,daemon_sha256:f['aqmasd-linux-arm64']!,linux_arm64_sha256:f['aqmas-linux-arm64']!,linux_amd64_sha256:f['aqmas-linux-amd64']!,darwin_arm64_sha256:f['aqmas-darwin-arm64']!}},{action:'approve'});
+      await flows.completeAction(api,auth,p);console.log(c.version);break;
+    }
+    case 'setup-preview': console.log(JSON.stringify(await api.setupGet!('/cutover/preview')));break;
+    case 'setup-host-key': console.log(JSON.stringify(await api.setupPost!('/host-key',{repo:args[0]})));break;
+    case 'age-keygen': {const k=await (await import(`${web}/src/setup.ts`)).generateAgeIdentity();writeFileSync(args[0]!,k.identity+'\n',{mode:0o600});console.log(k.recipient);break;}
+    case 'seal-drill': {const v=await api.sealStatus();await (await import(`${web}/src/setup.ts`)).sendDrill(api,v,readFileSync(args[0]!,'utf8'));break;}
     case 'capability': {
       const [action,name,capability]=args, v=await api.sealStatus(), key=action==='register'?null:await findPasskey(name!);
       const flow=await (await import(`${web}/src/capabilities.ts`)).startCapability(api,v,{action,nickname:name,credential_id:key?.raw_id??'',capability},new URL(origin).hostname);

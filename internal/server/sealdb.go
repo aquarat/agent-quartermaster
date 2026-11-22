@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/hpke"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
@@ -16,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aquarat/agent-quartermaster/internal/maint"
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
 	"github.com/aquarat/agent-quartermaster/internal/server/notify"
 	"github.com/aquarat/agent-quartermaster/internal/server/pki"
@@ -264,6 +266,8 @@ type sealStage struct {
 	salts         map[int64]seal.ID
 	activated     bool
 	expectedProof [32]byte
+	drill         hpke.PrivateKey // receives the recovery identity for the on-box drill
+	drilled       bool
 }
 
 func (s *Server) newStage() error {
@@ -306,7 +310,11 @@ func (s *Server) newStage() error {
 	if err = writeExclusive(filepath.Join(dir, "inventory.json"), b); err != nil {
 		return err
 	}
-	s.seal = &sealRuntime{inv: i, attempts: seal.NewAttempts(s.now), stop: make(chan struct{}), stage: &sealStage{mk: mk, dir: dir, expectedProof: sha256.Sum256([]byte(proof))}}
+	drill, err := maint.NewKey()
+	if err != nil {
+		return err
+	}
+	s.seal = &sealRuntime{inv: i, attempts: seal.NewAttempts(s.now), stop: make(chan struct{}), stage: &sealStage{mk: mk, dir: dir, expectedProof: sha256.Sum256([]byte(proof)), drill: drill}}
 	s.log.Info("sealed import fenced; compare bundle digest and recipient off-host and perform offline drill", "directory", dir, "inventory_sha256", seal.Digest(b), "installation", encodeID(g.Installation[:]), "recipient", i.Recipient)
 	success = true
 	return nil

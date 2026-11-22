@@ -1197,3 +1197,196 @@ dialog.sheet::backdrop {
 .subpage section, .command { margin-block:1rem; }
 .help .card { padding:1rem; }
 .command pre { overflow-x:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+
+/* ---- Admin → Setup (the task queue) ---- */
+
+a.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+.crumb {
+  margin: 0 0 4px;
+}
+.crumb a {
+  color: var(--muted);
+  text-decoration: none;
+}
+.setup,
+.setup-list,
+.setup-notices,
+.setup-status,
+.setup-form,
+.setup-last,
+.setup-run,
+.setup-key,
+.setup-cancel,
+.setup-copy,
+.update {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.setup-notices:empty,
+.setup-status:empty,
+.setup-form:empty,
+.setup-last:empty,
+.setup-run:empty,
+.setup-hostkeys:empty {
+  display: none;
+}
+.setup p,
+.setup h4 {
+  margin: 0;
+}
+.setup h4 {
+  font-size: 1rem;
+  margin-top: 4px;
+}
+.setup-banner {
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  border-radius: var(--radius-ctl);
+  padding: 10px 12px;
+  font-weight: 600;
+}
+.setup-notice {
+  display: grid;
+  gap: 8px;
+  font-weight: 500;
+}
+.setup-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.setup-head h3 {
+  margin: 0;
+  font-size: 1.125rem;
+}
+.setup-state {
+  border-color: transparent;
+  background: var(--ev-system-bg);
+  color: var(--ev-system);
+  white-space: nowrap;
+}
+.setup-state.state-available {
+  background: var(--ev-request-bg);
+  color: var(--ev-request);
+}
+.setup-state.state-running {
+  background: var(--ev-auto-bg);
+  color: var(--ev-auto);
+}
+.setup-state.state-waiting {
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+}
+.setup-state.state-done {
+  background: var(--ev-approve-bg);
+  color: var(--ev-approve);
+}
+.setup-state.state-failed {
+  background: var(--ev-deny-bg);
+  color: var(--ev-deny);
+}
+.setup-task[data-state="running"],
+.setup-task[data-state="waiting"] {
+  border: 2px solid var(--focus);
+}
+.setup-progress {
+  font-size: 1.0625rem;
+}
+.setup-more > summary {
+  cursor: pointer;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+}
+.setup-more[open] {
+  display: grid;
+  gap: 10px;
+}
+.setup-steps,
+.setup-checklist {
+  margin: 0;
+  padding-left: 1.5rem;
+  display: grid;
+  gap: 6px;
+}
+.setup-checklist {
+  gap: 14px;
+}
+.setup-step {
+  display: grid;
+  gap: 10px;
+}
+.setup-step.done > p {
+  color: var(--muted);
+}
+.setup input.text {
+  font: 500 1rem/1.3 var(--font);
+  letter-spacing: normal;
+  padding: 10px 12px;
+  min-height: 48px;
+  border-radius: var(--radius-ctl);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  width: 100%;
+}
+.setup-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-weight: 500;
+  min-height: 32px;
+}
+.setup-check input {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin: 1px 0 0;
+}
+.setup-secret {
+  border: 2px solid var(--high);
+  user-select: all;
+}
+.setup-log {
+  max-height: 18rem;
+  overflow: auto;
+}
+.setup-passkeys,
+.setup-fingerprints {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.setup-passkeys li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.update pre {
+  margin: 0;
+  overflow-x: auto;
+}
+.setup-checklist {
+  list-style: none;
+  padding-left: 0;
+  counter-reset: setup-step;
+}
+.setup-step {
+  counter-increment: setup-step;
+}
+.setup-step > p:first-child::before {
+  content: counter(setup-step) ". ";
+  font-weight: 700;
+}

@@ -41,6 +41,15 @@ func ReadLimit(r io.Reader, limit int64) ([]byte, error) {
 // Hashes uses the release API for private as well as public repositories. Never send
 // bearer credentials to the storage origin of a redirected download.
 func (s Source) Hashes(ctx context.Context, version string, github bool) (Sums, error) {
+	b, e := s.Asset(ctx, version, "SHA256SUMS", github, 4096)
+	if e != nil {
+		return nil, e
+	}
+	return Parse(b)
+}
+
+// Asset downloads one named release attachment (bounded). The caller verifies its digest.
+func (s Source) Asset(ctx context.Context, version, name string, github bool, limit int64) ([]byte, error) {
 	if !ValidVersion(version) {
 		return nil, errors.New("invalid release version")
 	}
@@ -63,7 +72,11 @@ func (s Source) Hashes(ctx context.Context, version string, github bool) (Sums, 
 		}
 		token = strings.TrimSpace(string(b))
 	}
-	client := http.Client{Timeout: 30 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	timeout := 30 * time.Second
+	if limit > 1<<20 {
+		timeout = 10 * time.Minute
+	}
+	client := http.Client{Timeout: timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) > 5 || !SafeURL(req.URL.String()) || via[0].URL.Scheme != req.URL.Scheme {
 			return errors.New("invalid release redirect")
 		}
@@ -118,7 +131,7 @@ func (s Source) Hashes(ctx context.Context, version string, github bool) (Sums, 
 	}
 	var target string
 	for _, a := range r.Assets {
-		if a.Name != "SHA256SUMS" {
+		if a.Name != name {
 			continue
 		}
 		if target != "" || a.ID <= 0 {
@@ -137,9 +150,5 @@ func (s Source) Hashes(ctx context.Context, version string, github bool) (Sums, 
 	if target == "" {
 		return nil, errors.New("missing release checksum asset")
 	}
-	b, e = get(target, "application/octet-stream", 4096)
-	if e != nil {
-		return nil, e
-	}
-	return Parse(b)
+	return get(target, "application/octet-stream", limit)
 }

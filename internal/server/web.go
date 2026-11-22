@@ -81,6 +81,7 @@ func (s *Server) WebHandler() http.Handler {
 		w.Write([]byte("ok\n"))
 	})
 	s.sealRoutes(api)
+	s.setupRoutes(api)
 	root.Handle("/api/", s.apiGuard(s.guardedWeb(api)))
 	root.Handle("/", static)
 
@@ -116,7 +117,7 @@ func (s *Server) apiGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.maintenance && r.Method != "GET" {
 			p := r.URL.Path
-			allowed := p == "/api/ui/login/begin" || p == "/api/ui/login/finish" || p == "/api/ui/logout"
+			allowed := p == "/api/ui/login/begin" || p == "/api/ui/login/finish" || p == "/api/ui/logout" || p == "/api/ui/setup/cancel"
 			if s.cutover != nil {
 				prefix := "/api/ui/migrations/" + s.cutover.ID + "/"
 				allowed = allowed || p == prefix+"challenge" || p == prefix+"activate"

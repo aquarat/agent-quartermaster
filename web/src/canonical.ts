@@ -63,6 +63,8 @@ const ALLOWED_KEYS: Record<string, string[]> = {
   standing: [...COMMON_KEYS, "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"],
   grant: [...COMMON_KEYS, "requesting_host", "kind", "target", "login_user", "ttl_seconds", "standing_hours"],
   passkey: [...COMMON_KEYS, "nickname", "new_nickname"],
+  // A maintenance task for the root runner (docs/SETUP.md): id names the task.
+  setup: [...COMMON_KEYS, "params", "secrets_sha256"],
 };
 // kind "cloudflare" (API.md 5.4): a different, exact key set for request/standing/grant.
 const CF_KEYS: Record<string, string[]> = {
@@ -80,6 +82,7 @@ const ALLOWED_ACTIONS: Record<string, string[]> = {
   standing: ["revoke"],
   grant: ["revoke"],
   passkey: ["add", "rename", "remove"],
+  setup: ["run"],
 };
 export const catalogueVerbs={organisation:['create'],service:['create'],credential_set:['create'],org_policy:['replace'],org_host:['admit','remove']};
 for(const [k,v] of Object.entries(catalogueVerbs)){ALLOWED_KEYS[k]=[...COMMON_KEYS,'plan'];ALLOWED_ACTIONS[k]=v;}
@@ -151,6 +154,7 @@ export function parseCanonical(text: string): Canonical {
     }
     if(c.to_commit!==c.id) throw new CanonicalError('update id differs from commit');
   }
+  if (c.object === "setup") checkSetup(c);
   if (c.object==='request' && !cf && (typeof c.principal!=='string'||!c.principal||typeof c.address!=='string'||!c.address)) throw new CanonicalError('invalid SSH source or principal');
   if (c.object==='enrollment' && (typeof c.replaces_id!=='string'||Boolean(c.replaces_id)!==c.replaces||c.ttl_seconds!==0||c.standing_hours!==0)) throw new CanonicalError('inconsistent enrollment');
   if ((c.object==='host'||c.object==='enrollment') && (typeof c.address!=='string'||!c.address||!['owner-device','agent'].includes(c.class ?? ''))) throw new CanonicalError('invalid host address or class');
@@ -166,6 +170,20 @@ export function parseCanonical(text: string): Canonical {
   }
   if (cf) checkCloudflare(c, allowed);
   return c;
+}
+
+/** Object "setup": v1, the task's parameters as one JSON object text, and the digest of the
+ * sealed secrets packet (or ""). The caller compares both with what it derived itself. */
+function checkSetup(c: Canonical): void {
+  if (c.v !== 1) throw new CanonicalError("setup requires canonical v1");
+  if (typeof c.params !== "string" || typeof c.secrets_sha256 !== "string" || !/^([0-9a-f]{64})?$/.test(c.secrets_sha256)) throw new CanonicalError("invalid setup fields");
+  let p: unknown;
+  try {
+    p = JSON.parse(c.params);
+  } catch {
+    p = null;
+  }
+  if (p === null || typeof p !== "object" || Array.isArray(p)) throw new CanonicalError("setup parameters are not a JSON object");
 }
 
 /** Kind "cloudflare": every key present, a scope this page can describe, well-formed
@@ -250,6 +268,9 @@ export interface Expectation extends UpdateFields {
   scope_params?: string;
   mode?: string;
   ip_condition?: string;
+  /** Setup: the task's canonical parameters and the sealed packet's digest ("" for none). */
+  params?: string;
+  secrets_sha256?: string;
   /** Passkey actions: the passkey's current nickname ("" for add). */
   nickname?: string;
   /** Passkey rename: the new nickname ("" for add and remove). */
@@ -271,6 +292,10 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
   else if(Object.hasOwn(catalogueVerbs,c.object))cmp('plan',c.plan,e.plan??'');
   else if(e.scoped_facts || c.v===2){cmp('v',c.v,2);cmp('indefinite',c.indefinite,e.indefinite??false);cmp('standing_indefinite',c.standing_indefinite,e.standing_indefinite??false);for(const k of bindingKeys(c.kind)){if(!e.scoped_facts || !Object.hasOwn(e.scoped_facts,k))out.push(`card lacks ${k}`);else cmp(k,c[k],e.scoped_facts[k]);}}
   if (e.object==='update') for (const k of UPDATE_KEYS) cmp(k,c[k],e[k]??'');
+  if (e.object === "setup" || c.object === "setup") {
+    cmp("params", c.params, e.params ?? "");
+    cmp("secrets_sha256", c.secrets_sha256, e.secrets_sha256 ?? "");
+  }
   cmp("requesting_host", c.requesting_host, e.requesting_host);
   cmp("kind", c.kind, e.kind);
   cmp("target", c.target, e.target);
@@ -340,6 +365,8 @@ const FIELD_LABELS: Record<string, string> = {
   nickname: "Passkey",
   new_nickname: "New name",
   key_fingerprint: "Key",
+  params: "Task parameters",
+  secrets_sha256: "Sealed secrets (SHA-256)",
   id: "ID",
   issued_at: "Issued",
   nonce: "Nonce",
@@ -354,6 +381,7 @@ function fieldValue(k: string, v: unknown): string {
   if (k === "scope_params" && v === "") return "none";
   if (k === "ip_condition" && v === "") return "n/a (proxy)";
   if ((k === "nickname" || k === "new_nickname") && v === "") return "(none)";
+  if (k === "secrets_sha256" && v === "") return "none";
   if (typeof v === "string") return v;
   return JSON.stringify(v);
 }
@@ -399,6 +427,10 @@ export function describe(c: Canonical): Description {
     case 'update:approve':
       headline=t`Install aqmasd ${String(c.to_version)} on the bastion, replacing ${String(c.from_version)}.`;
       warnings.push('The updater will rebuild this commit, verify all four binaries, and restart the credential broker.');
+      break;
+    case "setup:run":
+      headline = t`Run the setup task ${c.id} on the bastion.`;
+      warnings.push("The root maintenance runner checks this signature itself and carries the task out.");
       break;
     case "request:approve":
       headline = t`Approve ${kind} as ${who(c)} for ${duration(c.ttl_seconds ?? 0)}, requested by ${host}.`;

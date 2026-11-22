@@ -5,6 +5,7 @@
 //   bun mock/server.ts --port 9000 --fresh
 //   GET /mock/spawn         adds a new pending SSH request (dev convenience)
 //   GET /mock/login         MOCK ONLY: signs this browser in without a passkey (screenshots)
+//   GET /mock/setup?...     jumps Admin → Setup to a state (see mock/setup.ts)
 //
 // Fake WebAuthn: no signature checks. It does check the assertion's JSON shape (the fields
 // go-webauthn parses), that clientDataJSON's type and challenge match the issued challenge,
@@ -15,6 +16,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { resolve, sep, extname } from "node:path";
 import type { AuditEntry, GrantSummary, PasskeyInfo, PendingCloudflare, PendingItem, StandingApproval } from "../src/types";
+import { MockSetup } from "./setup";
 
 const b64url = (b: Uint8Array | Buffer) => Buffer.from(b).toString("base64url");
 const fromB64url = (s: string) => {
@@ -173,6 +175,8 @@ export interface MockOptions {
   /** Include the `passkeys` field in /api/ui/state (default true; false mimics an older server). */
   passkeyList?: boolean;
   log?: boolean;
+  /** Admin → Setup: how long each step of the fake runner takes (default 1500 ms). */
+  setupStepMs?: number;
 }
 
 /** A mock passkey: credential id (for allowCredentials) plus what the UI lists. */
@@ -218,6 +222,8 @@ export class MockStore {
   recent: AuditEntry[] = [];
   /** Challenge ids applied, in order (tests read this). */
   applied: Array<{ object: string; action: string; canonical: Record<string, unknown> }> = [];
+  /** Admin → Setup (mock/setup.ts); set by startMock. */
+  setup!: MockSetup;
 
   constructor(enrollCode: string | null) {
     this.enrollCode = enrollCode;
@@ -613,6 +619,29 @@ export function startMock(opts: MockOptions = {}) {
     return { publicKey: pk }; // go-webauthn CredentialAssertion
   }
 
+  store.setup = new MockSetup(
+    {
+      passkeys: () => store.passkeys.map((p) => ({ id: p.id, hex: p.info.id, name: p.info.nickname })),
+      sessionPasskey: (session) => (session ? store.sessionPasskey.get(session) : undefined),
+      issue: (text, canonical, session) => {
+        const { id, rec } = issue("action", { canonical, canonicalText: text, sessionBound: session }, createHash("sha256").update(text, "utf8").digest());
+        return { id, challenge: rec.challenge };
+      },
+      redeem: (challengeId, assertion, session) => {
+        const rec = take(challengeId, "action");
+        if (rec.sessionBound !== session) throw new HttpError(403, "forbidden", "challenge belongs to another session");
+        checkCredential(assertion, rec, "webauthn.get");
+        return rec.canonical!;
+      },
+      requestOptions: (req, challenge) => requestOptions(req, challenge, true),
+      fail: (status, code, message) => {
+        throw new HttpError(status, code, message);
+      },
+      audit: (action, object, detail) => store.audit("owner", action, object, detail),
+    },
+    opts.setupStepMs,
+  );
+
   function creationOptions(req: Request, challenge: string) {
     return {
       publicKey: {
@@ -852,11 +881,19 @@ export function startMock(opts: MockOptions = {}) {
     const isPost = req.method === "POST";
     let m: RegExpMatchArray | null;
     if(p==='/api/ui/hosts' && !isPost){needSession();return json([]);}
-    if(p==='/api/ui/updates' && !isPost){needSession();return json({current:'dev',commit:'unknown',candidate:{},stat:'',diff:'',status:'',error:'Update discovery is disabled'});}
+    // Admin → Setup, its cutover review, seal import and upgrade approval (mock/setup.ts).
+    if (/^\/api\/ui\/(setup|migration|migrations|updates|seal)(\/|$)/.test(p)) {
+      needSession();
+      const out = await store.setup.handle(req, url, body, session);
+      if (out !== undefined) return json(out);
+    }
     if(p==='/api/ui/help' && !isPost){needSession();return json({agent_api_url:'https://agent.example.com:8443',cli_download_base_url:'',ca_pin:'sha256:'+ '0'.repeat(64),owner_max_seconds:86400});}
 
     if (p === "/api/ui/state" && !isPost) {
       needSession();
+      // The maintenance modes answer with a bare state, as aqmasd does.
+      if (store.setup.mode === "seal-setup") return json({ seal_enabled: true, owner: { name: store.ownerName } });
+      if (store.setup.mode === "cutover") return json({ owner: { name: store.ownerName }, pending: [], grants: [], standing: [], migration: await store.setup.handle(new Request(url.origin + "/api/ui/migration"), new URL(url.origin + "/api/ui/migration"), {}, session) });
       const state: Record<string, unknown> = {
         owner: { name: store.ownerName, passkeys: store.passkeys.length },
         pending: store.pending,
@@ -1022,6 +1059,11 @@ export function startMock(opts: MockOptions = {}) {
           store.sessions.add(sid);
           if (store.passkeys[0]) store.sessionPasskey.set(sid, store.passkeys[0].info.id);
           res = new Response(null, { status: 302, headers: { Location: "/", "Set-Cookie": `aqmas_session=${sid}; Path=/; HttpOnly; SameSite=Strict` } });
+        } else if (url.pathname === "/mock/setup") {
+          res = json(store.setup.jump(url.searchParams));
+        } else if (url.pathname.startsWith("/api/") && store.setup.downUntil > Date.now()) {
+          // A setup task is restarting the broker.
+          res = json({ error: "unavailable", message: "broker restarting" }, 502);
         } else if (url.pathname === "/mock/spawn") {
           const item = store.spawnRequest();
           res = json({ spawned: item.id });
@@ -1047,7 +1089,10 @@ export function startMock(opts: MockOptions = {}) {
     server,
     store,
     url: `http://${server.hostname}:${server.port}`,
-    stop: () => server.stop(true),
+    stop: () => {
+      store.setup.stop();
+      return server.stop(true);
+    },
   };
 }
 
@@ -1064,4 +1109,5 @@ if (import.meta.main) {
   console.log(`aqmas mock on ${url}  (open http://localhost:${m.server.port}: WebAuthn needs "localhost", not an IP)`);
   if (m.store.enrollCode) console.log(`no passkey yet; enroll code: ${m.store.enrollCode}`);
   console.log(`add a pending request: curl ${url}/mock/spawn`);
+  console.log(`setup queue: ${url}/#/setup  (jump: curl '${url}/mock/setup?scoped=1&mode=seal-setup&wrap=tested')`);
 }

@@ -22,6 +22,9 @@ export interface SealView {
   epoch: string;
   choices: { id: string; name: string; selection: Selection }[];
   manifest?: string;
+  /** Setup mode: the key the recovery identity is sealed to for the drill, and its outcome. */
+  drill_key?: string;
+  drilled?: boolean;
   leaf_expires?: string;
   leaf_repair?: string;
   verified_access?: boolean;
@@ -85,6 +88,68 @@ export async function prepareControl(
   return decodeRequestOptions(o);
 }
 
+type Opening = Awaited<ReturnType<typeof makeOpening>>;
+type Choice = SealView["choices"][number];
+
+/** Challenge + pre-signing checks for one unlock or wrap ceremony of `key` (optionally
+ * combined with opening an approval window). Nothing is signed until `p.finish(auth)`. */
+export async function beginChoice(api: Api, key: Choice, op?: Opening) {
+  const b = await api.sealPost!<SealBegin>("unlock/challenge", {
+    credential: key.id,
+    registration_id: key.selection.registration_id,
+    window: op?.input,
+  });
+  const id = op ? JSON.parse(JSON.parse(b.canonical).window).id : "";
+  const selection: Selection = op
+    ? {
+        ...key.selection,
+        action: "unlock-window",
+        window: op.terms(id),
+      }
+    : key.selection;
+  const p = await prepareSeal(selection, b, location.hostname);
+  return { p, selection, id: id as string };
+}
+
+/** Challenge + pre-signing checks for a seal control action; `finish` signs and applies it.
+ * For "activate", `detail` is the complete bound manifest plus its digest. */
+export async function beginControl(
+  api: Api,
+  v: SealView,
+  action: "activate" | "lock" | "renew-leaf",
+) {
+  const b = await api.sealPost!<Control>("control/challenge", { action });
+  const opts = await prepareControl(v, action, b, location.hostname);
+  // The complete bound manifest (all roles, pins, credential and ciphertext digests) stays visible through signing.
+  const detail =
+    action !== "activate"
+      ? b.canonical
+      : JSON.stringify(
+          JSON.parse(JSON.parse(b.canonical).manifest),
+          null,
+          2,
+        ) +
+        "\nCompare SHA-256 with the local operator view: " +
+        Array.from(
+          new Uint8Array(
+            await crypto.subtle.digest(
+              "SHA-256",
+              new TextEncoder().encode(v.manifest!),
+            ),
+          ),
+          (x) => x.toString(16).padStart(2, "0"),
+        ).join("");
+  return {
+    detail,
+    async finish(auth: Authenticator) {
+      await api.sealPost!("control/finish", {
+        challenge_id: b.challenge_id,
+        assertion: encodeAssertion(await auth.get(opts)),
+      });
+    },
+  };
+}
+
 export function sealPanel(
   api: Api,
   auth: Authenticator,
@@ -145,21 +210,10 @@ export function sealPanel(
     if (v.mode === "unlocked")
       controls.append(
         button("Review TLS leaf renewal", async () => {
-          const b = await api.sealPost!<Control>("control/challenge", {
-            action: "renew-leaf",
-          });
-          const opts = await prepareControl(
-            v,
-            "renew-leaf",
-            b,
-            location.hostname,
+          const c = await beginControl(api, v, "renew-leaf");
+          confirm("Renew leaf and restart locked", c.detail, () =>
+            c.finish(auth),
           );
-          confirm("Renew leaf and restart locked", b.canonical, async () => {
-            await api.sealPost!("control/finish", {
-              challenge_id: b.challenge_id,
-              assertion: encodeAssertion(await auth.get(opts)),
-            });
-          });
         }),
       );
   }
@@ -205,20 +259,7 @@ export function sealPanel(
                   profile.settings.max_seconds,
                 )
               : undefined;
-          const b = await api.sealPost!<SealBegin>("unlock/challenge", {
-            credential: key.id,
-            registration_id: key.selection.registration_id,
-            window: op?.input,
-          });
-          const id = op ? JSON.parse(JSON.parse(b.canonical).window).id : "";
-          const selection: Selection = op
-            ? {
-                ...key.selection,
-                action: "unlock-window",
-                window: op.terms(id),
-              }
-            : key.selection;
-          const p = await prepareSeal(selection, b, location.hostname);
+          const { p, selection, id } = await beginChoice(api, key, op);
           const title = op
             ? "Unlock and open approval window"
             : v.mode === "locked"
@@ -256,33 +297,8 @@ export function sealPanel(
       action === "lock" ? "Lock now" : "Activate sealed installation";
     controls.append(
       button(label + "…", async () => {
-        const b = await api.sealPost!<Control>("control/challenge", { action });
-        const opts = await prepareControl(v, action, b, location.hostname);
-        // The complete bound manifest (all roles, pins, credential and ciphertext digests) stays visible through signing.
-        const detail =
-          action === "lock"
-            ? b.canonical
-            : JSON.stringify(
-                JSON.parse(JSON.parse(b.canonical).manifest),
-                null,
-                2,
-              ) +
-              "\nCompare SHA-256 with the local operator view: " +
-              Array.from(
-                new Uint8Array(
-                  await crypto.subtle.digest(
-                    "SHA-256",
-                    new TextEncoder().encode(v.manifest!),
-                  ),
-                ),
-                (x) => x.toString(16).padStart(2, "0"),
-              ).join("");
-        confirm(label, detail, async () => {
-          await api.sealPost!("control/finish", {
-            challenge_id: b.challenge_id,
-            assertion: encodeAssertion(await auth.get(opts)),
-          });
-        });
+        const c = await beginControl(api, v, action);
+        confirm(label, c.detail, () => c.finish(auth));
       }),
     );
   }

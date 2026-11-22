@@ -87,7 +87,10 @@ Next steps (by hand, on the bastion):
      (owner only) on the public_base_url host name.
   6. sudo -u aqmas aqmasd passkey-enroll-code, open public_base_url within 15 minutes
      and register the owner passkey.
-  7. Cloudflare (optional, milestone 2; docs/CLOUDFLARE.md section 8): put the parent tokens in
+  7. sudo aqmasd maint-init   (after the owner passkey exists): installs the maintenance
+     runner so that the organisations cutover, sealing, self-update and upgrades run from
+     Admin -> Setup with passkey approvals (docs/SETUP.md).
+  8. Cloudflare (optional, milestone 2; docs/CLOUDFLARE.md section 8): put the parent tokens in
      /etc/aqmas/cf-proxy-token and /etc/aqmas/cf-minter-token (root:root 0600), add the
      LoadCredential= drop-in described in aqmasd.service, fill [cloudflare] in config.toml,
      then systemctl daemon-reload && systemctl restart aqmasd.

@@ -61,6 +61,7 @@ test: vet
 # Real binaries end to end: aqmasd + aqmas + a throwaway sshd on 127.0.0.1 (test/interop/run.sh).
 interop:
 	test/interop/run.sh
+	test/interop/run-setup.sh
 
 # Milestone 2: real aqmasd + aqmas against the fake Cloudflare API (test/interop/run-cf.sh);
 # WRANGLER=1 also deploys with wrangler through `aqmas cf env` (installs wrangler with bun).

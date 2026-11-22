@@ -110,7 +110,7 @@ func (s *Server) guardedWeb(next http.Handler) http.Handler {
 				switch r.Method {
 				case "GET":
 					switch p {
-					case "/api/ui/state", "/api/ui/help", "/api/ui/hosts", "/api/ui/updates":
+					case "/api/ui/state", "/api/ui/help", "/api/ui/hosts", "/api/ui/updates", "/api/ui/setup":
 					default:
 						if !itemPath(p, "requests", "") && !itemPath(p, "enrollments", "") {
 							s.writeErr(w, r, lockedErr())
@@ -118,7 +118,7 @@ func (s *Server) guardedWeb(next http.Handler) http.Handler {
 						}
 					}
 				case "POST":
-					allowed := false
+					allowed := s.sealSetup && p == "/api/ui/setup/cancel"
 					if !s.sealSetup {
 						for _, k := range []string{"requests", "enrollments", "standing", "grants", "hosts", "passkeys"} {
 							verb := "revoke"
