@@ -5,18 +5,18 @@ import { decode, encode } from "./b64url";
 import { decodeRequestOptions, encodeAssertion, unwrapPublicKey, type Authenticator } from "./webauthn";
 
 const utf8 = new TextEncoder();
-const suite = new CipherSuite({ kem: new DhkemP256HkdfSha256(), kdf: new HkdfSha256(), aead: new Aes128Gcm() });
+export const suite = new CipherSuite({ kem: new DhkemP256HkdfSha256(), kdf: new HkdfSha256(), aead: new Aes128Gcm() });
 function number(n: number) {
   if (!Number.isSafeInteger(n) || n < 1) throw Error("Invalid seal generation");
   const out = new Uint8Array(8); new DataView(out.buffer).setBigUint64(0, BigInt(n)); return out;
 }
-function frames(parts: Uint8Array[]) {
+export function frames(parts: Uint8Array[]) {
   const out = new Uint8Array(parts.reduce((n, p) => n + 4 + p.length, 0));
   const v = new DataView(out.buffer); let i = 0;
   for (const p of parts) { v.setUint32(i, p.length); out.set(p, i + 4); i += 4 + p.length; }
   return out;
 }
-function tuple(role: string, ...parts: Uint8Array[]) {
+export function tuple(role: string, ...parts: Uint8Array[]) {
   return frames([utf8.encode("aqmas-seal"), number(1), utf8.encode(role), ...parts]);
 }
 

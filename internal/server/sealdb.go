@@ -31,6 +31,7 @@ CREATE TRIGGER seal_keep_unlock BEFORE DELETE ON passkeys WHEN EXISTS(SELECT 1 F
 
 type sealRuntime struct {
 	windows      windowPool
+	vault        vaultPool
 	capabilities capabilityStages
 	delayed      atomic.Int64
 	inv          seal.Inventory
@@ -162,7 +163,10 @@ func (s *Server) loadSeal() error {
 	if err = s.store.InitWindows(context.Background()); err != nil {
 		return err
 	}
-	return s.store.InitEnv(context.Background())
+	if err = s.store.InitEnv(context.Background()); err != nil {
+		return err
+	}
+	return s.store.InitVault(context.Background())
 }
 func (s *Server) isLocked() bool {
 	if s.seal == nil {

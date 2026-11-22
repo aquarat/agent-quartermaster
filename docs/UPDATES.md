@@ -115,6 +115,14 @@ Ordinary installation/restart alone does not advance the version.
 Install `aqmas` at `~/.local/bin/aqmas` on Apple Silicon or `/usr/local/bin/aqmas` on Linux. Use `aqmas upgrade --check`; `aqmas upgrade` (alias `update`) displays the version and digest, downloads and verifies the executable over mTLS, then prompts. For a deliberate non-interactive install supply **both** `--yes` and `--expect-sha256 HEX`. For root-owned installs use `sudo aqmas upgrade` with root's own enrolled, protected CLI configuration. Do not point a privileged installer at an agent-writable config, token, executable directory or trust store. GitHub uses a separate system-CA HTTPS client, never the mTLS client identity. The CLI's `[github]` table accepts the same `api` and optional `token_file` settings as above. No Forgejo credential goes on fleet hosts.
 
 The only degraded mode is an explicit `--allow-single-source` when GitHub is unreachable; it warns loudly and trusts the previously verified cache on the broker. It never overrides a malformed manifest or a mismatch. Without that exception, failure to verify is fatal. Interactive runs check the enrolled API for a one-line notice at most daily; no implicit install or prompt. Roll back with a rename of `aqmas.prev` over `aqmas` in the install directory. On macOS Go's arm64 linker already ad-hoc signs release binaries. The installer clears quarantine on its staged file if present and checks the signature. Invalid signatures require a corrected release; re-signing bytes locally after verification would invalidate the approved digest.
+**Vault tables (web form, reveal policy, signers):** additive tables and triggers created on a
+sealed start (`signer_keys`, `org_vault`, `sign_requests`), with no schema-version change. A
+previous binary ignores them. A signer set is stored as an application set at revision 0 with no
+env revision, so a previous binary sees an empty env set: nothing to request, deliver or check
+in its recovery inventory. Its key record uses a seal role the previous binary does not open. Reveal-policy rows and
+signing grants are simply not consulted by a previous binary, which has no reveal or signing
+route.
+
 **Sealed format:** activating schema 8 is a supervised import, never an
 on-start migration. The root seal-required config and active manifest must
 agree; pre-seal binaries are not valid rollback candidates. A compatible

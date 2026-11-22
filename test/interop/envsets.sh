@@ -27,6 +27,7 @@ env_scenario() {
   [[ $("${mtls[@]}" -X POST -o /dev/null -w '%{http_code}' "$base/v2/grants/$gid/collect") == 423 ]] || fail 'collection while locked'
   owner seal-eval; "${mtls[@]}" --fail -X POST -o /dev/null "$base/v2/grants/$gid/collect"
   [[ $("${mtls[@]}" -X POST -o /dev/null -w '%{http_code}' "$base/v2/grants/$gid/collect") == 409 ]] || fail 'collection replay'
+  vault_scenario
   # No diagnostic, audit or SQLite WAL (including free pages) contains the value.
   if grep -aFl "$sentinel" "$T/data/aqmas.db" "$T/data/aqmas.db-wal" "$T"/env-*.out "$T"/env-*.err "$T"/seal-*.log; then fail 'env value leaked'; fi
   rmdir "$ram/aqmas-env" "$ram"; ok 'env import, signed revision, child env, RAM checkout/checkin, revoke, shell export/unset, sentinel scan'

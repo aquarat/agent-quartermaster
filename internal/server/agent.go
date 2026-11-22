@@ -38,6 +38,7 @@ func (s *Server) AgentHandler() http.Handler {
 	}
 	mux := http.NewServeMux()
 	s.envAgentRoutes(mux)
+	s.signAgentRoutes(mux)
 	mux.Handle("GET /v1/releases/latest", s.requireHost(s.latestRelease))
 	mux.Handle("GET /v1/releases/{version}/{asset}", s.requireHost(s.releaseAsset))
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)

@@ -13,6 +13,7 @@
 // real server, so the UI's commitment check runs for real. For a browser on localhost, use a
 // real passkey or Chrome DevTools > WebAuthn > virtual authenticator (with user verification).
 
+import { MockVault } from "./vault";
 import { createHash, randomBytes } from "node:crypto";
 import { resolve, sep, extname } from "node:path";
 import type { AuditEntry, GrantSummary, PasskeyInfo, PendingCloudflare, PendingItem, StandingApproval } from "../src/types";
@@ -175,6 +176,8 @@ export interface MockOptions {
   /** Include the `passkeys` field in /api/ui/state (default true; false mimics an older server). */
   passkeyList?: boolean;
   log?: boolean;
+  /** Start with the sealed, organisation-scoped Credential sets view on (mock/vault.ts). */
+  vault?: boolean;
   /** Admin → Setup: how long each step of the fake runner takes (default 1500 ms). */
   setupStepMs?: number;
 }
@@ -224,6 +227,7 @@ export class MockStore {
   applied: Array<{ object: string; action: string; canonical: Record<string, unknown> }> = [];
   /** Admin → Setup (mock/setup.ts); set by startMock. */
   setup!: MockSetup;
+  vault!: MockVault;
 
   constructor(enrollCode: string | null) {
     this.enrollCode = enrollCode;
@@ -642,6 +646,25 @@ export function startMock(opts: MockOptions = {}) {
     opts.setupStepMs,
   );
 
+  store.vault = new MockVault({
+    issue: (text, canonical, session) => {
+      const { id, rec } = issue("action", { canonical, canonicalText: text, sessionBound: session }, createHash("sha256").update(text, "utf8").digest());
+      return { id, challenge: rec.challenge };
+    },
+    redeem: (challengeId, assertion, session) => {
+      const rec = take(challengeId, "action");
+      if (rec.sessionBound !== session) throw new HttpError(403, "forbidden", "challenge belongs to another session");
+      checkCredential(assertion, rec, "webauthn.get");
+      return rec.canonical!;
+    },
+    requestOptions: (req, challenge) => requestOptions(req, challenge, true),
+    fail: (status, code, message) => {
+      throw new HttpError(status, code, message);
+    },
+    audit: (action, object, detail) => store.audit("owner", action, object, detail),
+  });
+  store.vault.enabled = opts.vault === true;
+
   function creationOptions(req: Request, challenge: string) {
     return {
       publicKey: {
@@ -887,6 +910,11 @@ export function startMock(opts: MockOptions = {}) {
       const out = await store.setup.handle(req, url, body, session);
       if (out !== undefined) return json(out);
     }
+    if (/^\/api\/ui\/(seal|catalogue)(\/|$)/.test(p)) {
+      needSession();
+      const out = await store.vault.handle(req, url, body, session);
+      if (out !== undefined) return json(out);
+    }
     if(p==='/api/ui/help' && !isPost){needSession();return json({agent_api_url:'https://agent.example.com:8443',cli_download_base_url:'',ca_pin:'sha256:'+ '0'.repeat(64),owner_max_seconds:86400});}
 
     if (p === "/api/ui/state" && !isPost) {
@@ -900,6 +928,7 @@ export function startMock(opts: MockOptions = {}) {
         standing: store.standing,
         recent: store.recent.slice(0, 50),
       };
+      if (store.vault.enabled) Object.assign(state, { seal_enabled: true, catalogue_enabled: true });
       if (withGrants) state.grants = store.grants;
       if (withPasskeys) state.passkeys = store.passkeyInfos(session);
       return json(state);
@@ -1059,6 +1088,11 @@ export function startMock(opts: MockOptions = {}) {
           store.sessions.add(sid);
           if (store.passkeys[0]) store.sessionPasskey.set(sid, store.passkeys[0].info.id);
           res = new Response(null, { status: 302, headers: { Location: "/", "Set-Cookie": `aqmas_session=${sid}; Path=/; HttpOnly; SameSite=Strict` } });
+        } else if (url.pathname === "/mock/vault") {
+          // MOCK ONLY: show the sealed, organisation-scoped Credential sets view.
+          store.vault.enabled = true;
+          store.vault.locked = url.searchParams.get("locked") === "1";
+          res = json({ vault: true, locked: store.vault.locked });
         } else if (url.pathname === "/mock/setup") {
           res = json(store.setup.jump(url.searchParams));
         } else if (url.pathname.startsWith("/api/") && store.setup.downUntil > Date.now()) {

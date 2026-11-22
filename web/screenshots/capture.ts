@@ -2,6 +2,7 @@
 // /mock/login), at phone, tablet and desktop widths. Not part of the build or the tests.
 //
 //   cd web && bun run build && bun screenshots/capture.ts [path/to/headless_shell]
+//   SHOTS=vault bun screenshots/capture.ts     only the Credential sets pictures (vault-*.png)
 //
 // Uses Chromium's DevTools protocol directly (no extra dependencies). Default browser: the
 // Playwright headless shell under ~/.cache/ms-playwright.
@@ -26,7 +27,8 @@ function findBrowser(): string {
 }
 
 const mock = startMock({ port: 0, distDir: dist });
-const origin = `http://localhost:${mock.server.port}`;
+const defaultOrigin = `http://localhost:${mock.server.port}`;
+const only = process.env.SHOTS ?? "";
 const profile = mkdtempSync(join(tmpdir(), "aqmas-shots-"));
 const browser = Bun.spawn(
   [findBrowser(), "--headless", "--no-sandbox", "--disable-gpu", "--hide-scrollbars", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"],
@@ -67,7 +69,8 @@ async function cdp<T = Record<string, unknown>>(method: string, params: Record<s
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function evaluate(expr: string): Promise<unknown> {
-  const r = await cdp<{ result: { value?: unknown } }>("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true });
+  const r = await cdp<{ result: { value?: unknown }; exceptionDetails?: { text: string; exception?: { description?: string } } }>("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true });
+  if (r.exceptionDetails) throw new Error(`page: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text}`);
   return r.result.value;
 }
 async function until(expr: string, ms = 5000) {
@@ -78,7 +81,7 @@ async function until(expr: string, ms = 5000) {
   }
 }
 
-async function open(width: number, dark: boolean) {
+async function open(width: number, dark: boolean, origin = defaultOrigin) {
   await cdp("Emulation.setDeviceMetricsOverride", { width, height: 900, deviceScaleFactor: 1, mobile: width < 600 });
   await cdp("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: dark ? "dark" : "light" }] });
   await cdp("Page.navigate", { url: `${origin}/mock/login` });
@@ -105,9 +108,91 @@ async function shoot(name: string, width: number, full: boolean) {
   console.log(`${name} ${width}x${height}`);
 }
 
+/** One element, whole, wherever it is on the page. */
+async function shootEl(name: string, selector: string, width: number) {
+  const m = await cdp<{ cssContentSize: { height: number } }>("Page.getLayoutMetrics");
+  await cdp("Emulation.setDeviceMetricsOverride", { width, height: Math.ceil(m.cssContentSize.height), deviceScaleFactor: 1, mobile: width < 600 });
+  await sleep(250);
+  const r = (await evaluate(`(() => { const r = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect(); return { x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height }; })()`)) as { x: number; y: number; w: number; h: number };
+  const pad = 12;
+  const clip = { x: 0, y: Math.max(0, r.y - pad), width, height: Math.ceil(r.h + 2 * pad), scale: 1 };
+  const shot = await cdp<{ data: string }>("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip });
+  writeFileSync(join(outDir, name), Buffer.from(shot.data, "base64"));
+  console.log(`${name} ${width}x${clip.height}`);
+  await cdp("Emulation.setDeviceMetricsOverride", { width, height: 900, deviceScaleFactor: 1, mobile: width < 600 });
+}
+const click = (selector: string, text?: string) =>
+  evaluate(`(() => { const el = [...document.querySelectorAll(${JSON.stringify(selector)})].find((b) => ${text === undefined ? "true" : `b.textContent.trim() === ${JSON.stringify(text)}`}); if (!el) throw new Error("no " + ${JSON.stringify(selector + " " + (text ?? ""))}); el.click(); })()`);
+const pick = (selector: string, label: string) =>
+  evaluate(`(() => { const el = document.querySelector(${JSON.stringify(selector)}); el.value = [...el.options].find((o) => o.textContent.includes(${JSON.stringify(label)})).value; el.dispatchEvent(new Event("change")); })()`);
+const type = (selector: string, value: string) =>
+  evaluate(`(() => { const el = document.querySelector(${JSON.stringify(selector)}); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event("input", { bubbles: true })); })()`);
+// The headless shell has no authenticator. The mock checks an assertion's shape and
+// challenge, not its signature, so the pictures use a stand-in (screenshots only).
+const FAKE_PASSKEY = `navigator.credentials.get = async (o) => {
+  const b64 = (u) => btoa(String.fromCharCode(...new Uint8Array(u))).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const cd = JSON.stringify({ type: "webauthn.get", challenge: b64(o.publicKey.challenge), origin: location.origin, crossOrigin: false });
+  return { id: b64(raw), rawId: raw.buffer, type: "public-key", authenticatorAttachment: "platform", getClientExtensionResults: () => ({}),
+    response: { clientDataJSON: new TextEncoder().encode(cd).buffer, authenticatorData: crypto.getRandomValues(new Uint8Array(37)).buffer, signature: crypto.getRandomValues(new Uint8Array(71)).buffer, userHandle: new Uint8Array(16).buffer } };
+}; true`;
+
+const ENV_FILE = "# staging\nAPP_SECRET=mock-rotated-secret\nAPP_TOKEN=mock-new-token\nTLS_KEY=\"-----BEGIN PRIVATE KEY-----\nTU9DSyBLRVkgTUFURVJJQUwgUk9UQVRFRA==\n-----END PRIVATE KEY-----\n\"\n";
+
+/** Admin → Credential sets and the signing cards, against the mock's made-up organisations. */
+async function vaultShots(w: number) {
+  const m = startMock({ port: 0, distDir: dist, vault: true });
+  const origin = `http://localhost:${m.server.port}`;
+  try {
+    await open(w, false, origin);
+    await until(`document.querySelectorAll("#sec-signing .sign-card").length >= 2`);
+    await sleep(300);
+    await shootEl(`vault-sign-single-${w}.png`, "#sec-signing .sign-card:nth-of-type(1)", w);
+    await shootEl(`vault-sign-timed-${w}.png`, "#sec-signing .sign-card:nth-of-type(2)", w);
+    await evaluate(FAKE_PASSKEY);
+    await evaluate(`location.hash = "#/admin"`);
+    await until(`!!document.querySelector("#sec-vault .vault-pick select")`);
+    // The write-only form with a .env import waiting to be saved.
+    await pick("#vault-org", "client-a");
+    await until(`!!document.querySelector("#sec-vault .vault-editor .vault-keys li")`);
+    await evaluate(`(() => { const dt = new DataTransfer(); dt.items.add(new File([${JSON.stringify(ENV_FILE)}], "staging.env")); const i = document.querySelector("#vault-file"); i.files = dt.files; i.dispatchEvent(new Event("change")); })()`);
+    await until(`document.querySelectorAll("#sec-vault .vault-changes li").length === 3`);
+    await click("#sec-vault .vault-keys li:nth-child(3) .btn", "Remove");
+    await sleep(200);
+    await shootEl(`vault-form-${w}.png`, "#sec-vault .vault-editor", w);
+    // Reveal: values on the page, with the countdown.
+    await evaluate(`[...document.querySelectorAll("#sec-vault .kv-row .btn")].forEach((b) => b.click())`);
+    await click("#sec-vault .vault-editor .btn", "Reveal all…");
+    await until(`!!document.querySelector("#sec-vault .vault-confirm .confirm")`);
+    await click("#sec-vault .vault-confirm .confirm");
+    await until(`document.querySelectorAll("#sec-vault .revealed-item").length === 4`);
+    await sleep(200);
+    await shootEl(`vault-reveal-${w}.png`, "#sec-vault .vault-editor", w);
+    await click("#sec-vault .revealed-head .btn", "Hide now");
+    // A new signing key: the public key before the tap, then what verifiers need.
+    await pick("#vault-org", "personal");
+    await until(`!!document.querySelector("#sec-vault .vault-signer")`);
+    await evaluate(`document.querySelector("#sec-vault .vault-new-signer").open = true`);
+    await type("#ns-slug", "ota-key");
+    await type("#ns-title", "OTA key");
+    await click("#sec-vault .vault-new-signer .btn", "Review…");
+    await until(`!!document.querySelector("#sec-vault .vault-new-signer .vault-confirm .vault-key")`);
+    await sleep(200);
+    await shootEl(`vault-signer-${w}.png`, "#sec-vault .vault-new-signer", w);
+    await click("#sec-vault .vault-new-signer .vault-confirm .confirm");
+    await until(`!!document.querySelector("#sec-vault .vault-signer .vault-done")`);
+    await sleep(600);
+    await shootEl(`vault-signer-created-${w}.png`, "#sec-vault .vault-signer", w);
+  } finally {
+    m.stop();
+  }
+}
+
 try {
   await cdp("Page.enable");
   await cdp("Runtime.enable");
+  if (only === "" || only === "vault") for (const w of [375, 1280]) await vaultShots(w);
+  if (only !== "") throw "done";
   for (const w of [375, 768, 1280, 1920, 2560]) {
     await open(w, false);
     await shoot(`main-${w}.png`, w, true);
@@ -145,6 +230,8 @@ try {
   await evaluate(`document.querySelector("#sec-recent .ev-toggle").click()`);
   await sleep(200);
   await shoot("activity-passkeys-filter-1280.png", 1280, false);
+} catch (e) {
+  if (e !== "done") throw e;
 } finally {
   ws.close();
   browser.kill();

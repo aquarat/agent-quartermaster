@@ -57,6 +57,9 @@ type Edit struct {
 	Op      string  `json:"operation"`
 	Salt    []byte  `json:"salt"`
 	Entries []Entry `json:"entries"`
+	// Remove is used by "merge" only (the web form): names deleted in the same
+	// revision as Entries are added or replaced.
+	Remove []string `json:"remove,omitempty"`
 }
 type Draft struct {
 	Binding
@@ -135,8 +138,18 @@ func Names(entries []Entry) []string {
 	return n
 }
 func (e Edit) Commit(b Binding) (string, error) {
-	if len(e.Salt) != 32 || Validate(e.Entries) != nil || b.Revision < 0 || !(e.Op == "import" || e.Op == "put" && len(e.Entries) == 1 || e.Op == "unset" && len(e.Entries) == 1 && e.Entries[0].Value == "") {
+	if len(e.Salt) != 32 || Validate(e.Entries) != nil || b.Revision < 0 || !(e.Op == "import" || e.Op == "merge" && len(e.Entries)+len(e.Remove) > 0 || e.Op == "put" && len(e.Entries) == 1 || e.Op == "unset" && len(e.Entries) == 1 && e.Entries[0].Value == "") {
 		return "", errors.New("invalid edit")
+	}
+	if len(e.Remove) > 0 && (e.Op != "merge" || len(e.Remove) > 64) {
+		return "", errors.New("invalid edit")
+	}
+	removed := slices.Clone(e.Remove)
+	slices.Sort(removed)
+	for i, n := range removed {
+		if !nameRE.MatchString(n) || i > 0 && removed[i-1] == n || slices.ContainsFunc(e.Entries, func(x Entry) bool { return x.Name == n }) {
+			return "", errors.New("invalid edit")
+		}
 	}
 	h := sha256.New()
 	add := func(p []byte) { h.Write(binary.BigEndian.AppendUint32(nil, uint32(len(p)))); h.Write(p) }
@@ -153,6 +166,11 @@ func (e Edit) Commit(b Binding) (string, error) {
 		add([]byte(e.Op))
 		add([]byte(x.Name))
 		add([]byte(x.Value))
+	}
+	for _, n := range removed {
+		add([]byte("remove"))
+		add([]byte(n))
+		add(nil)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -172,6 +190,13 @@ func (e Edit) Changes(old []string) (string, error) {
 		}
 		present[x.Name] = true
 		ops = append(ops, x.Name+":"+kind)
+	}
+	for _, n := range e.Remove {
+		if e.Op != "merge" || !slices.Contains(old, n) || present[n] {
+			return "", errors.New("cannot remove missing key")
+		}
+		present[n] = true
+		ops = append(ops, n+":remove")
 	}
 	if e.Op == "import" {
 		for _, n := range old {
@@ -197,6 +222,9 @@ func (e Edit) Apply(old []Entry) ([]Entry, error) {
 			m[x.Name] = x.Value
 		}
 	}
+	for _, n := range e.Remove {
+		delete(m, n)
+	}
 	out := make([]Entry, 0, len(m))
 	for k, v := range m {
 		out = append(out, Entry{k, v})
@@ -204,30 +232,105 @@ func (e Edit) Apply(old []Entry) ([]Entry, error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, Validate(out)
 }
+
+// ParseFile reads the literal dotenv subset documented in docs/API.md
+// ("Dotenv import"): NAME=value lines, blank lines and # comment lines.
+// A value is bare (no quotes, backslash, $, backtick, # or surrounding
+// space), single-quoted (literal; may span lines) or double-quoted (may span
+// lines; only the escapes \n \r \t \\ \" are accepted). Nothing is ever
+// expanded. Errors name the line, never its content.
 func ParseFile(b []byte) ([]Entry, error) {
-	if len(b) > MaxBytes || !utf8.Valid(b) {
+	if len(b) > MaxBytes+4096 || !utf8.Valid(b) {
 		return nil, errors.New("invalid dotenv size or encoding")
 	}
+	s := strings.ReplaceAll(string(b), "\r\n", "\n")
 	var out []Entry
-	for n, line := range bytes.Split(b, []byte{'\n'}) {
-		s := strings.TrimSuffix(string(line), "\r")
-		if s == "" || strings.HasPrefix(s, "#") {
+	line := 1
+	bad := func() ([]Entry, error) { return nil, fmt.Errorf("unsupported literal assignment on line %d", line) }
+	for len(s) > 0 {
+		if s[0] == '\n' {
+			s = s[1:]
+			line++
 			continue
 		}
-		k, v, ok := strings.Cut(s, "=")
-		if !ok || !SafeName(k) || strings.ContainsAny(v, "\r\n\x00\"'`$\\#") || strings.TrimSpace(v) != v {
-			return nil, fmt.Errorf("unsupported literal assignment on line %d", n+1)
+		end := strings.IndexByte(s, '\n')
+		if end < 0 {
+			end = len(s)
+		}
+		if s[0] == '#' {
+			s = s[end:]
+			continue
+		}
+		k, rest, ok := strings.Cut(s[:end], "=")
+		if !ok || !SafeName(k) {
+			return bad()
+		}
+		var v string
+		if rest != "" && (rest[0] == '\'' || rest[0] == '"') {
+			quote := rest[0]
+			body := s[len(k)+2:]
+			var sb strings.Builder
+			i, start := 0, line
+			for {
+				if i >= len(body) {
+					line = start
+					return bad()
+				}
+				c := body[i]
+				i++
+				if c == quote {
+					break
+				}
+				if c == '\n' {
+					line++
+				}
+				if c == '\\' && quote == '"' {
+					if i >= len(body) {
+						line = start
+						return bad()
+					}
+					e := strings.IndexByte(`nrt\"`, body[i])
+					if e < 0 {
+						return bad()
+					}
+					c = "\n\r\t\\\""[e]
+					i++
+				}
+				sb.WriteByte(c)
+			}
+			v = sb.String()
+			tail := body[i:]
+			end = strings.IndexByte(tail, '\n')
+			if end < 0 {
+				end = len(tail)
+			}
+			if strings.Trim(tail[:end], " \t") != "" {
+				return bad()
+			}
+			s = tail[end:]
+		} else {
+			if strings.ContainsAny(rest, "\r\x00\"'`$\\#") || strings.TrimSpace(rest) != rest {
+				return bad()
+			}
+			v = rest
+			s = s[end:]
 		}
 		out = append(out, Entry{k, v})
 	}
 	return out, Validate(out)
 }
+
+// FileBytes renders the portable literal subset only: `checkout` refuses a
+// value that file readers disagree about (spaces, quotes, newlines, ...).
 func FileBytes(e []Entry) ([]byte, error) {
 	if err := Validate(e); err != nil {
 		return nil, err
 	}
 	var b bytes.Buffer
 	for _, x := range e {
+		if strings.ContainsAny(x.Value, "\r\n") {
+			return nil, fmt.Errorf("%s is a multi-line value: a literal .env file cannot carry it; use `aqmas run` or `aqmas checkout-shell`", x.Name)
+		}
 		for _, c := range x.Value {
 			if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.ContainsRune("_./:@%+,=-", c)) {
 				return nil, fmt.Errorf("%s needs process delivery: not a portable literal dotenv value", x.Name)

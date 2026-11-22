@@ -199,6 +199,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess strin
 	}
 	if s.seal != nil {
 		s.seal.windows.logout(sess)
+		s.seal.vault.logout(sess)
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 	writeJSON(w, http.StatusOK, api.OK{OK: true})

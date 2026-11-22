@@ -38,6 +38,22 @@ func (s *Server) ownerCatalogue(ctx context.Context, q *store.Q, sess string, pk
 	if err != nil {
 		return c, err
 	}
+	if s.seal != nil && s.seal.stage == nil {
+		// A signer set is stored as an application set with a signer_keys row.
+		signers, err := q.SignerSets(ctx)
+		if err != nil {
+			return c, err
+		}
+		for i := range c.Orgs {
+			for j := range c.Orgs[i].Services {
+				for k := range c.Orgs[i].Services[j].Sets {
+					if set := &c.Orgs[i].Services[j].Sets[k]; signers[set.ID] {
+						set.Kind = "signer"
+					}
+				}
+			}
+		}
+	}
 	for i := range c.Orgs {
 		o := &c.Orgs[i]
 		for _, r := range o.Rules {

@@ -47,6 +47,12 @@ Usage:
   aqmas run PATH --why REASON [--ttl 10m] -- COMMAND...
   aqmas checkout|co PATH --why REASON [--file .env]; aqmas checkin|ci PATH
   aqmas checkout-shell|cos PATH --why REASON; aqmas checkin-shell|cis PATH
+  aqmas sign ORG/SERVICE/KEY --why REASON [--ttl 30m [--count N]] FILE... | - | --digest sha256:HEX
+      Have aqmas sign: files are hashed here, the owner approves the names, sizes
+      and SHA-256 digests, the key never leaves aqmas. Writes FILE.sig (or --out,
+      --format raw|hex|base64, --force); stdin and --digest print hex. --ttl asks
+      for a signing grant reused by later calls; "aqmas sign PATH --end" ends it.
+  aqmas signer ORG/SERVICE/KEY [--pem]   the key's scheme and public key
   aqmas version | help
   aqmas upgrade | update [--check] [--yes --expect-sha256 HEX] [--allow-single-source]
 
@@ -142,6 +148,43 @@ func run(args []string) int {
 			ttl = int(d / time.Second)
 		}
 		return fail(env.EnvUse(ctx, f.pos[0], mode, f.str["why"], name, ttl, f.cmd))
+	case "signer":
+		f, err := parseFlags(rest, map[string]bool{"pem": false})
+		if err != nil {
+			return fail(err)
+		}
+		if len(f.pos) != 1 || f.cmd != nil {
+			return fail(&client.UsageError{Msg: "expected org/service/key"})
+		}
+		return fail(env.SignerInfo(ctx, f.pos[0], f.bool["pem"]))
+	case "sign":
+		f, err := parseFlags(rest, map[string]bool{"why": true, "ttl": true, "count": true, "out": true, "format": true, "digest": true, "force": false, "end": false})
+		if err != nil {
+			return fail(err)
+		}
+		if len(f.pos) < 1 {
+			return fail(&client.UsageError{Msg: "expected org/service/key, then the files to sign"})
+		}
+		o := client.SignOptions{Path: f.pos[0], Why: f.str["why"], Out: f.str["out"], Format: f.str["format"], Digest: f.str["digest"], Force: f.bool["force"], Files: append(f.pos[1:], f.cmd...)}
+		if f.bool["end"] {
+			if len(o.Files) > 0 || o.Digest != "" {
+				return fail(&client.UsageError{Msg: "--end takes only the key path"})
+			}
+			return fail(env.SignEnd(ctx, o.Path))
+		}
+		if f.str["ttl"] != "" {
+			d, err := time.ParseDuration(f.str["ttl"])
+			if err != nil || d < time.Second || d%time.Second != 0 || d > 24*time.Hour {
+				return fail(&client.UsageError{Msg: "--ttl is a duration up to 24h, such as 30m"})
+			}
+			o.TTL = int(d / time.Second)
+		}
+		if f.str["count"] != "" {
+			if o.Count, err = strconv.Atoi(f.str["count"]); err != nil || o.Count < 1 || o.Count > 1000 {
+				return fail(&client.UsageError{Msg: "--count is between 1 and 1000"})
+			}
+		}
+		return fail(env.Sign(ctx, o))
 	case "ci", "checkin", "cis", "checkin-shell":
 		if len(rest) != 1 {
 			return fail(&client.UsageError{Msg: "expected qualified set path"})

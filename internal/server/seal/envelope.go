@@ -212,7 +212,7 @@ func (o Object) fields(g Generation) ([][]byte, error) {
 			return nil, errRecord
 		}
 		f = append(f, []byte("global"), []byte(o.Global))
-	case "cf-proxy", "cf-minter", "env-draft", "env-revision":
+	case "cf-proxy", "cf-minter", "env-draft", "env-revision", "signer-key":
 		if o.Global != "" || !label(o.Org) || !label(o.Service) || !label(o.Set) {
 			return nil, errRecord
 		}

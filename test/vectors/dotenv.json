@@ -1,0 +1,178 @@
+[
+  {
+    "name": "bare",
+    "input": "APP_URL=https://example.com/a?b=c\u0026d\nAPP_ID=\n",
+    "entries": [
+      {
+        "name": "APP_URL",
+        "value": "https://example.com/a?b=c\u0026d"
+      },
+      {
+        "name": "APP_ID",
+        "value": ""
+      }
+    ]
+  },
+  {
+    "name": "comments and blanks",
+    "input": "# first\n\nAPP_TOKEN=abc\n# APP_SECRET=no\n",
+    "entries": [
+      {
+        "name": "APP_TOKEN",
+        "value": "abc"
+      }
+    ]
+  },
+  {
+    "name": "crlf",
+    "input": "APP_TOKEN=abc\r\nAPP_SECRET=def\r\n",
+    "entries": [
+      {
+        "name": "APP_TOKEN",
+        "value": "abc"
+      },
+      {
+        "name": "APP_SECRET",
+        "value": "def"
+      }
+    ]
+  },
+  {
+    "name": "single quoted literal",
+    "input": "APP_SECRET='a \"b\" $HOME \\n #x'\n",
+    "entries": [
+      {
+        "name": "APP_SECRET",
+        "value": "a \"b\" $HOME \\n #x"
+      }
+    ]
+  },
+  {
+    "name": "single quoted multi-line",
+    "input": "APP_KEY='-----BEGIN KEY-----\nAAAA\n-----END KEY-----'\nAPP_ID=1\n",
+    "entries": [
+      {
+        "name": "APP_KEY",
+        "value": "-----BEGIN KEY-----\nAAAA\n-----END KEY-----"
+      },
+      {
+        "name": "APP_ID",
+        "value": "1"
+      }
+    ]
+  },
+  {
+    "name": "double quoted escapes",
+    "input": "APP_SECRET=\"tab\\there \\\"q\\\" back\\\\slash\\r\\n\"\n",
+    "entries": [
+      {
+        "name": "APP_SECRET",
+        "value": "tab\there \"q\" back\\slash\r\n"
+      }
+    ]
+  },
+  {
+    "name": "double quoted multi-line",
+    "input": "APP_KEY=\"-----BEGIN KEY-----\nAAAA\\nBBBB\n-----END KEY-----\n\"  \nAPP_ID=1",
+    "entries": [
+      {
+        "name": "APP_KEY",
+        "value": "-----BEGIN KEY-----\nAAAA\nBBBB\n-----END KEY-----\n"
+      },
+      {
+        "name": "APP_ID",
+        "value": "1"
+      }
+    ]
+  },
+  {
+    "name": "dollar is literal inside quotes",
+    "input": "APP_SECRET=\"${HOME} $(id) `id`\"\n",
+    "entries": [
+      {
+        "name": "APP_SECRET",
+        "value": "${HOME} $(id) `id`"
+      }
+    ]
+  },
+  {
+    "name": "unicode",
+    "input": "APP_SECRET='pässwörd ✓'\n",
+    "entries": [
+      {
+        "name": "APP_SECRET",
+        "value": "pässwörd ✓"
+      }
+    ]
+  },
+  {
+    "name": "no newline at end",
+    "input": "APP_TOKEN=abc",
+    "entries": [
+      {
+        "name": "APP_TOKEN",
+        "value": "abc"
+      }
+    ]
+  },
+  {
+    "name": "bad: unsafe name",
+    "input": "PATH=/tmp\n",
+    "error_line": 1
+  },
+  {
+    "name": "bad: lower-case name",
+    "input": "APP_TOKEN=a\napp_secret=b\n",
+    "error_line": 2
+  },
+  {
+    "name": "bad: bare dollar",
+    "input": "APP_TOKEN=a\nAPP_SECRET=$HOME\n",
+    "error_line": 2
+  },
+  {
+    "name": "bad: bare inline comment",
+    "input": "APP_TOKEN=a #x\n",
+    "error_line": 1
+  },
+  {
+    "name": "bad: bare leading space",
+    "input": "APP_TOKEN= a\n",
+    "error_line": 1
+  },
+  {
+    "name": "bad: unknown escape",
+    "input": "APP_TOKEN=a\nAPP_ID=1\nAPP_SECRET=\"a\\x\"\n",
+    "error_line": 3
+  },
+  {
+    "name": "bad: escape on a later line",
+    "input": "APP_SECRET=\"a\nb\\q\"\n",
+    "error_line": 2
+  },
+  {
+    "name": "bad: text after quote",
+    "input": "APP_SECRET='a' b\n",
+    "error_line": 1
+  },
+  {
+    "name": "bad: unterminated",
+    "input": "APP_TOKEN=a\nAPP_SECRET='abc\nAPP_ID=1\n",
+    "error_line": 2
+  },
+  {
+    "name": "bad: duplicate",
+    "input": "APP_TOKEN=a\nAPP_TOKEN=b\n",
+    "error_line": -1
+  },
+  {
+    "name": "bad: export prefix",
+    "input": "export APP_TOKEN=a\n",
+    "error_line": 1
+  },
+  {
+    "name": "bad: no equals",
+    "input": "APP_TOKEN\n",
+    "error_line": 1
+  }
+]

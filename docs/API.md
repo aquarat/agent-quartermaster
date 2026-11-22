@@ -666,8 +666,10 @@ ticket at the CLI prompt (`--ticket-fd N` for a protected input stream).
 `aqmas set import PATH --from FILE` replaces the **entire** set. `set put PATH
 KEY` reads a hidden prompt or exact stdin bytes; `set unset PATH KEY` removes
 one key. Imports accept UTF-8 literal assignments, whole-line comments and
-blank lines; no quotes, interpolation, duplicate names or NUL. Compare the
-CLI's Ref and commitment to the card before signing. No value-read UI exists.
+blank lines, and quoted values that may span lines ("Dotenv import" below);
+no interpolation, duplicate names or NUL. Compare the CLI's Ref and
+commitment to the card before signing. The web form and reveal are described
+under "Vault" below.
 
 Upload (`POST /v2/env/upload`) stores only metadata and a per-draft encrypted
 blob. SHA-256 commitment input is u32be-length-prefixed components: UTF-8
@@ -699,7 +701,8 @@ commit requires a new release. TTL bounds collection, not upstream validity.
 * `aqmas checkout PATH --why REASON [--file .env]` (`co`) uses a private
   0700 Linux tmpfs `XDG_RUNTIME_DIR` and an exclusive link in the trusted
   current directory. `checkin PATH` (`ci`) removes it and ends the grant.
-  File values must be portable literal tokens. A detached holder polls for
+  File values must be portable literal tokens; a set with a multi-line value
+  is refused in file mode (after collection: use `run` or `cos` for it). A detached holder polls for
   revocation, expires locally and cleans up on loss of contact. A killed
   holder leaves its target until a subsequent checkout reaps it or the mount
   disappears. Exclude that mount from backups; disable persistent swap,
@@ -720,3 +723,132 @@ and the public WebAuthn verification fields when signed authenticator data
 has no extensions. When it carries extensions, audit records that the opener
 was verified live; the assertion cannot later be independently reverified
 from the audit alone. No PRF/KEK or decrypted finish packet is persisted.
+
+# Vault: web form, reveal and signer sets
+
+Sealed, organisation-scoped installations only. The owner's **Credential sets**
+page talks to four session-only routes under `/api/ui/seal/vault/`; agents ask
+for signatures under `/v2/sign/`. [SIGNING.md](SIGNING.md) is the guide; this
+section is the wire contract.
+
+## Transport encryption
+
+Values and private keys cross the edge as one RFC 9180 HPKE base-mode message
+per fresh key pair: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, the
+suite of the unlock finish. Public keys are uncompressed SEC1 points (65
+bytes); binary fields are unpadded base64url. `T(role, f...)` is the sealed
+store's framed tuple (`aqmas-seal`, uint64 1, role, then each field, every
+component prefixed with its uint32 big-endian length).
+
+| Direction | Recipient key | `info` | AAD |
+|---|---|---|---|
+| Browser → broker (form edit, signer import) | Broker's, from `POST attempt`: in memory, one packet, five minutes, bound to the session | `T("hpke-vault", installation, purpose)` with purpose `edit` or `signer-import` | `T("hpke-vault-aad", attempt ID (32 bytes), epoch, set ID as UTF-8)` |
+| Broker → browser (reveal) | Browser's, generated for this reveal and named in the signed canonical | `T("hpke-vault", installation, "reveal")` | `T("hpke-vault-aad", SHA-256 of the canonical, epoch, set ID as UTF-8)` |
+
+The edge and any HTTP body logger see ciphertext only. As with unlock
+([SEALED.md](SEALED.md)), this does not defend against an edge that serves a
+different page: such a page can read what is typed into it.
+A packet for one set, attempt, lock epoch or purpose does not open as another.
+The reveal AAD contains the canonical's digest, and so its nonce: a recorded
+response cannot be replayed into a later ceremony. Vectors:
+`test/vectors/vault.json` (Go and TypeScript each open what the other sealed).
+
+## Routes
+
+* `GET state` → `{unlocked, schemes, organisations:[{id,slug,title,allow_reveal}], sets, requests}`.
+  A set carries `org_id, org_slug, org_title, service_id, service_slug,
+  service_title, set_id, set_slug, set_title, kind ("env-set" | "signer"),
+  revision, names, allow_reveal` and, for a signer, `scheme, origin, created_at,
+  signatures, public_key, public_hex, public_pem, fingerprint` (SHA-256 of the
+  raw public key). `requests` are pending signing requests and live signing
+  grants (below). Metadata only; works while locked.
+* `POST attempt` `{}` → `{attempt_id, recipient, expires_at}`. Unlocked only.
+* `POST challenge` with a choice (below) → `{canonical, challenge_id, public_key, facts}`.
+* `POST finish` `{challenge_id, assertion}` → the action's result.
+
+Every action is a v3 review canonical: sorted keys `action, epoch, id,
+installation, issued_at, metadata, nonce, object ("vault"), v (3)`.
+`metadata` is a string holding a JSON object with sorted keys, no
+insignificant space, `/`, `<`, `>` and `&` unescaped, U+2028/U+2029 as
+` `/` `. The page builds the expected metadata from what the owner
+chose and what `state` showed, and refuses a canonical that differs by one
+byte. `finish` consumes the stored challenge, verifies a fresh user-verified
+assertion over its SHA-256, rebuilds the metadata from current rows and
+applies only if it is byte-identical. No vault action can be confirmed under
+an approval window or in a batch. *Target fields* below are `org_id, org_slug,
+org_title, service_id, service_slug, service_title, set_id, set_slug,
+set_title, kind, revision`.
+
+| `action`, `id` | Choice fields | Signed metadata | Result |
+|---|---|---|---|
+| `commit`, set ID | `attempt_id, enc, ciphertext, commitment` | target fields, `attempt_id, operation, changes, commitment, result_revision` | `{ok}`; a new immutable revision |
+| `reveal`, set ID | `names` (sorted, unique, non-empty), `recipient` | target fields, `names, recipient` | `{enc, ciphertext}` |
+| `policy`, org ID | `allow_reveal` | `org_id, org_slug, org_title, old_allow_reveal, allow_reveal` | `{ok}` |
+| `signer-create`, new set ID (32 lower-case hex) | `service_id, set_slug, set_title, scheme, source` (`generate` or `import`); for import also `attempt_id, enc, ciphertext` | target fields of the new set (`kind` `signer`, `revision` 0), `scheme, source, attempt_id, public_key, fingerprint, result_revision` (0: a signer set stays at revision 0, its key is immutable) | `{set_id, path, scheme, public_key, public_hex, public_pem, fingerprint}` |
+| `sign-approve`, `sign-deny`, `sign-revoke`; request ID | approve: `ttl_seconds, max_signatures` | target fields, `request_id, host, enrollment, address, scheme, fingerprint, items` (each `name, size, sha256` and, for a SHA-512 scheme, `sha512`), `requested_ttl_seconds, requested_max_signatures, ttl_seconds, max_signatures, admission_generation, policy_revision, service_revision, soft_cap_seconds, beyond_soft_cap` | `{ok}` |
+
+`facts` are unsigned conveniences: `attempt_id` (the broker allocates one for
+a generated key) and, for `signer-create`, `public_key, public_hex, public_pem,
+fingerprint`. The page copies `attempt_id`, `public_key` and `fingerprint`
+into its expected metadata, shows the public key from the canonical, and for
+an import the owner compares it with the public half they already know.
+
+**Form edit.** The plaintext is `{"operation","salt","entries":[{"name","value"}],"remove":[names]}`
+(`salt`: 32 random bytes, standard base64 with padding). `operation` is
+`merge` (add or replace `entries`, delete `remove`, keep the rest) or `import`
+(the set becomes exactly `entries`; no `remove`). `commitment` is the env edit
+commitment below with, for `merge`, one more group per removed name (sorted):
+`"remove"`, the name, an empty value. `changes` is the sorted, comma-joined
+list of `NAME:add`, `NAME:replace`, `NAME:remove`. The page never receives old
+values: it computes `changes` from the key names in `state`. Limits are those
+of an env set (64 keys, 8192 bytes a value, 24 KiB in all); a value may hold
+any UTF-8 text except NUL, including newlines.
+
+**Reveal.** Refused for a signer (always), when the organisation's
+`allow_reveal` is off, and while locked. The plaintext is
+`{"entries":[{"name","value"}]}` for exactly the signed names. The audit row
+names the set, revision and key names. A new organisation allows reveal;
+`policy` turns it off or on (turning it on needs an unlocked broker).
+
+**Signer.** The private key is generated by the broker, or parsed from the
+sealed import packet `{"private_key": text}` (hex seed or scalar; PKCS#8, SEC1
+or OpenSSH PEM, unencrypted). It is sealed under role `signer-key` and opened
+only to sign. No route returns it; there is no export.
+
+**Dotenv import** (browser and `aqmas set import`): `NAME=value` lines, blank
+lines and `#` comment lines. A value is bare (no quote, backslash, `$`,
+backtick, `#` or surrounding space), single-quoted (literal, may span lines)
+or double-quoted (may span lines; exactly the escapes `\n \r \t \\ \"`).
+Nothing is expanded; only space or tab may follow a closing quote; CRLF is
+read as LF. Errors name the line, never its content. Vectors:
+`test/vectors/dotenv.json`.
+
+## Signing (agent API, client certificate required)
+
+* `GET /v2/sign/key?path=org/service/set` → the binding: `path, title, org,
+  service, set, revision, service_revision, policy_revision,
+  admission_generation, enrollment, host, class, scheme, public_key (standard
+  base64), default_seconds, soft_cap_seconds`. Admitted hosts only; 404 otherwise.
+* `POST /v2/sign/requests` `{binding, reason, ttl_seconds, max_signatures, items}` →
+  the pending request. `ttl_seconds` 0 asks for a single-use grant (exactly
+  `items`, once, collected within ten minutes of approval); above 0 asks for a
+  time-boxed grant of up to `max_signatures` (default 20, at most 1000) for at
+  most 24 hours. An item is `{name, size, sha256}` plus `sha512` or `message`
+  (standard base64) when the scheme signs that; `size` is -1 when only a digest
+  was given. At most 16 items a call.
+* `GET /v2/sign/requests/{id}`, `POST .../{id}/cancel`, `GET /v2/sign/grants/{id}`,
+  `POST /v2/sign/grants/{id}/end`: metadata, cancel, end early.
+* `POST /v2/sign/grants/{id}/sign` `{items}` → `{request, signatures:[{name, sha256, signature}]}`.
+  423 while locked. Same host and address as the request. Each signature is
+  verified against the public key and audited (path, scheme, digests, size,
+  name, enrollment, address) in the transaction that spends the grant.
+
+| Scheme | Key | Broker receives | Signature |
+|---|---|---|---|
+| `ed25519` | Ed25519 | the artifact (at most 4096 bytes) | pure Ed25519 over it; 64 raw bytes |
+| `ed25519-sha256` | Ed25519 | SHA-256 | pure Ed25519 over the 32 raw digest bytes; 64 raw bytes |
+| `ed25519ph` | Ed25519 | SHA-256 and SHA-512 | RFC 8032 Ed25519ph, empty context; 64 raw bytes |
+| `ecdsa-p256-sha256` | P-256 | SHA-256 | ECDSA over the digest; ASN.1 DER |
+
+A key has one scheme for life, fixed in the signed `signer-create` and inside
+its sealed record.

@@ -316,6 +316,7 @@ seal_cutover
 "$AQMAS" ssh testhost --fresh --why "while locked" -- echo ok </dev/null >"$T/locked.out" 2>"$T/locked.err" &
 RPID=$!; RID=$(owner wait ssh interop-host 20); if owner approve "$RID" 300 >/dev/null 2>&1; then fail 'approved while locked'; fi
 owner seal-eval; owner batch "$RID" >/dev/null; wait "$RPID"; grep -qx ok "$T/locked.out" || fail 'sealed SSH signer with exact-action batch'
+source "$ROOT/test/interop/vault.sh"
 source "$ROOT/test/interop/envsets.sh"
 env_scenario
 echo "interop: ALL OK"

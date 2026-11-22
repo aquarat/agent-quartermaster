@@ -14,6 +14,7 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
+	"github.com/aquarat/agent-quartermaster/internal/signer"
 	"github.com/aquarat/agent-quartermaster/internal/webui"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -113,7 +114,7 @@ func (s *Server) Recover(ctx context.Context, dir string, input io.Reader) error
 func (s *Server) verifyEnvInventory(ctx context.Context, k *seal.Key) error {
 	ctx = context.WithValue(ctx, leaseKey{}, k)
 	db := s.store.DB()
-	rows, err := db.QueryContext(ctx, `SELECT o.id,v.id,s.id,s.revision,r.blob,r.payload,r.wrap,r.names FROM credential_sets s JOIN services v ON v.id=s.service_id JOIN organisations o ON o.id=v.org_id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision WHERE s.kind='env-set' AND s.revision>0`)
+	rows, err := db.QueryContext(ctx, `SELECT o.id,v.id,s.id,s.revision,r.blob,r.payload,r.wrap,r.names FROM credential_sets s JOIN services v ON v.id=s.service_id JOIN organisations o ON o.id=v.org_id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision WHERE s.kind='env-set' AND s.revision>0 AND NOT EXISTS(SELECT 1 FROM signer_keys k WHERE k.set_id=s.id)`)
 	if err != nil {
 		return err
 	}
@@ -130,7 +131,31 @@ func (s *Server) verifyEnvInventory(ctx context.Context, k *seal.Key) error {
 			return errors.New("backup contains a missing or damaged live env revision")
 		}
 	}
-	return rows.Err()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	// Every signer key must open under its own binding and match its public half.
+	sets, err := s.store.Q().VaultSets(ctx)
+	if err != nil {
+		return err
+	}
+	for _, t := range sets {
+		if t.Kind != "signer" {
+			continue
+		}
+		sc, ok := signer.Lookup(t.Scheme)
+		rec, err := s.store.Q().SignerCipher(ctx, t.SetID)
+		var key signerSecret
+		if err == nil {
+			_, err = s.signerCipher(ctx, t, rec, &key, false)
+		}
+		pub, perr := sc.Public(key.Private)
+		clear(key.Private)
+		if !ok || err != nil || perr != nil || !bytes.Equal(pub, t.PublicKey) {
+			return errors.New("backup contains a missing or damaged signer key")
+		}
+	}
+	return nil
 }
 
 func (f *recoveryFlow) serve(w http.ResponseWriter, r *http.Request) {

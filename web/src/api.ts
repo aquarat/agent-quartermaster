@@ -44,6 +44,9 @@ export interface ApiOptions {
 
 export interface Api {
   envState?():Promise<import('./envsets').EnvState>;
+  /** Credential sets page (docs/API.md "Vault"). */
+  vaultState?(): Promise<import('./vault').VaultState>;
+  vaultPost?<T>(path: 'attempt' | 'challenge' | 'finish', body: unknown): Promise<T>;
   envPost?<T>(path:'ticket'|'challenge'|'finish',body:unknown):Promise<T>;
   sealStatus?(): Promise<import('./sealPanel').SealView>;
   sealPost?<T>(path: 'unlock/challenge'|'unlock/finish'|'control/challenge'|'control/finish'|`passkeys/${'challenge'|'authorize'|'create'|'evaluate'|'finish'}`|`batch/${'challenge'|'finish'}`|'drill'|`windows/${'policy/challenge'|'policy/finish'|'open/challenge'|'open/finish'|'prepare'|'confirm'|'presence'|'close'}`, body: unknown): Promise<T>;
@@ -117,6 +120,8 @@ export function createApi(opts: ApiOptions = {}): Api {
   }
 
   return {
+    vaultState: () => call('GET', '/api/ui/seal/vault/state'),
+    vaultPost: (path, body) => call('POST', `/api/ui/seal/vault/${path}`, body),
     envState:()=>call('GET','/api/ui/seal/env/state'),envPost:(path,body)=>call('POST',`/api/ui/seal/env/${path}`,body),
     sealStatus: () => call('GET','/api/ui/seal/status'),
     sealPost: (path,body) => call('POST',`/api/ui/seal/${path}`,body),

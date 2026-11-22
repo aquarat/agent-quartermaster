@@ -37,6 +37,21 @@ export async function exerciseCatalogue(api: Api, auth: Authenticator, mode: str
       admitted_services: o.services,
     });
   };
+  if (mode.startsWith("add-set:")) {
+    // add-set:ORG/SERVICE/SLUG: one more empty env set, created through the web API.
+    const [o, sv, slug] = mode.slice(8).split("/");
+    const parent = await org(o!),
+      service = parent.services.find((s) => s.slug === sv)!,
+      set = fresh(slug!);
+    await apply("credential_set", "create", set.id, {
+      organisation: node(parent),
+      service: node(service),
+      set,
+      kind: "env-set",
+      result_revision: 0,
+    });
+    return;
+  }
   if (mode === "remove" || mode === "readmit") {
     await admit("personal", mode === "readmit");
     return;

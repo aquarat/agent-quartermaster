@@ -1,8 +1,8 @@
 # agent-quartermaster (`aqmas`)
 
 Credential broker for a single owner's fleet: AI agents and the owner request short-lived,
-passkey-approved access (SSH certificates, Cloudflare API grants; GitHub, Forgejo and HTTP
-APIs later) instead of holding long-lived keys. The server (`aqmasd`) runs on a dedicated
+passkey-approved access (SSH certificates, Cloudflare API grants, env credential sets,
+signatures from keys that never leave the broker; GitHub, Forgejo and HTTP APIs later) instead of holding long-lived keys. The server (`aqmasd`) runs on a dedicated
 bastion host; hosts enroll with the `aqmas` CLI.
 
 Use the approval queue for daily work, the gear icon for passkeys and enrolled hosts,
@@ -10,6 +10,10 @@ and **Help** for enrollment and command examples using the running server’s UR
 
 - Design and milestone 1 scope: [docs/DESIGN.md](docs/DESIGN.md)
 - API contract: [docs/API.md](docs/API.md), shared types in `internal/api`
+- Credential sets from the approval page (write-only form, reveal) and signing inside aqmas:
+  [docs/SIGNING.md](docs/SIGNING.md). Signing keys should not leave aqmas where a signer
+  scheme exists: agents call `aqmas sign ORG/SERVICE/KEY --why "..." FILE`; `aqmas run`
+  remains for the cases where that is not possible.
 - Host and Forgejo trust: [docs/HOSTS.md](docs/HOSTS.md)
 - Cloudflare (milestone 2): [docs/CLOUDFLARE.md](docs/CLOUDFLARE.md)
 - Setup from the approval page (organisations cutover, sealing, self-update, upgrades) and the root maintenance runner: [docs/SETUP.md](docs/SETUP.md)

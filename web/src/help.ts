@@ -82,6 +82,18 @@ export function helpPage(c: HelpConfig) {
       ].map(([label, cmd]) => [h("h3", null, label), command(cmd!)]),
     ),
     card(
+      "Prefer aqmas sign over fetching a key",
+      p(
+        "Where a signing scheme exists, the key should not leave aqmas. Put it in a signing key set (Admin → Credential sets) and have the host ask for signatures: the CLI hashes the files locally, the approval card shows each file name, size and SHA-256, and aqmas returns the signatures. The private key is never delivered, revealed or exported.",
+      ),
+      command('aqmas sign personal/firmware/release-key --why "release 1.2.3" image.bin'),
+      p("Writes image.bin.sig. Several files, stdin (-) and a bare digest work too; --ttl and --count ask for a time-boxed grant that later calls reuse without another tap."),
+      command('aqmas sign personal/firmware/release-key --why "nightly builds" --ttl 30m --count 20 build/*.bin'),
+      command('aqmas sign personal/firmware/release-key --why "release 1.2.3" --digest sha256:<hex>'),
+      p("aqmas run remains for tools that can only read a secret from their environment, where no signing scheme fits. A value delivered that way has left aqmas for good: rotate it at its provider when in doubt."),
+      command('aqmas run client-a/paas/staging --why "check migration" -- ./migrate status'),
+    ),
+    card(
       "Git, scp and rsync",
       p("Run cert first. Replace KEY, CERT, KNOWN, address and port below with the printed values. Use a pinned target for these recipes."),
       command('aqmas cert git@forgejo --why "fetch repository"'),

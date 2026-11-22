@@ -501,7 +501,11 @@ func (s *Server) allPending(ctx context.Context, q *store.Q, host int64, now tim
 	n, err := q.CountPendingRequests(ctx, host, now)
 	if s.seal != nil && err == nil {
 		e, err := q.EnvPending(ctx, host, now)
-		return n + e, err
+		if err != nil {
+			return 0, err
+		}
+		g, err := q.SignPending(ctx, host, now)
+		return n + e + g, err
 	}
 	return n, err
 }

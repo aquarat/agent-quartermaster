@@ -29,6 +29,7 @@ func (s *Server) sealRoutes(m *http.ServeMux) {
 	s.capabilityRoutes(m)
 	s.approvalRoutes(m)
 	s.envWebRoutes(m)
+	s.vaultRoutes(m)
 	for path, f := range map[string]func(http.ResponseWriter, *http.Request, string){"GET /api/ui/seal/status": s.sealStatus, "POST /api/ui/seal/unlock/challenge": s.sealBegin, "POST /api/ui/seal/unlock/finish": s.sealFinish, "POST /api/ui/seal/control/challenge": s.sealControlBegin, "POST /api/ui/seal/control/finish": s.sealControlFinish, "POST /api/ui/seal/drill": s.sealDrill} {
 		m.Handle(path, s.requireSession(f))
 	}

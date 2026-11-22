@@ -59,6 +59,8 @@ import {sealPanel,type SealView} from './sealPanel';
 import {capabilityForm} from './capabilities';
 import {TabWindow,multiPanel,windowAdmin} from './approvals';
 import {envPanel,type EnvState} from './envsets';
+import { VaultPage, signCards, type VaultHost } from './vaultPage';
+import type { VaultState } from './vault';
 
 function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/setup' ? 'setup' : location.hash === '#/help' ? 'help' : 'queue'; }
 function nav(label:string,hash:string,title:string) { const a=h('a',{title,'aria-label':title},label); a.href=hash; return a; }
@@ -91,6 +93,10 @@ export class App {
   private seal?: SealView;
   private tab=new TabWindow();
   private envState?:EnvState;
+  /** Credential sets (docs/API.md "Vault"): undefined when this server has none. */
+  private vaultState?: VaultState;
+  private vaultPage?: VaultPage;
+  private vaultHost(): VaultHost { return { api: this.api, auth: this.auth, changed: () => this.changed(), propose: (t, c) => this.sheet.openCatalogue(t, c) }; }
   private hosts: HostInfo[]=[];
   /** Admin: a one-line summary of Admin → Setup (null = this server has none). */
   private setupView?: SetupView | null;
@@ -121,7 +127,7 @@ export class App {
   }
 
   start(): void {
-    window.addEventListener('pagehide',()=>this.tab.end());window.addEventListener('pageshow',ev=>{if(ev.persisted){this.tab.forget();location.reload()}});
+    window.addEventListener('pagehide',()=>{this.tab.end();this.vaultPage?.clearSecrets();});window.addEventListener('pageshow',ev=>{if(ev.persisted){this.tab.forget();location.reload()}});
     window.addEventListener('hashchange',()=>{
       this.sheet.close(true); this.focusId=/^#r=([A-Za-z0-9_-]{1,64})$/.exec(location.hash)?.[1] ?? null;
       if(this.view==='main') void this.refresh();
@@ -156,6 +162,7 @@ export class App {
       const s = await this.api.state();
       this.seal=s.seal_enabled?await this.api.sealStatus!():undefined;
       this.envState=this.seal&&['unlocked','locked'].includes(this.seal.mode)?await this.api.envState!():undefined;
+      this.vaultState=this.seal&&s.catalogue_enabled&&this.api.vaultState&&['unlocked','locked'].includes(this.seal.mode)?await this.api.vaultState().catch((e)=>{if(e instanceof ApiError&&e.status===404)return undefined;throw e;}):undefined;
       if(this.tab.id()&&!this.seal?.active_windows?.some(w=>w.id===this.tab.id()))this.tab.forget();
       this.migration=s.migration;
       if(requested==='admin') [this.hosts,this.setupView]=await Promise.all([this.api.hosts(),this.api.setupGet?this.api.setupGet<SetupView>('').catch(()=>null):null]);
@@ -409,10 +416,10 @@ export class App {
     replace(
       this.root,
       h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Request queue')), h("p", { class: "status", id: "status" }),h('nav',{'aria-label':'Pages'},nav('Help','#/help','Help'),nav('⚙','#/admin','Admin'))),
-      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='setup' ? h('main',{class:'subpage'},h('p',{class:'crumb'},nav('‹ Admin','#/admin','Back to Admin')),h('h2',null,'Setup'),h('p',{class:'muted'},'Each step is one passkey approval. A small root program on this machine checks your signature itself and does the work.'),h('div',{id:'setup-root',class:'setup'})) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('setup','Setup and upgrades'),section('orgs','Organisations'),section('passkeys','Passkeys'),section('hosts','Enrolled hosts')) : h(
+      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='setup' ? h('main',{class:'subpage'},h('p',{class:'crumb'},nav('‹ Admin','#/admin','Back to Admin')),h('h2',null,'Setup'),h('p',{class:'muted'},'Each step is one passkey approval. A small root program on this machine checks your signature itself and does the work.'),h('div',{id:'setup-root',class:'setup'})) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('setup','Setup and upgrades'),section('orgs','Organisations'),section('vault','Credential sets'),section('passkeys','Passkeys'),section('hosts','Enrolled hosts')) : h(
         "main",
         { class: "sections" },
-        h("div", { class: "col col-queue" }, section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
+        h("div", { class: "col col-queue" }, section("signing", "Signatures to approve"), section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
         h(
           "div",
           { class: "col col-access" },
@@ -423,6 +430,7 @@ export class App {
       ),
     );
     if(this.sealOnTop())this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));
+    if(this.page!=='admin')this.vaultPage?.clearSecrets();
     if(this.page==='setup'){
       this.setupPage=new SetupPage($('#setup-root',this.root),this.api,this.auth,{
         openMigration:t=>this.sheet.openMigration(t),
@@ -453,6 +461,11 @@ export class App {
       if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);}
       else if(this.page==='help'&&this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
       if(this.page==='admin')this.section('orgs',this.catalogue,()=>this.catalogue?[cataloguePage(this.catalogue,(t,c)=>this.sheet.openCatalogue(t,c))]:['Available after personal activation.']);
+      if(this.page==='admin'){
+        const v=this.vaultState;
+        this.section('vault',!!v,()=>v?[(this.vaultPage??=new VaultPage(this.vaultHost())).el]:[h('p',{class:'empty'},'Available once organisations are active and the store is sealed (Setup).')]);
+        if(v&&this.seal)this.vaultPage!.update(v,this.seal,this.catalogue);
+      }
       this.updateStatus();return;
     }
     const requests = s.pending!.filter((p) => p.kind !== "enrollment");
@@ -471,6 +484,11 @@ export class App {
       false,
       touching,
     );
+    {
+      const v = this.vaultState, reqs = v?.requests ?? [];
+      const busy = !!this.root.querySelector("#sec-signing .vault-confirm");
+      this.section("signing", [reqs, v?.unlocked, this.seal?.epoch], () => (v && this.seal ? signCards(this.vaultHost(), this.seal, v) : []), reqs.length === 0, touching || busy, reqs.filter((r) => r.status === "pending").length);
+    }
     this.section("enroll", enrolls, () => enrolls.map((p) => this.enrollCard(p)), enrolls.length === 0, touching);
     this.section(
       "grants",

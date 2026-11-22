@@ -107,6 +107,30 @@ try {
     case 'repair-leaf':{const v=await api.sealStatus();const b=await api.sealPost('control/challenge',{action:'renew-leaf'});const opts=await (await import(`${web}/src/sealPanel.ts`)).prepareControl(v,'renew-leaf',b,new URL(origin).hostname);const {encodeAssertion}=await import(`${web}/src/webauthn.ts`);await api.sealPost('control/finish',{challenge_id:b.challenge_id,assertion:encodeAssertion(await auth.get(opts))});break;}
     case 'env-ticket':{const cat=await api.catalogue();const host=cat.organisations.find((o:any)=>o.slug==='client-a').hosts.find((h:any)=>h.active&&h.class==='owner-device');console.log((await api.envPost('ticket',{path:'client-a/paas/staging',operation:args[0],enrollment:host.enrollment})).ticket);break}
     case 'env-decide':{const [action,mode]=args;for(let n=0;;n++){const state=await api.envState();const item=action==='commit'?state.drafts[0]:state.releases.find((r:any)=>r.mode===mode&&r.status===(action==='revoke'?'approved':'pending'));if(item){const review=await (await import(`${web}/src/envsets.ts`)).envReview(api,await api.sealStatus(),item,action,action==='approve'?300:0,new URL(origin).hostname);await review.tap(auth);break}if(n>=150)throw Error('no env decision queued');await Bun.sleep(100)}break}
+    case 'vault-state': console.log(JSON.stringify(await api.vaultState()));break;
+    case 'vault-commit': { // PATH merge|import ENVFILE [REMOVE...]: the write-only form, values sealed in this process
+      const vault=await import(`${web}/src/vault.ts`);const [path,operation,file,...remove]=args;
+      const set=(await api.vaultState()).sets.find((s:any)=>`${s.org_slug}/${s.service_slug}/${s.set_slug}`===path);if(!set)throw Error('no set '+path);
+      const p=await vault.vaultCommit(api,await api.sealStatus(),set,{operation,entries:vault.parseDotenv(readFileSync(file!,'utf8')),remove},new URL(origin).hostname);await p.tap(auth);console.log(p.changes);break;}
+    case 'vault-reveal': { // PATH NAME...: prints the decrypted entries as JSON (the caller keeps them out of scanned files)
+      const vault=await import(`${web}/src/vault.ts`);const [path,...names]=args;
+      const set=(await api.vaultState()).sets.find((s:any)=>`${s.org_slug}/${s.service_slug}/${s.set_slug}`===path);if(!set)throw Error('no set '+path);
+      const p=await vault.vaultReveal(api,await api.sealStatus(),set,names.sort(),new URL(origin).hostname);console.log(JSON.stringify(await p.tap(auth)));break;}
+    case 'vault-policy': { // ORG on|off
+      const vault=await import(`${web}/src/vault.ts`);const org=(await api.vaultState()).organisations.find((o:any)=>o.slug===args[0]);
+      const p=await vault.vaultPolicy(api,await api.sealStatus(),org,args[1]==='on',new URL(origin).hostname);await p.tap(auth);break;}
+    case 'vault-signer': { // ORG/SERVICE/SLUG SCHEME generate|import [KEYFILE]: prints the created signer as JSON
+      const vault=await import(`${web}/src/vault.ts`);const [path,scheme,source,file]=args;const [o,sv,slug]=path!.split('/');
+      const cat=await api.catalogue();const org=cat.organisations.find((x:any)=>x.slug===o),service=org.services.find((x:any)=>x.slug===sv);
+      const parent={org_id:org.id,org_slug:org.slug,org_title:org.title,service_id:service.id,service_slug:service.slug,service_title:service.title};
+      const p=await vault.vaultSignerCreate(api,await api.sealStatus(),parent,{id:vault.newSetId(),slug,title:slug},scheme,source,file?readFileSync(file,'utf8'):undefined,new URL(origin).hostname);
+      const made=await p.tap(auth);if(made.public_key!==p.publicKey)throw Error('created another key than the one reviewed');console.log(JSON.stringify(made));break;}
+    case 'vault-sign': { // approve|deny|revoke [TTL MAX]: the oldest matching signing request, exactly as the card signs it
+      const vault=await import(`${web}/src/vault.ts`);const [verb,ttl,max]=args;
+      for(let n=0;;n++){const st=await api.vaultState();const req=st.requests.find((r:any)=>r.status===(verb==='revoke'?'approved':'pending'));
+        if(req){const set=st.sets.find((s:any)=>s.set_id===req.set);const single=verb==='approve'&&ttl===undefined;
+          const p=await vault.vaultSignDecision(api,await api.sealStatus(),set,req,'sign-'+verb,verb==='approve'?(single?0:Number(ttl)):0,verb==='approve'?(single?req.items.length:Number(max)):0,new URL(origin).hostname);await p.tap(auth);break}
+        if(n>=150)throw Error('no signing request queued');await Bun.sleep(100)}break;}
     case 'batch': {const state=await api.state(),v=await api.sealStatus();const sel=args.map(id=>({item:state.pending.find((p:any)=>p.id===id),action:'approve',ttl_seconds:300}));const b=await (await import(`${web}/src/approvals.ts`)).batchReview(api,v,sel,new URL(origin).hostname);await b.tap(auth);break;}
     case 'seal-status': console.log((await api.sealStatus()).mode);break;
     // ---- Admin → Setup (docs/SETUP.md), through the web UI's own setup module ----
