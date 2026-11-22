@@ -33,7 +33,8 @@ and `aqmas-maint.service`; and, **only if there are none yet**, the maintenance 
 That first pinning is trust on first use, which is why it happens in your terminal session
 and not through a request. `--repin` repeats it (the way back in if every pinned passkey is
 lost). `aqmasd.service` must allow the spool (`ReadWritePaths=-/var/spool/aqmas-update`, as
-shipped).
+shipped); because that entry only takes effect if the directory exists when the broker
+starts, `maint-init` restarts a running broker once after creating the spool.
 
 ## What the runner trusts
 
@@ -68,7 +69,10 @@ retired plaintext key files, install packages and toolchains, write token files,
 embedded release installer.
 
 An interrupted task (crash, power loss) leaves a journal; the path unit starts the runner
-again and it either finishes (after a signed activation) or restores the previous state.
+again and it either finishes (after a signed activation) or restores the previous state. If
+finishing keeps failing it retries a few times, then stops and names the one command to run
+on the machine. A task that fails or a request that is refused is reported on the page and
+is not an error for systemd: `journalctl -u aqmas-maint` has the detail.
 
 ## Sealing from the browser
 

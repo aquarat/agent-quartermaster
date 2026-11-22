@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -282,7 +283,14 @@ func maintenance(cmd string, args []string) error {
 	if err != nil {
 		return err
 	}
-	return r.Run(ctx)
+	// A refused request or a failed task is reported on the Setup page; for systemd the
+	// run succeeded. Only an unfinished recovery exits non-zero (and is started again).
+	var reported *maint.Handled
+	if err = r.Run(ctx); errors.As(err, &reported) {
+		fmt.Fprintln(os.Stderr, "aqmasd:", err)
+		return nil
+	}
+	return err
 }
 
 // Only public CA material is needed on the machine inspecting the backup.

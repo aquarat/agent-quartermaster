@@ -5,8 +5,11 @@
 Description=aqmas maintenance runner (owner-approved setup tasks and upgrades)
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# A failed or refused task still exits 0 (it is reported on the Setup page). Only an
+# interrupted task that cannot be finished exits non-zero; the runner paces those retries
+# itself and gives up after a few. The limit below only stops a runaway loop.
+StartLimitIntervalSec=120
+StartLimitBurst=20
 
 [Service]
 Type=oneshot

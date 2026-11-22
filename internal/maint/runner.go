@@ -34,6 +34,8 @@ type Runner struct {
 	raw  []byte // configuration text as loaded
 	key  hpke.PrivateKey
 	poll time.Duration
+	// retryDelay slows the restart loop while an interrupted task cannot be finished yet.
+	retryDelay time.Duration
 	// Waits for the owner. Tests shorten them.
 	CutoverWait, SealWait time.Duration
 }
@@ -44,6 +46,7 @@ type journal struct {
 	Backup    string `json:"backup"`
 	Purge     bool   `json:"purge_backups,omitempty"`
 	LockAlert bool   `json:"lock_alert,omitempty"`
+	Attempts  int    `json:"recovery_attempts,omitempty"`
 	Started   string `json:"started_at"`
 }
 
@@ -55,9 +58,9 @@ func New(l Layout, log *slog.Logger) (*Runner, error) {
 	if l.test && os.Geteuid() == 0 {
 		return nil, errors.New("test layout is not available to root")
 	}
-	r := &Runner{l: l, log: log, now: time.Now, poll: time.Second, CutoverWait: 20 * time.Minute, SealWait: 30 * time.Minute}
+	r := &Runner{l: l, log: log, now: time.Now, poll: time.Second, retryDelay: 20 * time.Second, CutoverWait: 20 * time.Minute, SealWait: 30 * time.Minute}
 	if l.test {
-		r.poll = 100 * time.Millisecond
+		r.poll, r.retryDelay = 100*time.Millisecond, 0
 	}
 	if err := r.loadConfig(); err != nil {
 		return nil, err
@@ -174,19 +177,36 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	var first error
 	if j, ok := r.readJournal(); ok {
+		// Count the attempt before trying, so a crash loop is bounded too.
+		j.Attempts++
+		_ = r.writeJournal(j)
 		r.begin(j.Task)
 		r.step("Recovering a task that was interrupted")
 		msg, err := r.recover(ctx, j)
+		if _, left := r.readJournal(); left && err != nil {
+			// The journal is what restarts the runner. Retry a few times, slowly; then stop
+			// and leave the decision to a person at the machine.
+			if j.Attempts >= maxRecoveries {
+				_ = os.Rename(r.l.journal(), r.l.journal()+".stuck")
+				err = errors.New(err.Error() + " Automatic retries stopped. On the machine: sudo mv " + r.l.journal() + ".stuck " + r.l.journal())
+				r.finish(err, "")
+				return handled(err)
+			}
+			r.finish(err, "")
+			time.Sleep(r.retryDelay)
+			return err
+		}
 		r.finish(err, msg)
-		first = err
+		first = handled(err)
 	}
 	if _, err := os.Lstat(filepath.Join(r.l.State, "pending-rollback.json")); err == nil {
 		r.begin(TaskUpgrade)
 		r.step("Restoring the previous broker after an interrupted upgrade")
 		err := r.runUpdater(ctx, "")
 		r.finish(err, "Previous broker restored after an interrupted upgrade.")
-		if first == nil {
-			first = err
+		if err != nil {
+			time.Sleep(r.retryDelay)
+			return err
 		}
 	}
 	if _, err := os.Lstat(r.l.request()); err != nil {
@@ -234,7 +254,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.refreshInfo()
 	r.finish(err, done)
-	return err
+	return handled(err)
 }
 
 // refuse records why a request was not run. The text is fixed wording from this package.
@@ -242,8 +262,25 @@ func (r *Runner) refuse(err error) error {
 	r.st.Refused = &Refusal{At: stamp(r.now()), Reason: clean(err.Error())}
 	r.save()
 	r.log.Error("request refused", "error", err)
-	return err
+	return handled(err)
 }
+
+// Handled marks an outcome that is fully reported in the status file: a refused request or
+// a task that failed and cleaned up after itself. The runner then exits 0, because for
+// systemd nothing went wrong and nothing should be retried. Anything else exits non-zero.
+type Handled struct{ Err error }
+
+func (h *Handled) Error() string { return h.Err.Error() }
+func (h *Handled) Unwrap() error { return h.Err }
+
+func handled(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &Handled{err}
+}
+
+const maxRecoveries = 6
 
 func (r *Runner) writeJournal(j journal) error {
 	j.Started = stamp(r.now())

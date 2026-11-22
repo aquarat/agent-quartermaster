@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -26,6 +28,22 @@ import (
 )
 
 const origin = "https://approvals.example.com"
+
+// The unit runs the runner with UMask=0077: every file somebody else must read needs an
+// explicit mode. Run the whole suite that way.
+func TestMain(m *testing.M) {
+	syscall.Umask(0o077)
+	os.Exit(m.Run())
+}
+
+func mode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.Mode().Perm()
+}
 
 // Secrets that must never appear in anything the runner publishes or journals.
 const (
@@ -109,7 +127,8 @@ d='`+b.dir+`'
 echo "$*" >> "$d/hook.log"
 case $1 in
 stop) rm -f "$d/active" ;;
-start) [ -e "$d/refuse-once-$2" ] && { rm "$d/refuse-once-$2"; exit 1; }
+start) [ -e "$d/refuse-always" ] && exit 1
+  [ -e "$d/refuse-once-$2" ] && { rm "$d/refuse-once-$2"; exit 1; }
   [ -e "$d/refuse-migrated" ] && grep -q MIGRATED "$d/data/aqmas.db" && exit 1
   echo "$2" > "$d/active" ;;
 active) [ -e "$d/active" ] ;;
@@ -233,7 +252,8 @@ func (b *lab) when(mode string, owner func()) chan struct{} {
 	go func() {
 		defer close(done)
 		for i := 0; i < 400; i++ {
-			if strings.TrimSpace(b.read("active")) == mode {
+			// The owner can only act once the page shows the task waiting for them.
+			if st := ReadStatus(b.l.status()); strings.TrimSpace(b.read("active")) == mode && st.Current != nil && st.Current.State == "waiting" {
 				owner()
 				return
 			}
@@ -473,6 +493,55 @@ func TestSealRecovery(t *testing.T) {
 	}
 }
 
+// After a signed activation the runner cannot go back. If finishing keeps failing it retries
+// (non-zero exit, so systemd starts it again), a bounded number of times, then stops and says
+// what to do. A task that merely failed is reported and exits cleanly.
+func TestRecoveryRetriesAreBounded(t *testing.T) {
+	b := newLab(t)
+	b.setFacts(7, "")
+	r := b.runner()
+	r.st = ReadStatus(b.l.status())
+	dir, err := r.backup(context.Background(), "seal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, _ := addSeal(r.raw, sealParams().Recipient)
+	_ = os.WriteFile(b.l.Config, staged, 0640)
+	_ = r.writeJournal(journal{Task: TaskSeal, Backup: dir})
+	b.activateSeal(strings.Repeat("ef", 32))()
+	b.write(0600, "", "refuse-always")
+	var handledErr *Handled
+	for i := 1; i < maxRecoveries; i++ {
+		err := b.runner().Run(context.Background())
+		if err == nil || errors.As(err, &handledErr) {
+			t.Fatalf("attempt %d: an unfinished recovery must ask to be started again: %v", i, err)
+		}
+		if _, e := os.Stat(b.l.journal()); e != nil {
+			t.Fatal("journal gone while the task is unfinished")
+		}
+	}
+	err = b.runner().Run(context.Background())
+	if !errors.As(err, &handledErr) || !strings.Contains(b.last(TaskSeal).Message, "Automatic retries stopped") {
+		t.Fatalf("retries not bounded: %v", err)
+	}
+	if _, e := os.Stat(b.l.journal()); e == nil {
+		t.Fatal("journal still triggers the runner")
+	}
+	// Put back by a person at the machine, with the cause fixed, it finishes.
+	_ = os.Remove(b.path("refuse-always"))
+	if e := os.Rename(b.l.journal()+".stuck", b.l.journal()); e != nil {
+		t.Fatal(e)
+	}
+	if err = b.runner().Run(context.Background()); err != nil || b.last(TaskSeal).State != "done" {
+		t.Fatalf("did not finish after the cause was fixed: %v %+v", err, b.last(TaskSeal))
+	}
+	// An ordinary failed task is not a runner failure.
+	b.queue(b.sign(TaskCutover, CutoverParams{}, nil))
+	if err = b.runner().Run(context.Background()); !errors.As(err, &handledErr) {
+		t.Fatalf("a refused prerequisite should be a handled outcome: %v", err)
+	}
+}
+
 // releases serves both release APIs (Forgejo and GitHub shapes) for the lab's versions.
 func (b *lab) releases(versions ...string) {
 	assets := map[string][]byte{}
@@ -559,6 +628,12 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 		t.Fatal("host key not trusted")
 	case b.read("releases", "0.3.0", "aqmas-linux-amd64") != "binary aqmas-linux-amd64" || !strings.Contains(b.read("releases", "latest.json"), `"version":"0.3.0"`):
 		t.Fatal("release cache not seeded")
+	}
+	for path, want := range map[string]os.FileMode{b.path("releases", "0.3.0"): 0755, b.path("releases", "0.3.0", "aqmas-linux-amd64"): 0644, b.path("releases", "0.3.0", "SHA256SUMS"): 0644,
+		b.path("releases", "latest.json"): 0644, b.l.status(): 0644, b.path("known_hosts"): 0644, b.path("etc", "github-read-token"): 0440, b.path("etc", "repo-key"): 0440, b.l.pins(): 0600, b.l.key(): 0600} {
+		if got := mode(t, path); got != want {
+			t.Errorf("%s has mode %o, want %o", strings.TrimPrefix(path, b.dir), got, want)
+		}
 	}
 	b.noSecrets("etc/forgejo-read-token", "etc/github-read-token")
 

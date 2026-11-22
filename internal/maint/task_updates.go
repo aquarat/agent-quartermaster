@@ -104,9 +104,12 @@ func (r *Runner) toolchains(ctx context.Context) error {
 		b, _ := c.Output()
 		return string(b)
 	}
+	// The runner's umask is 077, but the unprivileged builder must be able to read and run
+	// the toolchains: readable by all, writable by root only.
+	open := func() error { return r.l.run(ctx, "chmod", "-R", "a+rX,go-w", r.l.Tools) }
 	if strings.Contains(version(filepath.Join(r.l.Tools, "go", "bin", "go"), "version"), ci.GoVersion+" ") &&
 		strings.TrimSpace(version(filepath.Join(r.l.Tools, "bin", "bun"), "--version")) == ci.BunVersion {
-		return nil
+		return open()
 	}
 	if _, err := os.Lstat(r.l.Tools); err == nil {
 		if err := os.Rename(r.l.Tools, r.l.Tools+".old-"+r.now().UTC().Format("20060102T150405Z")); err != nil {
@@ -119,7 +122,7 @@ func (r *Runner) toolchains(ctx context.Context) error {
 		_ = os.RemoveAll(r.l.Tools)
 		return errors.New("installing the pinned toolchains failed (network, or a changed download)")
 	}
-	return r.l.run(ctx, "chmod", "-R", "go-w", r.l.Tools)
+	return open()
 }
 
 func (r *Runner) trustHost(lines []string) error {
@@ -197,11 +200,12 @@ func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) error {
 		if hex.EncodeToString(sum[:]) != m.Forgejo[name] {
 			return errors.New(name + " does not match the published digest")
 		}
-		if err = os.WriteFile(filepath.Join(stage, name), b, 0644); err != nil {
+		// Explicit modes: the runner's umask is 077 and the broker serves these files.
+		if err = writeOwned(filepath.Join(stage, name), b, 0, 0, 0644); err != nil {
 			return err
 		}
 	}
-	if err = os.WriteFile(filepath.Join(stage, "SHA256SUMS"), []byte(m.Forgejo.Text()), 0644); err != nil {
+	if err = writeOwned(filepath.Join(stage, "SHA256SUMS"), []byte(m.Forgejo.Text()), 0, 0, 0644); err != nil {
 		return err
 	}
 	if err = os.Chmod(stage, 0755); err != nil {

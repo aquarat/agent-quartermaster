@@ -163,7 +163,9 @@ func (r *Runner) finish(err error, okMessage string) {
 	} else {
 		c.State, c.Message = "done", clean(okMessage)
 	}
-	c.Log = append(c.Log, c.Finished+" "+c.Message)
+	if c.Message != "" && c.Message != c.Step {
+		c.Log = append(c.Log, c.Finished+" "+c.Message)
+	}
 	r.st.Tasks[c.Task] = c
 	r.st.Current = nil
 	r.save()
