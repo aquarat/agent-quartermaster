@@ -391,7 +391,7 @@ async function upload(api: Api, v: SealView, purpose: "edit" | "signer-import", 
     const recipientPublicKey = await suite.kem.deserializePublicKey(pk.buffer as ArrayBuffer);
     const sender = await suite.createSenderContext({ recipientPublicKey, info: tuple("hpke-vault", install, utf8.encode(purpose)).buffer as ArrayBuffer });
     const ct = await sender.seal(plain.buffer as ArrayBuffer, tuple("hpke-vault-aad", attempt, epoch, utf8.encode(setId)).buffer as ArrayBuffer);
-    return { attempt_id: a.attempt_id, enc: encode(sender.enc), ciphertext: encode(ct) };
+    return { sent: { attempt_id: a.attempt_id, enc: encode(sender.enc), ciphertext: encode(ct) }, recipient: a.recipient };
   } finally {
     plain.fill(0);
   }
@@ -405,8 +405,9 @@ export async function vaultCommit(api: Api, v: SealView, set: VaultSet, edit: Ed
   const commitment = await editCommitment({ ...edit, salt }, { org: set.org_id, service: set.service_id, set: set.set_id, revision: set.revision });
   const body: Record<string, unknown> = { operation: edit.operation, salt: stdB64(salt), entries: edit.entries.map((e) => ({ name: e.name, value: e.value })) };
   if (edit.remove.length) body.remove = edit.remove;
-  const sent = await upload(api, v, "edit", set.set_id, utf8.encode(JSON.stringify(body)));
-  const r = await review(api, v, "commit", set.set_id, { ...sent, commitment }, () => ({ ...targetFields(set), attempt_id: sent.attempt_id, operation: edit.operation, changes, commitment, result_revision: set.revision + 1 }), rp);
+  // The signed text names the key this page sealed to: a packet re-sealed on the way is refused.
+  const { sent, recipient } = await upload(api, v, "edit", set.set_id, utf8.encode(JSON.stringify(body)));
+  const r = await review(api, v, "commit", set.set_id, { ...sent, commitment }, () => ({ ...targetFields(set), attempt_id: sent.attempt_id, operation: edit.operation, changes, commitment, result_revision: set.revision + 1, recipient }), rp);
   return {
     detail: `Save ${pathOf(set)}: revision ${set.revision} → ${set.revision + 1} (${edit.operation}). Changes: ${changes}`,
     changes,
@@ -470,11 +471,13 @@ export async function vaultSignerCreate(api: Api, v: SealView, parent: SignerPar
   if (!/^[0-9a-f]{32}$/.test(set.id)) throw Error("Invalid set ID");
   const body: Record<string, unknown> = { service_id: parent.service_id, set_slug: set.slug, set_title: set.title, scheme, source };
   let attempt: string | undefined;
+  let recipient = ""; // the key an imported private key was sealed to; empty for a generated one
   if (source === "import") {
     if (!privateKey?.trim()) throw Error("Paste the private key to import");
-    const sent = await upload(api, v, "signer-import", set.id, utf8.encode(JSON.stringify({ private_key: privateKey })));
-    attempt = sent.attempt_id;
-    Object.assign(body, sent);
+    const up = await upload(api, v, "signer-import", set.id, utf8.encode(JSON.stringify({ private_key: privateKey })));
+    attempt = up.sent.attempt_id;
+    recipient = up.recipient;
+    Object.assign(body, up.sent);
   } else if (privateKey !== undefined) throw Error("A generated key takes no input");
   let key: Uint8Array = new Uint8Array(0);
   let fingerprint = "";
@@ -485,7 +488,7 @@ export async function vaultSignerCreate(api: Api, v: SealView, parent: SignerPar
     if (key.length !== 32 && !(key.length === 65 && key[0] === 4)) throw Error("Invalid public key from the server");
     fingerprint = hex(await sha256(key));
     if (facts.fingerprint !== fingerprint) throw Error("The fingerprint does not match the public key");
-    return { org_id: parent.org_id, org_slug: parent.org_slug, org_title: parent.org_title, service_id: parent.service_id, service_slug: parent.service_slug, service_title: parent.service_title, set_id: set.id, set_slug: set.slug, set_title: set.title, kind: "signer", revision: 0, scheme, source, attempt_id: facts.attempt_id, public_key: facts.public_key, fingerprint, result_revision: 0 };
+    return { org_id: parent.org_id, org_slug: parent.org_slug, org_title: parent.org_title, service_id: parent.service_id, service_slug: parent.service_slug, service_title: parent.service_title, set_id: set.id, set_slug: set.slug, set_title: set.title, kind: "signer", revision: 0, scheme, source, attempt_id: facts.attempt_id, public_key: facts.public_key, fingerprint, result_revision: 0, recipient };
   }, rp);
   const publicKey = encode(key);
   return {
@@ -509,7 +512,7 @@ export async function itemMessage(it: SignItem): Promise<Uint8Array | null> {
   if (hex(await sha256(m)) !== it.sha256 || it.size !== m.length) throw Error("An artifact does not match its SHA-256");
   return m;
 }
-export function hexPreview(m: Uint8Array, max = 256): string {
+export function hexPreview(m: Uint8Array, max = 4096): string {
   const rows: string[] = [];
   for (let i = 0; i < Math.min(m.length, max); i += 16) rows.push(hex(m.subarray(i, Math.min(i + 16, m.length, max))).replace(/(..)(?=.)/g, "$1 "));
   return rows.join("\n") + (m.length > max ? `\n… ${m.length - max} more bytes` : "");

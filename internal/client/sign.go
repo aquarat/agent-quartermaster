@@ -130,6 +130,7 @@ func (e *Env) signTargets(sc signer.Scheme, o SignOptions) ([]signTarget, error)
 		return nil, &UsageError{Msg: "--out needs exactly one input; several files get FILE.sig each"}
 	}
 	seen := map[string]bool{}
+	total := 0
 	for _, f := range o.Files {
 		t := signTarget{out: o.Out}
 		var err error
@@ -161,6 +162,9 @@ func (e *Env) signTargets(sc signer.Scheme, o SignOptions) ([]signTarget, error)
 			return nil, &UsageError{Msg: "the same artifact is named twice"}
 		}
 		seen[t.item.Name+t.item.SHA256] = true
+		if total += len(t.item.Message); total > signer.MaxMessageBytes {
+			return nil, fmt.Errorf("scheme %s signs the artifacts themselves: at most %d bytes of them a call", sc.ID, signer.MaxMessageBytes)
+		}
 		out = append(out, t)
 	}
 	return out, nil

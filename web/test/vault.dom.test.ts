@@ -159,4 +159,42 @@ describe("Credential sets page in a DOM", () => {
     expect(labels[0]).toContain("SHA-512 · this is what gets signed");
     expect(labels[1]).toContain("NOT covered by the signature");
   });
+
+  test("the confirmation describes the choice captured at the click, and the form cannot move under it", async () => {
+    const timed = state.requests.find((r) => r.status === "pending" && r.ttl_seconds > 0)!;
+    const box = win.document.createElement("div") as unknown as HTMLElement;
+    (win.document.body as unknown as HTMLElement).append(box);
+    box.append(...cards(host, seal, { ...state, requests: [timed] }));
+    const once = box.querySelector<HTMLInputElement>("input[type=checkbox]")!;
+    const minutes = box.querySelector<HTMLInputElement>("input[type=number]")!;
+    click(box, "Approve…");
+    // While aqmas is asked and while the panel is open, the limits are frozen.
+    expect(once.disabled).toBe(true);
+    expect(minutes.disabled).toBe(true);
+    await until(() => !!box.querySelector(".vault-confirm"));
+    once.checked = true; // a script or a stray event changing the box changes nothing that is shown or signed
+    once.dispatchEvent(new win.Event("input") as unknown as Event);
+    const panel = box.querySelector(".vault-confirm")!.textContent!;
+    expect(panel).toContain(`up to ${timed.max_signatures} signatures over ANYTHING this host submits`);
+    expect(panel).not.toContain("Single use");
+    click(box.querySelector(".vault-confirm")!, "Cancel");
+    expect(once.disabled).toBe(false);
+    box.remove();
+
+    // The save panel: the changes listed are the ones taken with the edit.
+    const pick = page.el.querySelector<HTMLSelectElement>("#vault-org")!;
+    pick.value = state.organisations.find((o) => o.slug === "client-a")!.id;
+    pick.dispatchEvent(new win.Event("change") as unknown as Event);
+    const editor = page.el.querySelector<HTMLElement>(".vault-editor")!;
+    const remove = [...editor.querySelectorAll("button")].filter((b) => b.textContent === "Remove");
+    remove[0]!.click();
+    click(editor, "Review and save…");
+    expect(remove.every((b) => b.disabled)).toBe(true);
+    await until(() => !!editor.querySelector(".vault-confirm"));
+    const text = editor.querySelector(".vault-confirm")!.textContent!;
+    expect(text).toContain("removed");
+    expect(text).toContain(":remove"); // the signed changes string itself
+    click(editor.querySelector(".vault-confirm")!, "Cancel");
+    expect(remove[1]!.disabled).toBe(false);
+  });
 });

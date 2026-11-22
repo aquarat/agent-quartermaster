@@ -150,10 +150,24 @@ func (q *Q) SignBinding(ctx context.Context, host int64, path string, now time.T
 	err = q.q.QueryRowContext(ctx, `SELECT o.slug||'/'||v.slug||'/'||s.slug,o.title||' / '||v.title||' / '||s.title,o.id,v.id,s.id,s.revision,v.revision,o.revision,a.generation,h.enrollment_id,h.name,e.class,k.scheme,k.public_key,p.default_seconds,p.soft_cap FROM org_hosts a JOIN hosts h ON h.id=a.host_id JOIN enrollments e ON e.id=h.enrollment_id JOIN organisations o ON o.id=a.org_id JOIN services v ON v.org_id=o.id JOIN credential_sets s ON s.service_id=v.id JOIN signer_keys k ON k.set_id=s.id JOIN org_policies p ON p.org_id=o.id AND p.revision=o.revision WHERE h.id=? AND o.slug||'/'||v.slug||'/'||s.slug=? AND a.active AND NOT o.archived AND NOT s.archived AND NOT v.archived AND v.provider='application' AND h.revoked_at IS NULL AND h.not_after>? AND k.wrap IS NOT NULL`, host, path, ms(now)).Scan(&b.Path, &b.Title, &b.Org, &b.Service, &b.Set, &b.Revision, &b.ServiceRevision, &b.PolicyRevision, &b.Generation, &b.Enrollment, &b.Host, &b.Class, &b.Scheme, &b.PublicKey, &b.Default, &b.Soft)
 	return b, notFound(err)
 }
+
+// SweepSign expires what is overdue and forgets requests that ended more than
+// thirty days ago (the audit log keeps their history).
 func (q *Q) SweepSign(ctx context.Context, now time.Time) error {
-	_, err := q.q.ExecContext(ctx, `UPDATE sign_requests SET status='expired' WHERE (status='pending' AND deadline<=?1) OR (status='approved' AND until_ms<=?1)`, ms(now))
+	if _, err := q.q.ExecContext(ctx, `UPDATE sign_requests SET status='expired' WHERE (status='pending' AND deadline<=?1) OR (status='approved' AND until_ms<=?1)`, ms(now)); err != nil {
+		return err
+	}
+	_, err := q.q.ExecContext(ctx, `DELETE FROM sign_requests WHERE status NOT IN ('pending','approved') AND max(deadline,until_ms)<?`, ms(now.Add(-30*24*time.Hour)))
 	return err
 }
+
+// SignRecent counts a host's requests whose pending deadline is after t.
+func (q *Q) SignRecent(ctx context.Context, host int64, t time.Time) (int, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, `SELECT count(*) FROM sign_requests WHERE host=? AND deadline>?`, host, ms(t)).Scan(&n)
+	return n, err
+}
+
 func (q *Q) NewSignRequest(ctx context.Context, host int64, r signer.Request) error {
 	b, err := json.Marshal(r.Binding)
 	if err != nil {

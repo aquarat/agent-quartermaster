@@ -197,6 +197,10 @@ describe("vault actions against the mock", () => {
       (c) => (c.id = set("client-a/paas/production").set_id),
       (_c, meta) => (meta.operation = "import"),
       (_c, meta) => (meta.attempt_id = "A".repeat(43)),
+      // The key the page sealed to is part of what is signed: a packet re-sealed on the way
+      // to another recipient shows up as another key here.
+      (_c, meta) => (meta.recipient = (meta.recipient as string).replace(/.$/, (x) => (x === "A" ? "B" : "A"))),
+      (_c, meta) => delete meta.recipient,
       (_c, meta) => (meta.result_revision = 99),
       (_c, meta) => (meta.extra = true),
       (c) => (c.action = "reveal"),

@@ -409,7 +409,7 @@ func (f *recoveryFlow) commit(ctx context.Context, text string, assertion []byte
 	if _, err = tx.ExecContext(ctx, `INSERT INTO seal_wraps VALUES(?,?,?,?,?)`, row, f.salt[:], f.wrap, s.seal.inv.Version, now); err != nil {
 		return err
 	}
-	for _, stmt := range []string{`DELETE FROM web_sessions`, `DELETE FROM challenges`, `DELETE FROM enroll_codes`, `DELETE FROM env_drafts`, `UPDATE requests SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`, `UPDATE enrollments SET status='expired' WHERE status='pending'`, `UPDATE env_releases SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`} {
+	for _, stmt := range []string{`DELETE FROM web_sessions`, `DELETE FROM challenges`, `DELETE FROM enroll_codes`, `DELETE FROM env_drafts`, `UPDATE requests SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`, `UPDATE enrollments SET status='expired' WHERE status='pending'`, `UPDATE env_releases SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`, `UPDATE sign_requests SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`} {
 		if _, err = tx.ExecContext(ctx, stmt); err != nil {
 			return err
 		}

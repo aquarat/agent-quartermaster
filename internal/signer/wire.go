@@ -27,7 +27,13 @@ type Binding struct {
 const (
 	MaxGrantSeconds    = 24 * 3600
 	MaxGrantSignatures = 1000
+	MinGrantSeconds    = 60
 	DefaultSignatures  = 20
+	// MaxMessageBytes bounds the artifacts of one call for a scheme that signs
+	// the artifact itself (they travel in one bounded JSON body).
+	MaxMessageBytes = 40 << 10
+	// MaxRequestsPerHour bounds one host's signing requests, whatever became of them.
+	MaxRequestsPerHour = 30
 	// CollectSeconds is how long an approved single-use grant waits for the
 	// requester to fetch its signatures.
 	CollectSeconds = 600

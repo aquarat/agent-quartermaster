@@ -47,6 +47,7 @@ type vaultEnv struct {
 	gen        seal.Generation
 	check      []byte
 	target     map[string]any
+	recipient  string // of the last upload attempt
 	lastReveal map[string]any
 }
 type syncBuffer struct {
@@ -230,6 +231,7 @@ func (v *vaultEnv) sealUpload(purpose, set string, plain []byte) (attempt, enc, 
 	epoch := v.s.seal.attempts.Epoch()
 	e, c, err := seal.SealTo(pub, seal.Tuple("hpke-vault", v.gen.Installation[:], []byte(purpose)), seal.Tuple("hpke-vault-aad", raw, epoch[:], []byte(set)), plain)
 	requireNoError(v.t, err)
+	v.recipient = a.Recipient
 	return a.ID, encodeID(e), encodeID(c)
 }
 
@@ -246,7 +248,7 @@ func (v *vaultEnv) commitChallenge(edit envset.Edit, oldNames []string) (vaultRe
 	st := v.web("POST", "/api/ui/seal/vault/challenge", map[string]any{"action": "commit", "id": v.set, "attempt_id": attempt, "enc": enc, "ciphertext": ct, "commitment": commit}, &r)
 	if st == 200 {
 		changes, _ := edit.Changes(oldNames)
-		v.expect(r, "commit", v.set, with(v.target, "revision", rev, "attempt_id", attempt, "operation", edit.Op, "changes", changes, "commitment", commit, "result_revision", rev+1))
+		v.expect(r, "commit", v.set, with(v.target, "revision", rev, "attempt_id", attempt, "operation", edit.Op, "changes", changes, "commitment", commit, "result_revision", rev+1, "recipient", v.recipient))
 	}
 	return r, st
 }
@@ -569,10 +571,12 @@ type signerFixture struct {
 func (v *vaultEnv) createSigner(id, slug, scheme, private string) signerFixture {
 	v.t.Helper()
 	choice := map[string]any{"action": "signer-create", "id": id, "service_id": v.service, "set_slug": slug, "set_title": "Release key", "scheme": scheme, "source": "generate"}
+	recipient := ""
 	if private != "" {
 		plain, _ := json.Marshal(map[string]string{"private_key": private})
 		a, e, c := v.sealUpload("signer-import", id, plain)
 		choice["source"], choice["attempt_id"], choice["enc"], choice["ciphertext"] = "import", a, e, c
+		recipient = v.recipient
 	}
 	var r vaultReviewResp
 	mustStatus(v.t, "signer challenge", v.web("POST", "/api/ui/seal/vault/challenge", choice, &r), 200)
@@ -580,7 +584,7 @@ func (v *vaultEnv) createSigner(id, slug, scheme, private string) signerFixture 
 	if r.Facts["fingerprint"] != signer.Fingerprint(pub) {
 		v.t.Fatal("fingerprint is not of the public key")
 	}
-	v.expect(r, "signer-create", id, with(v.target, "set_id", id, "set_slug", slug, "set_title", "Release key", "kind", "signer", "revision", 0, "scheme", scheme, "source", choice["source"], "attempt_id", r.Facts["attempt_id"], "public_key", r.Facts["public_key"], "fingerprint", r.Facts["fingerprint"], "result_revision", 0))
+	v.expect(r, "signer-create", id, with(v.target, "set_id", id, "set_slug", slug, "set_title", "Release key", "kind", "signer", "revision", 0, "scheme", scheme, "source", choice["source"], "attempt_id", r.Facts["attempt_id"], "public_key", r.Facts["public_key"], "fingerprint", r.Facts["fingerprint"], "result_revision", 0, "recipient", recipient))
 	var out struct {
 		Path      string
 		PublicKey string `json:"public_key"`
@@ -708,6 +712,33 @@ func TestSignerSingleUse(t *testing.T) {
 	}
 	if !v.audited("sign", "client-a/paas/release-key scheme=ed25519 sha256="+a.SHA256) || !v.audited("sign", "sha256="+b.SHA256) || !v.audited("vault_sign_approve", "items="+a.SHA256+","+b.SHA256) {
 		t.Fatal("signatures not audited by digest")
+	}
+	// Limits of a request: a grant shorter than a minute, more artifact bytes than one call carries.
+	if _, st := v.askSign(v.agent, f, 30, 5, a); st != 400 {
+		t.Fatal("sub-minute grant accepted")
+	}
+	var many []signer.Item
+	for i := 0; i < 11; i++ {
+		many = append(many, signItemFor(f.scheme, "part.bin", bytes.Repeat([]byte{byte(i)}, signer.MaxMessage)))
+	}
+	if _, st := v.askSign(v.agent, f, 0, 0, many...); st != 400 {
+		t.Fatal("more artifact bytes than a call may carry")
+	}
+	// A host cannot flood the owner with requests by cancelling each one.
+	last := 0
+	for i := 0; i < signer.MaxRequestsPerHour+1; i++ {
+		var req signer.Request
+		if req, last = v.askSign(v.other, f, 0, 0, signItemFor(f.scheme, "n.bin", []byte{byte(i)})); last != 200 {
+			break
+		}
+		mustStatus(t, "cancel", v.host(v.other, "POST", "/v2/sign/requests/"+req.ID+"/cancel", map[string]any{}, nil), 200)
+	}
+	if last != 429 {
+		t.Fatalf("request flood not limited (%d)", last)
+	}
+	v.clock.Advance(61 * time.Minute)
+	if _, st := v.askSign(v.other, f, 0, 0, a); st != 200 {
+		t.Fatal("rate limit did not clear after an hour")
 	}
 	// The private key is nowhere but the sealed record: no response, log, audit row or database page.
 	if where := v.leaked(seed); where != "" {
@@ -892,6 +923,25 @@ func TestSignerCreateBinding(t *testing.T) {
 	if _, st := challenge("source", "import", "attempt_id", a, "enc", e, "ciphertext", c); st != 400 {
 		t.Fatal("key packet accepted for another set")
 	}
+	// An abandoned upload or generated key is dropped on its own timer, with no further vault call.
+	v.s.seal.vault.ttl = 50 * time.Millisecond
+	v.sealUpload("edit", v.set, plain)
+	if _, st := challenge("id", "ffffffffffffffffffffffffffffffff", "set_slug", "abandoned"); st != 200 {
+		t.Fatal("generate challenge")
+	}
+	for i := 0; ; i++ {
+		v.s.seal.vault.mu.Lock()
+		n := len(v.s.seal.vault.m)
+		v.s.seal.vault.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		if i > 1000 {
+			t.Fatalf("%d pending secrets outlived their timer", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	v.s.seal.vault.ttl = 0
 	// Two generate reviews: each has its own key; the one tapped is the one created; the other dies with a conflict.
 	one, st := challenge()
 	mustStatus(t, "generate", st, 200)

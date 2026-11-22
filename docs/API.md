@@ -745,9 +745,14 @@ component prefixed with its uint32 big-endian length).
 | Browser → broker (form edit, signer import) | Broker's, from `POST attempt`: in memory, one packet, five minutes, bound to the session | `T("hpke-vault", installation, purpose)` with purpose `edit` or `signer-import` | `T("hpke-vault-aad", attempt ID (32 bytes), epoch, set ID as UTF-8)` |
 | Broker → browser (reveal) | Browser's, generated for this reveal and named in the signed canonical | `T("hpke-vault", installation, "reveal")` | `T("hpke-vault-aad", SHA-256 of the canonical, epoch, set ID as UTF-8)` |
 
-The edge and any HTTP body logger see ciphertext only. As with unlock
-([SEALED.md](SEALED.md)), this does not defend against an edge that serves a
-different page: such a page can read what is typed into it.
+The edge and any HTTP body logger see ciphertext only. The broker's upload
+key is named in the signed metadata (`recipient`), as the unlock recipient is:
+the page signs for the key it sealed to, so a packet opened and re-sealed on
+the way is refused by the page before the tap. As with unlock
+([SEALED.md](SEALED.md)), none of this defends against an edge that serves a
+different page: such a page can read what is typed into it. An upload attempt
+and a generated key awaiting its tap are dropped after five minutes, at
+logout, and when their challenge is refused or finished.
 A packet for one set, attempt, lock epoch or purpose does not open as another.
 The reveal AAD contains the canonical's digest, and so its nonce: a recorded
 response cannot be replayed into a later ceremony. Vectors:
@@ -781,10 +786,10 @@ set_title, kind, revision`.
 
 | `action`, `id` | Choice fields | Signed metadata | Result |
 |---|---|---|---|
-| `commit`, set ID | `attempt_id, enc, ciphertext, commitment` | target fields, `attempt_id, operation, changes, commitment, result_revision` | `{ok}`; a new immutable revision |
+| `commit`, set ID | `attempt_id, enc, ciphertext, commitment` | target fields, `attempt_id, recipient, operation, changes, commitment, result_revision` | `{ok}`; a new immutable revision |
 | `reveal`, set ID | `names` (sorted, unique, non-empty), `recipient` | target fields, `names, recipient` | `{enc, ciphertext}` |
 | `policy`, org ID | `allow_reveal` | `org_id, org_slug, org_title, old_allow_reveal, allow_reveal` | `{ok}` |
-| `signer-create`, new set ID (32 lower-case hex) | `service_id, set_slug, set_title, scheme, source` (`generate` or `import`); for import also `attempt_id, enc, ciphertext` | target fields of the new set (`kind` `signer`, `revision` 0), `scheme, source, attempt_id, public_key, fingerprint, result_revision` (0: a signer set stays at revision 0, its key is immutable) | `{set_id, path, scheme, public_key, public_hex, public_pem, fingerprint}` |
+| `signer-create`, new set ID (32 lower-case hex) | `service_id, set_slug, set_title, scheme, source` (`generate` or `import`); for import also `attempt_id, enc, ciphertext` | target fields of the new set (`kind` `signer`, `revision` 0), `scheme, source, attempt_id, recipient` (empty for a generated key), `public_key, fingerprint, result_revision` (0: a signer set stays at revision 0, its key is immutable) | `{set_id, path, scheme, public_key, public_hex, public_pem, fingerprint}` |
 | `sign-approve`, `sign-deny`, `sign-revoke`; request ID | approve: `ttl_seconds, max_signatures` | target fields, `request_id, host, enrollment, address, scheme, fingerprint, items` (each `name, size, sha256` and, for a SHA-512 scheme, `sha512`), `requested_ttl_seconds, requested_max_signatures, ttl_seconds, max_signatures, admission_generation, policy_revision, service_revision, soft_cap_seconds, beyond_soft_cap` | `{ok}` |
 
 `facts` are unsigned conveniences: `attempt_id` (the broker allocates one for
@@ -802,7 +807,9 @@ commitment below with, for `merge`, one more group per removed name (sorted):
 list of `NAME:add`, `NAME:replace`, `NAME:remove`. The page never receives old
 values: it computes `changes` from the key names in `state`. Limits are those
 of an env set (64 keys, 8192 bytes a value, 24 KiB in all); a value may hold
-any UTF-8 text except NUL, including newlines.
+any UTF-8 text except NUL, including newlines. The page stores line breaks
+as LF and refuses an imported value that contains a carriage return (a text
+box cannot keep one); `aqmas set import` stores such a value exactly.
 
 **Reveal.** Refused for a signer (always), when the organisation's
 `allow_reveal` is off, and while locked. The plaintext is
@@ -832,10 +839,13 @@ read as LF. Errors name the line, never its content. Vectors:
 * `POST /v2/sign/requests` `{binding, reason, ttl_seconds, max_signatures, items}` →
   the pending request. `ttl_seconds` 0 asks for a single-use grant (exactly
   `items`, once, collected within ten minutes of approval); above 0 asks for a
-  time-boxed grant of up to `max_signatures` (default 20, at most 1000) for at
-  most 24 hours. An item is `{name, size, sha256}` plus `sha512` or `message`
+  time-boxed grant of up to `max_signatures` (default 20, at most 1000) for
+  one minute to 24 hours. An item is `{name, size, sha256}` plus `sha512` or `message`
   (standard base64) when the scheme signs that; `size` is -1 when only a digest
-  was given. At most 16 items a call.
+  was given. At most 16 items a call and, for a scheme that signs the artifact
+  itself, 40 KiB of artifacts. At most 30 requests an hour from one host
+  (429), whatever became of them; ended requests are forgotten after 30 days
+  (the audit log keeps them).
 * `GET /v2/sign/requests/{id}`, `POST .../{id}/cancel`, `GET /v2/sign/grants/{id}`,
   `POST /v2/sign/grants/{id}/end`: metadata, cancel, end early.
 * `POST /v2/sign/grants/{id}/sign` `{items}` → `{request, signatures:[{name, sha256, signature}]}`.

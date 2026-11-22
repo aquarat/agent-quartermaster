@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdh"
 	"encoding/hex"
@@ -51,8 +52,16 @@ type vaultPending struct {
 	priv, pub []byte
 }
 type vaultPool struct {
-	mu sync.Mutex
-	m  map[string]*vaultPending
+	mu  sync.Mutex
+	m   map[string]*vaultPending
+	ttl time.Duration // zero: vaultAttemptTTL
+}
+
+func (p *vaultPool) life() time.Duration {
+	if p.ttl > 0 {
+		return p.ttl
+	}
+	return vaultAttemptTTL
 }
 
 func (p *vaultPool) prune(now time.Time) {
@@ -81,13 +90,24 @@ func (p *vaultPool) add(now time.Time, v *vaultPending) (string, error) {
 	}
 	id := seal.RandomID()
 	s := encodeID(id[:])
-	v.expires = now.Add(vaultAttemptTTL)
+	v.expires = now.Add(p.life())
 	p.m[s] = v
+	// Expiry does not wait for the next vault call: the recipient key, packet
+	// or generated key is dropped on a timer of its own.
+	time.AfterFunc(p.life(), func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.m[s] == v {
+			clear(v.priv)
+			delete(p.m, s)
+		}
+	})
 	return s, nil
 }
 
-// get returns a snapshot of a live entry of this session (its slices are
-// written once and never modified); take also removes the entry.
+// get returns a snapshot of a live entry of this session. The caller owns the
+// snapshot's copy of a generated key and clears it; the packet slices are
+// written once and never modified. take also removes and wipes the entry.
 func (p *vaultPool) get(now time.Time, sess, id string, take bool) *vaultPending {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -96,10 +116,12 @@ func (p *vaultPool) get(now time.Time, sess, id string, take bool) *vaultPending
 	if v == nil || v.session != sess {
 		return nil
 	}
+	c := *v
+	c.priv = slices.Clone(v.priv)
 	if take {
+		clear(v.priv)
 		delete(p.m, id)
 	}
-	c := *v
 	return &c
 }
 
@@ -399,6 +421,7 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		}
 		m = targetFields(t)
 		m["attempt_id"], m["operation"], m["changes"], m["commitment"], m["result_revision"] = c.Attempt, edit.Op, changes, p.commit, t.Revision+1
+		m["recipient"] = encodeID(p.recipient.Public())
 	case "reveal":
 		t, err := q.VaultSet(ctx, c.ID)
 		if err != nil {
@@ -455,6 +478,7 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		}
 		t.SetID, t.SetSlug, t.SetTitle, t.Kind, t.Revision = c.ID, c.Slug, c.Title, "signer", 0
 		var pub []byte
+		recipient := "" // the upload recipient of an import; empty for a generated key
 		switch {
 		case c.Source == "generate" && begin:
 			if c.Attempt != "" || c.Enc != "" || c.Ciphertext != "" {
@@ -474,6 +498,7 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 			if p == nil || p.purpose != "signer-generate" || p.target != t.SetID || p.scheme != sc.ID {
 				return "", nil, errConflict("generated key expired; start again")
 			}
+			clear(p.priv)
 			pub = p.pub
 		case c.Source == "import":
 			var p *vaultPending
@@ -490,11 +515,13 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 				return "", nil, err
 			}
 			clear(priv)
+			recipient = encodeID(p.recipient.Public())
 		default:
 			return "", nil, errBad("choose generate or import")
 		}
 		m = targetFields(t)
 		m["scheme"], m["source"], m["attempt_id"], m["public_key"], m["fingerprint"], m["result_revision"] = sc.ID, c.Source, c.Attempt, encodeID(pub), signer.Fingerprint(pub), 0
+		m["recipient"] = recipient
 		pemText, _ := sc.PublicPEM(pub)
 		facts["public_key"], facts["fingerprint"], facts["public_hex"], facts["public_pem"] = encodeID(pub), signer.Fingerprint(pub), hex.EncodeToString(pub), pemText
 	case "sign-approve", "sign-deny", "sign-revoke":
@@ -621,6 +648,7 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 		TTL         int      `json:"ttl_seconds"`
 		Max         int      `json:"max_signatures"`
 		Changes     string   `json:"changes"`
+		PublicKey   string   `json:"public_key"`
 	}
 	if json.Unmarshal([]byte(m.Metadata), &f) != nil {
 		return nil, errBad("invalid vault decision")
@@ -750,9 +778,14 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 					return err
 				}
 			} else {
-				priv, pub = slices.Clone(p.priv), p.pub
+				priv, pub = p.priv, p.pub // p is this request's own snapshot
 			}
 			defer clear(priv)
+			// Whatever happened to the pending entry meanwhile, never seal a key
+			// that is not the private half of the public key the owner signed for.
+			if derived, err := sc.Public(priv); err != nil || !bytes.Equal(derived, pub) || encodeID(pub) != f.PublicKey {
+				return errConflict("key expired; start again")
+			}
 			t, err := q.VaultService(ctx, f.Service)
 			if err != nil {
 				return err
@@ -827,8 +860,9 @@ type signerSecret struct {
 	Private []byte `json:"private"`
 }
 
-// signerCipher seals or opens a signer's private key. It is opened in exactly
-// one place (signWith) and its plaintext is never marshalled anywhere else.
+// signerCipher seals or opens a signer's private key. It is opened to sign
+// (signWith) and to check a recovery inventory (verifyEnvInventory); its
+// plaintext is never marshalled anywhere else.
 func (s *Server) signerCipher(ctx context.Context, t store.VaultTarget, rec store.CipherRecord, data *signerSecret, encrypt bool) (store.CipherRecord, error) {
 	k, _ := ctx.Value(leaseKey{}).(*seal.Key)
 	if k == nil || ctx.Err() != nil {

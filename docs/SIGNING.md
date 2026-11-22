@@ -33,11 +33,12 @@ aqmas sign client-a/releases/firmware-key --why "CI digest" --digest sha256:9f86
   print hex to stdout. An existing output file is refused without `--force`.
 * The CLI verifies every signature against the signer's public key before it
   writes anything.
-* `--why` is required for a new request. `--ttl` (up to 24 h) with `--count`
+* `--why` is required for a new request. `--ttl` (1 min to 24 h) with `--count`
   (default 20, at most 1000) asks for a time-boxed grant; later calls for the
   same key on the same host reuse it until it runs out, expires or is revoked.
-* At most 16 artifacts a call. `--digest` works for schemes that sign a
-  SHA-256 digest.
+* At most 16 artifacts a call (and 40 KiB of them for `ed25519`, which sends
+  the artifacts), and 30 requests an hour from one host: use a grant for a run
+  of signatures. `--digest` works for schemes that sign a SHA-256 digest.
 * Exit codes are those of the other commands: 3 denied, 4 expired, 130 cancelled.
 
 ## For the owner
@@ -61,7 +62,11 @@ move a key elsewhere, import the copy you kept, or make a new key.
 exactly it signs, the requesting host and address, and for each artifact its
 name, size and full SHA-256. Names and the reason are the requester's words;
 the digest is what gets signed. For a scheme that signs the artifact itself
-the card also shows the bytes in hex. Two kinds of approval:
+the card also shows all of its bytes in hex, checked against the SHA-256.
+For `ed25519ph` the SHA-512 is what gets signed and is shown first; the
+SHA-256 is then only the requester's claim. The confirmation before the
+passkey prompt restates the limits you chose, and the inputs are frozen while
+it is open. Two kinds of approval:
 
 | Grant | What one tap authorises |
 |---|---|

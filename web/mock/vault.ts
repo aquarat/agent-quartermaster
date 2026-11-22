@@ -74,6 +74,8 @@ interface Attempt {
   commitment?: string;
   scheme?: string;
   pub?: Buffer;
+  /** The upload recipient handed out for this attempt (base64url), signed in the canonical. */
+  recipient?: string;
 }
 
 export class MockVault {
@@ -215,7 +217,7 @@ export class MockVault {
         if (commitment !== a.commitment) fail(400, "bad_request", "invalid edit commitment");
         facts.attempt_id = c.attempt_id;
         facts.edit = e; // mock-internal, removed before the response
-        return { meta: { ...this.target(s), attempt_id: c.attempt_id, operation: e.operation, changes, commitment, result_revision: s.revision + 1 }, facts };
+        return { meta: { ...this.target(s), attempt_id: c.attempt_id, operation: e.operation, changes, commitment, result_revision: s.revision + 1, recipient: a.recipient ?? "" }, facts };
       }
       case "reveal": {
         const s = setOf(c.id);
@@ -237,6 +239,7 @@ export class MockVault {
         needUnlocked();
         let attempt = c.attempt_id as string | undefined;
         let pub: Buffer;
+        let recipient = "";
         if (c.source === "generate" && begin) {
           attempt = b64url(randomBytes(32));
           pub = keyFor(scheme.id);
@@ -248,6 +251,7 @@ export class MockVault {
         } else if (c.source === "import") {
           const a = begin ? this.submit(session, c, "signer-import", c.id) : this.live(session, attempt);
           if (a.purpose !== "signer-import" || a.target !== c.id || a.scheme !== scheme.id) fail(409, "conflict", "upload attempt expired; start again");
+          recipient = a.recipient ?? "";
           const packet = JSON.parse((await this.open(a, "signer-import", attempt!, c.id)).toString("utf8")) as { private_key?: string };
           try {
             pub = keyFor(scheme.id, String(packet.private_key ?? ""));
@@ -257,7 +261,7 @@ export class MockVault {
         } else return fail(400, "bad_request", "choose generate or import");
         Object.assign(facts, { attempt_id: attempt, public_key: b64url(pub), fingerprint: hex(sha256(pub)), public_hex: hex(pub), public_pem: spki(pub) });
         return {
-          meta: { org_id: parent.org_id, org_slug: parent.org_slug, org_title: parent.org_title, service_id: parent.service_id, service_slug: parent.service_slug, service_title: parent.service_title, set_id: c.id, set_slug: c.set_slug, set_title: c.set_title, kind: "signer", revision: 0, scheme: scheme.id, source: c.source, attempt_id: attempt, public_key: b64url(pub), fingerprint: hex(sha256(pub)), result_revision: 0 },
+          meta: { org_id: parent.org_id, org_slug: parent.org_slug, org_title: parent.org_title, service_id: parent.service_id, service_slug: parent.service_slug, service_title: parent.service_title, set_id: c.id, set_slug: c.set_slug, set_title: c.set_title, kind: "signer", revision: 0, scheme: scheme.id, source: c.source, attempt_id: attempt, public_key: b64url(pub), fingerprint: hex(sha256(pub)), result_revision: 0, recipient },
           facts,
         };
       }
@@ -305,7 +309,7 @@ export class MockVault {
       const priv = Buffer.alloc(32);
       e.getPrivateKey().copy(priv, 32 - e.getPrivateKey().length);
       const id = b64url(randomBytes(32));
-      this.attempts.set(id, { session, priv, expires: Date.now() + 300_000 });
+      this.attempts.set(id, { session, priv, expires: Date.now() + 300_000, recipient: b64url(e.getPublicKey()) });
       return { attempt_id: id, recipient: b64url(e.getPublicKey()), expires_at: Date.now() + 300_000 };
     }
     if (verb === "challenge" && post) {

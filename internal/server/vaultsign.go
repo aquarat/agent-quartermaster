@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
@@ -99,7 +100,11 @@ func checkItems(sc signer.Scheme, items []signer.Item) error {
 		return errBad(fmt.Sprintf("send 1 to %d artifacts", signer.MaxItems))
 	}
 	seen := map[string]bool{}
+	bytes := 0
 	for _, it := range items {
+		if bytes += len(it.Message); bytes > signer.MaxMessageBytes {
+			return errBad(fmt.Sprintf("at most %d bytes of artifacts a call for a scheme that signs the artifact itself", signer.MaxMessageBytes))
+		}
 		if err := sc.Valid(it); err != nil {
 			return errBad(err.Error())
 		}
@@ -141,7 +146,7 @@ func (s *Server) signRequest(ctx context.Context, q *store.Q, r *http.Request, h
 		return nil, errBad("invalid reason")
 	}
 	switch {
-	case in.TTL < 0 || in.Max < 0 || in.Max > signer.MaxGrantSignatures:
+	case in.TTL < 0 || in.TTL > 0 && in.TTL < signer.MinGrantSeconds || in.Max < 0 || in.Max > signer.MaxGrantSignatures:
 		return nil, errBad("invalid duration or count")
 	case in.TTL == 0:
 		if in.Max != 0 && in.Max != len(in.Items) {
@@ -169,7 +174,14 @@ func (s *Server) signRequest(ctx context.Context, q *store.Q, r *http.Request, h
 	if n >= MaxPendingPerHost {
 		return nil, &apiErr{429, "rate_limited", "too many pending requests"}
 	}
-	out := signer.Request{Binding: b, ID: ids.New(), Peer: peer, Reason: in.Reason, Items: in.Items, TTL: in.TTL, Max: in.Max, Deadline: now.Add(secs(s.cfg.TTL.PendingExpirySeconds)).UnixMilli(), Status: "pending"}
+	// Cancelled and decided requests count too: each one notifies the owner.
+	pending := secs(s.cfg.TTL.PendingExpirySeconds)
+	if recent, err := q.SignRecent(ctx, h.ID, now.Add(pending-time.Hour)); err != nil {
+		return nil, err
+	} else if recent >= signer.MaxRequestsPerHour {
+		return nil, &apiErr{429, "rate_limited", "too many signing requests this hour; use a time-boxed grant (--ttl) for a run of signatures"}
+	}
+	out := signer.Request{Binding: b, ID: ids.New(), Peer: peer, Reason: in.Reason, Items: in.Items, TTL: in.TTL, Max: in.Max, Deadline: now.Add(pending).UnixMilli(), Status: "pending"}
 	if err = q.NewSignRequest(ctx, h.ID, out); err != nil {
 		return nil, err
 	}

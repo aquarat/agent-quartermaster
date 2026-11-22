@@ -79,8 +79,27 @@ function bytes(n: number): string {
 
 /** Two steps, as everywhere in this app: the server's canonical is checked against the
  * choice first (prepare), then one button starts the passkey prompt inside its own tap. */
-function ceremony<T>(slot: HTMLElement, auth: Authenticator, confirmLabel: string, cls: string, prepare: () => Promise<{ detail: string; tap(a: Authenticator): Promise<T> }>, before: (detail: string) => Child[], done: (out: T) => void, cancelled?: () => void): void {
+/** Disables every control under root except those in `except`, and returns the undo. While a
+ * ceremony is open the inputs it was built from must not move: the confirmation describes the
+ * choice captured at the click, and so does the text the passkey signs. */
+function freeze(root: HTMLElement, except: HTMLElement): () => void {
+  const els = [...root.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | HTMLButtonElement>("input,textarea,select,button")].filter((el) => !except.contains(el) && !el.disabled);
+  for (const el of els) el.disabled = true;
+  return () => {
+    for (const el of els) el.disabled = false;
+  };
+}
+
+/** `before` must describe the captured choice only (never read live inputs): it runs after an
+ * asynchronous round trip. `frozen` is the form the choice came from. */
+function ceremony<T>(slot: HTMLElement, auth: Authenticator, confirmLabel: string, cls: string, prepare: () => Promise<{ detail: string; tap(a: Authenticator): Promise<T> }>, before: (detail: string) => Child[], done: (out: T) => void, cancelled?: () => void, frozen?: HTMLElement): void {
   const error = h("p", { class: "error", role: "alert" });
+  const thaw = frozen ? freeze(frozen, slot) : () => {};
+  const stop = cancelled;
+  cancelled = () => {
+    thaw();
+    stop?.();
+  };
   replace(slot, h("p", { class: "muted", role: "status" }, "Checking with aqmas…"));
   prepare().then(
     (p) => {
@@ -90,6 +109,7 @@ function ceremony<T>(slot: HTMLElement, auth: Authenticator, confirmLabel: strin
         try {
           const out = await p.tap(auth);
           replace(slot);
+          thaw();
           done(out);
         } catch (e) {
           replace(slot, h("p", { class: "error", role: "alert" }, "Not applied: ", message(e), ". Nothing changed; start again."));
@@ -211,14 +231,15 @@ function signCard(host: VaultHost, seal: SealView, state: VaultState, req: SignR
     if (!timed || once.checked) return { ttl: 0, max: req.items.length };
     return { ttl: Math.round(Number(minutes.value) * 60), max: Math.round(Number(count.value)) };
   };
+  const grantText = (c: { ttl: number; max: number }) =>
+    c.ttl === 0
+      ? `Single use: aqmas signs exactly ${req.items.length === 1 ? "this artifact" : "these artifacts"}, once, and nothing else.`
+      : `Time-boxed: up to ${c.max} signatures over ANYTHING this host submits for ${duration(c.ttl)}, not only the artifacts above. Each one is logged.${c.ttl > req.soft_cap_seconds ? " BEYOND SOFT CAP." : ""}`;
   const describe = () => {
     const c = choice();
     minutes.disabled = count.disabled = once.checked;
     blunt.className = c.ttl === 0 ? "muted" : "warn";
-    blunt.textContent =
-      c.ttl === 0
-        ? `Single use: aqmas signs exactly ${req.items.length === 1 ? "this artifact" : "these artifacts"}, once, and nothing else.`
-        : `Time-boxed: up to ${c.max} signatures over ANYTHING this host submits for ${duration(c.ttl)}, not only the artifacts above. Each one is logged.${c.ttl > req.soft_cap_seconds ? " BEYOND SOFT CAP." : ""}`;
+    blunt.textContent = grantText(c);
   };
   if (timed) {
     const maxMin = Math.max(1, Math.floor(req.ttl_seconds / 60));
@@ -248,15 +269,18 @@ function signCard(host: VaultHost, seal: SealView, state: VaultState, req: SignR
       return;
     }
     actions.hidden = true;
+    // The panel states the choice captured at this click (c), which is what gets signed.
+    const text = action === "sign-approve" ? grantText(c) : "Deny this request. Nothing is signed.";
     ceremony(
       slot,
       host.auth,
       action === "sign-approve" ? "Approve with passkey" : "Deny with passkey",
       action === "sign-approve" ? "approve" : "deny",
       () => vaultSignDecision(host.api, seal, set, req, action, c.ttl, c.max, location.hostname),
-      () => [h("p", null, action === "sign-approve" ? vt(blunt.textContent) : "Deny this request. Nothing is signed.")],
+      () => [h("p", { class: action === "sign-approve" && c.ttl !== 0 ? "warn" : "muted" }, vt(text))],
       () => host.changed(),
       () => (actions.hidden = false),
+      card,
     );
   };
   actions.append(btn("Deny…", "deny", () => decide("sign-deny")), btn(state.unlocked ? "Approve…" : "Unlock to approve", "approve", () => decide("sign-approve")));
@@ -554,7 +578,15 @@ export class VaultPage {
               hide();
             }
           }, 500);
-          this.forget.push(() => ((shown = null), hide()));
+          // A background tab's timers are throttled: check the deadline the moment it is seen again.
+          const seen = () => {
+            if (Date.now() >= until) {
+              shown = null;
+              hide();
+            }
+          };
+          document.addEventListener("visibilitychange", seen);
+          this.forget.push(() => (document.removeEventListener("visibilitychange", seen), (shown = null), hide()));
         },
       );
     const existing = h("ul", { class: "vault-keys" });
@@ -585,6 +617,10 @@ export class VaultPage {
         if (file.size > 64 << 10) throw Error("That file is too large for an env set.");
         const entries = parseDotenv(new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer()));
         if (!entries.length) throw Error("No assignments found in that file.");
+        // A text box turns every carriage return into a line feed. Rather than store something
+        // other than what the file says, leave such a value to `aqmas set import`.
+        const cr = entries.find((x) => x.value.includes("\r"));
+        if (cr) throw Error(`${cr.name} contains a carriage return, which this form cannot keep; convert it to line feeds or use aqmas set import`);
         clearRows();
         for (const e of entries) addRow(e.name, e.value);
         imported = file.name;
@@ -627,7 +663,10 @@ export class VaultPage {
     });
 
     const save = btn("Review and save…", "approve", () => {
+      // Everything the panel shows is taken now, with the edit: the rows, the Remove and Keep
+      // buttons and the import mode are frozen until the ceremony ends.
       const e = edit();
+      const snapshot = summary.cloneNode(true);
       save.disabled = true;
       ceremony(
         slot,
@@ -635,13 +674,14 @@ export class VaultPage {
         "Save with passkey",
         "approve",
         () => vaultCommit(this.host.api, this.seal!, set, e, location.hostname),
-        () => [h("p", null, "Revision ", String(set.revision), " → ", String(set.revision + 1), mode === "import" ? ", replacing the whole set" : "", ". Hosts holding a release of the old revision lose it."), summary.cloneNode(true)],
+        (detail) => [h("p", null, "Revision ", String(set.revision), " → ", String(set.revision + 1), e.operation === "import" ? ", replacing the whole set" : "", ". Hosts holding a release of the old revision lose it."), snapshot, h("p", { class: "hint muted" }, vt(detail))],
         () => {
           clearRows();
           for (const x of e.entries) x.value = "";
           this.host.changed();
         },
         refresh,
+        card,
       );
     });
     this.forget.push(() => {

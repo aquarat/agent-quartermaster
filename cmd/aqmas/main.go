@@ -174,8 +174,8 @@ func run(args []string) int {
 		}
 		if f.str["ttl"] != "" {
 			d, err := time.ParseDuration(f.str["ttl"])
-			if err != nil || d < time.Second || d%time.Second != 0 || d > 24*time.Hour {
-				return fail(&client.UsageError{Msg: "--ttl is a duration up to 24h, such as 30m"})
+			if err != nil || d < time.Minute || d%time.Second != 0 || d > 24*time.Hour {
+				return fail(&client.UsageError{Msg: "--ttl is a duration from 1m to 24h, such as 30m"})
 			}
 			o.TTL = int(d / time.Second)
 		}
