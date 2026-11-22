@@ -62,7 +62,7 @@ func (s *Server) pollUpdates(ctx context.Context) {
 func gitOutput(ctx context.Context, dir, key string, limit int64, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "fetch.fsckObjects=true"}, args...)...)
 	cmd.Dir = dir
-	cmd.Env = []string{"PATH=/usr/bin:/bin", "GIT_ALLOW_PROTOCOL=ssh", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "HOME=/nonexistent", "LC_ALL=C", "GIT_SSH_COMMAND=ssh -F /dev/null -oBatchMode=yes -oIdentitiesOnly=yes -oStrictHostKeyChecking=yes -i " + key}
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "GIT_ALLOW_PROTOCOL=ssh", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "HOME=/nonexistent", "LC_ALL=C", "GIT_SSH_COMMAND=ssh -F /dev/null -oBatchMode=yes -oIdentitiesOnly=yes -oStrictHostKeyChecking=yes -oUserKnownHostsFile=/dev/null -oGlobalKnownHostsFile='/etc/ssh/ssh_known_hosts " + filepath.Join(filepath.Dir(key), "known_hosts") + "' -i " + key}
 	pipe, e := cmd.StdoutPipe()
 	if e != nil {
 		return "", e

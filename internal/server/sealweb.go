@@ -558,7 +558,15 @@ func (s *Server) sealControlFinish(w http.ResponseWriter, r *http.Request, sess 
 		return
 	}
 	if c.ObjectID == "activate" {
-		err = s.activateSeal(ctx, sess, row, c.Canonical, in.Assertion)
+		// When the maintenance runner drives the import it verifies this signature against
+		// its pins before it finishes. Refuse an unpinned passkey here, while that is still
+		// only an error message and not a half-finished sealing.
+		if _, installed := s.runnerStatus(); installed {
+			err = s.pinnedFor(ctx, row)
+		}
+		if err == nil {
+			err = s.activateSeal(ctx, sess, row, c.Canonical, in.Assertion)
+		}
 	} else if c.ObjectID == "renew-leaf" {
 		err = s.withLease(ctx, func(ctx context.Context) error {
 			return s.store.Tx(ctx, func(q *store.Q) error {

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/aquarat/agent-quartermaster/deploy/bastion"
 )
@@ -19,7 +20,10 @@ import (
 // maintenance pins. The first pins are the passkeys the broker has registered at this
 // moment, which is why Init is run by the owner from a terminal and never by a request.
 // repin replaces existing pins the same way (the out-of-band recovery for lost keys).
-func Init(ctx context.Context, l Layout, repin bool, out io.Writer) error {
+//
+// sources, when given, pins the release sources "Enable self-update" may use; a request from
+// the web page can then neither choose nor change them.
+func Init(ctx context.Context, l Layout, repin bool, sources *Sources, out io.Writer) error {
 	r, err := New(l, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if err != nil {
 		return err
@@ -86,6 +90,21 @@ func Init(ctx context.Context, l Layout, repin bool, out io.Writer) error {
 	if err := r.ensureDeployKey(ctx); err != nil {
 		return err
 	}
+	if sources != nil {
+		// Typed at the machine by its owner: validated for shape, not for policy.
+		p := UpdatesParams{Repo: sources.Repo, ForgejoAPI: sources.ForgejoAPI, GitHubAPI: sources.GitHubAPI, KnownHosts: []string{KnownHost(sources.Repo) + " ssh-ed25519 " + strings.Repeat("A", 68)}}
+		if err := p.validate(); err != nil {
+			return err
+		}
+		b, err := json.Marshal(sources)
+		if err != nil {
+			return err
+		}
+		if err = writeOwned(l.sources(), append(b, '\n'), 0, 0, 0644); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "release sources pinned: %s\n", sources.Repo)
+	}
 	for name, body := range map[string][]byte{"aqmas-maint.service": bastion.MaintUnit, "aqmas-maint.path": bastion.MaintPath} {
 		if err := writeOwned(filepath.Join(l.UnitDir, name), body, 0, 0, 0644); err != nil {
 			return err
@@ -113,37 +132,35 @@ func Init(ctx context.Context, l Layout, repin bool, out io.Writer) error {
 	return nil
 }
 
-// recover finishes or undoes a task whose runner died (crash, reboot).
+// recover finishes or undoes a task whose runner died or was stopped (crash, reboot, unit
+// stop). Each branch removes the journal only when the broker is in a consistent state and
+// serving; otherwise the journal stays and the runner is started again.
 func (r *Runner) recover(ctx context.Context, j journal) (string, error) {
+	_ = r.l.stop(ctx)
 	f, err := r.l.facts(ctx)
 	if err != nil {
-		return "", err
+		return "", errors.New("the database could not be checked; the runner keeps trying")
 	}
 	switch j.Task {
 	case TaskCutover:
-		defer r.clearJournal()
-		if err := r.restart(ctx); err != nil {
-			return "", errors.New("URGENT: the broker did not come back after an interrupted cutover; check it on the machine.")
-		}
 		if f.Schema >= 6 {
-			return "The cutover was interrupted after activation; organisations are active.", nil
+			return r.finishCutover(ctx, j.Backup)
 		}
-		return "", errors.New("The cutover was interrupted before activation; nothing was changed.")
+		return "", r.resume(ctx, errors.New("The cutover was interrupted before activation; nothing was changed."))
 	case TaskSeal:
-		// finishSeal keeps the journal on failure so the next start tries again.
 		if f.Schema == 8 {
 			return r.finishSeal(ctx, j)
 		}
 		return "", r.unseal(ctx, j, errors.New("Sealing was interrupted before activation: the store is unchanged and unsealed."))
 	case TaskUpdates:
-		defer r.clearJournal()
-		_ = r.l.stop(ctx)
 		if err := r.restoreConfig(j.Backup); err != nil {
 			return "", err
 		}
 		if err := r.restart(ctx); err != nil {
-			return "", err
+			return "", errors.New("the broker did not come back yet; the runner keeps trying")
 		}
+		_ = os.RemoveAll(j.Backup)
+		r.clearJournal()
 		return "", errors.New("Enabling self-update was interrupted; the previous configuration was restored.")
 	}
 	r.clearJournal()

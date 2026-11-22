@@ -46,7 +46,9 @@ commands:
   version               print the version
 
 as root (docs/SETUP.md):
-  maint-init [--repin]  install the maintenance runner: units, spool, keys and passkey pins
+  maint-init [--repin] [--repo URL --forgejo-api URL --github-api URL]
+                        install the maintenance runner: units, spool, keys and passkey pins;
+                        optionally pin the release sources self-update may use
   maint-run             run one owner-approved maintenance request (started by aqmas-maint.path)
 
 Run every command as the aqmas user (sudo -u aqmas aqmasd ...).
@@ -253,21 +255,36 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 // "--test-layout DIR HOOK" relocates everything for the interop suite and is refused for root.
 func maintenance(cmd string, args []string) error {
 	layout := maint.Production()
-	repin := false
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	test := fs.Bool("test-layout", false, "DIR HOOK follow: relocate everything (never as root)")
+	repin := fs.Bool("repin", false, "replace the maintenance pins with the passkeys registered now")
+	var src maint.Sources
+	fs.StringVar(&src.Repo, "repo", "", "pin the release repository (ssh://…)")
+	fs.StringVar(&src.ForgejoAPI, "forgejo-api", "", "pin the Forgejo release API")
+	fs.StringVar(&src.GitHubAPI, "github-api", "", "pin the GitHub release API")
+	usage := fmt.Errorf("usage: aqmasd maint-run | aqmasd maint-init [--repin] [--repo URL --forgejo-api URL --github-api URL]")
+	if err := fs.Parse(args); err != nil {
+		return usage
+	}
+	var sources *maint.Sources
+	if src != (maint.Sources{}) {
+		if src.Repo == "" || src.ForgejoAPI == "" || src.GitHubAPI == "" {
+			return usage
+		}
+		sources = &src
+	}
 	switch {
-	case len(args) == 0:
-	case len(args) == 1 && args[0] == "--repin" && cmd == "maint-init":
-		repin = true
-	case len(args) == 3 && args[0] == "--test-layout":
+	case *test && fs.NArg() == 2:
 		exe, err := os.Executable()
 		if err != nil {
 			return err
 		}
-		if layout, err = maint.TestLayout(args[1], exe, args[2]); err != nil {
+		if layout, err = maint.TestLayout(fs.Arg(0), exe, fs.Arg(1)); err != nil {
 			return err
 		}
-	default:
-		return fmt.Errorf("usage: aqmasd maint-run | aqmasd maint-init [--repin]")
+	case *test || fs.NArg() != 0 || cmd == "maint-run" && (*repin || sources != nil):
+		return usage
 	}
 	if os.Geteuid() == 0 {
 		if err := rootPin(layout.Config); err != nil {
@@ -277,7 +294,7 @@ func maintenance(cmd string, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if cmd == "maint-init" {
-		return maint.Init(ctx, layout, repin, os.Stdout)
+		return maint.Init(ctx, layout, *repin, sources, os.Stdout)
 	}
 	r, err := maint.New(layout, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	if err != nil {

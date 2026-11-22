@@ -29,6 +29,8 @@ Verify GitHub's SSH host key at the forge. Check mirror status after syncing. Th
 
 Start on a known-good bastion with an enrolled owner passkey, a merged-`/usr` Linux/arm64
 host and the maintenance runner installed (`sudo aqmasd maint-init`, [SETUP.md](SETUP.md)).
+`maint-init --repo … --forgejo-api … --github-api …` pins the release sources at the machine;
+requests from the page can then never choose or change them.
 Then use **Admin → Setup → Enable self-update**. One approval does all of this as root, with
 nothing taken from the request but the typed values you see and sign:
 
@@ -39,7 +41,8 @@ nothing taken from the request but the typed values you see and sign:
 2. Creates the dedicated SSH key `/etc/aqmas/repo-key` (root:aqmas 0440) if `maint-init` has
    not already. Its public half is shown on the page: register it as a **read-only** deploy
    key of the repository on the forge. Appends the forge host key lines you signed to
-   `/etc/ssh/ssh_known_hosts`; the page can fetch them for you to compare first.
+   `/etc/aqmas/known_hosts` (consulted only by the broker's and the builder's `git fetch`);
+   the page can fetch them and shows fingerprints it computed itself for you to compare.
 3. Stores the release-reading tokens you pasted as `/etc/aqmas/forgejo-read-token` and
    `/etc/aqmas/github-read-token` (root:aqmas 0440: the broker reads them to discover
    releases). They travel sealed to the runner. While GitHub is private use a fine-grained

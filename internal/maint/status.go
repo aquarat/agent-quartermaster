@@ -30,6 +30,7 @@ type RunnerInfo struct {
 	SecretsKey string   `json:"secrets_key"` // HPKE public key for pasted secrets
 	Pins       []string `json:"pins"`        // pinned credential IDs, base64url
 	DeployKey  string   `json:"deploy_key,omitempty"`
+	Sources    *Sources `json:"sources,omitempty"` // pinned on the machine; nil when not
 }
 
 // TaskStatus is one run of one task.

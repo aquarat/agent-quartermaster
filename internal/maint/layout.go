@@ -33,7 +33,7 @@ type Layout struct {
 	Tools      string // pinned toolchains
 	AlertDir   string // lock-alert credentials
 	Libexec    string
-	KnownHosts string
+	KnownHosts string // forge host keys, used only by the broker's and the builder's git fetch
 	User       string // the broker's service account
 	// Hook replaces systemd in a test layout: `hook stop|start MODE|active`.
 	Hook string
@@ -47,6 +47,7 @@ const (
 	journalName = "journal.json"
 	pinsName    = "update-passkeys.json"
 	keyName     = "maint-secrets.key"
+	sourcesName = "maint-sources.json"
 	unitName    = "aqmasd.service"
 )
 
@@ -55,7 +56,7 @@ func Production() Layout {
 	return Layout{Bin: "/usr/local/bin/aqmasd", Config: "/etc/aqmas/config.toml", ConfigDir: "/etc/aqmas", UnitDir: "/etc/systemd/system",
 		RunDropIn: "/run/systemd/system/aqmasd.service.d/50-aqmas-maint.conf", Spool: "/var/spool/aqmas-update", Cache: "/var/lib/aqmas-releases",
 		State: "/var/lib/aqmas-maint", Backups: "/var/lib/aqmas-backups", Tools: "/opt/aqmas-tools", AlertDir: "/etc/aqmas-alert",
-		Libexec: "/usr/local/libexec", KnownHosts: "/etc/ssh/ssh_known_hosts", User: "aqmas"}
+		Libexec: "/usr/local/libexec", KnownHosts: "/etc/aqmas/known_hosts", User: "aqmas"}
 }
 
 // TestLayout relocates everything under dir. It refuses to exist for root, so no flag or
@@ -70,7 +71,7 @@ func TestLayout(dir, bin, hook string) (Layout, error) {
 	j := func(p ...string) string { return filepath.Join(append([]string{dir}, p...)...) }
 	return Layout{Bin: bin, Config: j("etc", "config.toml"), ConfigDir: j("etc"), UnitDir: j("systemd"), RunDropIn: j("run", "50-aqmas-maint.conf"),
 		Spool: j("spool"), Cache: j("releases"), State: j("maint"), Backups: j("backups"), Tools: j("tools"), AlertDir: j("alert"),
-		Libexec: j("libexec"), KnownHosts: j("known_hosts"), Hook: hook, test: true}, nil
+		Libexec: j("libexec"), KnownHosts: j("etc", "known_hosts"), Hook: hook, test: true}, nil
 }
 
 func (l Layout) request() string { return filepath.Join(l.Spool, requestName) }
@@ -80,6 +81,24 @@ func (l Layout) journal() string { return filepath.Join(l.State, journalName) }
 func (l Layout) pins() string    { return filepath.Join(l.ConfigDir, pinsName) }
 func (l Layout) key() string     { return filepath.Join(l.ConfigDir, keyName) }
 func (l Layout) unit() string    { return filepath.Join(l.UnitDir, unitName) }
+func (l Layout) sources() string { return filepath.Join(l.ConfigDir, sourcesName) }
+
+// Sources are release sources pinned from a terminal on the machine (`maint-init --repo …`).
+// While they exist, "Enable self-update" accepts exactly these and nothing else.
+type Sources struct {
+	Repo       string `json:"repo"`
+	ForgejoAPI string `json:"forgejo_api"`
+	GitHubAPI  string `json:"github_api"`
+}
+
+func (l Layout) readSources() *Sources {
+	var s Sources
+	b, err := os.ReadFile(l.sources())
+	if err != nil || json.Unmarshal(b, &s) != nil || s.Repo == "" {
+		return nil
+	}
+	return &s
+}
 
 // StatusPath is where aqmasd reads the runner's public status.
 func StatusPath(cache string) string { return filepath.Join(cache, statusName) }
@@ -95,7 +114,10 @@ type Facts struct {
 	Commit   string `json:"commit"`
 	Schema   int    `json:"schema"`
 	Manifest string `json:"seal_manifest_sha256,omitempty"`
-	Passkeys []struct {
+	// The signed activation as the import process recorded it (schema 8 only).
+	Activation      string          `json:"seal_activation,omitempty"`
+	ActivationProof json.RawMessage `json:"seal_activation_assertion,omitempty"`
+	Passkeys        []struct {
 		ID        []byte `json:"id"`
 		PublicKey []byte `json:"publicKey"`
 	} `json:"passkeys"`

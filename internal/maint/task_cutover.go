@@ -24,20 +24,23 @@ func (r *Runner) cutover(ctx context.Context) (string, error) {
 	if err = r.l.healthy(ctx, r.cfg.ListenWeb); err != nil {
 		return "", errors.New("the broker is not healthy; fix that first")
 	}
+	// The journal comes first: from here on a crash or a stop is recovered by the next start.
+	j := journal{Task: TaskCutover}
+	if err = r.writeJournal(j); err != nil {
+		return "", err
+	}
 	r.step("Stopping the broker")
 	if err = r.l.stop(ctx); err != nil {
 		return "", r.resume(ctx, err)
 	}
 	r.step("Backing up the database, keys and configuration")
-	dir, err := r.backup(ctx, "cutover")
-	if err != nil {
+	if j.Backup, err = r.backup(ctx, "cutover"); err != nil {
 		return "", r.resume(ctx, err)
 	}
-	r.result("backup", dir)
-	if err = r.writeJournal(journal{Task: TaskCutover, Backup: dir}); err != nil {
+	r.result("backup", j.Backup)
+	if err = r.writeJournal(j); err != nil {
 		return "", r.resume(ctx, err)
 	}
-	defer r.clearJournal()
 	r.step("Starting the broker fenced for review")
 	if err = r.l.start(ctx, "organisations-cutover"); err == nil {
 		err = r.l.healthy(ctx, r.cfg.ListenWeb)
@@ -47,14 +50,19 @@ func (r *Runner) cutover(ctx context.Context) (string, error) {
 	}
 	deadline := r.now().Add(r.CutoverWait)
 	r.wait("activation", "Waiting for you to review the plan and activate it", deadline)
-	if o := r.await(ctx, deadline, func(f Facts) bool { return f.Schema >= 6 }); o != reached {
+	switch o := r.await(ctx, deadline, func(f Facts) bool { return f.Schema >= 6 }); o {
+	case reached:
+	case interrupted:
+		return "", errInterrupted
+	default:
 		return "", r.resume(ctx, errors.New("Cutover "+o.reason()+": nothing was changed."))
 	}
 	time.Sleep(2 * r.poll) // let the activation response reach the browser
-	return r.finishCutover(ctx, dir)
+	return r.finishCutover(ctx, j.Backup)
 }
 
-// resume returns to normal serving after a failure before activation.
+// resume returns to normal serving after a failure before activation. The journal goes only
+// once the broker is serving again; until then the runner is started again to retry.
 func (r *Runner) resume(ctx context.Context, cause error) error {
 	r.step("Returning the broker to normal service")
 	_ = r.l.stop(ctx)
@@ -63,11 +71,14 @@ func (r *Runner) resume(ctx context.Context, cause error) error {
 		err = r.l.healthy(ctx, r.cfg.ListenWeb)
 	}
 	if err != nil {
-		return errors.New(cause.Error() + " URGENT: the broker did not come back; check it on the machine.")
+		return errors.New(cause.Error() + " The broker did not come back yet; the runner keeps trying.")
 	}
+	r.clearJournal()
 	return cause
 }
 
+// finishCutover is everything after the signed activation. backup may be "" when a crash
+// happened before one was taken (then there was no activation to undo either).
 func (r *Runner) finishCutover(ctx context.Context, backup string) (string, error) {
 	r.step("Activated. Restarting the broker")
 	err := r.l.stop(ctx)
@@ -84,7 +95,11 @@ func (r *Runner) finishCutover(ctx context.Context, backup string) (string, erro
 		}
 	}
 	if err == nil {
+		r.clearJournal()
 		return "Organisations are active. Your hosts are in the personal organisation.", nil
+	}
+	if backup == "" {
+		return "", errors.New("The broker is unhealthy after the cutover and there is no backup to restore; the runner keeps trying.")
 	}
 	// Nothing was served since the backup: restoring it loses no approval or revocation.
 	r.step("The broker is unhealthy after activation: restoring the backup")
@@ -99,5 +114,6 @@ func (r *Runner) finishCutover(ctx context.Context, backup string) (string, erro
 	if rerr != nil {
 		return "", errors.New("URGENT: the broker is unhealthy after the cutover and restoring the backup failed; see the backup directory on the machine.")
 	}
+	r.clearJournal()
 	return "", errors.New("The broker was unhealthy after the cutover. The backup was restored and the legacy broker is serving again.")
 }

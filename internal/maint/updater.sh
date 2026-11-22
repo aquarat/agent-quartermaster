@@ -42,6 +42,7 @@ pid=$(systemctl show -p MainPID --value aqmasd)
 status "Building approved $v ($sha)."
 install -d -o aqmas-build -g aqmas-build -m 0700 "$t/work"
 install -o aqmas-build -g aqmas-build -m 0400 "$DEPLOY_KEY" "$t/fetch-key"
+install -o aqmas-build -g aqmas-build -m 0400 "$KNOWN_HOSTS" "$t/known_hosts"
 uid=$(id -u aqmas-build); gid=$(id -g aqmas-build)
 echo "aqmas-build:x:$uid:$gid:Builder:/tmp/home:/bin/sh" > "$t/passwd"
 echo "aqmas-build:x:$gid:" > "$t/group"
@@ -61,10 +62,10 @@ box=(setpriv --reuid=aqmas-build --regid=aqmas-build --clear-groups --no-new-pri
   --setenv BUN_INSTALL_CACHE_DIR /work/buncache)
 net=(--share-net --ro-bind /etc/resolv.conf /etc/resolv.conf --ro-bind /etc/ssl /etc/ssl
   --ro-bind-try /etc/pki /etc/pki)
-"${box[@]}" "${net[@]}" --ro-bind "$t/fetch-key" /key --ro-bind "$KNOWN_HOSTS" /known_hosts \
+"${box[@]}" "${net[@]}" --ro-bind "$t/fetch-key" /key --ro-bind "$t/known_hosts" /known_hosts \
   --setenv GIT_ALLOW_PROTOCOL ssh --setenv GIT_SSH_COMMAND 'ssh -F /dev/null -oBatchMode=yes -oIdentitiesOnly=yes -oStrictHostKeyChecking=yes -oUserKnownHostsFile=/known_hosts -i /key' \
   /bin/sh -ec 'git init -q src; cd src; git -c fetch.fsckObjects=true fetch -q --no-tags -- "$1" refs/heads/main:refs/remotes/source/main "+refs/tags/v*:refs/tags/v*"; test "$(git rev-parse "refs/tags/v$2^{commit}")" = "$3"; test "$(git show refs/remotes/source/main:VERSION)" = "$2"; test "$(git tag --list | grep -Ex "v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)" | sort -V | tail -1)" = "v$2"; git merge-base --is-ancestor "$4" "$3"; git merge-base --is-ancestor "$3" refs/remotes/source/main' sh "$REPO" "$v" "$sha" "$(jq -er .commit "$cache/latest.json")"
-rm "$t/fetch-key"
+rm "$t/fetch-key" "$t/known_hosts"
 status "Fetched $v. Downloading dependencies, then testing and building offline."
 "${box[@]}" /bin/sh -ec 'cd src; git -c core.hooksPath=/dev/null checkout -q --detach "$1"; test "$(cat VERSION)" = "$2"' sh "$sha" "$v"
 "${box[@]}" "${net[@]}" --setenv GOPROXY https://proxy.golang.org --setenv GOSUMDB sum.golang.org \

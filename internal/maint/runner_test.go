@@ -65,6 +65,8 @@ type lab struct {
 	health *httptest.Server
 	forge  *httptest.Server
 	sums   release.Sums
+	// forgeOpen lets the Forgejo side answer without a token.
+	forgeOpen bool
 }
 
 func cose(a *vauth.Authenticator) []byte {
@@ -121,7 +123,7 @@ func newLab(t *testing.T) *lab {
 	}))
 	t.Cleanup(b.health.Close)
 	// The stand-in broker binary prints the facts file; the hook plays systemd.
-	b.write(0755, "#!/bin/sh\ncat '"+b.path("facts.json")+"'\n", "aqmasd")
+	b.write(0755, "#!/bin/sh\n[ -e '"+b.path("facts-fail")+"' ] && exit 1\ncat '"+b.path("facts.json")+"'\n", "aqmasd")
 	b.write(0755, `#!/bin/sh
 d='`+b.dir+`'
 echo "$*" >> "$d/hook.log"
@@ -190,7 +192,7 @@ users = ["alice"]
 `, "etc", "config.toml")
 	b.write(0600, "active", "active")
 	_ = os.WriteFile(b.path("active"), []byte("serve\n"), 0600)
-	if err := Init(context.Background(), b.l, false, io.Discard); err != nil {
+	if err := Init(context.Background(), b.l, false, nil, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	return b
@@ -365,20 +367,34 @@ func sealParams() SealParams {
 	return SealParams{Recipient: "age1" + strings.Repeat("q", 58), PurgeBackups: true, LockAlert: true}
 }
 
-func (b *lab) activateSeal(manifest string) func() {
-	return func() {
-		b.write(0600, `{"inventory":true}`, "data", "seal-stage-1", "inventory.json")
-		b.write(0600, `{"manifest":true}`, "data", "seal-stage-1", "manifest.json")
-		b.write(0600, "proof", "data", "seal-stage-1", "recovery.proof")
-		b.setFacts(8, manifest)
-		_ = os.Remove(b.path("active")) // the import process exits after activation
-	}
+// activation builds what the import process records at activation: the manifest and the
+// owner's signature over the seal-control canonical that carries it.
+func activation(signer *vauth.Authenticator, recipient string) (manifest, digest, canonical string, assertion json.RawMessage) {
+	m, _ := json.Marshal(map[string]any{"seal_format": 1, "offline_recipient": recipient, "inventory_digest": "x"})
+	sum := sha256.Sum256(m)
+	c, _ := json.Marshal(map[string]any{"v": 3, "action": "activate", "object": "seal-control", "nonce": canon.NewNonce(), "issued_at": "2026-11-22T10:00:00Z", "id": "inst", "epoch": "e", "manifest": string(m)})
+	return string(m), hex.EncodeToString(sum[:]), string(c), signer.Assert(canon.Challenge(string(c)))
+}
+
+// activateSeal plays the owner finishing the import: staging files, a signed activation for
+// the recipient of sealParams, schema 8, and the import process exiting.
+func (b *lab) activateSeal() string { return b.activateSealAs(b.auth, sealParams().Recipient) }
+
+func (b *lab) activateSealAs(signer *vauth.Authenticator, recipient string) string {
+	b.write(0600, `{"inventory":true}`, "data", "seal-stage-1", "inventory.json")
+	b.write(0600, `{"manifest":true}`, "data", "seal-stage-1", "manifest.json")
+	b.write(0600, "proof", "data", "seal-stage-1", "recovery.proof")
+	var digest string
+	_, digest, b.facts.Activation, b.facts.ActivationProof = activation(signer, recipient)
+	b.setFacts(8, digest)
+	_ = os.Remove(b.path("active")) // the import process exits after activation
+	return digest
 }
 
 func TestSeal(t *testing.T) {
 	b := newLab(t)
 	b.setFacts(7, "")
-	manifest := strings.Repeat("ab", 32)
+	var manifest string
 	if err := os.MkdirAll(filepath.Join(b.l.Backups, "20260101T000000Z-old", "state", "ca"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +403,7 @@ func TestSeal(t *testing.T) {
 		if cfg := b.read("etc", "config.toml"); !strings.Contains(cfg, "[seal]\nrequired = true\nrecipient = \"age1") || strings.Contains(cfg, "manifest_sha256") {
 			t.Error("import mode started without the staged fence")
 		}
-		b.activateSeal(manifest)()
+		manifest = b.activateSeal()
 	})
 	if err := b.runner().Run(context.Background()); err != nil {
 		t.Fatal(err, b.last(TaskSeal))
@@ -473,9 +489,9 @@ func TestSealRecovery(t *testing.T) {
 		_ = os.WriteFile(b.l.Config, staged, 0640)
 		_ = r.writeJournal(journal{Task: TaskSeal, Backup: dir, Purge: true})
 		_ = os.Remove(b.path("active"))
-		manifest := strings.Repeat("cd", 32)
+		manifest := "never activated"
 		if activated {
-			b.activateSeal(manifest)()
+			manifest = b.activateSeal()
 		}
 		err = b.runner().Run(context.Background())
 		s := b.last(TaskSeal)
@@ -508,7 +524,7 @@ func TestRecoveryRetriesAreBounded(t *testing.T) {
 	staged, _ := addSeal(r.raw, sealParams().Recipient)
 	_ = os.WriteFile(b.l.Config, staged, 0640)
 	_ = r.writeJournal(journal{Task: TaskSeal, Backup: dir})
-	b.activateSeal(strings.Repeat("ef", 32))()
+	b.activateSeal()
 	b.write(0600, "", "refuse-always")
 	var handledErr *Handled
 	for i := 1; i < maxRecoveries; i++ {
@@ -542,6 +558,190 @@ func TestRecoveryRetriesAreBounded(t *testing.T) {
 	}
 }
 
+// Root finishes a sealing only on its own evidence: an activation signed by a pinned passkey
+// for the recovery key of the signed task. A database that merely says "schema 8" (which the
+// broker's account can write) gets nothing pinned and nothing deleted.
+func TestSealNeedsTheOwnersActivation(t *testing.T) {
+	for name, forge := range map[string]func(b *lab){
+		"signed by an unpinned key": func(b *lab) { b.activateSealAs(newAuth(), sealParams().Recipient) },
+		"sealed to another key":     func(b *lab) { b.activateSealAs(b.auth, "age1"+strings.Repeat("p", 58)) },
+		"no activation record": func(b *lab) {
+			b.activateSeal()
+			b.facts.Activation, b.facts.ActivationProof = "", nil
+			b.setFacts(8, b.facts.Manifest)
+		},
+		"manifest swapped after signing": func(b *lab) {
+			b.activateSeal()
+			b.setFacts(8, strings.Repeat("0", 64))
+		},
+	} {
+		b := newLab(t)
+		b.setFacts(7, "")
+		if err := os.MkdirAll(filepath.Join(b.l.Backups, "20260101T000000Z-old"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		b.queue(b.sign(TaskSeal, sealParams(), map[string]string{"ntfy_topic_url": secretTopic, "ntfy_token": secretToken}))
+		owner := b.when("seal-import", func() { forge(b) })
+		err := b.runner().Run(context.Background())
+		<-owner
+		var h *Handled
+		cfg := b.read("etc", "config.toml")
+		left, _ := os.ReadDir(b.l.Backups)
+		switch {
+		case err == nil || errors.As(err, &h):
+			t.Errorf("%s: accepted (%v)", name, err)
+		case strings.Contains(cfg, "manifest_sha256") || b.read("data", "ca", "ssh_user_ca") == "" || b.read("etc", "cf-proxy-token") == "" || len(left) != 2:
+			t.Errorf("%s: something was pinned or deleted without the owner's activation", name)
+		case strings.TrimSpace(b.read("active")) == "serve":
+			t.Errorf("%s: broker started", name)
+		}
+		if _, e := os.Stat(b.l.journal()); e != nil {
+			t.Errorf("%s: journal dropped", name)
+		}
+		// With the real activation in place the next start finishes the job.
+		b.activateSeal()
+		if err := b.runner().Run(context.Background()); err != nil || b.last(TaskSeal).State != "done" {
+			t.Errorf("%s: did not finish once the activation was genuine: %v", name, err)
+		}
+	}
+}
+
+// Stopping the unit while a task waits for the owner must not half-undo anything: the
+// journal stays, and the next start finishes or undoes the task with working tools.
+func TestStopWhileWaiting(t *testing.T) {
+	for _, activateAfter := range []bool{false, true} {
+		b := newLab(t)
+		b.setFacts(7, "")
+		before := b.read("etc", "config.toml")
+		ctx, stop := context.WithCancel(context.Background())
+		b.queue(b.sign(TaskSeal, sealParams(), map[string]string{"ntfy_topic_url": secretTopic, "ntfy_token": secretToken}))
+		owner := b.when("seal-import", stop)
+		err := b.runner().Run(ctx)
+		<-owner
+		var h *Handled
+		if err == nil || errors.As(err, &h) {
+			t.Fatalf("a stopped runner must ask to be started again: %v", err)
+		}
+		if _, e := os.Stat(b.l.journal()); e != nil || strings.TrimSpace(b.read("active")) != "seal-import" || !strings.Contains(b.read("etc", "config.toml"), "[seal]") || b.read("alert", "publish-token") == "" {
+			t.Fatal("the stop changed something: the import must be left exactly as it was")
+		}
+		if activateAfter {
+			b.activateSeal()
+		}
+		err = b.runner().Run(context.Background())
+		s := b.last(TaskSeal)
+		if activateAfter {
+			if err != nil || s.State != "done" || b.read("data", "ca", "ssh_user_ca") != "" {
+				t.Fatalf("activated while the runner was down, not finished: %v %+v", err, s)
+			}
+		} else if err == nil || b.read("etc", "config.toml") != before || b.read("alert", "publish-token") != "" {
+			t.Fatalf("not undone after the restart: %v %+v", err, s)
+		}
+		if _, e := os.Stat(b.l.journal()); e == nil || strings.TrimSpace(b.read("active")) != "serve" {
+			t.Fatal("journal left or broker not serving")
+		}
+	}
+	// The same for a cutover: fenced mode is left alone, the next start returns to service.
+	b := newLab(t)
+	ctx, stop := context.WithCancel(context.Background())
+	b.queue(b.sign(TaskCutover, CutoverParams{}, nil))
+	owner := b.when("organisations-cutover", stop)
+	err := b.runner().Run(ctx)
+	<-owner
+	if _, e := os.Stat(b.l.journal()); err == nil || e != nil || strings.TrimSpace(b.read("active")) != "organisations-cutover" {
+		t.Fatalf("cutover stop: %v", err)
+	}
+	if err = b.runner().Run(context.Background()); err == nil || strings.TrimSpace(b.read("active")) != "serve" || !strings.Contains(b.last(TaskCutover).Message, "before activation") {
+		t.Fatalf("cutover not resumed: %v", err)
+	}
+}
+
+// If the runner cannot read the database it does not know whether the owner activated, so
+// it must not undo anything.
+func TestUnknownStateUndoesNothing(t *testing.T) {
+	b := newLab(t)
+	b.setFacts(7, "")
+	before := b.read("etc", "config.toml")
+	b.queue(b.sign(TaskSeal, sealParams(), map[string]string{"ntfy_topic_url": secretTopic, "ntfy_token": secretToken}))
+	owner := b.when("seal-import", func() {
+		b.write(0600, "{}", "data", "seal-stage-1", "inventory.json")
+		b.write(0600, "", "facts-fail")
+		_ = os.Remove(b.path("active")) // the import process dies
+	})
+	err := b.runner().Run(context.Background())
+	<-owner
+	var h *Handled
+	if err == nil || errors.As(err, &h) || !strings.Contains(b.read("etc", "config.toml"), "[seal]") || b.read("data", "seal-stage-1", "inventory.json") == "" {
+		t.Fatalf("undid a sealing it could not check: %v", err)
+	}
+	if _, e := os.Stat(b.l.journal()); e != nil {
+		t.Fatal("journal dropped")
+	}
+	_ = os.Remove(b.path("facts-fail"))
+	if err = b.runner().Run(context.Background()); err == nil || b.read("etc", "config.toml") != before || strings.TrimSpace(b.read("active")) != "serve" {
+		t.Fatalf("not undone once the database was readable: %v", err)
+	}
+}
+
+// Whatever the broker's account plants in the spool or in its staging directory, root
+// neither follows it nor waits on it.
+func TestHostileSpoolAndStaging(t *testing.T) {
+	b := newLab(t)
+	if err := os.MkdirAll(filepath.Join(b.l.request(), "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	b.write(0600, "x", "spool", "approved", "sub", "file")
+	if err := b.runner().Run(context.Background()); err == nil {
+		t.Fatal("a directory was accepted as a request")
+	}
+	if _, err := os.Lstat(b.l.request()); err == nil {
+		t.Fatal("a directory in the spool jams the runner")
+	}
+	if err := syscall.Mkfifo(b.l.request(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- b.runner().Run(context.Background()) }()
+	select {
+	case err := <-done:
+		if _, e := os.Lstat(b.l.request()); err == nil || e == nil {
+			t.Fatal("a FIFO was accepted or left in the spool")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the runner blocked on a FIFO in the spool")
+	}
+
+	// Staging: a FIFO where the inventory should be, and a link out of the data directory.
+	b.setFacts(7, "")
+	b.write(0600, `{"secret":"ROOT ONLY"}`, "outside", "inventory.json")
+	b.queue(b.sign(TaskSeal, sealParams(), map[string]string{"ntfy_topic_url": secretTopic, "ntfy_token": secretToken}))
+	owner := b.when("seal-import", func() {
+		b.activateSeal()
+		_ = os.Remove(b.path("data", "seal-stage-1", "inventory.json"))
+		_ = syscall.Mkfifo(b.path("data", "seal-stage-1", "inventory.json"), 0600)
+		_ = os.Symlink(b.path("outside"), b.path("data", "seal-stage-2"))
+	})
+	go func() { done <- b.runner().Run(context.Background()) }()
+	select {
+	case err := <-done:
+		<-owner
+		if err != nil || b.last(TaskSeal).State != "done" {
+			t.Fatalf("sealing did not finish around hostile staging files: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the runner blocked on a FIFO in the staging directory")
+	}
+	kept, _ := filepath.Glob(b.path("backups", "sealed-*", "inventory.json"))
+	for _, k := range kept {
+		if x, _ := os.ReadFile(k); strings.Contains(string(x), "ROOT ONLY") {
+			t.Fatal("root copied a file from outside the data directory")
+		}
+	}
+	if b.read("outside", "inventory.json") == "" {
+		t.Fatal("root deleted through a link out of the data directory")
+	}
+}
+
 // releases serves both release APIs (Forgejo and GitHub shapes) for the lab's versions.
 func (b *lab) releases(versions ...string) {
 	assets := map[string][]byte{}
@@ -559,6 +759,9 @@ func (b *lab) releases(versions ...string) {
 	b.forge = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		want := map[string]string{"/api/v1/repos/example/aqmas": secretForge, "/gh/repos/example/aqmas": secretHub}
 		for prefix, token := range want {
+			if b.forgeOpen && token == secretForge {
+				continue
+			}
 			if strings.HasPrefix(r.URL.Path, prefix) && r.Header.Get("Authorization") != "Bearer "+token {
 				http.Error(w, "token", 401)
 				return
@@ -590,10 +793,25 @@ func (b *lab) updatesParams() UpdatesParams {
 		KnownHosts: []string{"[forge.example.com]:2222 ssh-ed25519 " + strings.Repeat("A", 68)}, ForgejoToken: true, GitHubToken: true}
 }
 
+// pinSources is `maint-init --repo …`: the owner, at the machine, names the release sources.
+func (b *lab) pinSources() {
+	b.t.Helper()
+	p := b.updatesParams()
+	if err := Init(context.Background(), b.l, false, &Sources{Repo: p.Repo, ForgejoAPI: p.ForgejoAPI, GitHubAPI: p.GitHubAPI}, io.Discard); err != nil {
+		b.t.Fatal(err)
+	}
+}
+
 func TestEnableUpdatesAndUpgrade(t *testing.T) {
 	b := newLab(t)
 	b.releases("0.3.0", "0.3.1")
 	before := b.read("etc", "config.toml")
+	// Unpinned, a request may not point the broker at plain-http or same-host sources.
+	b.queue(b.sign(TaskUpdates, b.updatesParams(), map[string]string{"forgejo_token": secretForge, "github_token": secretHub}))
+	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "https") {
+		t.Fatalf("loopback http sources accepted without a pin: %+v", b.last(TaskUpdates))
+	}
+	b.pinSources()
 	tokens := map[string]string{"forgejo_token": secretForge, "github_token": secretHub}
 
 	// The restart fails: the previous configuration comes back.
@@ -605,15 +823,39 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 
 	// A broker that is not the published binary is refused before the configuration changes.
 	b.queue(b.sign(TaskUpdates, b.updatesParams(), tokens))
-	b.write(0755, b.read("aqmasd")+"# changed\n", "aqmasd")
+	published := b.read("aqmasd")
+	b.write(0755, published+"# changed\n", "aqmasd")
 	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "not the published") || b.read("etc", "config.toml") != before {
 		t.Fatalf("unpublished binary accepted: %+v", b.last(TaskUpdates))
 	}
-	b.releases("0.3.0", "0.3.1")
+	b.write(0755, published, "aqmasd")
 
 	b.queue(b.sign(TaskUpdates, b.updatesParams(), tokens))
 	if err := b.runner().Run(context.Background()); err != nil {
 		t.Fatal(err, b.last(TaskUpdates))
+	}
+	if left, _ := filepath.Glob(b.path("maint", "config.before-*")); len(left) != 0 {
+		t.Fatal("a copy of the old configuration outlived the task")
+	}
+	// Pinned sources cannot be moved by a request, however well signed.
+	moved := b.updatesParams()
+	moved.GitHubAPI = strings.Replace(moved.GitHubAPI, "/gh/", "/elsewhere/", 1)
+	b.queue(b.sign(TaskUpdates, moved, tokens))
+	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "pinned on this machine") {
+		t.Fatalf("a request moved the release sources: %+v", b.last(TaskUpdates))
+	}
+	// A re-run that no longer carries a token removes the old one.
+	onlyHub := b.updatesParams()
+	onlyHub.ForgejoToken = false
+	b.forgeOpen = true
+	b.queue(b.sign(TaskUpdates, onlyHub, map[string]string{"github_token": secretHub}))
+	if err := b.runner().Run(context.Background()); err != nil || b.read("etc", "forgejo-read-token") != "" || strings.Contains(b.read("etc", "config.toml"), "forgejo-read-token") {
+		t.Fatalf("stale token kept: %v", err)
+	}
+	b.forgeOpen = false
+	b.queue(b.sign(TaskUpdates, b.updatesParams(), tokens))
+	if err := b.runner().Run(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	cfg := b.read("etc", "config.toml")
 	s := b.last(TaskUpdates)
@@ -624,13 +866,13 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 		t.Fatal("configuration:\n" + cfg)
 	case strings.TrimSpace(b.read("etc", "forgejo-read-token")) != secretForge || strings.TrimSpace(b.read("etc", "github-read-token")) != secretHub:
 		t.Fatal("tokens not stored")
-	case !strings.Contains(b.read("known_hosts"), "[forge.example.com]:2222 ssh-ed25519 "):
+	case !strings.Contains(b.read("etc", "known_hosts"), "[forge.example.com]:2222 ssh-ed25519 "):
 		t.Fatal("host key not trusted")
 	case b.read("releases", "0.3.0", "aqmas-linux-amd64") != "binary aqmas-linux-amd64" || !strings.Contains(b.read("releases", "latest.json"), `"version":"0.3.0"`):
 		t.Fatal("release cache not seeded")
 	}
 	for path, want := range map[string]os.FileMode{b.path("releases", "0.3.0"): 0755, b.path("releases", "0.3.0", "aqmas-linux-amd64"): 0644, b.path("releases", "0.3.0", "SHA256SUMS"): 0644,
-		b.path("releases", "latest.json"): 0644, b.l.status(): 0644, b.path("known_hosts"): 0644, b.path("etc", "github-read-token"): 0440, b.path("etc", "repo-key"): 0440, b.l.pins(): 0600, b.l.key(): 0600} {
+		b.path("releases", "latest.json"): 0644, b.l.status(): 0644, b.path("etc", "known_hosts"): 0644, b.path("etc", "github-read-token"): 0440, b.path("etc", "repo-key"): 0440, b.l.pins(): 0600, b.l.key(): 0600} {
 		if got := mode(t, path); got != want {
 			t.Errorf("%s has mode %o, want %o", strings.TrimPrefix(path, b.dir), got, want)
 		}

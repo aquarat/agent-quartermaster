@@ -105,7 +105,7 @@ active) running ;;
 esac
 EOF
 chmod +x "$T/hook"
-maint() { "$AQMASD" "$1" --test-layout "$L" "$T/hook" >>"$T/maint.log" 2>&1; }
+maint() { "$AQMASD" "$1" "${@:2}" --test-layout "$L" "$T/hook" >>"$T/maint.log" 2>&1; }
 wait_health() { for _ in $(seq 100); do curl -fsS "http://127.0.0.1:$PW/healthz" >/dev/null 2>&1 && return; sleep 0.1; done; fail "broker not healthy: $(tail -5 "$T"/aqmasd-*.log)"; }
 
 "$T/hook" start serve && wait_health
@@ -241,7 +241,15 @@ UP_PARAMS="{\"repo\":\"$REPO\",\"forgejo_api\":\"http://127.0.0.1:$PF/api/v1/rep
 UP_SECRETS="{\"forgejo_token\":\"$FJ_TOKEN\",\"github_token\":\"$GH_TOKEN\"}"
 cp "$L/etc/config.toml" "$T/config.before-updates"
 serve_release "$T/rel-bad"
+# A request alone may not choose plain-http, same-host sources: those have to be pinned at
+# the machine (`maint-init --repo …`), which is what the test's loopback servers need.
 owner setup-run enable-updates "$UP_PARAMS" "$UP_SECRETS" 2>"$T/sign-updates.err" || { cat "$T/sign-updates.err"; fail "sign enable-updates"; }
+owner setup-wait enable-updates failed 60 | grep -q 'must be https' || fail "unpinned loopback sources not refused"
+maint maint-init --repo "$REPO" --forgejo-api "http://127.0.0.1:$PF/api/v1/repos/example/agent-quartermaster" --github-api "http://127.0.0.1:$PG/repos/example/agent-quartermaster" || fail "pinning the release sources"
+if owner setup-run enable-updates "${UP_PARAMS/agent-quartermaster.git/elsewhere.git}" "$UP_SECRETS" 2>"$T/moved.err"; then fail "a request moved the pinned sources"; fi
+grep -q 'fixed on this machine' "$T/moved.err" || { cat "$T/moved.err"; fail "pinned-source refusal"; }
+sleep 1 # the driver tells runs apart by their start second
+owner setup-run enable-updates "$UP_PARAMS" "$UP_SECRETS"
 owner setup-wait enable-updates failed 60 | grep -q 'not the published' || fail "mismatching release not refused"
 cmp -s "$L/etc/config.toml" "$T/config.before-updates" || fail "refused enable-updates changed the configuration"
 [[ $(owner seal-status) == unlocked ]] || fail "a refused task restarted the broker"
@@ -252,7 +260,7 @@ owner setup-wait enable-updates done 60 >"$T/updates-result.json"
 grep -q '"deploy_key":"ssh-ed25519 ' "$T/updates-result.json" || fail "deploy key not shown"
 grep -q "^repo = \"$REPO\"" "$L/etc/config.toml" && grep -q '^cache_dir' "$L/etc/config.toml" || fail "[updates] not written"
 [[ $(cat "$L/etc/github-read-token") == "$GH_TOKEN" && $(cat "$L/etc/forgejo-read-token") == "$FJ_TOKEN" ]] || fail "tokens not stored"
-grep -qF "$HOSTKEY" "$L/known_hosts" || fail "forge host key not trusted"
+grep -qF "$HOSTKEY" "$L/etc/known_hosts" || fail "forge host key not trusted"
 [[ $(cat "$L/releases/$VERSION/aqmas-linux-amd64") == "cli aqmas-linux-amd64" ]] && grep -q "\"commit\":\"$COMMIT\"" "$L/releases/latest.json" || fail "release cache not seeded"
 [[ $(owner seal-status) == locked ]] || fail "restart after enable-updates did not relock"
 owner login >/dev/null; owner seal-eval
@@ -272,6 +280,5 @@ ok "maintenance passkeys synced by a signed list"
 leaks=$(grep -rlE 'SENTINEL(lockalert|forgejoREAD|githubREAD)' "$T" --exclude-dir=alert --exclude=forgejo-read-token --exclude=github-read-token --exclude='config.before-*' --exclude='sign-*.err' 2>/dev/null || true)
 [[ -z $leaks ]] || fail "pasted secrets leaked into: $leaks"
 if grep -rl 'SENTINELapprovalsTOPIC\|AGE-SECRET-KEY-1' "$L" 2>/dev/null | grep -q .; then fail "retired notification URL or the recovery key is on the broker's disk"; fi
-grep -q '"refused"' "$L/releases/setup-status.json" && fail "a request was refused: $(cat "$L/releases/setup-status.json")"
 ok "pasted secrets exist only in their root-owned files; the recovery key was never stored"
 echo "setup-interop: all checks passed"

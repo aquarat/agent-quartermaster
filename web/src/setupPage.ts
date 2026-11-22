@@ -18,6 +18,7 @@ import {
   ageRecipientProblem,
   completeSetupTask,
   generateAgeIdentity,
+  hostKeyFingerprint,
   prepareSetupTask,
   sendDrill,
   type HostKeys,
@@ -961,7 +962,10 @@ export class SetupPage {
       replace(hostBox, h("p", { class: "spinner" }, "Asking the forge…"));
       try {
         const r = await this.api.setupPost!<HostKeys>("/host-key", { repo: url });
-        keys = (r.keys ?? []).filter((k) => typeof k?.line === "string" && typeof k.fingerprint === "string");
+        // Fingerprints are computed here from the lines that will be signed, not taken from the reply.
+        keys = await Promise.all(
+          (r.keys ?? []).filter((k) => typeof k?.line === "string").map(async (k) => ({ line: k.line, fingerprint: await hostKeyFingerprint(k.line) })),
+        );
         keysFor = url;
         if (!keys.length) throw new Error("The forge returned no usable host key.");
         showKeys();
@@ -1060,7 +1064,13 @@ export class SetupPage {
         params: { pins: chosen.map((k) => ({ id: k.credential, key_sha256: k.key_sha256 })) },
         summary: [
           h("p", { class: "headline pos" }, "Replace the pinned maintenance passkeys with: ", chosen.map((k, i) => [i ? ", " : "", h("bdi", { class: "val" }, vt(k.name))]), "."),
-          chosen.length < keys.length ? h("p", { class: "warn" }, "Passkeys you left out can no longer approve setup tasks or upgrades.") : null,
+          // Spell out every change, by identifier and key digest: a name alone can be imitated.
+          ...chosen
+            .filter((k) => !k.pinned)
+            .map((k) => h("p", { class: "warn" }, "Adding: ", h("bdi", { class: "val" }, vt(k.name)), " (credential ", h("span", { class: "mono" }, vt(k.credential.slice(0, 16)) + "…"), ", key ", h("span", { class: "mono" }, vt(k.key_sha256.slice(0, 16)) + "…"), "). Only add a passkey you registered yourself.")),
+          ...keys
+            .filter((k, i) => k.pinned && !boxes[i]!.checked)
+            .map((k) => h("p", { class: "warn" }, "Removing: ", h("bdi", { class: "val" }, vt(k.name)), ". It can no longer approve setup tasks or upgrades.")),
         ],
       };
     };

@@ -67,12 +67,17 @@ func SetupFacts(dataDir string) (maint.Facts, error) {
 		return f, err
 	}
 	if f.Schema == 8 {
+		// The manifest and the owner's signed activation, for root to verify against its pins.
 		var m string
-		if err = db.QueryRow(`SELECT manifest FROM seal_active WHERE singleton=1 AND length(manifest)<=32768`).Scan(&m); err != nil {
+		var assertion []byte
+		if err = db.QueryRow(`SELECT manifest, canonical, assertion FROM seal_active WHERE singleton=1 AND length(manifest)<=32768 AND length(canonical)<=65536 AND length(assertion)<=16384`).Scan(&m, &f.Activation, &assertion); err != nil {
 			return f, err
 		}
 		sum := sha256.Sum256([]byte(m))
 		f.Manifest = hex.EncodeToString(sum[:])
+		if json.Valid(assertion) {
+			f.ActivationProof = assertion
+		}
 	}
 	return f, nil
 }
@@ -143,8 +148,11 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 	} else if s.sealSetup {
 		v.Mode = "seal-setup"
 	}
-	if u := s.cfg.Updates; u.Repo != "" {
-		v.Updates = map[string]string{"repo": u.Repo, "forgejo_api": u.Forgejo.API, "github_api": u.GitHub.API}
+	// Sources pinned on the machine win; they are also what the runner will insist on.
+	if src := st.Runner.Sources; src != nil {
+		v.Updates = map[string]string{"repo": src.Repo, "forgejo_api": src.ForgejoAPI, "github_api": src.GitHubAPI, "pinned": "true"}
+	} else if u := s.cfg.Updates; u.Repo != "" {
+		v.Updates = map[string]string{"repo": u.Repo, "forgejo_api": u.Forgejo.API, "github_api": u.GitHub.API, "pinned": "true"}
 	}
 	q := s.store.Q()
 	keys, err := loadPasskeys(ctx, q)
@@ -369,6 +377,15 @@ func (s *Server) setupParams(ctx context.Context, task string, raw json.RawMessa
 		slices.Sort(p.KnownHosts)
 		if p.KnownHosts == nil {
 			p.KnownHosts = []string{}
+		}
+		// Say so now if the runner would refuse these sources (it decides; this is courtesy).
+		st, _ := s.runnerStatus()
+		want := st.Runner.Sources
+		if want == nil && s.cfg.Updates.Repo != "" {
+			want = &maint.Sources{Repo: s.cfg.Updates.Repo, ForgejoAPI: s.cfg.Updates.Forgejo.API, GitHubAPI: s.cfg.Updates.GitHub.API}
+		}
+		if err == nil && want != nil && (p.Repo != want.Repo || p.ForgejoAPI != want.ForgejoAPI || p.GitHubAPI != want.GitHubAPI) {
+			return "", nil, errConflict("the release sources are fixed on this machine; to change them run `sudo aqmasd maint-init --repo … --forgejo-api … --github-api …` there")
 		}
 		v = p
 	case maint.TaskPins:

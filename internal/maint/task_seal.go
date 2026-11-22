@@ -137,9 +137,16 @@ func (r *Runner) retire(ctx context.Context, sources []source) error {
 	return r.l.systemctl(ctx, "daemon-reload")
 }
 
+// stageDirs returns the names of the import's staging directories in the data directory.
 func (r *Runner) stageDirs() []string {
-	dirs, _ := filepath.Glob(filepath.Join(r.cfg.DataDir, "seal-stage-*"))
-	return dirs
+	var names []string
+	entries, _ := os.ReadDir(r.cfg.DataDir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "seal-stage-") {
+			names = append(names, e.Name())
+		}
+	}
+	return names
 }
 
 func (r *Runner) removeStages() {
@@ -148,8 +155,8 @@ func (r *Runner) removeStages() {
 		return
 	}
 	defer root.Close()
-	for _, d := range r.stageDirs() {
-		_ = root.RemoveAll(filepath.Base(d))
+	for _, name := range r.stageDirs() {
+		_ = root.RemoveAll(name)
 	}
 }
 
@@ -186,18 +193,21 @@ func (r *Runner) seal(ctx context.Context, p SealParams, secrets map[string]stri
 	if err = r.l.healthy(ctx, r.cfg.ListenWeb); err != nil {
 		return "", errors.New("the broker is not healthy; fix that first")
 	}
+	// The journal comes first: from here on a crash or a stop is recovered by the next start.
+	j := journal{Task: TaskSeal, Purge: p.PurgeBackups, LockAlert: p.LockAlert}
+	if err = r.writeJournal(j); err != nil {
+		return "", err
+	}
 	r.step("Stopping the broker")
 	if err = r.l.stop(ctx); err != nil {
-		return "", r.resume(ctx, err)
+		return "", r.unseal(ctx, j, err)
 	}
 	r.step("Backing up the database, keys and configuration")
-	dir, err := r.backup(ctx, "seal")
-	if err != nil {
-		return "", r.resume(ctx, err)
+	if j.Backup, err = r.backup(ctx, "seal"); err != nil {
+		return "", r.unseal(ctx, j, err)
 	}
-	j := journal{Task: TaskSeal, Backup: dir, Purge: p.PurgeBackups, LockAlert: p.LockAlert}
 	if err = r.writeJournal(j); err != nil {
-		return "", r.resume(ctx, err)
+		return "", r.unseal(ctx, j, err)
 	}
 	if p.LockAlert {
 		r.step("Storing the lock-alert credential (root only)")
@@ -226,24 +236,35 @@ func (r *Runner) seal(ctx context.Context, p SealParams, secrets map[string]stri
 	}
 	deadline := r.now().Add(r.SealWait)
 	r.wait("seal", "Waiting for you: create and test the passkey wrap, prove the recovery key, then activate", deadline)
-	if o := r.await(ctx, deadline, func(f Facts) bool { return f.Schema == 8 }); o != reached {
+	switch o := r.await(ctx, deadline, func(f Facts) bool { return f.Schema == 8 }); o {
+	case reached:
+	case interrupted:
+		return "", errInterrupted
+	default:
 		return "", r.unseal(ctx, j, errors.New("Sealing "+o.reason()+": the store is unchanged and unsealed."))
 	}
 	time.Sleep(2 * r.poll)
 	return r.finishSeal(ctx, j)
 }
 
-// unseal undoes a seal import that was not activated.
+// unseal undoes a seal import that was not activated. It first makes sure of that: if the
+// database cannot be read it changes nothing and leaves the journal for another try, and if
+// the activation did commit the only safe direction is forward.
 func (r *Runner) unseal(ctx context.Context, j journal, cause error) error {
 	r.step("Not activated: restoring the configuration")
 	_ = r.l.stop(ctx)
-	if f, err := r.l.facts(ctx); err == nil && f.Schema == 8 {
-		// Activation committed while we were giving up: the only safe direction is forward.
+	f, err := r.l.facts(ctx)
+	if err != nil {
+		return errors.New(cause.Error() + " The database could not be checked, so nothing was undone yet; the runner keeps trying.")
+	}
+	if f.Schema == 8 {
 		_, err := r.finishSeal(ctx, j)
 		return err
 	}
-	if err := r.restoreConfig(j.Backup); err != nil {
-		return errors.New(cause.Error() + " URGENT: the configuration could not be restored; the broker is stopped.")
+	if j.Backup != "" { // the configuration is only touched after the backup exists
+		if err := r.restoreConfig(j.Backup); err != nil {
+			return errors.New(cause.Error() + " URGENT: the configuration could not be restored; the broker is stopped.")
+		}
 	}
 	r.removeStages()
 	if j.LockAlert {
@@ -251,14 +272,14 @@ func (r *Runner) unseal(ctx context.Context, j journal, cause error) error {
 		_ = os.Remove(topic)
 		_ = os.Remove(token)
 	}
-	err := r.l.start(ctx, "serve")
+	err = r.l.start(ctx, "serve")
 	if err == nil {
 		err = r.l.healthy(ctx, r.cfg.ListenWeb)
 	}
-	r.clearJournal()
 	if err != nil {
-		return errors.New(cause.Error() + " URGENT: the broker did not come back; check it on the machine.")
+		return errors.New(cause.Error() + " The broker did not come back yet; the runner keeps trying.")
 	}
+	r.clearJournal()
 	return cause
 }
 
@@ -266,9 +287,9 @@ func (r *Runner) unseal(ctx context.Context, j journal, cause error) error {
 // repeated: the journal stays until the broker is serving locked.
 func (r *Runner) finishSeal(ctx context.Context, j journal) (string, error) {
 	fail := func(err error) (string, error) {
-		return "", errors.New("Activated, but finishing failed (" + err.Error() + "). The runner retries automatically; if this persists run `aqmasd maint-run` as root on the machine.")
+		return "", errors.New("Activated, but finishing failed (" + err.Error() + "). The runner retries by itself.")
 	}
-	r.step("Activated. Pinning the activation in the configuration")
+	r.step("Activated. Checking the signed activation")
 	_ = r.l.stop(ctx)
 	f, err := r.l.facts(ctx)
 	if err != nil {
@@ -280,6 +301,16 @@ func (r *Runner) finishSeal(ctx context.Context, j journal) (string, error) {
 	if err = r.loadConfig(); err != nil {
 		return fail(err)
 	}
+	// Root's own proof, before anything is pinned or deleted: a pinned passkey signed this
+	// manifest, and it seals to the recovery key from the signed task.
+	pins, err := r.readPins()
+	if err == nil {
+		err = verifyActivation(f, r.cfg.Seal.Recipient, r.cfg.PublicBaseURL, pins)
+	}
+	if err != nil {
+		return fail(err)
+	}
+	r.step("Pinning the activation in the configuration")
 	if r.cfg.Seal.Manifest == "" {
 		pinned, err := pinSeal(r.raw, f.Manifest)
 		if err == nil {
@@ -304,8 +335,13 @@ func (r *Runner) finishSeal(ctx context.Context, j journal) (string, error) {
 			return fail(err)
 		}
 		for _, name := range []string{"inventory.json", "manifest.json"} {
-			if err := copyFile(filepath.Join(keep, name), filepath.Join(stage, name), 1<<20, 0600); err != nil && !os.IsNotExist(err) {
-				return fail(err)
+			// Service-owned files: read without following links or blocking on a FIFO.
+			b, err := readRooted(r.cfg.DataDir, filepath.Join(stage, name), 1<<20)
+			if err == nil {
+				err = os.WriteFile(filepath.Join(keep, name), b, 0600)
+			}
+			if err != nil && !os.IsNotExist(err) {
+				r.result("recovery_bundle_note", name+" could not be copied; the database still holds it")
 			}
 		}
 		r.result("recovery_bundle", keep)

@@ -62,20 +62,21 @@ func (r *Runner) restoreConfig(dir string) error {
 	return r.loadConfig()
 }
 
-// restoreAll puts back state and configuration. The displaced state is kept beside the
-// backup, never deleted. The broker must be stopped.
+// restoreAll puts back state and configuration. The displaced state is kept beside the data
+// directory (same filesystem, so the swap is a rename), never deleted. The broker must be
+// stopped.
 func (r *Runner) restoreAll(ctx context.Context, dir string) error {
 	if err := complete(dir); err != nil {
 		return err
 	}
-	aside, err := os.MkdirTemp(dir, "displaced-")
-	if err != nil {
-		return err
+	if _, err := os.Lstat(r.cfg.DataDir); err == nil {
+		aside := r.cfg.DataDir + ".displaced-" + r.now().UTC().Format("20060102T150405.000000000Z")
+		if err = os.Rename(r.cfg.DataDir, aside); err != nil {
+			return err
+		}
+		r.result("displaced_state", aside)
 	}
-	if err = os.Rename(r.cfg.DataDir, filepath.Join(aside, "state")); err != nil {
-		return err
-	}
-	if err = r.l.run(ctx, "cp", "-a", "--reflink=auto", "--", filepath.Join(dir, "state"), r.cfg.DataDir); err != nil {
+	if err := r.l.run(ctx, "cp", "-a", "--reflink=auto", "--", filepath.Join(dir, "state"), r.cfg.DataDir); err != nil {
 		return err
 	}
 	return r.restoreConfig(dir)

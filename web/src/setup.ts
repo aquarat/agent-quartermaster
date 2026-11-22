@@ -197,6 +197,18 @@ export async function packetHash(packet: string): Promise<string> {
   return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * The OpenSSH fingerprint ("SHA256:…") of a known_hosts line, computed here from the key
+ * itself. The page never shows a fingerprint somebody else calculated for the line it signs.
+ */
+export async function hostKeyFingerprint(line: string): Promise<string> {
+  const blob = line.trim().split(" ")[2] ?? "";
+  if (!/^[A-Za-z0-9+/]{40,1000}={0,2}$/.test(blob)) throw new Error("not a host key line");
+  const raw = Uint8Array.from(atob(blob), (c) => c.charCodeAt(0));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", raw));
+  return "SHA256:" + btoa(String.fromCharCode(...digest)).replace(/=+$/, "");
+}
+
 // ---- task parameters (internal/maint/spec.go) ----
 
 /** A JSON string as Go's encoder writes it with SetEscapeHTML(false). */

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -146,6 +147,37 @@ func (r *Runner) trustHost(lines []string) error {
 	return writeOwned(r.l.KnownHosts, []byte(out), 0, 0, 0644)
 }
 
+func sameFile(a, b string) bool {
+	x, e1 := os.Stat(a)
+	y, e2 := os.Stat(b)
+	return e1 == nil && e2 == nil && os.SameFile(x, y)
+}
+
+// checkSources is the rule for where releases may come from. Sources pinned from a terminal
+// on the machine are the only ones accepted while they exist. Without them a request may
+// choose the sources once (https, two different hosts); after that a request can refresh
+// tokens and host keys but cannot move the broker to other sources.
+func (r *Runner) checkSources(p UpdatesParams) error {
+	if pinned := r.l.readSources(); pinned != nil {
+		if p.Repo != pinned.Repo || p.ForgejoAPI != pinned.ForgejoAPI || p.GitHubAPI != pinned.GitHubAPI {
+			return errors.New("these are not the release sources pinned on this machine (sudo aqmasd maint-init --repo … changes them)")
+		}
+		return nil
+	}
+	if cur := r.cfg.Updates; cur.Repo != "" && (p.Repo != cur.Repo || p.ForgejoAPI != cur.Forgejo.API || p.GitHubAPI != cur.GitHub.API) {
+		return errors.New("self-update is already set up with other release sources; change them on the machine (sudo aqmasd maint-init --repo …)")
+	}
+	a, e1 := url.Parse(p.ForgejoAPI)
+	b, e2 := url.Parse(p.GitHubAPI)
+	if e1 != nil || e2 != nil || a.Scheme != "https" || b.Scheme != "https" {
+		return errors.New("release APIs must be https")
+	}
+	if strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return errors.New("the two release APIs must be on different hosts: they are meant to be independent")
+	}
+	return nil
+}
+
 func fileHash(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -162,7 +194,14 @@ func fileHash(path string) (string, error) {
 // seed checks the installed broker against both published releases of its own version and
 // fills the release cache. Nothing is trusted from one source alone.
 func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) error {
-	m := release.Metadata{Version: f.Version, Commit: f.Commit}
+	// The identity that later upgrades are anchored on is this binary's own, compiled in.
+	// (The test layout's stand-in broker is a script, so there the facts supply it.)
+	m := release.Metadata{Version: release.Version, Commit: release.Commit}
+	if r.l.test {
+		m.Version, m.Commit = f.Version, f.Commit
+	} else if exe, err := os.Executable(); err != nil || !sameFile(exe, r.l.Bin) {
+		return errors.New("the runner is not the installed broker binary")
+	}
 	if !release.ValidVersion(m.Version) || !release.ValidCommit(m.Commit) {
 		return errors.New("the installed broker is not a release build")
 	}
@@ -229,6 +268,9 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 	if err != nil {
 		return "", err
 	}
+	if err = r.checkSources(p); err != nil {
+		return "", err
+	}
 	if err = r.l.healthy(ctx, r.cfg.ListenWeb); err != nil {
 		return "", errors.New("the broker is not healthy; fix that first")
 	}
@@ -275,11 +317,17 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 	if err != nil {
 		return "", err
 	}
-	for name, path := range map[string]string{"forgejo_token": u.Forgejo.TokenFile, "github_token": u.GitHub.TokenFile} {
-		if path != "" {
-			if err = writeOwned(path, []byte(secrets[name]+"\n"), 0, gid, 0440); err != nil {
-				return "", errors.New("could not store a token")
+	for name, file := range map[string]string{"forgejo_token": "forgejo-read-token", "github_token": "github-read-token"} {
+		path := filepath.Join(r.l.ConfigDir, file)
+		if secrets[name] == "" {
+			// Not part of this request: a token from an earlier run must not linger.
+			if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return "", errors.New("could not remove an old token")
 			}
+			continue
+		}
+		if err = writeOwned(path, []byte(secrets[name]+"\n"), 0, gid, 0440); err != nil {
+			return "", errors.New("could not store a token")
 		}
 	}
 	r.step("Checking the installed broker against both published releases")
@@ -288,7 +336,10 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 	}
 	r.result("release", f.Version+" ("+f.Commit[:12]+")")
 	r.step("Adding the update sources to the configuration and restarting the broker")
+	// A copy of the configuration for the few seconds of the restart; it may still contain
+	// the notification URL, so it never outlives the task.
 	before := filepath.Join(r.l.State, "config.before-updates")
+	_ = os.RemoveAll(before)
 	if err = os.MkdirAll(filepath.Join(before, "config"), 0700); err == nil {
 		err = os.WriteFile(filepath.Join(before, "config", filepath.Base(r.l.Config)), r.raw, 0600)
 	}
@@ -299,23 +350,27 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 		err = r.writeJournal(journal{Task: TaskUpdates, Backup: before})
 	}
 	if err != nil {
+		_ = os.RemoveAll(before)
 		return "", err
 	}
-	defer r.clearJournal()
-	if err = replaceFile(r.l.Config, next); err != nil {
-		return "", err
+	if err = replaceFile(r.l.Config, next); err == nil {
+		err = r.restart(ctx)
 	}
-	if err = r.restart(ctx); err != nil {
+	if err != nil {
 		r.step("The broker did not restart with the new configuration: restoring the old one")
 		_ = r.l.stop(ctx)
 		if rerr := r.restoreConfig(before); rerr == nil {
-			rerr = r.restart(ctx)
-			if rerr == nil {
+			if rerr = r.restart(ctx); rerr == nil {
+				_ = os.RemoveAll(before)
+				r.clearJournal()
 				return "", errors.New("The broker refused the new configuration; the previous one was restored.")
 			}
 		}
-		return "", errors.New("URGENT: the broker did not restart; check it on the machine.")
+		// The journal stays: the next start restores the configuration and tries again.
+		return "", errors.New("The broker did not come back yet; the runner keeps trying.")
 	}
+	_ = os.RemoveAll(before)
+	r.clearJournal()
 	return "Self-update is ready. Register the deploy key on the forge (read-only) if you have not yet; new releases then appear under “Upgrade aqmas”.", nil
 }
 

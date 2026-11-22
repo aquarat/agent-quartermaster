@@ -330,3 +330,16 @@ describe("signing a setup task", () => {
     expect(p.validUntil).toBeGreaterThan(Date.now());
   });
 });
+
+describe("host key fingerprint", () => {
+  test("is computed from the key itself, as OpenSSH prints it", async () => {
+    const { hostKeyFingerprint } = await import("../src/setup");
+    // ssh-keygen -lf on this line prints SHA256:fwpJzbd7GzTJbyNj4tyVpuWqcp+HsH4o+j2CCD+eLZM
+    const blob = "AAAAC3NzaC1lZDI1NTE5AAAAIGilJAtWZP1K8q90h5+KBdPRC0+wBFVVtHkOZQLmI9jB";
+    const raw = Uint8Array.from(atob(blob), (c) => c.charCodeAt(0));
+    const want = "SHA256:" + Buffer.from(new Uint8Array(await crypto.subtle.digest("SHA-256", raw))).toString("base64").replace(/=+$/, "");
+    expect(await hostKeyFingerprint(`forge.example.com ssh-ed25519 ${blob}`)).toBe(want);
+    expect(want).toMatch(/^SHA256:[A-Za-z0-9+/]{43}$/);
+    await expect(hostKeyFingerprint("forge.example.com ssh-ed25519 not-base64!")).rejects.toThrow();
+  });
+});

@@ -49,12 +49,15 @@ const flows = await import(`${web}/src/flows.ts`);
 interface Saved {
   /** Every passkey this helper holds, by nickname, and the one it signs with. */
   keys?: Record<string, SavedAuthenticator>;
+  /** When the last setup task or upgrade was approved (setup-wait reads runs started after it). */
+  ranAt?: number;
   active?: string;
   cookie?: string;
 }
 const saved: Saved = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : {};
 const keys: Record<string, SavedAuthenticator> = saved.keys ?? {};
 let active = saved.active ?? "";
+let ranAt = saved.ranAt ?? 0;
 let cookie = saved.cookie ?? "";
 
 // The session cookie is Secure; this helper talks plain HTTP to 127.0.0.1 exactly like
@@ -78,7 +81,7 @@ async function persist() {
   } catch {
     // no credential yet
   }
-  writeFileSync(stateFile, JSON.stringify({ keys, active, cookie } satisfies Saved), { mode: 0o600 });
+  writeFileSync(stateFile, JSON.stringify({ keys, active, cookie, ranAt } satisfies Saved), { mode: 0o600 });
 }
 
 async function findPasskey(name: string) {
@@ -110,9 +113,15 @@ try {
     case 'setup-state': {const v:any=await api.setupGet!('');const t=v.tasks.find((t:any)=>t.id===args[0]);console.log(t.state+(t.blocked_by?': '+t.blocked_by:''));break;}
     case 'setup-wait': {
       // The broker restarts during tasks: connection errors and a dropped session are expected.
-      const [task,want,seconds]=args;let last='';
+      // "done"/"failed" are read from the finished run itself: the card's own state can say
+      // "blocked: unlock first" when a sealed broker has just restarted.
+      const [task,want,seconds]=args;let last='';const since=Math.floor(ranAt/1000)*1000; // started_at has one-second resolution
       for(let n=0;n<Number(seconds??60)*5;n++){
-        try{const v:any=await api.setupGet!('');const t=v.tasks.find((t:any)=>t.id===task);last=t.state+' '+(t.last?.step??'')+' '+(t.last?.message??'');if(t.state===want){console.log(JSON.stringify(t.last??{}));last='';break}}catch(e){last=String((e as Error).message)}
+        try{const v:any=await api.setupGet!('');const t=v.tasks.find((t:any)=>t.id===task);last=t.state+' '+(t.last?.step??'')+' '+(t.last?.message??'');
+          const mine=Date.parse(t.last?.started_at??'')>=since;
+          const finished=!v.current&&mine&&t.last?.state===want;
+          const live=(want==='waiting'||want==='running')&&t.state===want;
+          if(live||finished){console.log(JSON.stringify(t.last??{}));last='';break}}catch(e){last=String((e as Error).message)}
         await sleep(200);
       }
       if(last)throw Error(`setup task ${task} did not reach ${want}: ${last}`);break;
@@ -121,14 +130,14 @@ try {
       const [task,params,secrets]=args;const setup=await import(`${web}/src/setup.ts`);const v:any=await api.setupGet!('');
       let p=JSON.parse(params??'{}');
       if(task==='sync-passkeys')p={pins:v.passkeys.map((k:any)=>({id:k.credential,key_sha256:k.key_sha256}))};
-      await setup.runSetupTask(api,auth,v,task!,p,secrets?JSON.parse(secrets):undefined);break;
+      const at=Date.now();await setup.runSetupTask(api,auth,v,task!,p,secrets?JSON.parse(secrets):undefined);ranAt=at;break;
     }
     case 'setup-cancel': await api.setupPost!('/cancel',{});break;
     case 'updates': console.log(JSON.stringify(await api.updates()));break;
     case 'approve-update': { // "Upgrade aqmas": the update approval, exactly as the card builds it
       const v=await api.updates(),c=v.candidate,f=c.forgejo??{};if(v.error||!c.version)throw Error('no verified update: '+v.error);
       const p=await flows.prepareAction(api,{object:'update',id:c.commit,facts:{from_version:v.current,from_commit:v.commit,to_version:c.version,to_commit:c.commit,daemon_sha256:f['aqmasd-linux-arm64']!,linux_arm64_sha256:f['aqmas-linux-arm64']!,linux_amd64_sha256:f['aqmas-linux-amd64']!,darwin_arm64_sha256:f['aqmas-darwin-arm64']!}},{action:'approve'});
-      await flows.completeAction(api,auth,p);console.log(c.version);break;
+      const at=Date.now();await flows.completeAction(api,auth,p);ranAt=at;console.log(c.version);break;
     }
     case 'setup-preview': console.log(JSON.stringify(await api.setupGet!('/cutover/preview')));break;
     case 'setup-host-key': console.log(JSON.stringify(await api.setupPost!('/host-key',{repo:args[0]})));break;

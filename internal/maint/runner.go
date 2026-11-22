@@ -36,6 +36,8 @@ type Runner struct {
 	poll time.Duration
 	// retryDelay slows the restart loop while an interrupted task cannot be finished yet.
 	retryDelay time.Duration
+	interrupt  context.Context // cancelled when the unit is being stopped
+	pinned     []KeyPin        // the pins this run verified its request against
 	// Waits for the owner. Tests shorten them.
 	CutoverWait, SealWait time.Duration
 }
@@ -111,24 +113,32 @@ func (r *Runner) refreshInfo() {
 		}
 	}
 	r.st.Runner.DeployKey = readDeployKey(r.l)
+	r.st.Runner.Sources = r.l.readSources()
 }
 
 // consume opens the request without following links, unlinks it, then reads the open file:
-// whatever the spool's owner does next cannot change what was read.
-func consume(path string) (Request, error) {
+// whatever the spool's owner does next cannot change what was read. Anything that is not a
+// regular file (a directory, a FIFO, a link) is removed through an os.Root and refused.
+func consume(spool string) (Request, error) {
 	var req Request
-	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	root, err := os.OpenRoot(spool)
 	if err != nil {
-		_ = os.Remove(path)
 		return req, err
+	}
+	defer root.Close()
+	f, err := root.OpenFile(requestName, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		_ = root.RemoveAll(requestName)
+		return req, errors.New("request could not be opened")
 	}
 	defer f.Close()
-	if err = os.Remove(path); err != nil {
-		return req, err
-	}
 	fi, err := f.Stat()
 	if err != nil || !fi.Mode().IsRegular() {
+		_ = root.RemoveAll(requestName)
 		return req, errors.New("request is not a regular file")
+	}
+	if err = root.Remove(requestName); err != nil {
+		return req, err
 	}
 	b, err := release.ReadLimit(f, 64<<10)
 	if err != nil {
@@ -175,7 +185,12 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.refreshInfo()
 	r.save()
 
-	var first error
+	// Stopping the unit (or a shutdown) cancels ctx. A task must never do its cleanup with a
+	// dead context: every operation runs detached from it, and the only thing cancellation
+	// does is end a wait for the owner, leaving the journal for the next start.
+	r.interrupt = ctx
+	ctx = context.WithoutCancel(ctx)
+
 	if j, ok := r.readJournal(); ok {
 		// Count the attempt before trying, so a crash loop is bounded too.
 		j.Attempts++
@@ -183,9 +198,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.begin(j.Task)
 		r.step("Recovering a task that was interrupted")
 		msg, err := r.recover(ctx, j)
-		if _, left := r.readJournal(); left && err != nil {
+		if _, left := r.readJournal(); left {
 			// The journal is what restarts the runner. Retry a few times, slowly; then stop
 			// and leave the decision to a person at the machine.
+			if err == nil {
+				err = errors.New("recovery did not finish")
+			}
 			if j.Attempts >= maxRecoveries {
 				_ = os.Rename(r.l.journal(), r.l.journal()+".stuck")
 				err = errors.New(err.Error() + " Automatic retries stopped. On the machine: sudo mv " + r.l.journal() + ".stuck " + r.l.journal())
@@ -197,7 +215,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 		r.finish(err, msg)
-		first = handled(err)
+		if err != nil {
+			return handled(err) // reported; a queued request waits for the next start
+		}
 	}
 	if _, err := os.Lstat(filepath.Join(r.l.State, "pending-rollback.json")); err == nil {
 		r.begin(TaskUpgrade)
@@ -210,10 +230,17 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 	if _, err := os.Lstat(r.l.request()); err != nil {
-		return first
+		return nil
 	}
-	req, err := consume(r.l.request())
+	req, err := consume(r.l.Spool)
 	if err != nil {
+		if _, still := os.Lstat(r.l.request()); still == nil {
+			// Something the runner cannot remove sits in the spool: say so, and pace the
+			// restarts the path unit will cause.
+			_ = r.refuse(errors.New("the spool holds something that is not a request and cannot be removed"))
+			time.Sleep(r.retryDelay)
+			return err
+		}
 		return r.refuse(err)
 	}
 	pins, err := r.readPins()
@@ -238,6 +265,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	_ = os.Remove(r.l.cancel())
 	r.st.Refused = nil
+	r.pinned = pins
 	r.begin(v.Task)
 	done := "Done."
 	switch p := v.Params.(type) {
@@ -254,6 +282,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.refreshInfo()
 	r.finish(err, done)
+	if _, left := r.readJournal(); left && err != nil {
+		// Unfinished: the journal makes systemd start the runner again to recover.
+		time.Sleep(r.retryDelay)
+		return err
+	}
 	return handled(err)
 }
 
@@ -316,15 +349,22 @@ const (
 	cancelled
 	timedOut
 	died
+	interrupted
 )
+
+// errInterrupted leaves the journal in place: the next start finishes or undoes the task.
+var errInterrupted = errors.New("The runner was stopped while it waited; it will finish or undo this task when it starts again.")
 
 // await polls the broker's facts until done reports true, the owner cancels (aqmasd drops
 // an unsigned marker: cancelling only ever returns to the previous state), the maintenance
-// process exits, or the deadline passes.
+// process exits, the deadline passes, or the runner itself is being stopped.
 func (r *Runner) await(ctx context.Context, deadline time.Time, done func(Facts) bool) outcome {
 	for {
 		if f, err := r.l.facts(ctx); err == nil && done(f) {
 			return reached
+		}
+		if r.interrupt != nil && r.interrupt.Err() != nil {
+			return interrupted
 		}
 		if _, err := os.Lstat(r.l.cancel()); err == nil {
 			_ = os.Remove(r.l.cancel())
@@ -337,7 +377,7 @@ func (r *Runner) await(ctx context.Context, deadline time.Time, done func(Facts)
 			}
 			return died
 		}
-		if !r.now().Before(deadline) || ctx.Err() != nil {
+		if !r.now().Before(deadline) {
 			return timedOut
 		}
 		time.Sleep(r.poll)
@@ -436,15 +476,21 @@ func writeOwned(path string, data []byte, uid, gid int, mode os.FileMode) error 
 	return os.Rename(f.Name(), path)
 }
 
-func copyFile(dst, src string, limit int64, mode os.FileMode) error {
-	in, err := os.OpenFile(src, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+// readRooted reads a small regular file below a directory another account controls,
+// without following links out of it and without blocking on a FIFO.
+func readRooted(dir, rel string, limit int64) ([]byte, error) {
+	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer in.Close()
-	b, err := release.ReadLimit(in, limit)
+	defer root.Close()
+	f, err := root.OpenFile(rel, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile(dst, b, mode)
+	defer f.Close()
+	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	return release.ReadLimit(f, limit)
 }

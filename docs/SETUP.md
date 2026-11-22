@@ -20,7 +20,9 @@ task can be run again after a failure.
 ## Install the runner (once, as root)
 
 ```sh
-sudo aqmasd maint-init
+sudo aqmasd maint-init --repo ssh://git@forge.example.com/example/agent-quartermaster.git \
+     --forgejo-api https://forge.example.com/api/v1/repos/example/agent-quartermaster \
+     --github-api https://api.github.com/repos/example/agent-quartermaster
 ```
 
 This creates the spool (`/var/spool/aqmas-update`, root:aqmas 0730), the release cache and
@@ -32,7 +34,15 @@ and `aqmas-maint.service`; and, **only if there are none yet**, the maintenance 
 (`/etc/aqmas/update-passkeys.json`, root 0600) from the passkeys registered at that moment.
 That first pinning is trust on first use, which is why it happens in your terminal session
 and not through a request. `--repin` repeats it (the way back in if every pinned passkey is
-lost). `aqmasd.service` must allow the spool (`ReadWritePaths=-/var/spool/aqmas-update`, as
+lost).
+
+The three source flags are optional and recommended: they **pin the release sources**
+(`/etc/aqmas/maint-sources.json`). "Enable self-update" then accepts exactly these, and no
+request from the page can point the bastion at other sources. Without them the first
+"Enable self-update" may choose the sources (https, two different hosts) and later requests
+cannot change them; changing them is always a `maint-init --repo …` at the machine.
+
+`aqmasd.service` must allow the spool (`ReadWritePaths=-/var/spool/aqmas-update`, as
 shipped); because that entry only takes effect if the directory exists when the broker
 starts, `maint-init` restarts a running broker once after creating the spool.
 
@@ -45,21 +55,39 @@ The spool is writable by the broker, so the runner treats every byte in it as ho
   outside each task's patterns are refused before anything runs (`internal/maint/spec.go`).
 * **The owner's signature is checked by root.** The request is the canonical text plus the
   WebAuthn assertion. The runner checks the assertion against its own pinned public keys, user
-  verification, the RP origin from the root-owned configuration, an issuance time at most two
-  minutes old, and a replay record. A compromised broker cannot forge any of that.
+  verification, the RP origin from the root-owned configuration, an issuance time at most
+  three minutes old, and a replay record. The broker cannot produce such a signature.
+* **A sealing is finished only on root's own evidence.** Before it pins the activation or
+  deletes a single key file, the runner verifies that a pinned passkey signed the activation
+  and that the signed manifest is the one in the database and seals to the recovery key of
+  the signed task. The database merely saying "sealed" is not enough.
 * **Pasted secrets are sealed to the runner.** The browser encrypts them (HPKE, P-256 /
   HKDF-SHA256 / AES-128-GCM) to the runner's public key; the signed text binds the SHA-256 of
-  that packet. The broker, its log, its audit trail and the tunnel only ever see ciphertext.
-  A compromised broker could show the browser a different key: don't paste on a host you
-  suspect.
+  that packet. The broker's log, audit trail and spool hold only ciphertext.
 * **Status is public and contains no secrets:** fixed step text, digests, public keys.
 * **Pins change only by a signed task** (or `maint-init --repin` on the machine). The new list
-  is spelled out in what you sign, as credential ID and public-key digest, and the runner
-  takes a key from the broker's record only when it matches.
+  is spelled out in what you sign, as credential ID and public-key digest; the page names
+  every passkey being added or removed; and the runner takes a key from the broker's record
+  only when it matches the signed digest.
+* **Release sources are fixed at the machine** (see above), and the forge host keys you sign
+  go into `/etc/aqmas/known_hosts`, used only by the broker's and the builder's `git fetch`,
+  never into the system-wide SSH configuration. The page computes host-key fingerprints
+  itself from the lines it will sign.
 * **The runner ships inside `aqmasd`** (`aqmasd maint-run`), so an approved upgrade also
   upgrades the runner. This is a deliberate convenience: an approved release now determines
   the code that will verify later approvals. Units, pins and the secrets key are not touched
   by an upgrade.
+
+**What a signature does not prove.** The approval page is served by the broker, and a passkey
+is not a trusted display: it signs whatever challenge the page hands it. A *compromised*
+broker (or anything that can alter the page in transit, such as the party terminating TLS
+for the tunnel) can therefore turn any passkey tap, even a login, into an approval of any
+task on this page: replace the pins with its own key, start a sealing, approve an upgrade.
+It can also show the browser another key to seal pasted secrets to. What it still cannot do
+is make root run anything that is not compiled in, or install a build that the two pinned
+release sources do not both publish. So the root boundary holds against a broker bug or a
+stolen database; against a broker you have reason to distrust, the defence is not to tap.
+Rebuild it instead.
 
 Things the runner does as root, all with fixed arguments: stop/start `aqmasd` (maintenance
 modes are selected by a drop-in under `/run`, gone after a reboot), copy and restore the state
@@ -81,6 +109,10 @@ identity, made with WebCrypto, never sent anywhere) or to take a public key you 
 `age-keygen`. Save the secret half (`AGE-SECRET-KEY-1…`) in your password manager before you
 continue: with a backup of the database it decrypts everything, and it is the only way back if
 every unlock passkey is lost.
+
+Copying the key puts it on the clipboard and downloading it writes a plain file: move it into
+the password manager and clear both. The page cannot check that you really saved it; the
+drill below is what proves the copy you kept works.
 
 The recovery drill runs **on the bastion** (an owner decision trading the isolated-machine
 drill of [SEAL-OPERATIONS.md](SEAL-OPERATIONS.md) for one you will actually do): you paste
@@ -147,10 +179,12 @@ packet uses the same construction with the import process's `drill_key` and info
 
 ## Trust limits
 
-A compromised broker can refuse to queue a task, lie about progress, or show a misleading
-page, and it already holds every credential until the store is sealed. It cannot make the
-runner execute anything but a compiled-in task that a pinned passkey signed within the last
-two minutes, and it cannot read pasted secrets it did not already have access to. The
-release-reading tokens are stored root:aqmas 0440 because the broker reads them to discover
-releases. The first pins come from the broker's database at `maint-init` time. Self-update
-cannot change the pinned toolchains or the unit files; those remain manual changes.
+A compromised broker can refuse to queue a task, lie about progress, show a misleading page,
+and (see *What a signature does not prove*) misuse a tap. It already holds every credential
+until the store is sealed. Without a tap from a pinned passkey it cannot make the runner do
+anything, and with one it is still limited to the compiled-in tasks and the pinned release
+sources. The release-reading tokens are stored root:aqmas 0440 because the broker reads them
+to discover releases. The first pins come from the broker's database at `maint-init` time.
+The secrets key is static: a later leak of `/etc/aqmas/maint-secrets.key` exposes packets
+somebody recorded earlier. Self-update cannot change the pinned toolchains or the unit files;
+those remain manual changes.
