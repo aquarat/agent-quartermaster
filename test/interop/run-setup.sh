@@ -94,8 +94,10 @@ cat >"$T/hook" <<EOF
 #!/usr/bin/env bash
 set -u
 pidfile=$T/aqmasd.pid
-# A killed broker stays a zombie where PID 1 does not reap (CI containers): kill -0 still succeeds.
-running() { [[ -f \$pidfile ]] && kill -0 "\$(cat \$pidfile)" 2>/dev/null && ! grep -qs '^State:[[:space:]]*Z' "/proc/\$(cat \$pidfile)/status"; }
+# A killed broker stays a zombie where PID 1 does not reap (CI containers), so "the PID exists"
+# is not "running". One read of /proc decides: asking twice (kill -0, then the state) called a
+# broker that was reaped between the two questions "running", and stop or start then failed.
+running() { local s; [[ -f \$pidfile ]] && s=\$(cat "/proc/\$(cat \$pidfile)/status" 2>/dev/null) && [[ -n \$s ]] && ! grep -q '^State:[[:space:]]*[ZX]' <<<"\$s"; }
 case \$1 in
 stop) if running; then kill "\$(cat \$pidfile)"; for _ in \$(seq 600); do running || break; sleep 0.05; done; fi; ! running ;;  # up to 30 s: CI is slow
 start) running && exit 1
