@@ -241,14 +241,13 @@ UP_PARAMS="{\"repo\":\"$REPO\",\"forgejo_api\":\"http://127.0.0.1:$PF/api/v1/rep
 UP_SECRETS="{\"forgejo_token\":\"$FJ_TOKEN\",\"github_token\":\"$GH_TOKEN\"}"
 cp "$L/etc/config.toml" "$T/config.before-updates"
 serve_release "$T/rel-bad"
-# A request alone may not choose plain-http, same-host sources: those have to be pinned at
-# the machine (`maint-init --repo …`), which is what the test's loopback servers need.
-owner setup-run enable-updates "$UP_PARAMS" "$UP_SECRETS" 2>"$T/sign-updates.err" || { cat "$T/sign-updates.err"; fail "sign enable-updates"; }
-owner setup-wait enable-updates failed 60 | grep -q 'must be https' || fail "unpinned loopback sources not refused"
+# Where releases come from is decided at the machine (`maint-init --repo …`), never by a
+# request: until the sources are pinned the task is blocked.
+[[ $(owner setup-state enable-updates) == blocked:*"Pin the release sources"* ]] || fail "enable-updates without pinned sources: $(owner setup-state enable-updates)"
+if owner setup-run enable-updates "$UP_PARAMS" "$UP_SECRETS" 2>"$T/sign-updates.err"; then fail "a request chose the release sources"; fi
 maint maint-init --repo "$REPO" --forgejo-api "http://127.0.0.1:$PF/api/v1/repos/example/agent-quartermaster" --github-api "http://127.0.0.1:$PG/repos/example/agent-quartermaster" || fail "pinning the release sources"
 if owner setup-run enable-updates "${UP_PARAMS/agent-quartermaster.git/elsewhere.git}" "$UP_SECRETS" 2>"$T/moved.err"; then fail "a request moved the pinned sources"; fi
 grep -q 'fixed on this machine' "$T/moved.err" || { cat "$T/moved.err"; fail "pinned-source refusal"; }
-sleep 1 # the driver tells runs apart by their start second
 owner setup-run enable-updates "$UP_PARAMS" "$UP_SECRETS"
 owner setup-wait enable-updates failed 60 | grep -q 'not the published' || fail "mismatching release not refused"
 cmp -s "$L/etc/config.toml" "$T/config.before-updates" || fail "refused enable-updates changed the configuration"

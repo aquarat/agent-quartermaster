@@ -29,6 +29,7 @@ func (e *env) installRunner() ([]maint.KeyPin, string) {
 	}
 	st := maint.Status{Tasks: map[string]*maint.TaskStatus{}}
 	st.Runner.SecretsKey = maint.PublicKey(k)
+	st.Runner.Sources = e.sources
 	var pins []maint.KeyPin
 	for _, p := range keys {
 		pins = append(pins, maint.KeyPin{ID: p.CredentialID, PublicKey: p.cred.PublicKey})
@@ -79,7 +80,7 @@ func TestSetupQueue(t *testing.T) {
 	pins, _ := e.installRunner()
 	v = setupOut{}
 	mustStatus(t, "view", e.webDo("GET", "/api/ui/setup", nil, &v), 200)
-	if !v.Installed || v.state("cutover") != "available:" || v.state("seal") != "blocked:Switch to organisations first." ||
+	if !v.Installed || v.state("cutover") != "available:" || v.state("seal") != "blocked:Switch to organisations first." || !strings.HasPrefix(v.state("enable-updates"), "blocked:Pin the release sources") ||
 		v.state("upgrade") != "blocked:Enable self-update first." || v.state("sync-passkeys") != "done:" || !v.Passkeys[0].Pinned {
 		t.Fatalf("unexpected queue: %+v", v)
 	}
@@ -103,8 +104,9 @@ func TestSetupQueue(t *testing.T) {
 		"prerequisite":      {"seal", map[string]any{"params": map[string]any{"recipient": "age1" + strings.Repeat("q", 58)}}, 409},
 		"unknown key":       {"cutover", map[string]any{"params": map[string]any{"command": "id"}}, 400},
 		"stray secrets":     {"cutover", map[string]any{"secrets_sha256": strings.Repeat("a", 64)}, 400},
-		"bad repo":          {"enable-updates", map[string]any{"params": map[string]any{"repo": "ssh://git@forge.example.com/x.git; id", "forgejo_api": "https://forge.example.com/api/v1/repos/a/b", "github_api": "https://api.github.com/repos/a/b", "known_hosts": []string{"forge.example.com ssh-ed25519 " + strings.Repeat("A", 68)}}}, 400},
-		"missing secrets":   {"enable-updates", map[string]any{"params": map[string]any{"repo": "ssh://git@forge.example.com/a/b.git", "forgejo_api": "https://forge.example.com/api/v1/repos/a/b", "github_api": "https://api.github.com/repos/a/b", "known_hosts": []string{"forge.example.com ssh-ed25519 " + strings.Repeat("A", 68)}, "github_token": true}}, 400},
+		"unpinned sources":  {"enable-updates", map[string]any{"params": map[string]any{"repo": "ssh://git@forge.example.com/a/b.git", "forgejo_api": "https://forge.example.com/api/v1/repos/a/b", "github_api": "https://api.github.com/repos/a/b", "known_hosts": []string{"forge.example.com ssh-ed25519 " + strings.Repeat("A", 68)}}}, 409},
+		"bad repo":          {"enable-updates", map[string]any{"params": map[string]any{"repo": "ssh://git@forge.example.com/x.git; id", "forgejo_api": "https://forge.example.com/api/v1/repos/a/b", "github_api": "https://api.github.com/repos/a/b", "known_hosts": []string{"forge.example.com ssh-ed25519 " + strings.Repeat("A", 68)}}}, 409},
+		"missing secrets":   {"enable-updates", map[string]any{"params": map[string]any{"repo": "ssh://git@forge.example.com/a/b.git", "forgejo_api": "https://forge.example.com/api/v1/repos/a/b", "github_api": "https://api.github.com/repos/a/b", "known_hosts": []string{"forge.example.com ssh-ed25519 " + strings.Repeat("A", 68)}, "github_token": true}}, 409},
 		"foreign pin":       {"sync-passkeys", map[string]any{"params": map[string]any{"pins": []map[string]string{{"id": strings.Repeat("A", 22), "key_sha256": strings.Repeat("a", 64)}}}}, 409},
 	} {
 		mustStatus(t, name, e.webDo("POST", "/api/ui/setup/"+c.path+"/challenge", c.body, nil), c.want)
@@ -151,6 +153,7 @@ func TestSetupQueue(t *testing.T) {
 func TestSetupSecretsStaySealed(t *testing.T) {
 	e := newEnv(t)
 	e.setupOwner()
+	e.sources = &maint.Sources{Repo: "ssh://git@forge.example.com:2222/example/agent-quartermaster.git", ForgejoAPI: "https://forge.example.com/api/v1/repos/example/agent-quartermaster", GitHubAPI: "https://api.github.com/repos/example/agent-quartermaster"}
 	pins, priv := e.installRunner()
 	var v setupOut
 	mustStatus(t, "view", e.webDo("GET", "/api/ui/setup", nil, &v), 200)

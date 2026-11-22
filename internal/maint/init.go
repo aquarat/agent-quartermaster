@@ -136,6 +136,16 @@ func Init(ctx context.Context, l Layout, repin bool, sources *Sources, out io.Wr
 // stop). Each branch removes the journal only when the broker is in a consistent state and
 // serving; otherwise the journal stays and the runner is started again.
 func (r *Runner) recover(ctx context.Context, j journal) (string, error) {
+	switch j.Task {
+	case TaskCutover, TaskSeal, TaskUpdates:
+	default:
+		// Nothing this release knows how to finish: do not touch the broker.
+		r.clearJournal()
+		return "", errors.New("unknown interrupted task; inspect the machine")
+	}
+	// A broker that is up now (say after a reboot) may have served since the task was
+	// interrupted: then an old backup is no longer safe to put back.
+	served := r.l.active(ctx)
 	_ = r.l.stop(ctx)
 	f, err := r.l.facts(ctx)
 	if err != nil {
@@ -144,6 +154,9 @@ func (r *Runner) recover(ctx context.Context, j journal) (string, error) {
 	switch j.Task {
 	case TaskCutover:
 		if f.Schema >= 6 {
+			if served {
+				j.Backup = ""
+			}
 			return r.finishCutover(ctx, j.Backup)
 		}
 		return "", r.resume(ctx, errors.New("The cutover was interrupted before activation; nothing was changed."))
@@ -152,17 +165,19 @@ func (r *Runner) recover(ctx context.Context, j journal) (string, error) {
 			return r.finishSeal(ctx, j)
 		}
 		return "", r.unseal(ctx, j, errors.New("Sealing was interrupted before activation: the store is unchanged and unsealed."))
-	case TaskUpdates:
-		if err := r.restoreConfig(j.Backup); err != nil {
-			return "", err
-		}
-		if err := r.restart(ctx); err != nil {
-			return "", errors.New("the broker did not come back yet; the runner keeps trying")
-		}
-		_ = os.RemoveAll(j.Backup)
-		r.clearJournal()
-		return "", errors.New("Enabling self-update was interrupted; the previous configuration was restored.")
+	}
+	// TaskUpdates. A missing copy means the task had already finished its switch.
+	msg := "Enabling self-update was interrupted; the previous configuration was restored."
+	if complete(j.Backup) != nil {
+		msg = "Enabling self-update was interrupted at its very end; check the task and run it again if needed."
+	} else if err := r.restoreConfig(j.Backup); err != nil {
+		return "", err
+	}
+	r.tokens().rollback()
+	if err := r.restart(ctx); err != nil {
+		return "", errors.New("the broker did not come back yet; the runner keeps trying")
 	}
 	r.clearJournal()
-	return "", errors.New("unknown interrupted task; inspect the machine")
+	_ = os.RemoveAll(j.Backup)
+	return "", errors.New(msg)
 }

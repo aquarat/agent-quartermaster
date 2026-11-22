@@ -55,7 +55,13 @@ func (r *Runner) cutover(ctx context.Context) (string, error) {
 	case interrupted:
 		return "", errInterrupted
 	default:
-		return "", r.resume(ctx, errors.New("Cutover "+o.reason()+": nothing was changed."))
+		// An activation can land in the same instant as a cancel or the deadline.
+		if f, err := r.l.facts(ctx); err != nil || f.Schema < 6 {
+			if err != nil {
+				return "", errors.New("the database could not be checked; the runner keeps trying")
+			}
+			return "", r.resume(ctx, errors.New("Cutover "+o.reason()+": nothing was changed."))
+		}
 	}
 	time.Sleep(2 * r.poll) // let the activation response reach the browser
 	return r.finishCutover(ctx, j.Backup)
@@ -99,7 +105,8 @@ func (r *Runner) finishCutover(ctx context.Context, backup string) (string, erro
 		return "Organisations are active. Your hosts are in the personal organisation.", nil
 	}
 	if backup == "" {
-		return "", errors.New("The broker is unhealthy after the cutover and there is no backup to restore; the runner keeps trying.")
+		// No backup, or the activated broker may already have served: only forward.
+		return "", errors.New("The broker is unhealthy after the cutover and restoring the backup is not safe; the runner keeps trying.")
 	}
 	// Nothing was served since the backup: restoring it loses no approval or revocation.
 	r.step("The broker is unhealthy after activation: restoring the backup")

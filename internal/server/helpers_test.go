@@ -26,6 +26,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
+	"github.com/aquarat/agent-quartermaster/internal/maint"
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
 	"github.com/aquarat/agent-quartermaster/internal/server/vauth"
 )
@@ -46,14 +47,15 @@ func (c *fakeClock) Advance(d time.Duration) {
 
 // env is one in-process aqmasd with its listeners and an owner passkey.
 type env struct {
-	t     *testing.T
-	s     *Server
-	cfg   *config.Config
-	clock *fakeClock
-	agent *httptest.Server // TLS, client certs verified if given
-	web   *httptest.Server // plain HTTP (cloudflared side)
-	auth  *vauth.Authenticator
-	sess  string // session cookie value
+	sources *maint.Sources // release sources the test runner has pinned (setup_test.go)
+	t       *testing.T
+	s       *Server
+	cfg     *config.Config
+	clock   *fakeClock
+	agent   *httptest.Server // TLS, client certs verified if given
+	web     *httptest.Server // plain HTTP (cloudflared side)
+	auth    *vauth.Authenticator
+	sess    string // session cookie value
 }
 
 func testConfig(dir string) *config.Config {

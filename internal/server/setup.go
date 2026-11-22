@@ -148,11 +148,9 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 	} else if s.sealSetup {
 		v.Mode = "seal-setup"
 	}
-	// Sources pinned on the machine win; they are also what the runner will insist on.
+	// The release sources pinned on the machine: the only ones the runner accepts.
 	if src := st.Runner.Sources; src != nil {
 		v.Updates = map[string]string{"repo": src.Repo, "forgejo_api": src.ForgejoAPI, "github_api": src.GitHubAPI, "pinned": "true"}
-	} else if u := s.cfg.Updates; u.Repo != "" {
-		v.Updates = map[string]string{"repo": u.Repo, "forgejo_api": u.Forgejo.API, "github_api": u.GitHub.API, "pinned": "true"}
 	}
 	q := s.store.Q()
 	keys, err := loadPasskeys(ctx, q)
@@ -193,6 +191,10 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 			t.Rerunnable = true
 			if s.updatesReady() {
 				t.State = "done"
+			}
+			if installed && st.Runner.Sources == nil {
+				// Where releases come from is decided at the machine, never by a request.
+				t.State, t.Blocked, t.Rerunnable = "blocked", "Pin the release sources on the machine first: sudo aqmasd maint-init --repo … --forgejo-api … --github-api …", false
 			}
 		case maint.TaskPins:
 			t.Rerunnable = true
@@ -380,12 +382,8 @@ func (s *Server) setupParams(ctx context.Context, task string, raw json.RawMessa
 		}
 		// Say so now if the runner would refuse these sources (it decides; this is courtesy).
 		st, _ := s.runnerStatus()
-		want := st.Runner.Sources
-		if want == nil && s.cfg.Updates.Repo != "" {
-			want = &maint.Sources{Repo: s.cfg.Updates.Repo, ForgejoAPI: s.cfg.Updates.Forgejo.API, GitHubAPI: s.cfg.Updates.GitHub.API}
-		}
-		if err == nil && want != nil && (p.Repo != want.Repo || p.ForgejoAPI != want.ForgejoAPI || p.GitHubAPI != want.GitHubAPI) {
-			return "", nil, errConflict("the release sources are fixed on this machine; to change them run `sudo aqmasd maint-init --repo … --forgejo-api … --github-api …` there")
+		if want := st.Runner.Sources; err == nil && (want == nil || p.Repo != want.Repo || p.ForgejoAPI != want.ForgejoAPI || p.GitHubAPI != want.GitHubAPI) {
+			return "", nil, errConflict("the release sources are fixed on this machine; to set or change them run `sudo aqmasd maint-init --repo … --forgejo-api … --github-api …` there")
 		}
 		v = p
 	case maint.TaskPins:

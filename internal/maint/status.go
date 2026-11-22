@@ -35,7 +35,10 @@ type RunnerInfo struct {
 
 // TaskStatus is one run of one task.
 type TaskStatus struct {
-	Task     string            `json:"task"`
+	Task string `json:"task"`
+	// Request identifies the approval that started this run: the first 16 hex characters of
+	// SHA-256(canonical). Empty for a recovery the runner started itself.
+	Request  string            `json:"request,omitempty"`
 	State    string            `json:"state"` // running | waiting | done | failed
 	Step     string            `json:"step"`
 	Waiting  string            `json:"waiting_for,omitempty"`

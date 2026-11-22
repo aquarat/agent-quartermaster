@@ -87,7 +87,9 @@ done
 (cd "$out/assets" && sha256sum aqmas-* aqmasd-linux-arm64 > SHA256SUMS)
 install -m 0755 "$out/assets/aqmasd-linux-arm64" "$installstage/new"; rm "$out/assets/aqmasd-linux-arm64"
 chmod 0755 "$out/assets"; chmod 0644 "$out/assets/"* "$out/metadata"
-ln "$bin" "$installstage/prev"; mv -T "$installstage/prev" "$bin.prev"
+# After an earlier automatic rollback the running binary and .prev are one file already
+# (and mv refuses to rename a file onto its own hard link).
+if ! [[ $bin -ef $bin.prev ]]; then ln "$bin" "$installstage/prev"; mv -T "$installstage/prev" "$bin.prev"; fi
 sync -f "$installstage/new"
 cp "$cache/latest.json" "$journal.tmp"; mv -T "$journal.tmp" "$journal"; sync -f "$journal"
 rollback=1; mv -T "$installstage/new" "$bin"

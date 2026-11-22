@@ -383,6 +383,13 @@ func (r *Runner) finishSeal(ctx context.Context, j journal) (string, error) {
 				n++
 			}
 		}
+		// State a restore once set aside beside the data directory holds the same keys.
+		aside, _ := filepath.Glob(r.cfg.DataDir + ".displaced-*")
+		for _, d := range aside {
+			if os.RemoveAll(d) == nil {
+				n++
+			}
+		}
 		r.result("backups_deleted", strconv.Itoa(n))
 	} else {
 		r.result("plaintext_backups", r.l.Backups+" still holds pre-seal copies of the private keys")

@@ -232,6 +232,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	if _, err := os.Lstat(r.l.request()); err != nil {
 		return nil
 	}
+	if _, err := os.Lstat(r.l.journal() + ".stuck"); err == nil {
+		// An earlier task is half-finished and waiting for a person: nothing new may run.
+		_, _ = consume(r.l.Spool)
+		return r.refuse(errors.New("an earlier task did not finish and needs attention on the machine first (see its card)"))
+	}
 	req, err := consume(r.l.Spool)
 	if err != nil {
 		if _, still := os.Lstat(r.l.request()); still == nil {
@@ -267,6 +272,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.st.Refused = nil
 	r.pinned = pins
 	r.begin(v.Task)
+	r.st.Current.Request = hex.EncodeToString(canon.Challenge(req.Canonical))[:16]
 	done := "Done."
 	switch p := v.Params.(type) {
 	case CutoverParams:

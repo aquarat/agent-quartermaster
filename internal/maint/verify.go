@@ -111,22 +111,38 @@ func verifyAssertion(text string, assertion json.RawMessage, origin string, pins
 // verifyActivation is root's own check that the store was sealed by the owner and for the
 // owner: the activation the import process recorded must be signed by a pinned passkey, and
 // the manifest it signs must be the one in the database and name the recovery recipient from
-// the signed task. Without it nothing is pinned or deleted.
+// the signed task. Without it nothing is pinned or deleted. (What the manifest states is all
+// root can check: only the drill and a later unlock show the store really opens.)
 func verifyActivation(f Facts, recipient, origin string, pins []KeyPin) error {
+	// Exactly the text the import process builds: these eight keys, once each, in Go's
+	// canonical map encoding. Anything else (extra or duplicate keys, other spellings) does
+	// not survive the round trip.
+	var raw map[string]json.RawMessage
+	bad := errors.New("the activation record is missing or malformed")
+	if len(f.Activation) > 64<<10 || json.Unmarshal([]byte(f.Activation), &raw) != nil || len(raw) != 8 {
+		return bad
+	}
 	var c struct {
 		V        int    `json:"v"`
 		Action   string `json:"action"`
 		Object   string `json:"object"`
+		Nonce    string `json:"nonce"`
+		IssuedAt string `json:"issued_at"`
+		ID       string `json:"id"`
+		Epoch    string `json:"epoch"`
 		Manifest string `json:"manifest"`
 	}
-	if len(f.Activation) > 64<<10 || json.Unmarshal([]byte(f.Activation), &c) != nil || c.V != 3 || c.Object != "seal-control" || c.Action != "activate" {
-		return errors.New("the activation record is missing or malformed")
+	if json.Unmarshal([]byte(f.Activation), &c) != nil {
+		return bad
+	}
+	again, err := json.Marshal(map[string]any{"v": c.V, "action": c.Action, "object": c.Object, "nonce": c.Nonce, "issued_at": c.IssuedAt, "id": c.ID, "epoch": c.Epoch, "manifest": c.Manifest})
+	if err != nil || string(again) != f.Activation || c.V != 3 || c.Object != "seal-control" || c.Action != "activate" || c.ID == "" {
+		return bad
 	}
 	sum := sha256.Sum256([]byte(c.Manifest))
-	var m struct {
-		Recipient string `json:"offline_recipient"`
-	}
-	if hex.EncodeToString(sum[:]) != f.Manifest || json.Unmarshal([]byte(c.Manifest), &m) != nil || m.Recipient != recipient {
+	var m map[string]json.RawMessage
+	var named string
+	if hex.EncodeToString(sum[:]) != f.Manifest || json.Unmarshal([]byte(c.Manifest), &m) != nil || json.Unmarshal(m["offline_recipient"], &named) != nil || named != recipient {
 		return errors.New("the signed activation does not match the stored manifest and your recovery key")
 	}
 	if err := verifyAssertion(f.Activation, f.ActivationProof, origin, pins); err != nil {

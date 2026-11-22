@@ -288,6 +288,9 @@ func maintenance(cmd string, args []string) error {
 	}
 	if os.Geteuid() == 0 {
 		if err := rootPin(layout.Config); err != nil {
+			if cmd == "maint-run" {
+				time.Sleep(20 * time.Second)
+			}
 			return err
 		}
 	}
@@ -298,6 +301,10 @@ func maintenance(cmd string, args []string) error {
 	}
 	r, err := maint.New(layout, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	if err != nil {
+		// Whatever started the runner is still there and will start it again: go slowly.
+		if os.Geteuid() == 0 {
+			time.Sleep(20 * time.Second)
+		}
 		return err
 	}
 	// A refused request or a failed task is reported on the Setup page; for systemd the

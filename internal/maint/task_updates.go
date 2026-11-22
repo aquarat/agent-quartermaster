@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -153,29 +152,96 @@ func sameFile(a, b string) bool {
 	return e1 == nil && e2 == nil && os.SameFile(x, y)
 }
 
-// checkSources is the rule for where releases may come from. Sources pinned from a terminal
-// on the machine are the only ones accepted while they exist. Without them a request may
-// choose the sources once (https, two different hosts); after that a request can refresh
-// tokens and host keys but cannot move the broker to other sources.
+// checkSources is the rule for where releases may come from: only the sources pinned from a
+// terminal on the machine (`maint-init --repo …`). A request can use them; it can neither
+// choose nor change them, so no passkey tap can point the bastion at another publisher.
 func (r *Runner) checkSources(p UpdatesParams) error {
-	if pinned := r.l.readSources(); pinned != nil {
-		if p.Repo != pinned.Repo || p.ForgejoAPI != pinned.ForgejoAPI || p.GitHubAPI != pinned.GitHubAPI {
-			return errors.New("these are not the release sources pinned on this machine (sudo aqmasd maint-init --repo … changes them)")
-		}
-		return nil
+	pinned := r.l.readSources()
+	if pinned == nil {
+		return errors.New("pin the release sources on the machine first: sudo aqmasd maint-init --repo … --forgejo-api … --github-api …")
 	}
-	if cur := r.cfg.Updates; cur.Repo != "" && (p.Repo != cur.Repo || p.ForgejoAPI != cur.Forgejo.API || p.GitHubAPI != cur.GitHub.API) {
-		return errors.New("self-update is already set up with other release sources; change them on the machine (sudo aqmasd maint-init --repo …)")
-	}
-	a, e1 := url.Parse(p.ForgejoAPI)
-	b, e2 := url.Parse(p.GitHubAPI)
-	if e1 != nil || e2 != nil || a.Scheme != "https" || b.Scheme != "https" {
-		return errors.New("release APIs must be https")
-	}
-	if strings.EqualFold(a.Hostname(), b.Hostname()) {
-		return errors.New("the two release APIs must be on different hosts: they are meant to be independent")
+	if p.Repo != pinned.Repo || p.ForgejoAPI != pinned.ForgejoAPI || p.GitHubAPI != pinned.GitHubAPI {
+		return errors.New("these are not the release sources pinned on this machine (sudo aqmasd maint-init --repo … changes them)")
 	}
 	return nil
+}
+
+// tokenSwap replaces the release-reading tokens as one step that can be undone: new values
+// are staged beside the old ones, swapped in only after the releases were verified with
+// them, and the old files are kept until the broker has restarted on the new configuration.
+type tokenSwap struct {
+	dir string
+	gid int
+}
+
+var tokenFiles = map[string]string{"forgejo_token": "forgejo-read-token", "github_token": "github-read-token"}
+
+func (r *Runner) tokens() tokenSwap {
+	_, gid, _ := r.l.serviceIDs()
+	return tokenSwap{r.l.ConfigDir, gid}
+}
+
+func (t tokenSwap) path(name, suffix string) string {
+	return filepath.Join(t.dir, tokenFiles[name]+suffix)
+}
+
+// stage writes the new values under ".new" names and returns those paths.
+func (t tokenSwap) stage(secrets map[string]string) (map[string]string, error) {
+	staged := map[string]string{}
+	for name := range tokenFiles {
+		_ = os.Remove(t.path(name, ".new"))
+		if secrets[name] == "" {
+			continue
+		}
+		if err := writeOwned(t.path(name, ".new"), []byte(secrets[name]+"\n"), 0, t.gid, 0440); err != nil {
+			return nil, errors.New("could not store a token")
+		}
+		staged[name] = t.path(name, ".new")
+	}
+	return staged, nil
+}
+
+// commit moves the old files aside and the staged ones into place. A token that this
+// request no longer carries is set aside too, so it cannot linger. Where there was no old
+// file an empty ".old" marks that, so that a rollback removes what commit created.
+func (t tokenSwap) commit() error {
+	for name := range tokenFiles {
+		_ = os.Remove(t.path(name, ".old"))
+		err := os.Rename(t.path(name, ""), t.path(name, ".old"))
+		if os.IsNotExist(err) {
+			err = os.WriteFile(t.path(name, ".old"), nil, 0600)
+		}
+		if err != nil {
+			return err
+		}
+		if err := os.Rename(t.path(name, ".new"), t.path(name, "")); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// rollback puts the old state back (a no-op when nothing was committed).
+func (t tokenSwap) rollback() {
+	for name := range tokenFiles {
+		_ = os.Remove(t.path(name, ".new"))
+		st, err := os.Lstat(t.path(name, ".old"))
+		if err != nil {
+			continue
+		}
+		if st.Size() == 0 {
+			_ = os.Remove(t.path(name, ""))
+			_ = os.Remove(t.path(name, ".old"))
+		} else {
+			_ = os.Rename(t.path(name, ".old"), t.path(name, ""))
+		}
+	}
+}
+
+func (t tokenSwap) finish() {
+	for name := range tokenFiles {
+		_ = os.Remove(t.path(name, ".old"))
+	}
 }
 
 func fileHash(path string) (string, error) {
@@ -193,36 +259,36 @@ func fileHash(path string) (string, error) {
 
 // seed checks the installed broker against both published releases of its own version and
 // fills the release cache. Nothing is trusted from one source alone.
-func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) error {
+func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) (release.Metadata, error) {
 	// The identity that later upgrades are anchored on is this binary's own, compiled in.
 	// (The test layout's stand-in broker is a script, so there the facts supply it.)
 	m := release.Metadata{Version: release.Version, Commit: release.Commit}
 	if r.l.test {
 		m.Version, m.Commit = f.Version, f.Commit
 	} else if exe, err := os.Executable(); err != nil || !sameFile(exe, r.l.Bin) {
-		return errors.New("the runner is not the installed broker binary")
+		return m, errors.New("the runner is not the installed broker binary")
 	}
 	if !release.ValidVersion(m.Version) || !release.ValidCommit(m.Commit) {
-		return errors.New("the installed broker is not a release build")
+		return m, errors.New("the installed broker is not a release build")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 	var err error
 	if m.Forgejo, err = u.Forgejo.Hashes(ctx, m.Version, false); err != nil {
-		return errors.New("Forgejo release " + m.Version + ": " + err.Error())
+		return m, errors.New("Forgejo release " + m.Version + ": " + err.Error())
 	}
 	if m.GitHub, err = u.GitHub.Hashes(ctx, m.Version, true); err != nil {
-		return errors.New("GitHub release " + m.Version + ": " + err.Error())
+		return m, errors.New("GitHub release " + m.Version + ": " + err.Error())
 	}
 	if !m.Valid() {
-		return errors.New("the two releases of " + m.Version + " disagree")
+		return m, errors.New("the two releases of " + m.Version + " disagree")
 	}
 	if got, err := fileHash(r.l.Bin); err != nil || got != m.Forgejo[release.Daemon] {
-		return errors.New("the installed broker is not the published " + m.Version + " binary")
+		return m, errors.New("the installed broker is not the published " + m.Version + " binary")
 	}
 	stage, err := os.MkdirTemp(r.l.Cache, ".seed-")
 	if err != nil {
-		return err
+		return m, err
 	}
 	defer os.RemoveAll(stage)
 	for _, name := range release.Assets {
@@ -232,34 +298,34 @@ func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) error {
 		b, err := u.Forgejo.Asset(ctx, m.Version, name, false, 128<<20)
 		if err != nil {
 			if b, err = u.GitHub.Asset(ctx, m.Version, name, true, 128<<20); err != nil {
-				return errors.New("could not download " + name)
+				return m, errors.New("could not download " + name)
 			}
 		}
 		sum := sha256.Sum256(b)
 		if hex.EncodeToString(sum[:]) != m.Forgejo[name] {
-			return errors.New(name + " does not match the published digest")
+			return m, errors.New(name + " does not match the published digest")
 		}
 		// Explicit modes: the runner's umask is 077 and the broker serves these files.
 		if err = writeOwned(filepath.Join(stage, name), b, 0, 0, 0644); err != nil {
-			return err
+			return m, err
 		}
 	}
 	if err = writeOwned(filepath.Join(stage, "SHA256SUMS"), []byte(m.Forgejo.Text()), 0, 0, 0644); err != nil {
-		return err
+		return m, err
 	}
 	if err = os.Chmod(stage, 0755); err != nil {
-		return err
+		return m, err
 	}
 	dst := filepath.Join(r.l.Cache, m.Version)
 	_ = os.RemoveAll(dst)
 	if err = os.Rename(stage, dst); err != nil {
-		return err
+		return m, err
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
-		return err
+		return m, err
 	}
-	return writeAtomic(filepath.Join(r.l.Cache, "latest.json"), append(b, '\n'), 0644)
+	return m, writeAtomic(filepath.Join(r.l.Cache, "latest.json"), append(b, '\n'), 0644)
 }
 
 // enableUpdates prepares the machine for self-update and points the broker at its sources.
@@ -312,29 +378,22 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 	if err = r.trustHost(p.KnownHosts); err != nil {
 		return "", err
 	}
-	r.step("Storing the release-reading tokens")
-	_, gid, err := r.l.serviceIDs()
-	if err != nil {
-		return "", err
-	}
-	for name, file := range map[string]string{"forgejo_token": "forgejo-read-token", "github_token": "github-read-token"} {
-		path := filepath.Join(r.l.ConfigDir, file)
-		if secrets[name] == "" {
-			// Not part of this request: a token from an earlier run must not linger.
-			if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
-				return "", errors.New("could not remove an old token")
-			}
-			continue
-		}
-		if err = writeOwned(path, []byte(secrets[name]+"\n"), 0, gid, 0440); err != nil {
-			return "", errors.New("could not store a token")
-		}
-	}
 	r.step("Checking the installed broker against both published releases")
-	if err = r.seed(ctx, u, f); err != nil {
+	// The new tokens are only staged until they have proved themselves against the releases.
+	swap := r.tokens()
+	staged, err := swap.stage(secrets)
+	if err != nil {
+		swap.rollback()
 		return "", err
 	}
-	r.result("release", f.Version+" ("+f.Commit[:12]+")")
+	probe := u
+	probe.Forgejo.TokenFile, probe.GitHub.TokenFile = staged["forgejo_token"], staged["github_token"]
+	m, err := r.seed(ctx, probe, f)
+	if err != nil {
+		swap.rollback()
+		return "", err
+	}
+	r.result("release", m.Version+" ("+m.Commit[:12]+")")
 	r.step("Adding the update sources to the configuration and restarting the broker")
 	// A copy of the configuration for the few seconds of the restart; it may still contain
 	// the notification URL, so it never outlives the task.
@@ -351,26 +410,34 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 	}
 	if err != nil {
 		_ = os.RemoveAll(before)
+		swap.rollback()
 		return "", err
 	}
-	if err = replaceFile(r.l.Config, next); err == nil {
+	r.step("Storing the release-reading tokens")
+	if err = swap.commit(); err == nil {
+		err = replaceFile(r.l.Config, next)
+	}
+	if err == nil {
 		err = r.restart(ctx)
 	}
 	if err != nil {
 		r.step("The broker did not restart with the new configuration: restoring the old one")
 		_ = r.l.stop(ctx)
+		swap.rollback()
 		if rerr := r.restoreConfig(before); rerr == nil {
 			if rerr = r.restart(ctx); rerr == nil {
-				_ = os.RemoveAll(before)
 				r.clearJournal()
-				return "", errors.New("The broker refused the new configuration; the previous one was restored.")
+				_ = os.RemoveAll(before)
+				return "", errors.New("The broker refused the new configuration; the previous one and its tokens were restored.")
 			}
 		}
 		// The journal stays: the next start restores the configuration and tries again.
 		return "", errors.New("The broker did not come back yet; the runner keeps trying.")
 	}
-	_ = os.RemoveAll(before)
+	// Journal first: once it is gone nothing will look for the copy again.
 	r.clearJournal()
+	_ = os.RemoveAll(before)
+	swap.finish()
 	return "Self-update is ready. Register the deploy key on the forge (read-only) if you have not yet; new releases then appear under “Upgrade aqmas”.", nil
 }
 

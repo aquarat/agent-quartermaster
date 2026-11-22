@@ -543,6 +543,14 @@ func TestRecoveryRetriesAreBounded(t *testing.T) {
 	if _, e := os.Stat(b.l.journal()); e == nil {
 		t.Fatal("journal still triggers the runner")
 	}
+	// Until a person has dealt with it, nothing new runs on top of the half-finished task.
+	b.queue(b.sign(TaskPins, PinsParams{Pins: []Pin{{ID: base64.RawURLEncoding.EncodeToString(b.auth.CredID), KeyHash: func() string { h := sha256.Sum256(cose(b.auth)); return hex.EncodeToString(h[:]) }()}}}, nil))
+	if err = b.runner().Run(context.Background()); !errors.As(err, &handledErr) || !strings.Contains(ReadStatus(b.l.status()).Refused.Reason, "did not finish") {
+		t.Fatalf("a new request ran over a stuck task: %v", err)
+	}
+	if _, e := os.Lstat(b.l.request()); e == nil {
+		t.Fatal("refused request left in the spool")
+	}
 	// Put back by a person at the machine, with the cause fixed, it finishes.
 	_ = os.Remove(b.path("refuse-always"))
 	if e := os.Rename(b.l.journal()+".stuck", b.l.journal()); e != nil {
@@ -603,6 +611,50 @@ func TestSealNeedsTheOwnersActivation(t *testing.T) {
 		if err := b.runner().Run(context.Background()); err != nil || b.last(TaskSeal).State != "done" {
 			t.Errorf("%s: did not finish once the activation was genuine: %v", name, err)
 		}
+	}
+}
+
+// The activation record must be exactly the text the import process builds and signs.
+func TestActivationRecordIsStrict(t *testing.T) {
+	signer := newAuth()
+	pins := []KeyPin{{ID: signer.CredID, PublicKey: cose(signer)}}
+	recipient := sealParams().Recipient
+	_, digest, text, _ := activation(signer, recipient)
+	check := func(text string) error {
+		return verifyActivation(Facts{Schema: 8, Manifest: digest, Activation: text, ActivationProof: signer.Assert(canon.Challenge(text))}, recipient, origin, pins)
+	}
+	if err := check(text); err != nil {
+		t.Fatal(err)
+	}
+	for name, forged := range map[string]string{
+		"extra key":       strings.Replace(text, `{"action"`, `{"X":1,"action"`, 1),
+		"duplicate key":   strings.Replace(text, `"object":"seal-control"`, `"object":"login","object":"seal-control"`, 1),
+		"other spelling":  strings.Replace(text, `"action":"activate"`, `"ACTION":"activate"`, 1),
+		"other action":    strings.Replace(text, `"action":"activate"`, `"action":"lock"`, 1),
+		"reordered":       `{"v":3,` + strings.TrimSuffix(strings.TrimPrefix(text, "{"), `,"v":3}`) + "}",
+		"trailing spaces": text + " ",
+	} {
+		if forged == text {
+			t.Fatal("test does not change the text: " + name)
+		}
+		if err := check(forged); err == nil {
+			t.Errorf("%s: a signed but non-canonical activation was accepted", name)
+		}
+	}
+}
+
+// A journal this release cannot interpret must not take the broker down.
+func TestUnknownJournalLeavesTheBrokerAlone(t *testing.T) {
+	b := newLab(t)
+	b.write(0600, `{"task":"something-newer"}`, "maint", "journal.json")
+	log := b.read("hook.log")
+	err := b.runner().Run(context.Background())
+	var h *Handled
+	if !errors.As(err, &h) || b.read("hook.log") != log || strings.TrimSpace(b.read("active")) != "serve" {
+		t.Fatalf("an unknown journal touched the broker: %v", err)
+	}
+	if _, e := os.Stat(b.l.journal()); e == nil {
+		t.Fatal("unknown journal keeps triggering the runner")
 	}
 }
 
@@ -806,26 +858,27 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 	b := newLab(t)
 	b.releases("0.3.0", "0.3.1")
 	before := b.read("etc", "config.toml")
-	// Unpinned, a request may not point the broker at plain-http or same-host sources.
+	// Where releases come from is decided at the machine: without a pin a request is refused.
 	b.queue(b.sign(TaskUpdates, b.updatesParams(), map[string]string{"forgejo_token": secretForge, "github_token": secretHub}))
-	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "https") {
-		t.Fatalf("loopback http sources accepted without a pin: %+v", b.last(TaskUpdates))
+	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "pin the release sources") || b.read("etc", "forgejo-read-token") != "" {
+		t.Fatalf("a request chose the release sources: %+v", b.last(TaskUpdates))
 	}
 	b.pinSources()
 	tokens := map[string]string{"forgejo_token": secretForge, "github_token": secretHub}
 
 	// The restart fails: the previous configuration comes back.
 	b.write(0600, "", "refuse-once-serve")
+	b.write(0440, "old-forgejo-token\n", "etc", "forgejo-read-token")
 	b.queue(b.sign(TaskUpdates, b.updatesParams(), tokens))
-	if err := b.runner().Run(context.Background()); err == nil || b.read("etc", "config.toml") != before {
-		t.Fatalf("no rollback of the configuration: %+v", b.last(TaskUpdates))
+	if err := b.runner().Run(context.Background()); err == nil || b.read("etc", "config.toml") != before || b.read("etc", "forgejo-read-token") != "old-forgejo-token\n" || b.read("etc", "github-read-token") != "" {
+		t.Fatalf("configuration or tokens not rolled back: %+v", b.last(TaskUpdates))
 	}
 
 	// A broker that is not the published binary is refused before the configuration changes.
 	b.queue(b.sign(TaskUpdates, b.updatesParams(), tokens))
 	published := b.read("aqmasd")
 	b.write(0755, published+"# changed\n", "aqmasd")
-	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "not the published") || b.read("etc", "config.toml") != before {
+	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "not the published") || b.read("etc", "config.toml") != before || b.read("etc", "forgejo-read-token") != "old-forgejo-token\n" {
 		t.Fatalf("unpublished binary accepted: %+v", b.last(TaskUpdates))
 	}
 	b.write(0755, published, "aqmasd")

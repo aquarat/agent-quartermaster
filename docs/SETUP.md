@@ -36,11 +36,12 @@ That first pinning is trust on first use, which is why it happens in your termin
 and not through a request. `--repin` repeats it (the way back in if every pinned passkey is
 lost).
 
-The three source flags are optional and recommended: they **pin the release sources**
-(`/etc/aqmas/maint-sources.json`). "Enable self-update" then accepts exactly these, and no
-request from the page can point the bastion at other sources. Without them the first
-"Enable self-update" may choose the sources (https, two different hosts) and later requests
-cannot change them; changing them is always a `maint-init --repo …` at the machine.
+The three source flags **pin the release sources** (`/etc/aqmas/maint-sources.json`).
+"Enable self-update" accepts exactly these and stays blocked until they are pinned: where
+releases come from is decided at the machine, so no request from the page, and no misused
+passkey tap, can point the bastion at another publisher. Changing them is a
+`maint-init --repo …` at the machine, followed by "Enable self-update" again. The flags can
+be left out on a bastion that will not use self-update.
 
 `aqmasd.service` must allow the spool (`ReadWritePaths=-/var/spool/aqmas-update`, as
 shipped); because that entry only takes effect if the directory exists when the broker
@@ -59,8 +60,9 @@ The spool is writable by the broker, so the runner treats every byte in it as ho
   three minutes old, and a replay record. The broker cannot produce such a signature.
 * **A sealing is finished only on root's own evidence.** Before it pins the activation or
   deletes a single key file, the runner verifies that a pinned passkey signed the activation
-  and that the signed manifest is the one in the database and seals to the recovery key of
-  the signed task. The database merely saying "sealed" is not enough.
+  and that the signed manifest is the one in the database and names the recovery key of the
+  signed task. The database merely saying "sealed" is not enough. (That the store really
+  opens is what the drill and your first unlock show.)
 * **Pasted secrets are sealed to the runner.** The browser encrypts them (HPKE, P-256 /
   HKDF-SHA256 / AES-128-GCM) to the runner's public key; the signed text binds the SHA-256 of
   that packet. The broker's log, audit trail and spool hold only ciphertext.
@@ -84,8 +86,8 @@ broker (or anything that can alter the page in transit, such as the party termin
 for the tunnel) can therefore turn any passkey tap, even a login, into an approval of any
 task on this page: replace the pins with its own key, start a sealing, approve an upgrade.
 It can also show the browser another key to seal pasted secrets to. What it still cannot do
-is make root run anything that is not compiled in, or install a build that the two pinned
-release sources do not both publish. So the root boundary holds against a broker bug or a
+is make root run anything that is not compiled in, or install a build that the two release
+sources pinned at the machine do not both publish. So the root boundary holds against a broker bug or a
 stolen database; against a broker you have reason to distrust, the defence is not to tap.
 Rebuild it instead.
 
@@ -142,8 +144,9 @@ All under a signed-in session. `GET` works while locked and in the maintenance m
   `mode` is `serve`, `cutover` or `seal-setup`. Each task is its fixed description (`id`,
   `title`, `summary`, `steps[]`, `reversible`, `secrets[]`) plus `state` (`available`,
   `blocked`, `idle`, `running`, `waiting`, `done`, `failed`), `blocked_by`, `rerunnable` and
-  `last` (the last run: `state`, `step`, `waiting_for`, `deadline`, `started_at`,
-  `finished_at`, `message`, `log[]`, `result{}`). `passkeys[]` are
+  `last` (the last run: `request`, `state`, `step`, `waiting_for`, `deadline`,
+  `started_at`, `finished_at`, `message`, `log[]`, `result{}`; `request` is the first 16
+  hex characters of SHA-256 of the canonical text that started it). `passkeys[]` are
   `{id, credential, key_sha256, name, pinned, current}`.
 * `GET /api/ui/setup/cutover/preview` → `{id, plan}`: the plan the cutover would propose now.
 * `POST /api/ui/setup/host-key {repo}` → `{host, keys:[{line, fingerprint}]}`: the forge's SSH
