@@ -165,7 +165,8 @@ func (s *Server) discover(ctx context.Context, v *updateView) error {
 	if v.Stat, e = diff("--stat", 32<<10); e != nil {
 		return e
 	}
-	if v.Diff, e = diff("--binary", 512<<10); e != nil {
+	// Text patch only: binary files (images) appear in the stat and as "Binary files differ".
+	if v.Diff, e = diff("--patch", 4<<20); e != nil {
 		return fmt.Errorf("cannot display complete diff: %w", e)
 	}
 	v.Stat, v.Diff = quotePatch(v.Stat), quotePatch(v.Diff)
