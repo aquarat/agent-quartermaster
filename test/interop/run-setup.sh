@@ -94,7 +94,8 @@ cat >"$T/hook" <<EOF
 #!/usr/bin/env bash
 set -u
 pidfile=$T/aqmasd.pid
-running() { [[ -f \$pidfile ]] && kill -0 "\$(cat \$pidfile)" 2>/dev/null; }
+# A killed broker stays a zombie where PID 1 does not reap (CI containers): kill -0 still succeeds.
+running() { [[ -f \$pidfile ]] && kill -0 "\$(cat \$pidfile)" 2>/dev/null && ! grep -qs '^State:[[:space:]]*Z' "/proc/\$(cat \$pidfile)/status"; }
 case \$1 in
 stop) if running; then kill "\$(cat \$pidfile)"; for _ in \$(seq 600); do running || break; sleep 0.05; done; fi; ! running ;;  # up to 30 s: CI is slow
 start) running && exit 1
