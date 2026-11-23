@@ -348,9 +348,10 @@ func (s *Server) bastionDeliver(ctx context.Context, r *http.Request, req *store
 	if peerIP(r) != req.PeerAddress {
 		return errConflict("collect the certificate from the address that asked for it")
 	}
-	if bg.CloseBuckets && s.sealServing() {
-		// Again at the moment of delivery: whatever was opened since the approval closes.
-		s.closeAll()
+	if bg.CloseBuckets && s.sealServing() && !s.closeAllDrained() {
+		// Again at the moment of delivery: whatever was opened since the approval closes,
+		// and a key that an operation is still using is waited for. The requester retries.
+		return &apiErr{http.StatusServiceUnavailable, api.ErrConflict, "a credential is still in use on the bastion; retrying"}
 	}
 	err = s.store.Tx(ctx, func(q *store.Q) error {
 		if err := q.MarkBastionDelivered(ctx, g.ID, now, now.Add(-bastionCollect)); err != nil {
@@ -546,7 +547,9 @@ func (s *Server) applyBastion(ctx context.Context, q *store.Q, r *store.Request,
 		// If anything below fails the transaction rolls back and no certificate exists, with
 		// the buckets closed all the same.
 		bg.Closed = len(openNow)
-		s.closeAll()
+		if !s.closeAllDrained() {
+			return errConflict("a credential is in use this instant and could not be closed; approve again in a moment")
+		}
 		if left := s.openBuckets(ctx, q); len(left) != 0 {
 			return errConflict("buckets could not be closed: " + strings.Join(left, ", "))
 		}
@@ -611,6 +614,9 @@ func (s *Server) issueBastionGrant(ctx context.Context, q *store.Q, r *store.Req
 // sends the alert synchronously and records the outcome: until that record exists the
 // requester cannot collect the certificate.
 func (s *Server) afterBastionDecision(ctx context.Context, sg canon.Signed) (api.BastionDecision, error) {
+	// The decision is committed. Nothing from here on may depend on the owner's browser
+	// still being connected: neither the alert nor its record.
+	ctx = context.WithoutCancel(ctx)
 	a := sg.Action
 	out := api.BastionDecision{ID: a.ID, Kind: api.KindBastion, Level: a.Level, Status: api.StatusDenied}
 	q := s.store.Q()
@@ -641,7 +647,7 @@ func (s *Server) afterBastionDecision(ctx context.Context, sg canon.Signed) (api
 	}
 	text := fmt.Sprintf("ROOT session on the bastion approved for %s (%s), %d min; %s [ref %s]", a.RequestingHost, a.Address, (a.TTLSeconds+59)/60, buckets, ref(a.ID))
 	// The owner's browser going away must not skip the alert or its record.
-	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	actx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	out.Alert = alertSent
 	switch err := s.notify.Deliver(actx, "aqmas: ROOT ON THE BASTION", text, s.cfg.PublicBaseURL+"/"); {
@@ -651,7 +657,7 @@ func (s *Server) afterBastionDecision(ctx context.Context, sg canon.Signed) (api
 		out.Alert = alertFailed
 	}
 	now := s.now()
-	err = s.store.Tx(context.WithoutCancel(ctx), func(q *store.Q) error {
+	err = s.store.Tx(ctx, func(q *store.Q) error {
 		if err := q.SetBastionAlert(ctx, g.ID, out.Alert, now); err != nil {
 			return err
 		}
@@ -662,6 +668,23 @@ func (s *Server) afterBastionDecision(ctx context.Context, sg canon.Signed) (api
 		return out, errConflict("the alert outcome could not be recorded; the certificate will not be issued. Ask again.")
 	}
 	return out, nil
+}
+
+// closeAllDrained closes every bucket, hold, window and pending tap and reports whether every
+// key is gone from memory. A key that an operation is using at that instant is wiped when
+// the operation ends: it is waited for briefly, and "not drained" means do not issue yet.
+func (s *Server) closeAllDrained() bool {
+	if !s.sealServing() {
+		return true
+	}
+	s.closeAll()
+	for i := 0; i < 20; i++ {
+		if s.seal.pool.held() == 0 {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return s.seal.pool.held() == 0
 }
 
 // ---- allowlist ----

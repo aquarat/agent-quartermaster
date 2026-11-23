@@ -239,6 +239,14 @@ func (p *bucketPool) allHolds() map[seal.ID][]bucketHold {
 	return out
 }
 
+// held counts every key still in memory, including buckets that are closing while an
+// operation finishes with them.
+func (p *bucketPool) held() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.open)
+}
+
 func (p *bucketPool) count() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()

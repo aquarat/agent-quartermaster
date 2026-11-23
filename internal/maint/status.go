@@ -22,6 +22,9 @@ type Status struct {
 type Refusal struct {
 	At     string `json:"at"`
 	Reason string `json:"reason"`
+	// Request identifies the refused approval like TaskStatus.Request ("" when the spool
+	// held nothing readable).
+	Request string `json:"request,omitempty"`
 }
 
 // RunnerInfo describes the installed runner.

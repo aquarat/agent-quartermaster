@@ -154,6 +154,9 @@ func TestBastionDisabledWithoutConfig(t *testing.T) {
 	_, line := newSSHKey(t)
 	st, _ = agentDo(t, c, "POST", e.agent.URL+"/v1/bastion/requests", api.BastionRequest{Level: "inspect", PublicKey: line, Reason: "x", Requester: api.Requester{Tool: "other", User: "a"}}, nil)
 	mustStatus(t, "request", st, 404)
+	// Before access is installed no host can queue a maintenance card either.
+	st, _ = agentDo(t, c, "POST", e.agent.URL+"/v1/setup-requests", map[string]any{"task": maint.TaskDiskUsage, "reason": "x", "requester": map[string]any{"tool": "other", "user": "a"}}, nil)
+	mustStatus(t, "queue", st, 404)
 	var v api.BastionView
 	mustStatus(t, "view", e.webDo("GET", "/api/ui/bastion", nil, &v), 200)
 	if v.Enabled || len(v.Tasks) != 9 {
@@ -935,6 +938,23 @@ func TestSetupRequestsNeedTheTap(t *testing.T) {
 	agentDo(t, b.host, "GET", b.agent.URL+"/v1/setup-requests/"+rc.ID, nil, &rs)
 	if rs.Run == nil || rs.Run.State != "done" || rs.Run.Result["freed"] != "120M" {
 		t.Fatalf("run status %+v", rs.Run)
+	}
+	// A refusal is reported only to the request it refuses: another task's is not this host's news.
+	delete(status.Tasks, maint.TaskJournalVacuum)
+	status.Refused = &maint.Refusal{At: b.clock.Now().UTC().Format(time.RFC3339), Reason: "another task's refusal", Request: "0000000000000000"}
+	out, _ = json.Marshal(status)
+	requireNoError(t, os.WriteFile(maint.StatusPath(b.cfg.Updates.Cache()), out, 0o644))
+	rs = api.SetupRequestStatus{}
+	agentDo(t, b.host, "GET", b.agent.URL+"/v1/setup-requests/"+rc.ID, nil, &rs)
+	if rs.Run == nil || rs.Run.State != "queued" {
+		t.Fatalf("a foreign refusal was reported: %+v", rs.Run)
+	}
+	status.Refused.Request = digest
+	out, _ = json.Marshal(status)
+	requireNoError(t, os.WriteFile(maint.StatusPath(b.cfg.Updates.Cache()), out, 0o644))
+	agentDo(t, b.host, "GET", b.agent.URL+"/v1/setup-requests/"+rc.ID, nil, &rs)
+	if rs.Run == nil || rs.Run.State != "refused" {
+		t.Fatalf("its own refusal was not reported: %+v", rs.Run)
 	}
 	// Dismiss and cancel only ever return to "nothing queued".
 	requireNoError(t, os.Remove(spool))

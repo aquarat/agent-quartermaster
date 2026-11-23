@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -349,19 +348,17 @@ func checkUser(dataDir string) error {
 
 // inspectCommand is the forced command of the bastion's read-only account. It runs before
 // anything else in main: it reads no configuration (that account cannot) and takes its
-// request only from SSH_ORIGINAL_COMMAND. --bin DIR relocates the fixed tools for tests; it
-// gives a caller nothing they could not run themselves, and sshd's forced command line is
-// fixed by root.
+// request only from SSH_ORIGINAL_COMMAND. It takes no argument at all: nothing on its command
+// line can relocate the tools it runs.
+// inspectBin is where the inspect command's fixed tools live. Only tests change it.
+var inspectBin = "/usr/bin"
+
 func inspectCommand(args []string, request string, out, errOut io.Writer) int {
-	bin := "/usr/bin"
-	switch {
-	case len(args) == 0:
-	case len(args) == 2 && args[0] == "--bin" && filepath.IsAbs(args[1]):
-		bin = args[1]
-	default:
+	if len(args) != 0 {
 		fmt.Fprintln(errOut, "usage: aqmasd inspect   (the request is read from SSH_ORIGINAL_COMMAND)")
 		return 2
 	}
+	bin := inspectBin
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return inspect.Run(ctx, request, bin, version, out, errOut)

@@ -376,7 +376,8 @@ The only request-derived values that reach a command line are the boolean (as th
 fixed arguments) and `keep_days` (an integer re-formatted by the runner).
 
 **Queueing by an agent.** `POST /v1/setup-requests {task, params, reason, requester}` from an
-enrolled, admitted host. Accepted: the six routine tasks only (never the access tasks,
+enrolled, admitted host. Like everything here it is off until access to the bastion is
+installed (404 before): until then no host can put a maintenance card in front of the owner. Accepted: the six routine tasks only (never the access tasks,
 sealing, pins, updates of aqmas itself), never `kernel:true`, and `keep_days` of at least 7.
 `reason` is required. Limits: one undecided request per host, three in total, three per host
 in five minutes, and the shared per-host pending limit. The broker validates and
@@ -497,3 +498,16 @@ wider kernel/boot-chain exclusions verified against the boot files, dnf outside 
 sandbox, the boot-change marker that blocks `reboot`, and the sshd re-check after updates;
 agents cannot queue kernel updates or short journal trims and are rate-limited. Recommended
 and not built: a root-owned alert on every certificate login to the bastion.
+
+An independent review of the code then led to: queueing refused until access is installed;
+the alert and its record no longer depend on the owner's browser staying connected; "closed"
+now means no key is left in memory (a key in use at that instant is waited for, otherwise
+nothing is issued or delivered yet); `bastion-allow` withdraws the old list from sshd and from
+the broker before writing the new one, and both access tasks delete every principals file
+they do not write; a refusal is reported only to the request it refuses; the forced command
+takes no argument at all; and the interop run shows a real sshd refusing a properly approved
+root certificate from an address that is not on root's list. Known and accepted: the
+installer probes sshd's effective configuration for one client address, so an earlier
+`Match Address` block in the bastion's own sshd configuration could escape its check (the
+inspect certificate's own forced command still applies); in organisations mode the bastion
+decision requires the global owner at apply, which is the only approver that exists today.

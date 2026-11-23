@@ -27,8 +27,10 @@ const (
 )
 
 func (s *Server) handleSetupRequestCreate(w http.ResponseWriter, r *http.Request, h *store.Host) {
-	if !s.bastionOn {
-		s.writeErr(w, r, errNotFound())
+	// Off until the owner has installed access to the bastion: before that no host can put
+	// a maintenance card in front of the owner.
+	if _, err := s.bastionCfg(); err != nil {
+		s.writeErr(w, r, err)
 		return
 	}
 	var in api.SetupRequest
@@ -130,11 +132,9 @@ func (s *Server) setupRunOf(req *store.SetupRequest) *api.SetupRunStatus {
 	if t := st.Tasks[req.Task]; t != nil && t.Request == req.Digest {
 		return from(t)
 	}
-	// Not started (yet). A refusal recorded after the approval is the runner's answer to it.
-	if rf := st.Refused; rf != nil && req.DecidedAt != nil {
-		if at, err := time.Parse(time.RFC3339, rf.At); err == nil && !at.Before(req.DecidedAt.Truncate(time.Second)) {
-			return &api.SetupRunStatus{State: "refused", Message: rf.Reason, Finished: rf.At}
-		}
+	// Not started (yet). Only the refusal of this very request is this requester's business.
+	if rf := st.Refused; rf != nil && rf.Request == req.Digest {
+		return &api.SetupRunStatus{State: "refused", Message: rf.Reason, Finished: rf.At}
 	}
 	if req.DecidedAt != nil && s.now().Sub(*req.DecidedAt) > 2*maint.MaxAge {
 		return &api.SetupRunStatus{State: "failed", Message: "the maintenance runner did not pick this up"}

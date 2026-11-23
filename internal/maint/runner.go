@@ -38,6 +38,7 @@ type Runner struct {
 	retryDelay time.Duration
 	interrupt  context.Context // cancelled when the unit is being stopped
 	pinned     []KeyPin        // the pins this run verified its request against
+	refusing   string          // digest of the request being checked, for a refusal's record
 	// after runs once the task's final status is written (the machine restart: the page
 	// must say what happened before the machine goes away).
 	after func(context.Context)
@@ -251,6 +252,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		return r.refuse(err)
 	}
+	r.refusing = hex.EncodeToString(canon.Challenge(req.Canonical))[:16]
 	pins, err := r.readPins()
 	if err != nil {
 		return r.refuse(err)
@@ -331,7 +333,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 // refuse records why a request was not run. The text is fixed wording from this package.
 func (r *Runner) refuse(err error) error {
-	r.st.Refused = &Refusal{At: stamp(r.now()), Reason: clean(err.Error())}
+	r.st.Refused = &Refusal{At: stamp(r.now()), Reason: clean(err.Error()), Request: r.refusing}
 	r.save()
 	r.log.Error("request refused", "error", err)
 	return handled(err)

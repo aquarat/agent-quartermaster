@@ -137,6 +137,17 @@ bastion_scenario() {
 	[[ $(owner bastion | bun -e 'const v=await Bun.stdin.json();console.log(v.hosts.filter(h=>h.allowed).map(h=>h.name+"@"+h.allowed_address).join())') == interop-host@127.0.0.1 ]] || fail "allowlist not shown: $(owner bastion)"
 	bastion_sshd "$PB" root
 
+	# sshd itself enforces the address: with another address on root's list, a properly
+	# approved root certificate is refused at the door.
+	cp "$L/sysroot/etc/ssh/aqmas_principals/$ME" "$T/principals.keep"
+	echo "from=\"192.0.2.99\" $ME@bastion" >"$L/sysroot/etc/ssh/aqmas_principals/$ME"
+	"$AQMAS" ssh bastion --level root --ttl 5m --why "interop: from another address" -- echo root-ok </dev/null >"$T/root-from.out" 2>"$T/root-from.err" &
+	pid=$!
+	owner approve-root "$(owner wait bastion interop-host 20)" 300 close >/dev/null 2>&1 || fail "approve root (from= case)"
+	if wait $pid; then fail "sshd accepted a root certificate from an address that is not on root's list"; fi
+	[[ ! -s $T/root-from.out ]] && grep -qi 'permission denied' "$T/root-from.err" || fail "from= refusal: $(cat "$T/root-from.err")"
+	cp "$T/principals.keep" "$L/sysroot/etc/ssh/aqmas_principals/$ME"
+
 	# A bucket is open (a standing rule holds the SSH CA): the red card must list it.
 	"$AQMAS" ssh testhost --fresh --why "open something first" -- echo granted </dev/null >"$T/ssh.out" 2>"$T/ssh.err" &
 	pid=$!

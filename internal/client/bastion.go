@@ -449,7 +449,7 @@ func (e *Env) sweepRootTemp() {
 		if !ent.IsDir() || !strings.HasPrefix(ent.Name(), rootTempPrefix) {
 			continue
 		}
-		if fi, err := ent.Info(); err == nil && e.now().Sub(fi.ModTime()) > 2*time.Hour {
+		if fi, err := ent.Info(); err == nil && e.now().Sub(fi.ModTime()) > 65*time.Minute {
 			os.RemoveAll(filepath.Join(e.Paths.CacheDir, ent.Name()))
 		}
 	}

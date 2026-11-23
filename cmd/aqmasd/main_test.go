@@ -78,8 +78,10 @@ func TestInspectCommand(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	inspectBin = dir
+	defer func() { inspectBin = "/usr/bin" }()
 	var out, errOut bytes.Buffer
-	if code := inspectCommand([]string{"--bin", dir}, "logs aqmasd lines=5", &out, &errOut); code != 0 || out.String() != "ran\n" {
+	if code := inspectCommand(nil, "logs aqmasd lines=5", &out, &errOut); code != 0 || out.String() != "ran\n" {
 		t.Fatal(code, out.String(), errOut.String())
 	}
 	b, _ := os.ReadFile(log)
@@ -90,7 +92,7 @@ func TestInspectCommand(t *testing.T) {
 	out.Reset()
 	// Anything outside the grammar runs nothing; a shell is never involved.
 	for _, req := range []string{"sh", "logs aqmasd; id", "cat /etc/aqmas/config.toml", "logs aqmasd --file=/var/lib/aqmas/aqmas.db", "scp -t /tmp"} {
-		if code := inspectCommand([]string{"--bin", dir}, req, &out, &errOut); code != 2 || out.Len() != 0 {
+		if code := inspectCommand(nil, req, &out, &errOut); code != 2 || out.Len() != 0 {
 			t.Fatalf("%q: exit %d, output %q", req, code, out.String())
 		}
 	}
@@ -98,7 +100,7 @@ func TestInspectCommand(t *testing.T) {
 		t.Fatal("a refused request ran a command")
 	}
 	// Arguments on the forced command line itself are not a way to pass a request.
-	for _, args := range [][]string{{"logs", "aqmasd"}, {"--bin"}, {"--bin", "relative"}, {"--bin", dir, "x"}, {"-config", "/etc/aqmas/config.toml"}} {
+	for _, args := range [][]string{{"logs", "aqmasd"}, {"--bin"}, {"--bin", dir}, {"-config", "/etc/aqmas/config.toml"}} {
 		if code := inspectCommand(args, "help", &out, &errOut); code != 2 {
 			t.Fatalf("%v accepted", args)
 		}

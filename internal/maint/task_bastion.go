@@ -221,6 +221,27 @@ func (l Layout) writePrincipals(b config.Bastion, allowed []AllowedHost) error {
 	return writeOwned(path, []byte(`from="`+strings.Join(from, ",")+`" `+b.Principal(config.LevelRoot)+"\n"), 0, 0, 0644)
 }
 
+// purgePrincipals removes every principals file except those of the named accounts. On the
+// bastion the directory belongs to this runner alone: the fleet-host installer never runs here.
+func (l Layout) purgePrincipals(keep ...string) error {
+	ents, err := os.ReadDir(l.principalsDir())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		if slices.Contains(keep, e.Name()) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(l.principalsDir(), e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // swapConfig replaces the configuration, keeping a root-only copy of the old one.
 func (r *Runner) swapConfig(raw []byte, label string) error {
 	if err := os.MkdirAll(r.l.Backups, 0700); err != nil {
@@ -290,8 +311,11 @@ func (r *Runner) bastionAccess(ctx context.Context, p BastionAccessParams) (stri
 			_ = r.uninstallTrust(ctx)
 		}
 	}
-	if old.Enabled() && old.AdminUser != b.AdminUser {
-		_ = os.Remove(filepath.Join(r.l.principalsDir(), old.AdminUser))
+	// No principals file but the two this task writes may survive (an earlier admin account,
+	// an interrupted removal): a stale one would still be honoured for its account.
+	if err := r.l.purgePrincipals(config.InspectUser, b.AdminUser); err != nil {
+		undo()
+		return "", err
 	}
 	if err := r.l.writePrincipals(b, ReadAllow(AllowPath(r.l.ConfigDir))); err != nil {
 		undo()
@@ -338,20 +362,33 @@ func (r *Runner) bastionAllow(ctx context.Context, p BastionAllowParams) (string
 	if err != nil {
 		return "", err
 	}
-	r.step("Writing the root-owned list")
 	_, gid, err := r.l.serviceIDs()
 	if err != nil {
 		return "", err
 	}
-	if err := writeOwned(AllowPath(r.l.ConfigDir), []byte(text+"\n"), 0, gid, 0640); err != nil {
-		return "", err
+	// Narrow first: whichever file is written second, an interruption in between must never
+	// leave sshd accepting an address the new list dropped. So the old list is withdrawn from
+	// both places before the new one is written to either.
+	closed := func() error {
+		if err := r.l.writePrincipals(b, nil); err != nil {
+			return err
+		}
+		if err := os.Remove(AllowPath(r.l.ConfigDir)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	r.step("Writing the root-owned list")
+	if err := closed(); err != nil {
+		return "", errors.New("the previous list could not be withdrawn; nothing was changed that widens it")
 	}
 	r.step("Rewriting the admin account's principals file with the listed addresses")
-	if err := r.l.writePrincipals(b, p.Hosts); err != nil {
-		// Never leave the list wider than what sshd enforces.
-		_ = os.Remove(AllowPath(r.l.ConfigDir))
-		_ = r.l.writePrincipals(b, nil)
-		return "", errors.New("the principals file could not be written; nobody may ask for root now")
+	if err := r.l.writePrincipals(b, p.Hosts); err == nil {
+		err = writeOwned(AllowPath(r.l.ConfigDir), []byte(text+"\n"), 0, gid, 0640)
+	}
+	if err != nil {
+		_ = closed()
+		return "", errors.New("the list could not be written; nobody may ask for root now")
 	}
 	var names []string
 	for _, h := range p.Hosts {
@@ -383,9 +420,11 @@ func (r *Runner) bastionRemove(ctx context.Context) (string, error) {
 			}
 			return "", errors.New("the broker was not healthy without the bastion entry; the previous configuration was restored and nothing else was changed")
 		}
-		if err := os.Remove(filepath.Join(r.l.principalsDir(), b.AdminUser)); err != nil && !os.IsNotExist(err) {
-			return "", err
-		}
+	}
+	// Whether or not this run removed the table (an interrupted run may have): no admin
+	// principals file and no allowlist stay behind.
+	if err := r.l.purgePrincipals(config.InspectUser); err != nil {
+		return "", err
 	}
 	if err := os.Remove(AllowPath(r.l.ConfigDir)); err != nil && !os.IsNotExist(err) {
 		return "", err
