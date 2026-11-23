@@ -15,11 +15,22 @@ import (
 // §13) were added after schema 9 shipped. BucketDDL runs at every boot with IF
 // NOT EXISTS, so an existing store gains them empty and nothing else changes;
 // the schema version stays 9.
+//
+// passkey_prf is the sticky mark "this passkey has had a PRF wrap": the trigger
+// mark_passkey_prf sets it in the transaction that writes a passkey's first
+// PRF wrap (enable, recovery enrol, activation, seal-recover), and the INSERT
+// below marks, at boot, every passkey of an existing store that has one now.
+// Nothing clears it but removing the passkey. While it is set the passkey is
+// refused the remembered-browser path (§13.4), also after its wraps are gone.
 const BucketDDL = `CREATE TABLE IF NOT EXISTS bucket_scopes(scope TEXT PRIMARY KEY,public_key BLOB NOT NULL CHECK(length(public_key)=65),recovery BLOB NOT NULL,created INTEGER NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS scope_wraps(id INTEGER PRIMARY KEY,passkey INTEGER NOT NULL REFERENCES passkeys(id) ON DELETE CASCADE,scope TEXT NOT NULL REFERENCES bucket_scopes(scope) ON DELETE CASCADE,salt BLOB NOT NULL UNIQUE CHECK(length(salt)=32),wrap BLOB NOT NULL CHECK(length(wrap)=73),created INTEGER NOT NULL,tested_at INTEGER,UNIQUE(passkey,scope)) STRICT;
 CREATE TABLE IF NOT EXISTS buckets(id BLOB PRIMARY KEY CHECK(length(id)=32),scope TEXT NOT NULL REFERENCES bucket_scopes(scope),kind TEXT NOT NULL CHECK(kind IN ('ssh-ca','internal-ca','cf-proxy','env-set','signer')),ref TEXT NOT NULL,public_key BLOB NOT NULL CHECK(length(public_key)=65),wrap BLOB NOT NULL CHECK(length(wrap)=113),payload BLOB,created INTEGER NOT NULL,UNIQUE(kind,ref)) STRICT;
 CREATE TABLE IF NOT EXISTS browser_keys(id INTEGER PRIMARY KEY,passkey INTEGER NOT NULL REFERENCES passkeys(id) ON DELETE CASCADE,public_key BLOB NOT NULL CHECK(length(public_key)=65),label TEXT NOT NULL,created INTEGER NOT NULL,last_used INTEGER,UNIQUE(passkey,public_key)) STRICT;
 CREATE TABLE IF NOT EXISTS browser_wraps(id BLOB PRIMARY KEY CHECK(length(id)=32),browser_key INTEGER NOT NULL REFERENCES browser_keys(id) ON DELETE CASCADE,scope TEXT NOT NULL REFERENCES bucket_scopes(scope) ON DELETE CASCADE,wrap BLOB NOT NULL CHECK(length(wrap)=73),sealed_kek BLOB NOT NULL CHECK(length(sealed_kek)=113),created INTEGER NOT NULL,tested_at INTEGER,UNIQUE(browser_key,scope)) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS browser_keys_label ON browser_keys(passkey,label);
+CREATE TABLE IF NOT EXISTS passkey_prf(passkey INTEGER PRIMARY KEY REFERENCES passkeys(id) ON DELETE CASCADE,since INTEGER NOT NULL) STRICT;
+CREATE TRIGGER IF NOT EXISTS mark_passkey_prf AFTER INSERT ON scope_wraps BEGIN INSERT OR IGNORE INTO passkey_prf(passkey,since) VALUES(NEW.passkey,NEW.created); END;
+INSERT OR IGNORE INTO passkey_prf(passkey,since) SELECT passkey,min(created) FROM scope_wraps GROUP BY passkey;
 CREATE VIEW IF NOT EXISTS scope_openers AS SELECT passkey,scope,tested_at FROM scope_wraps UNION ALL SELECT k.passkey,w.scope,w.tested_at FROM browser_wraps w JOIN browser_keys k ON k.id=w.browser_key;
 CREATE TABLE IF NOT EXISTS notice_channel(singleton INTEGER PRIMARY KEY CHECK(singleton=1),topic_url TEXT NOT NULL) STRICT;
 CREATE TRIGGER IF NOT EXISTS keep_one_scope_passkey BEFORE DELETE ON passkeys WHEN EXISTS(` + orphanedWhere + `) BEGIN SELECT RAISE(ABORT,'last passkey that can open buckets'); END;`
@@ -33,7 +44,7 @@ const orphanedWhere = `SELECT DISTINCT w.scope FROM scope_openers w WHERE w.pass
 
 // BucketTriggers recreates the guard triggers of a format-2 store at boot, so
 // a store made by an earlier build of schema 9 gets the current guard.
-const BucketTriggers = `DROP TRIGGER IF EXISTS keep_one_scope_passkey;`
+const BucketTriggers = `DROP TRIGGER IF EXISTS keep_one_scope_passkey;DROP TRIGGER IF EXISTS mark_passkey_prf;`
 
 // SchemaBuckets is PRAGMA user_version of a format-2 store.
 const SchemaBuckets = 9
@@ -281,6 +292,25 @@ func (q *Q) PutBrowserKey(ctx context.Context, o BrowserKeyRow) (int64, error) {
 	var id int64
 	err := q.q.QueryRowContext(ctx, `SELECT id FROM browser_keys WHERE passkey=? AND public_key=?`, o.Passkey, o.Public).Scan(&id)
 	return id, err
+}
+
+// PasskeyHadPRF reports the sticky mark: the passkey has, or once had, a PRF wrap.
+func (q *Q) PasskeyHadPRF(ctx context.Context, passkey int64) (bool, error) {
+	var ok bool
+	err := q.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM passkey_prf WHERE passkey=?)`, passkey).Scan(&ok)
+	return ok, err
+}
+
+// PasskeysWithPRF lists the passkeys carrying the sticky mark.
+func (q *Q) PasskeysWithPRF(ctx context.Context) (map[int64]bool, error) {
+	out := map[int64]bool{}
+	err := q.rows(ctx, `SELECT passkey FROM passkey_prf`, func(r *sql.Rows) error {
+		var p int64
+		err := r.Scan(&p)
+		out[p] = true
+		return err
+	})
+	return out, err
 }
 
 // DeleteBrowserKey forgets a remembered browser; its wraps go with it (cascade).

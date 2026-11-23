@@ -631,6 +631,13 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 		s.writeErr(w, r, err)
 		return
 	}
+	var bwraps []store.BrowserWrapRow
+	if s.sealServing() {
+		if bwraps, err = q.BrowserWraps(ctx, 0); err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+	}
 	out.Passkeys = make([]api.PasskeyInfo, 0, len(pks))
 	for i := range pks {
 		p := pks[i].info(cur)
@@ -647,11 +654,6 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 					if w.Tested != nil && (p.TestedAt == nil || w.Tested.After(*p.TestedAt)) {
 						p.TestedAt = w.Tested
 					}
-				}
-				bwraps, err := q.BrowserWraps(ctx, 0)
-				if err != nil {
-					s.writeErr(w, r, err)
-					return
 				}
 				for _, bw := range bwraps {
 					if bw.Passkey == pks[i].ID && bw.Tested != nil && (p.TestedAt == nil || bw.Tested.After(*p.TestedAt)) {

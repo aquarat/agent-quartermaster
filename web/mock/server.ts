@@ -1097,6 +1097,7 @@ export function startMock(opts: MockOptions = {}) {
       // Its wraps go with it, of both kinds (ON DELETE CASCADE in the broker).
       store.buckets.wraps.delete(pk.id);
       store.buckets.browsers.delete(pk.id);
+      store.buckets.hadPrf.delete(pk.id);
       let signedOut = false;
       for (const [sid, pid] of store.sessionPasskey) {
         if (pid !== id) continue;

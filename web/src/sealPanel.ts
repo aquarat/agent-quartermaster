@@ -52,6 +52,8 @@ export interface PasskeyScopes {
   /** How it opens buckets: "prf" (its own secret), "browser" (only from the remembered
    * browsers listed, §13) or "" (nothing yet). Absent from an older server. */
   mode?: "prf" | "browser" | "";
+  /** Sticky: it has, or once had, a PRF wrap. Never offered the remembered-browser path. */
+  had_prf?: boolean;
   browsers?: RememberedBrowser[];
   scopes: { scope: string; tested: boolean }[];
   opens: number;

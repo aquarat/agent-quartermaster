@@ -710,7 +710,7 @@ the second the scope KEK.
      "buckets":  [{"id","kind","label","scope","scope_title","open","opened_at"?,
                    "holds":[{"kind","ref","reason","until"?,"since"}],
                    "paused":[{"kind","ref","reason"}]}],
-     "passkeys": [{"id","name","current","prf","mode","scopes":[{"scope","tested"}],"opens","of","missing",
+     "passkeys": [{"id","name","current","prf","had_prf","mode","scopes":[{"scope","tested"}],"opens","of","missing",
                    "browsers":[{"id","key","label","created_at","last_used_at"?,"scopes":[{"scope","tested"}]}]}],
      "active_windows"?, "profiles"?, "verified_access"?, "leaf_expires"?, "leaf_repair"?,
      "stage"?}
@@ -728,6 +728,8 @@ the second the scope KEK.
   signing grants, standing rules) without a hold on it: they wait for a **Reopen**.
 * Per passkey: `id` as in `PasskeyInfo`; `prf` true when it holds any PRF scope wrap; `opens` the
   number of buckets in its scopes, `of` all buckets; `missing` the scopes it has no wrap for.
+  `had_prf`: it has, or once had, a PRF wrap (sticky until the passkey is removed; such a
+  passkey is refused the remembered-browser path).
   `mode` says how it opens buckets: `prf` (its own secret), `browser` (only from the
   remembered browsers in `browsers`; `scopes` is then the union over them, `tested` when some
   browser's wrap is) or `""` (nothing). `browsers[]`: `id` the key's fingerprint
@@ -815,8 +817,9 @@ that answers them has PRF and the page stops (BUCKETS.md §13.4). `finish` takes
 one fresh random 32-byte KEK per scope in the usual packet; the broker stores the scope key
 wrapped under it and the KEK sealed to `browser_key`.
 
-Refusals: `remember` for a passkey that has a PRF wrap (409), or naming a scope that browser
-already opens with a tested wrap (409); `enable` for a passkey that has remembered browsers
+Refusals: `remember` for a passkey that has, or ever had, a PRF wrap (409; the mark is
+sticky, status `had_prf`), with a label another browser of that passkey has (409), or naming
+a scope that browser already opens with a tested wrap (409); `enable` for a passkey that has remembered browsers
 (409); `forget` of the only tested wrap of a scope (409); a malformed key or label, a
 `browser_key` on another action, a label on anything but `remember` (400).
 
@@ -838,7 +841,9 @@ of the descriptor. Not signed: a hint for the card. Such passkeys are in `allowC
   ID (32 bytes), `sealed_kek` (113 bytes) = HPKE base mode to the browser key,
   `info = T2("browser-kek", raw installation, rpId, raw credential ID, scope, raw wrap ID,
   raw browser key)`, empty AAD, plaintext the 32-byte KEK.
-* Errors: 409 for an unknown, expired, finished or already released tap; 403 for an
+* Errors: 409 for an unknown, expired, finished or already released tap, for a tap of
+  another session, for a tap whose challenge is no longer pending, and for a step that
+  releases nothing (an `enrol` tap, a PRF `test` tap); 403 for an
   assertion that does not verify; 423 `locked` when this browser is not remembered for the
   asserting passkey or for one of the scopes; 429 after three attempts on one tap.
 
@@ -861,7 +866,7 @@ by another passkey than the release was for (403).
    and `browser_label` the enrol is for a passkey without PRF from that browser
    ([Remembered browsers](#remembered-browsers)): the canonical adds `browser_key`,
    `browser_key_id` and `browser_label`, the descriptor carries `browser_key`, and the wraps
-   written are browser wraps. Refused (409) for a passkey that has a PRF wrap; an enrol
+   written are browser wraps. Refused (409) for a passkey that has or ever had a PRF wrap, and for a label another browser of that passkey has; an enrol
    without `browser_key` is refused (409) for a passkey that has remembered browsers.
 3. `POST /api/ui/seal/recovery/finish {challenge_id, assertion, packet, open?}` →
    `{ok, scopes, buckets}`: drill opens every scope key from its recovery wrap and every bucket

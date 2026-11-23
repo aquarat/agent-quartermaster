@@ -207,8 +207,17 @@ func (s *Server) checkIntent(ctx context.Context, q *store.Q, in capIntent) (*st
 		case "remember":
 			// Only for a passkey without PRF: one that has PRF wraps keeps using
 			// its own secret and is never moved to the weaker path (§13.4).
-			if len(wraps) > 0 {
-				return nil, errConflict("this passkey opens buckets with its own secret (PRF): a remembered browser is only for passkeys without PRF")
+			// The mark is sticky: a passkey that ever had a PRF wrap stays refused
+			// after a Disable or a rekey took its wraps away.
+			if had, err := q.PasskeyHadPRF(ctx, p.ID); err != nil {
+				return nil, err
+			} else if had || len(wraps) > 0 {
+				return nil, errConflict("this passkey has PRF (it opens, or has opened, buckets with its own secret): a remembered browser is only for passkeys without PRF. Use Enable")
+			}
+			for _, k := range keys {
+				if k.Label == in.Label && !bytes.Equal(k.Public, browser) {
+					return nil, errConflict("another remembered browser of this passkey is already called " + in.Label + ": choose another name")
+				}
 			}
 			for _, w := range keyWraps {
 				if w.Tested != nil && slices.Contains(scopes, w.Scope) {
@@ -323,14 +332,27 @@ func (s *Server) orphanErr(ctx context.Context, q *store.Q, row int64, orphans [
 		}
 		return "the other passkey"
 	}
+	bwraps, err := q.BrowserWraps(ctx, 0)
+	if err != nil {
+		return err
+	}
 	var names, untested []string
 	for _, sc := range orphans {
 		names = append(names, scopeName(ctx, q, sc))
+		hint := ""
 		for _, w := range wraps {
 			if w.Scope == sc && w.Passkey != row && w.Tested == nil {
-				untested = append(untested, "test passkey "+nick(w.Passkey)+" for "+scopeName(ctx, q, sc))
+				hint = "test passkey " + nick(w.Passkey) + " for " + scopeName(ctx, q, sc)
 				break
 			}
+		}
+		for _, w := range bwraps {
+			if hint == "" && w.Scope == sc && w.Passkey != row && w.Tested == nil {
+				hint = "test passkey " + nick(w.Passkey) + " from its remembered browser for " + scopeName(ctx, q, sc)
+			}
+		}
+		if hint != "" {
+			untested = append(untested, hint)
 		}
 	}
 	if len(untested) == len(orphans) {
@@ -988,7 +1010,9 @@ func (s *Server) capFinish(ctx context.Context, r *http.Request, sess string) (a
 	s.bcast.notify()
 	how := ""
 	if browser != nil {
-		how = " from a remembered browser (" + st.intent.Label + ")"
+		// No free text in a notice: the passkey's nickname (normalised) and the
+		// browser key's fingerprint, never the label the owner typed.
+		how = " (" + st.intent.Name + ") from a remembered browser, key " + seal.BrowserKeyID(browser)[:12]
 	}
 	s.notify.Send("aqmas: passkey", "A passkey can now open "+strings.Join(t.scopes, ", ")+how+" [ref "+ref(st.id)+"]", s.cfg.PublicBaseURL+"/")
 	return map[string]any{"ok": true, "scopes": t.scopes}, nil

@@ -6,7 +6,8 @@
 import { type Api } from "./api";
 import { type SealView } from "./sealPanel";
 import { browserPath, canonicalJSON, NoPrfError, prepareTap, type OpenPacket } from "./buckets";
-import { BrowserKeyError, defaultLabel, normalizeLabel, NOT_REMEMBERED, TRADE_OFF, type BrowserKeys, type LocalBrowserKey } from "./browserKey";
+import { BrowserKeyError, browserKeyId, defaultLabel, normalizeLabel, NOT_REMEMBERED, shortKey, TRADE_OFF, type BrowserKeys, type LocalBrowserKey } from "./browserKey";
+import { decode } from "./b64url";
 import { type PasskeyScopes, type RememberedBrowser } from "./sealPanel";
 import { type Authenticator, decodeCreationOptions, encodeAttestation, type AssertionJSON } from "./webauthn";
 import { h, replace } from "./dom";
@@ -110,11 +111,25 @@ export function checkCapability(text: string, v: SealView, i: Intent, scopes: st
     if (i.action === "remember" ? c.browser_label !== i.browser_label : c.browser_label !== undefined) throw Error("The server's passkey change names another browser label");
   } else if (c.browser_key !== undefined || c.browser_key_id !== undefined || c.browser_label !== undefined) throw Error("The server's passkey change names a browser key you did not choose");
   if (i.action !== "disable" && i.action !== "test" && i.action !== "forget" && !binary32(c.id)) throw Error("Invalid registration");
+  if (usesBrowser(i) && c.browser_key_id !== fingerprintOf.get(i.browser_key!)) throw Error("The server's fingerprint is not that of the browser key you chose");
   const facts = Object.keys(c)
     .filter((k) => !CORE.includes(k))
     .map((k): [string, string] => [k, typeof c[k] === "string" ? (c[k] as string) : JSON.stringify(c[k])]);
   return { id: typeof c.id === "string" ? c.id : "", facts };
 }
+
+/** Fingerprints this page computed itself (browser key, base64url → hex), so a card shows and
+ * checks the page's own value, not the server's. */
+const fingerprintOf = new Map<string, string>();
+async function fingerprint(key: string): Promise<string> {
+  const id = fingerprintOf.get(key) ?? (await browserKeyId(new Uint8Array(decode(key))));
+  fingerprintOf.set(key, id);
+  return id;
+}
+
+/** Passkeys that returned no PRF result at an enrol tap in this page session: Enable goes
+ * straight to the offer for them instead of spending two taps to find out again. */
+export const noPrfSeen = new Set<string>();
 
 const titleOf = (v: SealView, s: string) => v.scopes?.find((x) => x.scope === s)?.title || s;
 
@@ -135,6 +150,8 @@ export async function startCapability(api: Api, v: SealView, i: Intent, rp: stri
   const all = [...new Set(i.scopes)].filter((s) => !skip.includes(s));
   if (enabling && i.scopes.length && !all.length) throw Error(`${i.nickname} already opens ${i.scopes.map((s) => titleOf(v, s)).join(", ")} (tested): nothing to enable`);
   if (usesBrowser(i) && !i.browser_key) throw Error(NOT_REMEMBERED);
+  const keyId = usesBrowser(i) ? await fingerprint(i.browser_key!) : "";
+  const known = (v.passkeys ?? []).flatMap((p) => p.browsers ?? []).find((x) => x.id === keyId);
   const perRound = 2;
   const rounds = Math.max(1, Math.ceil(all.length / perRound));
   const mine = all.slice(round * perRound, round * perRound + perRound);
@@ -191,6 +208,7 @@ export async function startCapability(api: Api, v: SealView, i: Intent, rp: stri
           s = await t.sign(auth);
         } catch (err) {
           // No PRF: this passkey cannot hold the secret itself. Offer the remembered browser.
+          if (err instanceof NoPrfError) noPrfSeen.add(target);
           if (err instanceof NoPrfError && i.action === "enable" && opts.browser) return rememberOffer(api, v, { nickname: i.nickname, credential_id: target, scopes: all }, rp, opts.browser, `${i.nickname} returned no PRF result, so it cannot hold the secret itself.`, { thenTest: opts.thenTest });
           if (err instanceof NoPrfError && i.action === "register") throw Error("This passkey returned no PRF result, so it cannot hold a scope key. Add it as an approve-only passkey instead, then use Remember this browser on it.");
           throw err;
@@ -219,8 +237,8 @@ export async function startCapability(api: Api, v: SealView, i: Intent, rp: stri
     title: what,
     progress: i.action === "test" ? prog(1, `${i.nickname} taps`) : i.action === "disable" || i.action === "forget" ? undefined : prog(1, "your signed-in passkey approves" + (d ? " and opens the scope keys" : "")),
     lines: [
-      ...(i.action === "remember" ? [TRADE_OFF] : []),
-      ...(i.action === "forget" ? ["The broker deletes what it holds for that browser. This passkey then no longer opens anything from it."] : []),
+      ...(i.action === "remember" ? [`This browser's key: ${shortKey(keyId)} (the start of its fingerprint; Security lists it next to the name).`, TRADE_OFF] : []),
+      ...(i.action === "forget" ? [`Forgets ${known ? `“${known.label}”` : "a browser"}, key ${shortKey(keyId)}.`, "The broker deletes what it holds for that browser. This passkey then no longer opens anything from it."] : []),
       ...tap.lines,
       ...facts.map(([k, x]) => `${k}: ${x}`),
     ],
@@ -309,7 +327,7 @@ export function runSteps(review: HTMLElement, auth: Authenticator, first: Step, 
         h("p", { class: "warn tradeoff" }, h("strong", null, "The trade-off. "), TRADE_OFF),
         h("ul", { class: "open-lines" },
           h("li", null, "This browser makes a key that cannot be exported and keeps it in its own storage. It is never sent."),
-          h("li", null, "The broker stores only ciphertext it cannot open, and hands it to this browser only inside a tap by this passkey."),
+          h("li", null, "The broker stores only ciphertext it cannot open by itself, and hands it to this browser only inside a tap by this passkey. That ciphertext is also in every copy and backup of the broker's database: with this browser's key it opens without the passkey."),
           h("li", null, "A passkey that already opens your credentials approves this, in a signed action that names the passkey and this browser's key."),
           h("li", null, "If this browser's storage is cleared, it is no longer remembered: you enable it again. Forget removes it at any time."),
         ),
@@ -411,9 +429,9 @@ export function howItOpens(p: PasskeyScopes): { mark: string; cls: string; text:
   return undefined;
 }
 
-/** "Firefox on Linux, added 1 Nov 2026, last used 2 h ago". */
+/** "Firefox on Linux (key ab12 cd34 ef56), added 1 Nov 2026, last used 2 h ago". */
 export function browserWords(b: RememberedBrowser): string {
-  return `${b.label}, added ${shortDate(b.created_at)}, last used ${b.last_used_at ? ago(b.last_used_at) : "never"}`;
+  return `${b.label} (key ${shortKey(b.id)}), added ${shortDate(b.created_at)}, last used ${b.last_used_at ? ago(b.last_used_at) : "never"}`;
 }
 
 /** After Forget: this profile's key is deleted when it was the forgotten one and no other
@@ -510,8 +528,21 @@ export function capabilityForm(api: Api, auth: Authenticator, v: SealView, pks: 
       // may be replaced), then tests them in the same flow.
       const todo = keyed.filter((s) => !p.scopes.some((x) => x.scope === s && x.tested));
       // p.prf only means "has at least one wrap"; whether the authenticator supports PRF is learnt during Enable.
+      // A passkey that has (or had) a PRF wrap is never offered the browser path.
+      const offerable = !p.prf && !p.had_prf ? browser : undefined;
       if (raw && todo.length)
-        acts.append(btn("Enable…", async () => runSteps(review, auth, await startCapability(api, v, { action: "enable", capability: "unlock", nickname: nick, credential_id: raw, scopes: todo }, location.hostname, 0, { thenTest: true, skip: testedScopes(v, pks, raw), browser: p.prf ? undefined : browser }), refresh)));
+        acts.append(
+          btn("Enable…", async () =>
+            runSteps(
+              review,
+              auth,
+              offerable && noPrfSeen.has(raw)
+                ? rememberOffer(api, v, { nickname: nick, credential_id: raw, scopes: todo }, location.hostname, offerable, `${nick} returned no PRF result earlier, so it cannot hold the secret itself.`)
+                : await startCapability(api, v, { action: "enable", capability: "unlock", nickname: nick, credential_id: raw, scopes: todo }, location.hostname, 0, { thenTest: true, skip: testedScopes(v, pks, raw), browser: offerable }),
+              refresh,
+            ),
+          ),
+        );
       if (raw && p.scopes.length) {
         acts.append(btn("Test…", start({ action: "test", capability: "unlock", nickname: nick, credential_id: raw, scopes: p.scopes.map((s) => s.scope) })));
         acts.append(btn("Disable…", start({ action: "disable", capability: "approve-only", nickname: nick, credential_id: raw, scopes: p.scopes.map((s) => s.scope) })));

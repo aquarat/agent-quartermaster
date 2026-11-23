@@ -22,7 +22,11 @@ export const NOT_REMEMBERED =
 export const NO_STORAGE =
   "This browser cannot keep a key for this site (a private window, or site storage is blocked), so it cannot be remembered. Use a normal window, or a passkey with PRF.";
 export const TRADE_OFF =
-  "Anyone who has this browser profile and this passkey can open your credentials. Normally the passkey alone holds the secret; here part of it lives in this browser's storage, so malware or a copy of this profile, together with the passkey, is enough.";
+  "Anyone who has this browser profile and this passkey can open your credentials. So can anyone who has this browser profile and a copy of the broker's database or of a backup of it: those two together need no passkey and no tap. Normally the passkey alone holds the secret; here it lives in this browser's storage, where malware on this machine or a copy of this profile can use it.";
+
+/** "ab12 cd34 ef56": the start of a browser key's fingerprint, for cards and rows. The whole
+ * fingerprint is in the signed text. */
+export const shortKey = (id: string) => id.slice(0, 12).replace(/(.{4})(?=.)/g, "$1 ");
 
 export interface LocalBrowserKey {
   pair: CryptoKeyPair;
@@ -37,7 +41,9 @@ export interface LocalBrowserKey {
 /** Where the key pair lives. IndexedDB in a browser; memory in tests and the mock. */
 export interface BrowserKeyStore {
   load(): Promise<CryptoKeyPair | undefined>;
-  save(pair: CryptoKeyPair): Promise<void>;
+  /** Keep `pair` unless the profile already has a key (another tab made one a moment ago):
+   * returns the pair that is stored, which every tab then uses. Never overwrites. */
+  save(pair: CryptoKeyPair): Promise<CryptoKeyPair>;
   clear(): Promise<void>;
 }
 
@@ -68,6 +74,8 @@ async function withStore<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) =>
       tx.oncomplete = () => resolve();
       tx.onabort = tx.onerror = () => reject(tx.error ?? new Error("IndexedDB transaction failed"));
     });
+    // A failed request also aborts the transaction: the request's error is the one reported.
+    done.catch(() => {});
     const out = await request(fn(tx.objectStore(STORE)));
     await done;
     return out;
@@ -78,14 +86,24 @@ async function withStore<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) =>
 
 /** The CryptoKeyPair is stored by structured clone: the private key stays non-extractable. */
 export function idbStore(): BrowserKeyStore {
+  const load = async () => {
+    const v = (await withStore("readonly", (s) => s.get(SLOT))) as unknown;
+    const p = v as Partial<CryptoKeyPair> | undefined;
+    return p && p.privateKey && p.publicKey ? (p as CryptoKeyPair) : undefined;
+  };
   return {
-    async load() {
-      const v = (await withStore("readonly", (s) => s.get(SLOT))) as unknown;
-      const p = v as Partial<CryptoKeyPair> | undefined;
-      return p && p.privateKey && p.publicKey ? (p as CryptoKeyPair) : undefined;
-    },
+    load,
     async save(pair) {
-      await withStore("readwrite", (s) => s.put(pair, SLOT));
+      // add(), not put(): two tabs remembering at once must end with one key. The loser's
+      // add fails with ConstraintError and it reads the winner's key.
+      try {
+        await withStore("readwrite", (s) => s.add(pair, SLOT));
+        return pair;
+      } catch (e) {
+        const there = (e as { name?: string } | null)?.name === "ConstraintError" ? await load() : undefined;
+        if (!there) throw e;
+        return there;
+      }
     },
     async clear() {
       await withStore("readwrite", (s) => s.delete(SLOT));
@@ -99,7 +117,8 @@ export function memoryStore(): BrowserKeyStore & { pair?: CryptoKeyPair } {
       return m.pair;
     },
     async save(pair) {
-      m.pair = pair;
+      m.pair ??= pair; // as IndexedDB add(): the first key stays
+      return m.pair;
     },
     async clear() {
       delete m.pair;
@@ -165,8 +184,8 @@ export class BrowserKeys {
     try {
       // Non-extractable: the private scalar cannot be exported by any script, including ours.
       const pair = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"])) as CryptoKeyPair;
-      key = await describe(pair);
-      await this.store.save(pair);
+      // Another tab may have made the profile's key meanwhile: use the one that is stored.
+      key = await describe(await this.store.save(pair));
     } catch (e) {
       if (e instanceof BrowserKeyError) throw e;
       throw new BrowserKeyError(NO_STORAGE);

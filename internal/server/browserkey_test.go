@@ -8,9 +8,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/envset"
@@ -39,6 +41,9 @@ func newTestBrowser(t *testing.T) *testBrowser {
 }
 func (b *testBrowser) id() string { return seal.BrowserKeyID(b.pub) }
 
+// label is unique per browser: one passkey's browsers may not share a label.
+func (b *testBrowser) label() string { return "Test browser " + b.id()[:6] }
+
 type releaseResp struct {
 	Wraps []struct {
 		Scope     string `json:"scope"`
@@ -49,6 +54,23 @@ type releaseResp struct {
 
 func (v *vaultEnv) release(r tapResp, as json.RawMessage, pub []byte, out any) int {
 	return v.web("POST", "/api/ui/seal/browser/release", map[string]any{"challenge_id": r.ChallengeID, "assertion": as, "browser_key": encodeID(pub)}, out)
+}
+
+// releaseQuiet is release without the helper's shared response log, for
+// requests made at the same time.
+func (v *vaultEnv) releaseQuiet(r tapResp, as json.RawMessage, pub []byte) int {
+	body, _ := json.Marshal(map[string]any{"challenge_id": r.ChallengeID, "assertion": as, "browser_key": encodeID(pub)})
+	req, _ := http.NewRequest("POST", v.env.web.URL+"/api/ui/seal/browser/release", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Aqmas", "1")
+	req.Header.Set("Origin", testBase)
+	req.Header.Set("Cookie", sessionCookie+"="+v.sess)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	resp.Body.Close()
+	return resp.StatusCode
 }
 
 // tapBrowser plays the page of a remembered browser for a tap by a (a passkey
@@ -131,7 +153,7 @@ func rememberBody(spare *vauth.Authenticator, b *testBrowser, action string, sco
 	}
 	m := map[string]any{"action": action, "nickname": nick, "capability": "unlock", "credential_id": encodeID(spare.CredID), "scopes": scopes, "browser_key": encodeID(b.pub)}
 	if action == "remember" {
-		m["browser_label"] = "Test browser"
+		m["browser_label"] = b.label()
 	}
 	return m
 }
@@ -143,7 +165,7 @@ func (v *vaultEnv) remember(spare *vauth.Authenticator, b *testBrowser, scopes [
 	v.t.Helper()
 	var r tapResp
 	mustStatus(v.t, "remember challenge", v.web("POST", "/api/ui/seal/passkeys/challenge", rememberBody(spare, b, "remember", scopes), &r), 200)
-	if !strings.Contains(r.Canonical, `"browser_key_id":"`+b.id()+`"`) || !strings.Contains(r.Canonical, `"credential_id":"`+encodeID(spare.CredID)+`"`) || !strings.Contains(r.Canonical, `"browser_label":"Test browser"`) {
+	if !strings.Contains(r.Canonical, `"browser_key_id":"`+b.id()+`"`) || !strings.Contains(r.Canonical, `"credential_id":"`+encodeID(spare.CredID)+`"`) || !strings.Contains(r.Canonical, `"browser_label":"`+b.label()+`"`) {
 		v.t.Fatalf("the canonical does not name the passkey and the browser key: %s", r.Canonical)
 	}
 	as, pkt := tap(r)
@@ -206,6 +228,7 @@ type statusPasskey struct {
 	ID     string
 	Name   string
 	PRF    bool
+	HadPRF bool `json:"had_prf"`
 	Mode   string
 	Opens  int
 	Scopes []struct {
@@ -256,7 +279,7 @@ func TestBrowserKeyEnableOpenForget(t *testing.T) {
 		t.Fatal("the audit log does not name the passkey and the browser key")
 	}
 	p := v.statusOf(spare)
-	if p.Mode != "browser" || p.PRF || len(p.Browsers) != 1 || p.Browsers[0].ID != b.id() || p.Browsers[0].Label != "Test browser" || p.Browsers[0].LastUsed == "" || p.Browsers[0].Created == "" || len(p.Scopes) != 2 || !p.Scopes[0].Tested || p.Opens != 3 {
+	if p.Mode != "browser" || p.PRF || len(p.Browsers) != 1 || p.Browsers[0].ID != b.id() || p.Browsers[0].Label != b.label() || p.Browsers[0].LastUsed == "" || p.Browsers[0].Created == "" || len(p.Scopes) != 2 || !p.Scopes[0].Tested || p.Opens != 3 {
 		t.Fatalf("status after remember: %+v", p)
 	}
 	if o := v.statusOf(v.auth); o.Mode != "prf" || !o.PRF || len(o.Browsers) != 0 {
@@ -266,7 +289,7 @@ func TestBrowserKeyEnableOpenForget(t *testing.T) {
 	// The offer lists the pair; the tap opens the SSH CA.
 	var r tapResp
 	mustStatus(t, "challenge", v.web("POST", "/api/ui/requests/"+rc.ID+"/challenge", api.ChallengeRequest{Action: "approve", TTLSeconds: 300}, &r), 200)
-	if r.Open == nil || len(r.Open.Browsers) != 1 || r.Open.Browsers[0].CredentialID != encodeID(spare.CredID) || r.Open.Browsers[0].KeyID != b.id() || r.Open.Browsers[0].Label != "Test browser" {
+	if r.Open == nil || len(r.Open.Browsers) != 1 || r.Open.Browsers[0].CredentialID != encodeID(spare.CredID) || r.Open.Browsers[0].KeyID != b.id() || r.Open.Browsers[0].Label != b.label() {
 		t.Fatalf("offer: %+v", r.Open)
 	}
 	if strings.Contains(r.Open.Descriptor, "sealed") || strings.Contains(string(r.PublicKey), encodeID(w[0].SealedKEK)) {
@@ -519,7 +542,7 @@ func TestBrowserKeyCanonicalBinding(t *testing.T) {
 	rem := rememberBody(spare, b, "remember", []string{"installation"})
 	tamper("remember: fingerprint", rem, b.id(), b2.id())
 	tamper("remember: key", rem, encodeID(b.pub), encodeID(b2.pub))
-	tamper("remember: label", rem, `"browser_label":"Test browser"`, `"browser_label":"Other browser"`)
+	tamper("remember: label", rem, `"browser_label":"`+b.label()+`"`, `"browser_label":"Other browser"`)
 	tamper("remember: passkey", rem, encodeID(spare.CredID), encodeID(v.auth.CredID))
 	tamper("remember: action", rem, `"action":"remember"`, `"action":"enable"`)
 	if len(v.browserWraps(spare)) != 0 {
@@ -828,5 +851,203 @@ func TestBrowserKeyCreatesAScope(t *testing.T) {
 	requireNoError(t, v.s.store.DB().QueryRow(`SELECT count(*) FROM scope_wraps WHERE scope=?`, org).Scan(&n))
 	if n != 0 || len(v.browserWraps(spare)) != 2 {
 		t.Fatal("the new scope's only wrap should be the remembered browser's")
+	}
+}
+
+// No downgrade, also after the PRF wraps are gone: a passkey that ever had a
+// PRF wrap carries a sticky mark and is refused the remembered-browser path.
+func TestBrowserKeyStickyPRFMark(t *testing.T) {
+	v := newVault(t)
+	b := newTestBrowser(t)
+	marked := func(a *vauth.Authenticator) bool {
+		var n int
+		requireNoError(t, v.s.store.DB().QueryRow(`SELECT count(*) FROM passkey_prf f JOIN passkeys p ON p.id=f.passkey WHERE p.credential_id=?`, a.CredID).Scan(&n))
+		return n == 1
+	}
+	try := func(a *vauth.Authenticator, scope string) int {
+		return v.web("POST", "/api/ui/seal/passkeys/challenge", rememberBody(a, b, "remember", []string{scope}), nil)
+	}
+	// Disable takes the wrap away; the mark stays.
+	spare := v.registerSpare("unlock", []string{"installation"}, bytes.Repeat([]byte{7}, 32))
+	if len(v.wraps(spare)) != 1 || !marked(spare) || !v.statusOf(spare).HadPRF {
+		t.Fatal("the first PRF wrap did not mark the passkey")
+	}
+	mustStatus(t, "remember while a PRF wrap exists", try(spare, "installation"), 409)
+	body := map[string]any{"action": "disable", "nickname": "spare", "capability": "approve-only", "credential_id": encodeID(spare.CredID), "scopes": []string{"installation"}}
+	mustStatus(t, "disable", v.capability(v.auth, body, nil), 200)
+	if len(v.wraps(spare)) != 0 || !marked(spare) {
+		t.Fatal("disable cleared the mark")
+	}
+	mustStatus(t, "remember after Disable", try(spare, "installation"), 409)
+	if p := v.statusOf(spare); p.Mode != "" || !p.HadPRF || p.PRF {
+		t.Fatalf("status after disable: %+v", p)
+	}
+	// Recovery enrol for a browser is refused for it as well.
+	attempt, _, digest := v.sealIdentity()
+	rec := map[string]any{"mode": "enrol", "attempt_id": attempt, "packet_sha256": digest, "credential_id": encodeID(spare.CredID), "scopes": []string{"installation"}, "browser_key": encodeID(b.pub), "browser_label": b.label()}
+	mustStatus(t, "browser recovery enrol after Disable", v.web("POST", "/api/ui/seal/recovery/challenge", rec, nil), 409)
+	// A rekey by another passkey drops a PRF passkey's wrap: still refused.
+	third := v.registerSpare2("third")
+	v.fix.prf[string(third.CredID)] = []byte("third-prf-secret")
+	en := map[string]any{"action": "enable", "nickname": "third", "capability": "unlock", "credential_id": encodeID(third.CredID), "scopes": []string{v.org}}
+	var auth struct {
+		Registration string `json:"registration_id"`
+	}
+	mustStatus(t, "enable", v.capability(v.auth, en, &auth), 200)
+	v.enrolFinish(third, auth.Registration)
+	mustStatus(t, "rekey by another passkey", v.control(map[string]any{"action": "rekey", "scope": v.org}, nil), 200)
+	if len(v.wraps(third)) != 0 || !marked(third) {
+		t.Fatal("a rekey by another passkey cleared the mark, or kept the wrap")
+	}
+	mustStatus(t, "remember after a rekey dropped the wrap", try(third, v.org), 409)
+	// A passkey that never had one is not marked, and removal takes the mark away.
+	plain := v.registerSpare2("plain")
+	if marked(plain) || v.statusOf(plain).HadPRF {
+		t.Fatal("an approve-only passkey is marked")
+	}
+	mustStatus(t, "remember for a passkey without the mark", try(plain, "installation"), 200)
+	cr, st := v.challenge("/api/ui/passkeys/"+passkeyID(spare.CredID), api.ChallengeRequest{Action: "remove"})
+	mustStatus(t, "remove challenge", st, 200)
+	mustStatus(t, "remove", v.decide("/api/ui/passkeys/"+passkeyID(spare.CredID), "remove", cr, nil), 200)
+	var n int
+	requireNoError(t, v.s.store.DB().QueryRow(`SELECT count(*) FROM passkey_prf`).Scan(&n))
+	if n != 2 { // the owner and "third"
+		t.Fatalf("marks after removing the passkey: %d", n)
+	}
+	// An existing installation: no table, no trigger. Boot marks every passkey
+	// that has a PRF wrap now.
+	_, err := v.s.store.DB().Exec(`DROP TRIGGER mark_passkey_prf; DROP TABLE passkey_prf;`)
+	requireNoError(t, err)
+	v.restart(v.logs)
+	v.login()
+	if !marked(v.auth) || marked(third) || marked(plain) {
+		t.Fatal("boot did not mark exactly the passkeys that have a PRF wrap")
+	}
+	owner := map[string]any{"action": "remember", "nickname": "test", "capability": "unlock", "credential_id": encodeID(v.auth.CredID), "scopes": []string{"installation"}, "browser_key": encodeID(b.pub), "browser_label": b.label()}
+	mustStatus(t, "remember a PRF passkey of an existing installation", v.web("POST", "/api/ui/seal/passkeys/challenge", owner, nil), 409)
+}
+
+// One passkey's remembered browsers have different labels.
+func TestBrowserKeyLabelsAreUnique(t *testing.T) {
+	v := newVault(t)
+	spare := v.registerSpare("approve-only", []string{}, nil)
+	other := v.registerSpare2("other")
+	b, b2 := newTestBrowser(t), newTestBrowser(t)
+	v.remember(spare, b, []string{"installation"}, v.ownerTap)
+	dup := rememberBody(spare, b2, "remember", []string{"installation"})
+	dup["browser_label"] = b.label()
+	mustStatus(t, "a second browser with the same label", v.web("POST", "/api/ui/seal/passkeys/challenge", dup, nil), 409)
+	attempt, _, digest := v.sealIdentity()
+	rec := map[string]any{"mode": "enrol", "attempt_id": attempt, "packet_sha256": digest, "credential_id": encodeID(spare.CredID), "scopes": []string{"installation"}, "browser_key": encodeID(b2.pub), "browser_label": b.label()}
+	mustStatus(t, "recovery enrol with a taken label", v.web("POST", "/api/ui/seal/recovery/challenge", rec, nil), 409)
+	// The same browser again (more scopes) keeps its label; another passkey may use it.
+	mustStatus(t, "the same browser, same label", v.web("POST", "/api/ui/seal/passkeys/challenge", rememberBody(spare, b, "remember", []string{v.org}), nil), 200)
+	same := rememberBody(other, b2, "remember", []string{"installation"})
+	same["browser_label"] = b.label()
+	mustStatus(t, "another passkey, same label", v.web("POST", "/api/ui/seal/passkeys/challenge", same, nil), 200)
+	if _, err := v.s.store.DB().Exec(`INSERT INTO browser_keys(passkey,public_key,label,created) SELECT passkey,?,label,1 FROM browser_keys`, b2.pub); err == nil {
+		t.Fatal("the store accepted a duplicate label")
+	}
+}
+
+// What a release is refused for: other steps, other sessions, stale taps, too
+// many attempts, and anything that changed between the release and the finish.
+func TestBrowserKeyReleaseRefusals(t *testing.T) {
+	v := newVault(t)
+	spare := v.registerSpare("approve-only", []string{}, nil)
+	b := newTestBrowser(t)
+	v.remember(spare, b, []string{"installation"}, v.ownerTap)
+	rc := ownerOnlySSH(t, v)
+	challenge := func() tapResp {
+		t.Helper()
+		var r tapResp
+		mustStatus(t, "challenge", v.web("POST", "/api/ui/requests/"+rc.ID+"/challenge", api.ChallengeRequest{Action: "approve", TTLSeconds: 300}, &r), 200)
+		return r
+	}
+	bound := func(r tapResp) []byte { return seal.OpenChallenge([]byte(r.Canonical), []byte(r.Open.Descriptor)) }
+	finish := func(r tapResp, as json.RawMessage, pkt *api.OpenPacket) int {
+		return v.web("POST", "/api/ui/requests/"+rc.ID+"/decide", api.DecideRequest{ChallengeID: r.ChallengeID, Assertion: as, Open: pkt}, nil)
+	}
+	// Three attempts per tap, then 429, also for the assertion that would verify.
+	r := challenge()
+	for i := 0; i < 3; i++ {
+		mustStatus(t, "bad attempt", v.release(r, spare.Assert(sha256Bytes("x")), b.pub, nil), 403)
+	}
+	mustStatus(t, "fourth attempt", v.release(r, spare.Assert(bound(r)), b.pub, nil), 429)
+	// An enrol tap releases nothing (its KEKs are new); nor does a PRF passkey's test tap.
+	var e tapResp
+	mustStatus(t, "remember challenge", v.web("POST", "/api/ui/seal/passkeys/challenge", rememberBody(spare, b, "remember", []string{v.org}), &e), 200)
+	as, pkt := v.ownerTap(e)
+	var auth struct {
+		Registration string `json:"registration_id"`
+	}
+	mustStatus(t, "authorize", v.web("POST", "/api/ui/seal/passkeys/authorize", map[string]any{"challenge_id": e.ChallengeID, "assertion": as, "open": pkt}, &auth), 200)
+	mustStatus(t, "evaluate", v.web("POST", "/api/ui/seal/passkeys/evaluate", map[string]any{"registration_id": auth.Registration}, &e), 200)
+	mustStatus(t, "release against an enrol tap", v.release(e, spare.Assert(bound(e)), b.pub, nil), 409)
+	test := map[string]any{"action": "test", "nickname": "test", "capability": "unlock", "credential_id": encodeID(v.auth.CredID), "scopes": []string{"installation"}}
+	mustStatus(t, "PRF test challenge", v.web("POST", "/api/ui/seal/passkeys/challenge", test, &e), 200)
+	mustStatus(t, "release against a PRF test tap", v.release(e, v.auth.Assert(bound(e)), b.pub, nil), 409)
+	// Another session cannot ask for this session's tap.
+	r = challenge()
+	mine := v.sess
+	v.login()
+	mustStatus(t, "release from another session", v.release(r, spare.Assert(bound(r)), b.pub, nil), 409)
+	v.sess = mine
+	// An expired tap, and a tap whose challenge was consumed.
+	r = challenge()
+	v.clock.Advance(ChallengeTTL + time.Second)
+	mustStatus(t, "expired tap", v.release(r, spare.Assert(bound(r)), b.pub, nil), 409)
+	v.login()
+	r = challenge()
+	_, err := v.s.store.DB().Exec(`UPDATE challenges SET used=1 WHERE id=?`, r.ChallengeID)
+	requireNoError(t, err)
+	mustStatus(t, "challenge already consumed", v.release(r, spare.Assert(bound(r)), b.pub, nil), 409)
+	// The registry refuses a release once the finish has taken the tap, and a second one.
+	r = challenge()
+	tp := v.s.seal.taps.peek(r.ChallengeID)
+	if !v.s.seal.taps.release(r.ChallengeID, tp, &tapRelease{row: 1, key: 1}) || v.s.seal.taps.release(r.ChallengeID, tp, &tapRelease{row: 1, key: 1}) {
+		t.Fatal("a tap must release exactly once")
+	}
+	r = challenge()
+	tp = v.s.seal.taps.peek(r.ChallengeID)
+	v.s.seal.taps.take(r.ChallengeID)
+	if v.s.seal.taps.release(r.ChallengeID, tp, &tapRelease{row: 1, key: 1}) || tp.released.Load() != nil {
+		t.Fatal("a release after the finish took the tap")
+	}
+	// Two releases at once: one gets the sealed KEKs.
+	r = challenge()
+	as = spare.Assert(bound(r))
+	codes := make(chan int, 2)
+	for i := 0; i < 2; i++ {
+		go func() { codes <- v.releaseQuiet(r, as, b.pub) }()
+	}
+	if a, c := <-codes, <-codes; !(a == 200 && c == 409 || a == 409 && c == 200) {
+		t.Fatalf("two concurrent releases: %d and %d", a, c)
+	}
+	// Forget between the release and the finish: the finish opens nothing.
+	r = challenge()
+	as, pkt, st := v.tapBrowser(spare, b, r)
+	mustStatus(t, "release", st, 200)
+	var f tapResp
+	mustStatus(t, "forget challenge", v.web("POST", "/api/ui/seal/passkeys/challenge", rememberBody(spare, b, "forget", []string{}), &f), 200)
+	fa, _ := v.ownerTap(f)
+	mustStatus(t, "forget", v.web("POST", "/api/ui/seal/passkeys/authorize", map[string]any{"challenge_id": f.ChallengeID, "assertion": fa}, nil), 200)
+	mustStatus(t, "finish after Forget", finish(r, as, pkt), 423)
+	if v.s.seal.pool.count() != 0 {
+		t.Fatal("a finish after Forget opened a bucket")
+	}
+	// Passkey removal between the release and the finish.
+	v.remember(spare, b, []string{"installation"}, v.ownerTap)
+	r = challenge()
+	as, pkt, st = v.tapBrowser(spare, b, r)
+	mustStatus(t, "release", st, 200)
+	cr, cs := v.challenge("/api/ui/passkeys/"+passkeyID(spare.CredID), api.ChallengeRequest{Action: "remove"})
+	mustStatus(t, "remove challenge", cs, 200)
+	mustStatus(t, "remove", v.decide("/api/ui/passkeys/"+passkeyID(spare.CredID), "remove", cr, nil), 200)
+	if st := finish(r, as, pkt); st/100 == 2 {
+		t.Fatal("a removed passkey finished its tap")
+	}
+	if v.s.seal.pool.count() != 0 {
+		t.Fatal("a finish after removal opened a bucket")
 	}
 }

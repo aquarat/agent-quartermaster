@@ -89,6 +89,10 @@ export class MockBuckets {
   wraps = new Map<string, Map<string, MockWrap>>();
   /** Passkeys (raw base64url) that return no PRF result. */
   noPrf = new Set<string>();
+  /** Sticky, as the broker's passkey_prf: passkeys that have, or once had, a PRF wrap. */
+  hadPrf = new Set<string>();
+  /** Release attempts per pending tap (attempt id): three, as the broker. */
+  private releaseTries = new Map<string, number>();
   /** credential (raw base64url) -> its remembered browsers */
   browsers = new Map<string, MockBrowser[]>();
   attempts = new Map<string, OpenAttempt>();
@@ -139,6 +143,7 @@ export class MockBuckets {
     const m = this.wraps.get(cred) ?? new Map<string, MockWrap>();
     for (const s of this.scopes) if (s.has_key && !m.has(s.scope)) m.set(s.scope, { salt: b64url(randomBytes(32)), tested: true });
     this.wraps.set(cred, m);
+    if (m.size) this.hadPrf.add(cred);
   }
 
   bucket(id: string): MockBucket {
@@ -177,6 +182,7 @@ export class MockBuckets {
           current: p.hex === cur,
           prf,
           mode,
+          had_prf: prf || this.hadPrf.has(p.id),
           browsers,
           scopes,
           opens: this.buckets.filter((b) => has(b.scope)).length,
@@ -281,7 +287,10 @@ export class MockBuckets {
     const aid = typeof body.challenge_id === "string" ? this.byChallenge.get(body.challenge_id) : undefined;
     const attempt = aid ? this.attempts.get(aid) : undefined;
     if (!attempt || attempt.session !== session) return fail(409, "conflict", "stale approval; review again");
-    if (attempt.released) return fail(409, "conflict", "this approval's keys were already released; review again");
+    if (attempt.released) return fail(409, "conflict", "this approval was finished or its keys were already released; review again");
+    const tries = (this.releaseTries.get(attempt.id) ?? 0) + 1;
+    this.releaseTries.set(attempt.id, tries);
+    if (tries > 3) return fail(429, "rate_limited", "too many attempts for this approval; review again");
     const d = attempt.descriptor;
     const key = String(body.browser_key ?? "");
     if (d.object === "scope-enrol" && (d.purpose !== "test" || d.browser_key !== key)) return fail(409, "conflict", "this step releases nothing to a browser");

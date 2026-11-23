@@ -131,7 +131,7 @@ const browserKeys = new browserKey.BrowserKeys(
       if (!profileKey) return undefined;
       return { privateKey: await crypto.subtle.importKey("jwk", profileKey.privateJwk, ECDH, false, ["deriveBits"]), publicKey: await crypto.subtle.importKey("jwk", profileKey.publicJwk, ECDH, true, []) };
     },
-    async save() {
+    async save(): Promise<CryptoKeyPair> {
       throw new Error("the helper's profile key is made by newProfileKey()");
     },
     async clear() {

@@ -8,8 +8,8 @@ import { createApi, type Api } from "../src/api";
 import { completeLogin, prepareLogin } from "../src/flows";
 import { startMock } from "../mock/server";
 import { prfAuth, jarFetch, type PrfAuth, type Sent } from "./helpers";
-import { capabilityForm, checkCapability, howItOpens, rememberOffer, startCapability, type BrowserContext, type Intent, type Step } from "../src/capabilities";
-import { BrowserKeys, BrowserKeyError, browserKeyId, defaultLabel, memoryStore, normalizeLabel, NOT_REMEMBERED, NO_STORAGE, TRADE_OFF, type BrowserKeyStore, type LocalBrowserKey } from "../src/browserKey";
+import { capabilityForm, checkCapability, howItOpens, noPrfSeen, rememberOffer, startCapability, type BrowserContext, type Intent, type Step } from "../src/capabilities";
+import { BrowserKeys, BrowserKeyError, browserKeyId, defaultLabel, memoryStore, normalizeLabel, NOT_REMEMBERED, NO_STORAGE, shortKey, TRADE_OFF, type BrowserKeyStore, type LocalBrowserKey } from "../src/browserKey";
 import { browserKekInfo, browserPath, canonicalJSON, parseDescriptor, prepareTap } from "../src/buckets";
 import { beginControl } from "../src/sealPanel";
 import { readiness, readinessPanel } from "../src/readiness";
@@ -68,7 +68,7 @@ describe("the browser key", () => {
     await expect(t.ensure()).rejects.toThrow(NO_STORAGE);
     await t.forget(); // never throws
     // A private window that accepts the write and keeps nothing.
-    const dropping: BrowserKeyStore = { load: async () => undefined, save: async () => {}, clear: async () => {} };
+    const dropping: BrowserKeyStore = { load: async () => undefined, save: async (p) => p, clear: async () => {} };
     await expect(new BrowserKeys(dropping).ensure()).rejects.toBeInstanceOf(BrowserKeyError);
     // navigator.storage.persist() said no, or is not there: the key is still made.
     expect((await new BrowserKeys(memoryStore(), async () => false).ensure()).persisted).toBe(false);
@@ -77,6 +77,20 @@ describe("the browser key", () => {
     const planted = memoryStore();
     planted.pair = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"])) as CryptoKeyPair;
     expect(await new BrowserKeys(planted).current()).toBeUndefined();
+  });
+
+  test("two tabs remembering at once end with one key", async () => {
+    const store = memoryStore();
+    const [a, b] = await Promise.all([new BrowserKeys(store, async () => true).ensure(), new BrowserKeys(store, async () => true).ensure()]);
+    expect(a.key.public).toBe(b.key.public);
+    expect((await new BrowserKeys(store).current())!.public).toBe(a.key.public);
+    // A store whose add() loses to another tab: the stored key is the one used, not ours.
+    const winner = (await new BrowserKeys(memoryStore()).ensure()).key.pair;
+    let first = true;
+    const racing: BrowserKeyStore = { load: async () => (first ? undefined : winner), save: async () => ((first = false), winner), clear: async () => {} };
+    const got = await new BrowserKeys(racing).ensure();
+    expect(got.key.pair).toBe(winner);
+    expect(shortKey("0123456789abcdef0123456789abcdef")).toBe("0123 4567 89ab");
   });
 
   test("labels: a default from the user agent, normalised as the broker does", () => {
@@ -158,6 +172,7 @@ describe("remember this browser", () => {
     yk = prfAuth(m.url, { rawId: rawOf(m.store.passkeys[2]!.id) });
     // The password-manager passkey starts as it does for the owner: sign and approve only.
     m.store.buckets.wraps.delete(bw.id);
+    m.store.buckets.hadPrf.delete(bw.id);
     m.store.buckets.closeAll();
     ({ api, log } = await as(m, me));
     browserPath.keys = keys;
@@ -217,6 +232,10 @@ describe("remember this browser", () => {
     const remember = seen[3]!;
     expect(remember.title).toContain(`Remember this browser (Work laptop) for ${nick(bw.id)}`);
     expect(remember.lines).toContain(TRADE_OFF);
+    // The card names the browser key by the start of its fingerprint, computed by the page.
+    expect(remember.lines.join(" ")).toContain(`This browser's key: ${shortKey(local.id)}`);
+    expect(TRADE_OFF).toMatch(/copy of the broker's database or of a backup of it: those two together need no passkey and no tap/);
+    expect(noPrfSeen.has(bw.id)).toBe(true);
     expect(remember.lines.join(" ")).toMatch(/did not promise to keep/); // persist() refused: said, not fatal
     const signed = JSON.parse(remember.detail) as Record<string, unknown>;
     expect(signed).toMatchObject({ object: "passkey-capability", action: "remember", credential_id: bw.id, browser_key: local.public, browser_key_id: local.id, browser_label: "Work laptop" });
@@ -263,6 +282,10 @@ describe("remember this browser", () => {
     await other.api.sealPost!("control/finish", { challenge_id: b.challenge_id, ...signed });
     expect((await other.api.sealStatus!()).buckets!.find((x) => x.id === ssh.id)!.open).toBe(true);
     await expect(other.api.sealPost!("browser/release", { challenge_id: b.challenge_id, assertion: signed.assertion, browser_key: local.public })).rejects.toThrow(/stale/);
+    // Three attempts per tap, as the broker.
+    const c = await other.api.sealPost!<{ canonical: string; challenge_id: string; public_key: unknown; open?: unknown }>("control/challenge", { action: "reopen", buckets: [ssh.id] });
+    for (let n = 0; n < 3; n++) await expect(other.api.sealPost!("browser/release", { challenge_id: c.challenge_id, assertion: signed.assertion, browser_key: local.public })).rejects.toThrow(/rejected/);
+    await expect(other.api.sealPost!("browser/release", { challenge_id: c.challenge_id, assertion: signed.assertion, browser_key: local.public })).rejects.toThrow(/too many attempts/);
     m.store.buckets.closeAll();
     browserPath.release = (body) => api.sealPost!("browser/release", body);
   });
@@ -292,6 +315,19 @@ describe("remember this browser", () => {
   test("no silent downgrade: a PRF passkey is refused the browser path, by the broker and by the page", async () => {
     const v = await status();
     const local = (await keys.current())!;
+    // Sticky: a passkey that had a PRF wrap stays refused after its wraps are gone, and is not
+    // offered the browser path in the page either.
+    const kept = m.store.buckets.wraps.get(me.id)!;
+    m.store.buckets.wraps.delete(me.id);
+    expect((await pk(me.id))).toMatchObject({ prf: false, had_prf: true, mode: "" });
+    await expect(startCapability(api, await status(), intent({ action: "remember", credential_id: me.id, scopes: ["installation"], browser_key: local.public, browser_label: "Other name" }), rp)).rejects.toThrow(/has PRF/);
+    noPrfSeen.add(me.id);
+    const el = capabilityForm(api, me, await status(), (await api.state()).passkeys!, () => {}, browser);
+    [...el.querySelectorAll<HTMLButtonElement>(`[data-passkey="${hexOf(me.id)}"] button`)].find((x) => x.textContent === "Enable…")!.click();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(el.querySelector(".remember-offer")).toBeNull();
+    noPrfSeen.delete(me.id);
+    m.store.buckets.wraps.set(me.id, kept);
     // A passkey that has PRF wraps.
     await expect(startCapability(api, v, intent({ action: "remember", credential_id: me.id, scopes: ["installation"], browser_key: local.public, browser_label: "Work laptop" }), rp)).rejects.toThrow(/only for passkeys without PRF/);
     // A passkey with PRF and no wraps yet: its enrol tap returns a PRF result, so the page stops.
@@ -344,7 +380,8 @@ describe("remember this browser", () => {
     expect(row.getAttribute("data-mode")).toBe("browser");
     expect(row.querySelector(".how-mark.browser")!.textContent).toBe("Browser key");
     expect(row.textContent).toContain("Opens buckets only from remembered browsers:");
-    expect(row.textContent).toMatch(/Work laptop, added \d+ \w+ \d{4}, last used /);
+    expect(row.textContent).toMatch(/Work laptop \(key [0-9a-f]{4} [0-9a-f]{4} [0-9a-f]{4}\), added \d+ \w+ \d{4}, last used /);
+    expect(row.textContent).toContain(`(key ${shortKey(browser.local!.id)})`);
     expect(row.querySelector(".badge.this")!.textContent).toBe("this browser");
     expect([...row.querySelectorAll("button")].map((b) => b.textContent)).toEqual(["Forget…", "Test this browser…"]);
     expect(row.textContent).not.toContain("no longer remembered");
@@ -357,7 +394,7 @@ describe("remember this browser", () => {
     const panel = readinessPanel({ api, auth: me, passkeys: () => pks, refresh: () => {}, browser }, v, r);
     const li = [...panel.querySelectorAll("li")].find((x) => x.getAttribute("data-mode") === "browser")!;
     expect(li.textContent).toContain("Browser key");
-    expect(li.textContent).toContain("only from remembered browsers: Work laptop (this browser)");
+    expect(li.textContent).toContain(`only from remembered browsers: Work laptop (key ${shortKey(browser.local!.id)}) (this browser)`);
   });
 
   test("a lost key (cleared site data, eviction): not remembered, said plainly, enabled again", async () => {
@@ -387,6 +424,16 @@ describe("remember this browser", () => {
     await expect(api.sealPost!("control/finish", { challenge_id: b.challenge_id, ...signed })).rejects.toThrow(/no longer remembered for this passkey/);
     // A test of the lost browser stops before any tap, with the same words.
     await expect(startCapability(api, v, intent({ action: "test", credential_id: bw.id, scopes: ["installation"], browser_key: local.public }), rp).then((s) => s.tap(bw))).rejects.toThrow(NOT_REMEMBERED);
+    // The name of another browser of this passkey is refused; the broker says to choose another.
+    await expect(run(rememberOffer(api, v, { nickname: nick(bw.id), credential_id: bw.id, scopes: ["installation"] }, rp, browser, "again"), pick, "Work laptop")).rejects.toThrow(/already called Work laptop: choose another name/);
+    // Enable now goes straight to the offer: this passkey returned no PRF result earlier.
+    const form = capabilityForm(api, me, { ...v, passkeys: v.passkeys!.map((p) => (p.id === hexOf(bw.id) ? { ...p, mode: "" as const, browsers: [], scopes: [], opens: 0, missing: keyed } : p)) }, pks, () => {}, browser);
+    (win.document.body as unknown as HTMLElement).append(form);
+    [...form.querySelectorAll<HTMLButtonElement>(`[data-passkey="${hexOf(bw.id)}"] button`)].find((x) => x.textContent === "Enable…")!.click();
+    for (let n = 0; n < 100 && !form.querySelector(".remember-offer"); n++) await new Promise((r) => setTimeout(r, 10));
+    expect(form.querySelector(".remember-offer")!.textContent).toContain("returned no PRF result earlier");
+    expect(form.querySelector(".remember-offer")!.textContent).toContain("copy of the broker's database");
+    form.remove();
     // Enable again: a new key, a second remembered browser entry; the old one can be forgotten.
     const seen = await run(rememberOffer(api, v, { nickname: nick(bw.id), credential_id: bw.id, scopes: ["installation"] }, rp, browser, "again"), pick, "Work laptop (again)");
     expect(seen[seen.length - 1]!.title).toMatch(/^Test /);
@@ -407,6 +454,7 @@ describe("remember this browser", () => {
     let step = await startCapability(api, v, intent({ action: "forget", credential_id: bw.id, scopes: [], browser_key: second.key }), rp);
     expect(step.title).toBe(`Forget a remembered browser of ${nick(bw.id)}`);
     expect(JSON.parse(step.detail)).toMatchObject({ action: "forget", credential_id: bw.id, browser_key: second.key, browser_key_id: second.id, scopes: [] });
+    expect(step.lines[0]).toBe(`Forgets “Work laptop (again)”, key ${shortKey(second.id)}.`);
     await step.tap(me);
     expect((await pk(bw.id)).browsers!.map((b) => b.id)).toEqual([local.id]);
     expect(await keys.current()).toBeDefined();

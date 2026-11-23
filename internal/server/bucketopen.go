@@ -95,6 +95,15 @@ func (r *tapRegistry) peek(id string) *tapOpen {
 	defer r.Unlock()
 	return r.m[id]
 }
+
+// release records, under the lock take uses, which remembered browser a still
+// pending tap released its sealed KEKs to. It fails once the tap was taken (its
+// finish has begun) or already released: a finish never races a late release.
+func (r *tapRegistry) release(id string, t *tapOpen, rel *tapRelease) bool {
+	r.Lock()
+	defer r.Unlock()
+	return r.m[id] == t && t.released.CompareAndSwap(nil, rel)
+}
 func (r *tapRegistry) clear() {
 	r.Lock()
 	defer r.Unlock()

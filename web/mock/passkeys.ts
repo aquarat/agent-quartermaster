@@ -66,6 +66,7 @@ export class MockPasskeyFlows {
       m.set(s, { salt: salts[i]!, tested: false, kek: kekHash(keks[i]!) });
     });
     b.wraps.set(cred, m);
+    b.hadPrf.add(cred); // sticky: never cleared by disable or rekey
   }
 
   /** As the broker's BrowserOrphanedScopes: refuse to forget the only thing that opens a scope. */
@@ -107,7 +108,8 @@ export class MockPasskeyFlows {
         const mine = b.browsers.get(target) ?? [];
         const known = browser ? mine.find((x) => x.key === browser) : undefined;
         if (action === "remember") {
-          if (b.wraps.get(target)?.size) fail(409, "conflict", "this passkey opens buckets with its own secret (PRF): a remembered browser is only for passkeys without PRF");
+          if (b.wraps.get(target)?.size || b.hadPrf.has(target)) fail(409, "conflict", "this passkey has PRF (it opens, or has opened, buckets with its own secret): a remembered browser is only for passkeys without PRF. Use Enable");
+          if (mine.some((x) => x.label === label && x.key !== browser)) fail(409, "conflict", `another remembered browser of this passkey is already called ${label}: choose another name`);
           for (const s of scopes) if (known?.wraps.get(s)?.tested) fail(409, "conflict", `this browser is already remembered for ${s} (tested): nothing to do`);
         }
         if (action === "enable" && mine.length) fail(409, "conflict", "this passkey opens buckets only from remembered browsers: use Remember this browser, or forget its browsers first to enable it with PRF");
@@ -275,7 +277,8 @@ export class MockPasskeyFlows {
         const browser = typeof body.browser_key === "string" && body.browser_key ? body.browser_key : undefined;
         if (!browser && b.browsers.get(target)?.length) fail(409, "conflict", "this passkey opens buckets only from remembered browsers: enrol it for this browser, or forget its browsers first");
         if (browser) {
-          if (b.wraps.get(target)?.size) fail(409, "conflict", "this passkey opens buckets with its own secret (PRF): a remembered browser is only for passkeys without PRF");
+          if (b.wraps.get(target)?.size || b.hadPrf.has(target)) fail(409, "conflict", "this passkey has PRF (it opens, or has opened, buckets with its own secret): a remembered browser is only for passkeys without PRF");
+          if ((b.browsers.get(target) ?? []).some((x) => x.label === body.browser_label && x.key !== browser)) fail(409, "conflict", `another remembered browser of this passkey is already called ${String(body.browser_label)}: choose another name`);
           if (typeof body.browser_label !== "string" || !body.browser_label) fail(400, "bad_request", "a browser label has 1 to 64 printable characters, single spaces");
           Object.assign(canonical, { browser_key: browser, browser_key_id: browserKeyId(raw(browser)), browser_label: body.browser_label });
         }

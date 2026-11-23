@@ -101,7 +101,10 @@ type passkeyCoverage struct {
 	// Mode says how the passkey opens buckets: "prf" (its own secret), "browser"
 	// (only from the remembered browsers listed, §13) or "" (it opens nothing).
 	// For "browser", Scopes is the union over its browsers.
-	Mode     string          `json:"mode"`
+	Mode string `json:"mode"`
+	// HadPRF: the sticky mark that this passkey has, or once had, a PRF wrap.
+	// Such a passkey is never offered the remembered-browser path.
+	HadPRF   bool            `json:"had_prf"`
 	Browsers []browserView   `json:"browsers"`
 	Scopes   []coverageScope `json:"scopes"`
 	Opens    int             `json:"opens"`
@@ -252,6 +255,10 @@ func (s *Server) sealView(ctx context.Context, sess string) (sealView, error) {
 	if err != nil {
 		return v, err
 	}
+	hadPRF, err := q.PasskeysWithPRF(ctx)
+	if err != nil {
+		return v, err
+	}
 	bwraps, err := q.BrowserWraps(ctx, 0)
 	if err != nil {
 		return v, err
@@ -265,6 +272,7 @@ func (s *Server) sealView(ctx context.Context, sess string) (sealView, error) {
 			}
 		}
 		c.PRF = len(c.Scopes) > 0
+		c.HadPRF = c.PRF || hadPRF[k.ID]
 		c.Browsers = browserViews(bkeys, bwraps, k.ID)
 		switch {
 		case c.PRF:

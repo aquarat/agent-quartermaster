@@ -4,8 +4,9 @@
 // owner through enabling the others, one after the other. It adds no ceremony of its own:
 // every tap is a step of capabilities.ts (enable, then test), with the same signed text.
 import { type Api } from "./api";
-import { browserTested, howItOpens, rememberOffer, runSteps, startCapability, testedScopes, type BrowserContext } from "./capabilities";
+import { browserTested, howItOpens, noPrfSeen, rememberOffer, runSteps, startCapability, testedScopes, type BrowserContext } from "./capabilities";
 import { h, replace } from "./dom";
+import { shortKey } from "./browserKey";
 import { visibleText as vt } from "./format";
 import { serving, type PasskeyScopes, type SealView } from "./sealPanel";
 import type { PasskeyInfo } from "./types";
@@ -74,7 +75,7 @@ export function readinessPanel(host: ReadinessHost, v: SealView, r: Readiness): 
   const row = (p: PasskeyScopes, state: string, cls: string, note?: string) => {
     const how = howItOpens(p);
     // A passkey without PRF opens only from the browsers named here: say so in words.
-    const from = p.mode === "browser" ? `${how!.text}: ${(p.browsers ?? []).map((b) => b.label + (local && b.id === local.id ? " (this browser)" : "")).join(", ")}${(p.browsers ?? []).some((b) => local && b.id === local.id) ? "" : ". Not this browser"}.` : undefined;
+    const from = p.mode === "browser" ? `${how!.text}: ${(p.browsers ?? []).map((b) => b.label + ` (key ${shortKey(b.id)})` + (local && b.id === local.id ? " (this browser)" : "")).join(", ")}${(p.browsers ?? []).some((b) => local && b.id === local.id) ? "" : ". Not this browser"}.` : undefined;
     return h(
       "li",
       { class: cls, "data-mode": p.mode ?? "" },
@@ -172,10 +173,13 @@ async function enableAll(host: ReadinessHost, flow: HTMLElement, idle: () => voi
     try {
       // A passkey that already opens only from remembered browsers is never sent down the
       // PRF path, and the other way round: the offer is explicit either way.
+      const offerable = !p.prf && !p.had_prf ? host.browser : undefined;
       const step =
         p.mode === "browser" && host.browser
           ? rememberOffer(host.api, v, { nickname: info.nickname, credential_id: info.raw_id, scopes }, location.hostname, host.browser, `${info.nickname} has no PRF and opens only from remembered browsers.`, { skip: browserTested(p, host.browser.local) })
-          : await startCapability(host.api, v, { action: "enable", capability: "unlock", nickname: info.nickname, credential_id: info.raw_id, scopes }, location.hostname, 0, { thenTest: true, skip: testedScopes(v, pks, info.raw_id), browser: p.prf ? undefined : host.browser });
+          : offerable && noPrfSeen.has(info.raw_id)
+            ? rememberOffer(host.api, v, { nickname: info.nickname, credential_id: info.raw_id, scopes }, location.hostname, offerable, `${info.nickname} returned no PRF result earlier, so it cannot hold the secret itself.`)
+            : await startCapability(host.api, v, { action: "enable", capability: "unlock", nickname: info.nickname, credential_id: info.raw_id, scopes }, location.hostname, 0, { thenTest: true, skip: testedScopes(v, pks, info.raw_id), browser: offerable });
       runSteps(review, host.auth, step, () => {
         done++;
         void next();

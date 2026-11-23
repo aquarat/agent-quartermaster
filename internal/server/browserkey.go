@@ -159,8 +159,14 @@ func (s *Server) browserRelease(ctx context.Context, r *http.Request, sess strin
 		}
 		out = append(out, releasedWrap{Scope: scope, ID: encodeID(bw.ID), SealedKEK: encodeID(bw.SealedKEK)})
 	}
-	if !t.released.CompareAndSwap(nil, &tapRelease{row: row, key: key.ID}) {
-		return nil, errConflict("this approval's keys were already released; review again")
+	// Only while the tap is pending: under the registry lock a finish takes it
+	// with, and with its challenge still unused. A release that lost the race
+	// against the finish (or against a second release) hands out nothing.
+	if !s.seal.taps.release(in.ChallengeID, t, &tapRelease{row: row, key: key.ID}) {
+		return nil, errConflict("this approval was finished or its keys were already released; review again")
+	}
+	if ok, err := q.ChallengePending(ctx, in.ChallengeID, s.now()); err != nil || !ok {
+		return nil, errConflict("stale approval; review again")
 	}
 	s.log.Info("sealed keys released to a remembered browser", "passkey", passkeyID(key.RawID), "browser", seal.BrowserKeyID(pub), "scopes", len(out))
 	return map[string]any{"wraps": out}, nil

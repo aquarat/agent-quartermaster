@@ -114,8 +114,15 @@ func (s *Server) recoveryPlan(ctx context.Context, q *store.Q, sess string, c re
 		if l, err := normalizeBrowserLabel(c.Label); err != nil || l != c.Label {
 			return nil, nil, errBad("a browser label has 1 to 64 printable characters, single spaces")
 		}
-		if len(wraps) > 0 {
-			return nil, nil, errConflict("this passkey opens buckets with its own secret (PRF): a remembered browser is only for passkeys without PRF")
+		if had, err := q.PasskeyHadPRF(ctx, pk.ID); err != nil {
+			return nil, nil, err
+		} else if had || len(wraps) > 0 {
+			return nil, nil, errConflict("this passkey has PRF (it opens, or has opened, buckets with its own secret): a remembered browser is only for passkeys without PRF")
+		}
+		for _, k := range keys {
+			if k.Label == c.Label && !bytes.Equal(k.Public, pub) {
+				return nil, nil, errConflict("another remembered browser of this passkey is already called " + c.Label + ": choose another name")
+			}
 		}
 		f["browser_key"], f["browser_key_id"], f["browser_label"] = c.Browser, seal.BrowserKeyID(pub), c.Label
 		return f, pk, nil
