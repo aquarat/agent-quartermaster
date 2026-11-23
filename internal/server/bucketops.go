@@ -199,6 +199,24 @@ func (s *Server) cfAutoHold(ctx context.Context, q *store.Q) bucketHold {
 	set, _ := cfProxySet(ctx, q)
 	return bucketHold{Kind: "auto", Ref: "auto:" + set, Reason: "Cloudflare auto-approval until restart"}
 }
+
+// cfAutoOn reports whether the set's current policy still auto-approves some
+// scope the catalogue allows: the "auto" hold lives only while it does (§5).
+func (s *Server) cfAutoOn(ctx context.Context, q *store.Q, set string) (bool, error) {
+	if s.cf.cat == nil {
+		return false, nil
+	}
+	scopes, err := q.AutoScopes(ctx, set)
+	if err != nil {
+		return false, err
+	}
+	for _, name := range scopes {
+		if sc, ok := s.cf.cat.Lookup(name); ok && sc.AutoApprove {
+			return true, nil
+		}
+	}
+	return false, nil
+}
 func (s *Server) holdCF(ctx context.Context, holds ...bucketHold) {
 	if !s.sealServing() {
 		return
@@ -232,6 +250,13 @@ func (s *Server) ensureSetBucket(ctx context.Context, q *store.Q, kind, set, org
 	}
 	if err != nil {
 		return row, err
+	}
+	// A new scope's only wrap was made with a page-supplied KEK: nothing is
+	// written into it until a passkey has opened it once (§7).
+	if ok, err := q.ScopeTested(ctx, org); err != nil {
+		return row, err
+	} else if !ok {
+		return row, errConflict("test the new scope first: no passkey has opened " + scopeName(ctx, q, org) + " yet (Admin → Passkeys → Test)")
 	}
 	if err = s.insertBucket(ctx, q, sc, kind, set, nil); err != nil {
 		return row, err
@@ -601,6 +626,7 @@ func (s *Server) reconcileHolds(ctx context.Context) {
 	}
 	z := s.seal
 	z.pool.expire(s.now())
+	z.capabilities.expire(s.now())
 	q := s.store.Q()
 	dead := map[string]bool{}
 	for id, holds := range z.pool.allHolds() {
@@ -625,8 +651,12 @@ func (s *Server) holdLive(ctx context.Context, q *store.Q, h bucketHold) (bool, 
 	kind, id, _ := strings.Cut(h.Ref, ":")
 	gone := func(err error) bool { return errors.Is(err, store.ErrNotFound) }
 	switch kind {
-	case "tap", "auto":
+	case "tap":
 		return true, nil
+	case "auto":
+		// Until restart, Close all, or the policy no longer auto-approving.
+		on, err := s.cfAutoOn(ctx, q, id)
+		return on || err != nil, nil
 	case "request":
 		g, err := q.GrantByRequest(ctx, id)
 		if err != nil {

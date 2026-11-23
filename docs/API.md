@@ -476,6 +476,8 @@ token?, token_id?, token_delivered?, ip_condition?, permissions?}`.
 - `GET /v1/cf/snapshots/{id}` -> `CFSnapshot` with `content` (the object as Cloudflare
   returned it, redacted as proxied reads are).
 - Both need the calling host to hold an active Cloudflare grant (any scope or mode), else 403.
+  On a sealed store (format 2) both also need the Cloudflare proxy parent's bucket open, else
+  423 `locked` ("… is closed: waiting for the owner to reopen it"), as v0.4.1 required unlock.
 
 ### 5.4 Canonical approval text for kind "cloudflare"
 
@@ -630,6 +632,13 @@ Every other challenge keeps `challenge = SHA-256(canonical)`. The descriptor is 
   (`; `-joined); `until` the latest RFC 3339 end, or `""` for an event (revoke, collect,
   restart). Every bucket's `scope` is in `scopes`. `buckets` is `[]` when the tap opens only
   scope keys (passkey enable, rekey of an empty scope).
+* `rekey_salt` (seal-control `rekey` only, and then always): a fresh 32-byte salt. The
+  descriptor then names exactly one scope; every `evalByCredential` entry is
+  `{"first": salt(scope), "second": rekey_salt}`, and the packet carries
+  `F(KEK_1) ‖ F(KEK_rekey)` where `KEK_rekey` is derived as below with the same scope and
+  `rekey_salt` as the salt. The broker opens the old scope key with `KEK_1` and wraps the new
+  one under `KEK_rekey` (BUCKETS.md §7). The page accepts `rekey_salt` only on a rekey card
+  and refuses a rekey descriptor without it or a `second` input that differs.
 
 The WebAuthn challenge is
 
@@ -665,13 +674,15 @@ assertion's `clientExtensionResults` (the broker refuses extension output it doe
 expect). If the passkey returned no PRF results the page sends no `open`; the broker then
 succeeds only when every needed bucket is already open. An `open` on a challenge without a
 descriptor is refused (400); a packet sent while everything was open is consumed and
-discarded.
+discarded only when it names this challenge's own `attempt_id` (another pending tap's attempt
+is left alone).
 
 The broker verifies the assertion over the bound challenge, consumes the attempt, opens the
-packet, unwraps the signing passkey's scope wraps (marking them tested), unwraps exactly the
-descriptor's closed buckets, wipes scope keys and KEKs, holds the buckets for the apply, then
-keeps the descriptor's holds (or releases them on failure). A failure anywhere opens and
-applies nothing.
+packet, unwraps the signing passkey's scope wraps (marking them tested), re-reads each closed
+bucket and refuses (409, "changed since the review") one whose key pair changed since the
+challenge (a rekey in between), unwraps exactly the descriptor's closed buckets, wipes scope
+keys and KEKs, holds the buckets for the apply, then keeps the descriptor's holds (or releases
+them on failure). A failure anywhere opens and applies nothing.
 
 **Scope-enrol descriptors** (passkey enable and test, recovery enrolment, staging) have the
 same keys plus `credential_id` (the only allowed credential) and `salts` (one 32-byte salt per
@@ -705,8 +716,9 @@ the second the scope KEK.
   are filled in mode `buckets` for an owner session.
 * `scopes`: the installation and every organisation, with or without a scope key.
 * Hold `kind`: `instant`, `grant` (Cloudflare proxy grant), `env` (release until collected,
-  at most 10 minutes), `sign` (signing grant), `standing`, `auto` (Cloudflare auto-approval
-  until restart) or `window`. `paused` lists live users of the bucket (grants, env releases,
+  at most 10 minutes), `sign` (signing grant), `standing`, `auto` (Cloudflare auto-approval:
+  added only by a tap whose card said "re-arms Cloudflare auto-approval"; ends at restart,
+  Close all, or when the set's policy no longer auto-approves any scope) or `window`. `paused` lists live users of the bucket (grants, env releases,
   signing grants, standing rules) without a hold on it: they wait for a **Reopen**.
 * Per passkey: `id` as in `PasskeyInfo`; `prf` true when it holds any scope wrap; `opens` the
   number of buckets in its scopes, `of` all buckets; `missing` the scopes it has no wrap for.
@@ -727,7 +739,7 @@ the second the scope KEK.
 | `close-all` | nothing | `open_buckets` (count) | nothing | Wipes every open bucket and hold, ends every window, drops pending attempts and capability stages |
 | `renew-leaf` | nothing | `repair` (JSON string: `ca_pin`, `configured_sans`, `effect`) | `internal-ca`, instant | Renews the agent TLS leaf; the broker then restarts (everything closes) |
 | `reopen` | `buckets`: 1–16 sorted, unique bucket IDs | `buckets` `[{id, label}]` | those buckets | Keeps each open with the holds of its live users |
-| `rekey` | `scope` (with a key) | `scope`, `scope_title`, `bucket_count` | every bucket of the scope (an empty scope: its key alone) | New scope key and bucket keys, records re-encrypted, drafts dropped, the scope's buckets closed, only the tapping passkey keeps a wrap. Requires `open`; returns `{ok, buckets}` |
+| `rekey` | `scope` (with a key) | `scope`, `scope_title`, `bucket_count` | every bucket of the scope (an empty scope: its key alone) | New scope key and bucket keys, records re-encrypted, drafts dropped, the scope's buckets closed, only the tapping passkey keeps a wrap: of the new key, at the descriptor's `rekey_salt`, **untested** until it next opens (test it: `test` below). Requires `open` with both KEKs; returns `{ok, buckets}` |
 | `activate` | nothing (mode `setup`, stage ready) | `manifest` (the format-2 manifest JSON string) | nothing | Commits the stage; the process exits. A plain signature: challenge `SHA-256(canonical)`, `open` refused, a passkey not pinned by the runner refused |
 
 ## Passkey capabilities
@@ -741,11 +753,12 @@ Session routes under `/api/ui/seal/passkeys/` (BUCKETS.md §7):
    carries an open descriptor (purpose `approve`, `buckets` `[]`, the listed scopes that
    already have a key), so the approving passkey must already open them; with none, a plain
    challenge. Test: a scope-enrol descriptor (purpose `test`) at the target's own salts.
-   Disable: plain.
+   Disable: plain. `enable` of a scope the target already opens with a **tested** wrap is
+   refused (409): a tested wrap is never replaced.
 2. `authorize {challenge_id, assertion, open?}` → register: `{registration_id, public_key}`
    (creation options, PRF requested); enable: `{registration_id}`; disable: `{ok}` (deletes
-   the target's wraps for the listed scopes, or all; refused for the last passkey that opens a
-   scope); test: `{ok, scopes}` (marks the wraps tested).
+   the target's wraps for the listed scopes, or all; refused when no other passkey has a
+   **tested** wrap of such a scope); test: `{ok, scopes}` (marks the wraps tested).
 3. `create {registration_id, credential}` → `{ok}` (register only; an approve-only
    registration is committed here).
 4. `evaluate {registration_id}` → `ChallengeResponse` with canonical object `passkey-enrol`
@@ -755,9 +768,11 @@ Session routes under `/api/ui/seal/passkeys/` (BUCKETS.md §7):
    wraps each open scope key under the target's KEKs and wipes it.
 
 Repeat from step 1 for further scopes, two per round. A stage is bound to the session,
-expires after five minutes and is lost on restart (at most 16 pending). Admin's **Create**
+expires after five minutes (its opened scope keys are wiped then, by its own timer and by the
+15 s reconcile pass) and is lost on restart (at most 16 pending). Admin's **Create**
 for a new organisation's scope is `enable` of the signed-in passkey for that scope (two
-taps).
+taps). Until some passkey's wrap of a new scope has opened once (`test`, three taps in all),
+creating its first bucket is refused (409 "test the new scope first").
 
 ## Recovery (Admin, rare path)
 
@@ -780,7 +795,9 @@ header `X-Aqmas-Recovery`: the ticket for `begin`, then the session it returns):
 {credential}` → `{credential_id, scopes}`; `evaluate {}` → `{canonical, public_key, open}`
 (scope-enrol, purpose `enrol` until every scope is wrapped, then `test`); `finish {assertion,
 open}` → `{next: "evaluate"}` or `{next: "replace", canonical, public_key}`; `replace
-{assertion}` → `{ok}`.
+{assertion}` → `{ok}`. The scope keys the replacement passkey is wrapped for are **new**:
+`replace` rekeys every scope and bucket and re-encrypts every record in the same transaction
+that retires the old passkeys (its `effects` text says so).
 
 ## Stage
 

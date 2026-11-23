@@ -391,7 +391,12 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 	}
 	ctx := r.Context()
 	var standingUsed *store.Standing
-	err = s.store.Tx(ctx, func(q *store.Q) error {
+	// A standing rule issues only while the SSH CA is open. If it closes
+	// between that check and the signature (Close all, a rekey), the request
+	// is queued for the owner instead of failing: the transaction is retried
+	// once without standing rules.
+	skipStanding := false
+	tx := func(q *store.Q) error {
 		if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
 			return err
 		}
@@ -415,7 +420,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 			return err
 		}
 		// A standing rule issues without a tap only while the SSH CA is open (§5).
-		if !s.caOpen(ctx, q, seal.RoleSSHCA) {
+		if skipStanding || !s.caOpen(ctx, q, seal.RoleSSHCA) {
 			rules = nil
 		}
 		cand := policy.Candidate{HostID: h.ID, PeerAddress: req.PeerAddress, Kind: req.Kind, Target: req.TargetHost, LoginUser: req.LoginUser, TTL: ttl}
@@ -444,6 +449,9 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 			}
 			g, err := s.issueGrant(ctx, q, req, ttl, now)
 			if err != nil {
+				if isLocked(err) {
+					return errStandingClosed
+				}
 				return err
 			}
 			standingUsed = st
@@ -460,7 +468,13 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		}
 		return q.Audit(ctx, now, "host:"+h.Name, "request", "request:"+req.ID,
 			fmt.Sprintf("%s %s@%s ttl=%d key=%s from=%s", req.Kind, req.LoginUser, req.TargetHost, ttl, req.KeyFingerprint, req.PeerAddress))
-	})
+	}
+	err = s.store.Tx(ctx, tx)
+	if errors.Is(err, errStandingClosed) {
+		skipStanding, standingUsed = true, nil
+		req.Status, req.StandingID, req.DecidedAt, req.DecisionNote = api.StatusPending, "", nil, ""
+		err = s.store.Tx(ctx, tx)
+	}
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
@@ -618,4 +632,14 @@ func (s *Server) handleGrants(w http.ResponseWriter, r *http.Request, h *store.H
 // pemCert encodes DER as a PEM certificate.
 func pemCert(der []byte) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// errStandingClosed rolls back a standing approval whose bucket closed after
+// the check; the request is then queued.
+var errStandingClosed = errors.New("standing rule's bucket closed")
+
+// isLocked reports a closed bucket (423), as withBucket returns it.
+func isLocked(err error) bool {
+	var ae *apiErr
+	return errors.Is(err, errBucketClosed) || errors.As(err, &ae) && ae.status == http.StatusLocked
 }

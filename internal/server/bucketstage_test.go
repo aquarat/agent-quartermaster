@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -758,6 +759,11 @@ func TestSealRecoverBuckets(t *testing.T) {
 	requireNoError(t, err)
 	defer s.Close()
 	sock := filepath.Join(t.TempDir(), "rec")
+	oldScopes, err := s.store.Q().Scopes(t.Context())
+	requireNoError(t, err)
+	oldBuckets, err := s.store.Q().Buckets(t.Context())
+	requireNoError(t, err)
+	values := openAll(t, s, f.inst, f.identity, f.recipient)
 	done := make(chan error, 1)
 	go func() { done <- s.Recover(t.Context(), sock, strings.NewReader(f.identity.String()+"\n")) }()
 	var ticket []byte
@@ -849,6 +855,40 @@ func TestSealRecoverBuckets(t *testing.T) {
 	if n != 1 {
 		t.Fatal("old passkeys not retired")
 	}
+	// Every scope and bucket was rekeyed: copies of the retired passkeys' wraps open
+	// only the old keys. Every record still opens, with the same values.
+	newScopes, err := s.store.Q().Scopes(t.Context())
+	requireNoError(t, err)
+	newBuckets, err := s.store.Q().Buckets(t.Context())
+	requireNoError(t, err)
+	if len(newScopes) != len(oldScopes) || len(newBuckets) != len(oldBuckets) {
+		t.Fatal("scopes or buckets changed in number")
+	}
+	for i := range newScopes {
+		if bytes.Equal(newScopes[i].Public, oldScopes[i].Public) || bytes.Equal(newScopes[i].Recovery, oldScopes[i].Recovery) {
+			t.Fatalf("scope %s was not rekeyed", newScopes[i].Scope)
+		}
+	}
+	for _, nb := range newBuckets {
+		for _, ob := range oldBuckets {
+			if bytes.Equal(nb.ID, ob.ID) && (bytes.Equal(nb.Public, ob.Public) || bytes.Equal(nb.Wrap, ob.Wrap)) {
+				t.Fatalf("bucket %s was not rekeyed", nb.Label)
+			}
+		}
+	}
+	if got := openAll(t, s, f.inst, f.identity, f.recipient); !maps.Equal(got, values) || len(got) < 5 {
+		t.Fatal("values changed or did not open after the recovery rekey")
+	}
+	if !strings.Contains(string(readAuditDetail(t, s, "recovery_replace")), "rekeyed_scopes=3") {
+		t.Fatal("the rekey is not audited")
+	}
 	noSentinels(t, "recovery responses", seen.Bytes(), f, false)
 	noSentinels(t, "logs", []byte(v.logs.String()), f, false)
+}
+
+func readAuditDetail(t *testing.T, s *Server, action string) string {
+	t.Helper()
+	var d string
+	requireNoError(t, s.store.DB().QueryRow(`SELECT detail FROM audit WHERE action=? ORDER BY id DESC LIMIT 1`, action).Scan(&d))
+	return d
 }

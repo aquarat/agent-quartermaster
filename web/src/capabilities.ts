@@ -88,8 +88,9 @@ export function checkCapability(text: string, v: SealView, i: Intent, scopes: st
 const titleOf = (v: SealView, s: string) => v.scopes?.find((x) => x.scope === s)?.title || s;
 
 /** The whole loop for one intent: rounds of at most two scopes. Nothing is signed until a
- * step's tap(auth). */
-export async function startCapability(api: Api, v: SealView, i: Intent, rp: string, round = 0): Promise<Step> {
+ * step's tap(auth). With `thenTest`, an enable ends with test rounds of the same scopes (a
+ * new scope takes no value until a passkey has opened it once). */
+export async function startCapability(api: Api, v: SealView, i: Intent, rp: string, round = 0, opts: { thenTest?: boolean } = {}): Promise<Step> {
   const all = [...new Set(i.scopes)];
   const perRound = 2;
   const rounds = Math.max(1, Math.ceil(all.length / perRound));
@@ -115,8 +116,11 @@ export async function startCapability(api: Api, v: SealView, i: Intent, rp: stri
   const prog = (n: number, what: string) => `${rounds > 1 ? `Round ${round + 1} of ${rounds} · ` : ""}tap ${n} of ${taps}: ${what}`;
   const names = mine.map((s) => titleOf(v, s)).join(", ");
   const next = async (target: string): Promise<Step | void> => {
-    if (round + 1 >= rounds) return;
-    return startCapability(api, v, { ...i, action: i.action === "register" ? "enable" : i.action, credential_id: target }, rp, round + 1);
+    if (round + 1 >= rounds) {
+      if (opts.thenTest && (i.action === "enable" || i.action === "register") && all.length) return startCapability(api, v, { ...i, action: "test", capability: "unlock", credential_id: target, scopes: all }, rp, 0);
+      return;
+    }
+    return startCapability(api, v, { ...i, action: i.action === "register" ? "enable" : i.action, credential_id: target }, rp, round + 1, opts);
   };
 
   const enrol = async (registration: string, target: string, n: number): Promise<Step> => {
@@ -224,11 +228,12 @@ export function runSteps(review: HTMLElement, auth: Authenticator, first: Step, 
   show(first);
 }
 
-/** Admin → Buckets "Create": the signed-in passkey creates an organisation's scope key. */
+/** Admin → Buckets "Create": the signed-in passkey creates an organisation's scope key, then
+ * tests it (three taps): the broker writes nothing into a scope no passkey has opened yet. */
 export async function createScope(api: Api, auth: Authenticator, v: SealView, pks: PasskeyInfo[], scope: string, review: HTMLElement, refresh: () => void): Promise<void> {
   const me = pks.find((p) => p.current);
   if (!me?.raw_id) throw Error("Sign in with a passkey that can hold scope keys first");
-  const step = await startCapability(api, v, { action: "enable", capability: "unlock", nickname: me.nickname, credential_id: me.raw_id, scopes: [scope] }, location.hostname);
+  const step = await startCapability(api, v, { action: "enable", capability: "unlock", nickname: me.nickname, credential_id: me.raw_id, scopes: [scope] }, location.hostname, 0, { thenTest: true });
   runSteps(review, auth, step, refresh);
 }
 

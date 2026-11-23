@@ -9,7 +9,7 @@ import {
 import { encode } from "./b64url";
 import { binary32, checkReview, checkTap, type Review } from "./review";
 const effects =
-  "Replace all owner login keys and wraps. End every session, pending request, grant, standing rule and host admission; require new host enrollment. Preserve audit and SSH serials. Issued certificates, copied values and upstream children are not recalled.";
+  "Replace all owner login keys and wraps, and rekey every scope and bucket. End every session, pending request, grant, standing rule and host admission; require new host enrollment. Preserve audit and SSH serials. Issued certificates, copied values and upstream children are not recalled.";
 type Call = (stage: string, token: string, body: unknown) => Promise<any>;
 interface Step {
   detail: string;

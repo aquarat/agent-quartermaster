@@ -457,7 +457,7 @@ func TestBucketsWindowHoldsAndExpiry(t *testing.T) {
 		t.Fatal("window offered no open")
 	}
 	opts, _ := json.Marshal(cr.PublicKey)
-	as, pkt := v.fix.tapWith(t, s, v.auth, tapResp{cr.ChallengeID, cr.Canonical, opts, cr.Open})
+	as, pkt := v.fix.tapWith(t, s, v.auth, tapResp{ChallengeID: cr.ChallengeID, Canonical: cr.Canonical, PublicKey: opts, Open: cr.Open})
 	out, err := s.windowOpenFinish(ctx, jsonReq(api.DecideRequest{ChallengeID: cr.ChallengeID, Assertion: as, Open: pkt}), sess)
 	requireNoError(t, err)
 	rec := out.(windowReceipt)
@@ -486,7 +486,7 @@ func TestBucketsWindowHoldsAndExpiry(t *testing.T) {
 	requireNoError(t, err)
 	cr = res.(api.ChallengeResponse)
 	opts, _ = json.Marshal(cr.PublicKey)
-	as, pkt = v.fix.tapWith(t, s, v.auth, tapResp{cr.ChallengeID, cr.Canonical, opts, cr.Open})
+	as, pkt = v.fix.tapWith(t, s, v.auth, tapResp{ChallengeID: cr.ChallengeID, Canonical: cr.Canonical, PublicKey: opts, Open: cr.Open})
 	_, err = s.windowOpenFinish(ctx, jsonReq(api.DecideRequest{ChallengeID: cr.ChallengeID, Assertion: as, Open: pkt}), sess)
 	requireNoError(t, err)
 	if s.seal.pool.count() != 1 {

@@ -145,8 +145,16 @@ publish-only token. They are stored root-only in `/etc/aqmas-alert/` for the sep
 with one more step first: a tap by a format-1 unlock passkey opens the old master key once,
 the broker stages every credential in its bucket in memory and wipes that key. The move is
 one-way; until you activate, cancelling or a failure restores the configuration and the
-format-1 broker. `purge_backups` then deletes the pre-migration and older backups, which still
-hold format-1 data ([SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)).
+format-1 broker. `purge_backups` then deletes only the format-1 backups of this store: the
+pre-migration backup and any other backup in the backup directory whose configuration pins the
+same format-1 manifest (an earlier update's rollback point taken under v0.4.1, say); they
+still hold format-1 data ([SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)). It keeps everything else:
+backups without that pin (unsealed copies from before sealing, rollback points without a
+configuration), the new manifest copy `sealed-<digest>`, and state a restore once set aside
+beside the data directory (`<data_dir>.displaced-*`). The task result reports
+`backups_deleted` and, when such state exists, `displaced_kept`; delete those yourself once
+you no longer need them. If the pre-migration backup or its pin cannot be read, nothing is
+deleted and `format1_backups` says so.
 
 ## Web API
 

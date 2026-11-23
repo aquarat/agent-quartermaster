@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/release"
+	"github.com/aquarat/agent-quartermaster/internal/server/config"
 )
 
 // schemaBuckets is the database schema of a store sealed in per-credential buckets.
@@ -162,27 +163,60 @@ func (r *Runner) finishBuckets(ctx context.Context, j journal) (string, error) {
 	}
 	if j.Purge {
 		// They hold format-1 data: anyone with a copy and one tap for an old salt gets the MK.
-		r.step("Deleting the pre-migration and older backups")
-		entries, _ := os.ReadDir(r.l.Backups)
-		n := 0
-		for _, e := range entries {
-			if e.Name() == keep {
-				continue
-			}
-			if os.RemoveAll(filepath.Join(r.l.Backups, e.Name())) == nil {
-				n++
-			}
-		}
-		aside, _ := filepath.Glob(r.cfg.DataDir + ".displaced-*")
-		for _, d := range aside {
-			if os.RemoveAll(d) == nil {
-				n++
-			}
+		r.step("Deleting the format-1 backups of this store")
+		n, err := r.purgeFormat1(j.Backup, keep)
+		if err != nil {
+			r.result("format1_backups", "nothing was deleted ("+err.Error()+"): delete the format-1 copies in "+r.l.Backups+" yourself")
 		}
 		r.result("backups_deleted", strconv.Itoa(n))
+		if aside, _ := filepath.Glob(r.cfg.DataDir + ".displaced-*"); len(aside) > 0 {
+			r.result("displaced_kept", "state set aside by an earlier restore is kept beside the data directory; delete it once you no longer need it")
+		}
 	} else {
 		r.result("format1_backups", r.l.Backups+" still holds format-1 copies of the store: delete them once you have checked the new one")
 	}
 	r.clearJournal()
 	return "Moved to per-credential buckets. Nothing is open: each approval opens only the credentials it needs.", nil
+}
+
+// purgeFormat1 deletes only the backups of this store in format 1: those whose
+// configuration pins the same format-1 manifest as the pre-migration backup
+// (pre) of this task. Other backups (unsealed copies, rollback points of other
+// tasks taken after the move, the new manifest copy keep) and state that a
+// restore set aside beside the data directory are kept: they are other tasks'
+// rollback points, and the owner decides about them (docs/SETUP.md).
+func (r *Runner) purgeFormat1(pre, keep string) (int, error) {
+	pin := func(dir string) string {
+		b, err := readRooted(dir, filepath.Join("config", filepath.Base(r.l.Config)), 1<<20)
+		if err != nil {
+			return ""
+		}
+		cfg, err := config.Parse(b)
+		if err != nil || !cfg.Seal.Required || !release.ValidHash(cfg.Seal.Manifest) {
+			return ""
+		}
+		return cfg.Seal.Manifest
+	}
+	if pre == "" || complete(pre) != nil {
+		return 0, errors.New("the pre-migration backup is missing")
+	}
+	old := pin(pre)
+	if old == "" || old == r.cfg.Seal.Manifest {
+		return 0, errors.New("the pre-migration backup names no format-1 pin")
+	}
+	entries, err := os.ReadDir(r.l.Backups)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, e := range entries {
+		dir := filepath.Join(r.l.Backups, e.Name())
+		if e.Name() == keep || !e.IsDir() || pin(dir) != old {
+			continue
+		}
+		if os.RemoveAll(dir) == nil {
+			n++
+		}
+	}
+	return n, nil
 }

@@ -254,7 +254,7 @@ func (s *Server) loadSeal(mode string) error {
 	}
 	// Freed pages must not keep old wraps (§7). The signer-key trigger of
 	// format 1 also froze payload and wrap, which rekey re-encrypts.
-	if _, err = s.store.DB().ExecContext(ctx, `PRAGMA secure_delete=ON;`+store.BucketDDL+`DROP TRIGGER IF EXISTS signer_key_immutable;`); err != nil {
+	if _, err = s.store.DB().ExecContext(ctx, `PRAGMA secure_delete=ON;`+store.BucketTriggers+store.BucketDDL+`DROP TRIGGER IF EXISTS signer_key_immutable;`); err != nil {
 		return err
 	}
 	s.seal = newSealRuntime(s, modeBuckets, m.Installation)

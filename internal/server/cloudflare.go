@@ -365,7 +365,9 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 			if err != nil {
 				return err
 			}
-			cfHolds = []bucketHold{s.cfGrantHold(req.ID, g.NotAfter), s.cfAutoHold(ctx, q)}
+			// Only the grant's own hold: the "auto" hold is added by a tap whose
+			// card said it re-arms auto-approval (decisionNeeds), never here.
+			cfHolds = []bucketHold{s.cfGrantHold(req.ID, g.NotAfter)}
 			return q.Audit(ctx, now, "system", "cf_auto_approve", "request:"+req.ID,
 				fmt.Sprintf("grant=%s host=%s %s mode=%s ttl=%d from=%s", g.ID, h.Name, what, req.Mode, ttl, peer))
 		}
@@ -889,6 +891,13 @@ func (s *Server) handleCFCatalogue(w http.ResponseWriter, r *http.Request, h *st
 func (s *Server) cfSnapshotAccess(r *http.Request, h *store.Host) error {
 	if s.cf.proxy == nil {
 		return errNotFound()
+	}
+	if s.seal != nil {
+		// As v0.4.1 required unlock: snapshots are served only while the proxy
+		// parent's bucket is open (423 while closed, so the agent keeps waiting).
+		if err := s.cfParentReady(r.Context()); err != nil {
+			return err
+		}
 	}
 	ok, err := (cfGrantSource{s}).HasActiveGrant(r.Context(), h.ID, s.now())
 	if err != nil {

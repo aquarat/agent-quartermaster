@@ -644,7 +644,7 @@ func (s *Server) stageChallenge(ctx context.Context, r *http.Request, sess strin
 	return api.ChallengeResponse{ChallengeID: id, Canonical: text, PublicKey: opts, Open: t.offer()}, nil
 }
 
-func (s *Server) stageFinish(ctx context.Context, r *http.Request, sess string) (any, error) {
+func (s *Server) stageFinish(ctx context.Context, r *http.Request, sess string) (out any, err error) {
 	var in api.DecideRequest
 	if err := decode(r, &in); err != nil {
 		return nil, err
@@ -691,6 +691,14 @@ func (s *Server) stageFinish(ctx context.Context, r *http.Request, sess string) 
 	if err != nil {
 		return nil, err
 	}
+	if meta.Action == "open-legacy" {
+		// Any failure from here on leaves nothing staged from the format-1 key.
+		defer func() {
+			if err != nil {
+				st.reset()
+			}
+		}()
+	}
 	if meta.Action == "test" && !slices.Equal(salts, t.salts) {
 		return nil, errConflict("stale staging step; start it again")
 	}
@@ -706,6 +714,11 @@ func (s *Server) stageFinish(ctx context.Context, r *http.Request, sess string) 
 	if meta.Action == "open-legacy" {
 		if err = s.openLegacy(ctx, st, row, t.cred, keks[0]); err != nil {
 			return nil, err
+		}
+		if stageAfterLegacy != nil {
+			if err = stageAfterLegacy(); err != nil {
+				return nil, err
+			}
 		}
 		keks = keks[1:]
 	}
@@ -747,6 +760,10 @@ func (s *Server) stageFinish(ctx context.Context, r *http.Request, sess string) 
 	s.bcast.notify()
 	return api.OK{OK: true}, nil
 }
+
+// stageAfterLegacy is nil outside tests: a test sets it to fail the
+// open-legacy tap after the format-1 key opened, to prove the stage resets.
+var stageAfterLegacy func() error
 
 // stageKEKs consumes the tap's attempt and opens its packet into want keys.
 func (s *Server) stageKEKs(t *tapOpen, sess string, challenge []byte, pkt *api.OpenPacket, want int) ([]*seal.Key, error) {

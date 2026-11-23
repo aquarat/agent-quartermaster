@@ -104,7 +104,8 @@ store. Run it from **Admin → Setup → Move to per-credential buckets** (task 
    which becomes approve-only until enabled again. One transaction writes everything, drops
    the format-1 wraps and sets schema 9. The runner verifies the signature against its pins,
    pins the new manifest digest, restarts `serve` with everything closed and, if
-   `purge_backups` was set, deletes the pre-migration and older backups.
+   `purge_backups` was set, deletes the format-1 backups of this store (those whose
+   configuration pins the same format-1 manifest) and keeps the rest ([SETUP.md](SETUP.md)).
 
 Before activation an interruption commits nothing: the runner restores the configuration and
 restarts the format-1 broker, and the task can be run again. After activation it only
@@ -146,10 +147,12 @@ Prove the recovery identity opens a real backup. Do both from time to time.
 2. **Rekey** each scope it opened (Admin → Buckets → **Rekey**, one tap by a passkey that
    opens the scope). The scope and every bucket in it get new key pairs, every record is
    re-encrypted, drafts are dropped and the scope's open buckets close (their users pause until
-   **Reopen**). Only the tapping passkey keeps a wrap. Copies of the old wraps in backups then
-   expose only values as they were at the copy.
-3. **Enable** your other passkeys again from the one that rekeyed (Admin → Passkeys), and test
-   them.
+   **Reopen**). Only the tapping passkey keeps a wrap, of the new key at a fresh PRF salt
+   (the same tap's second evaluation). Copies of the old wraps in backups then expose only
+   values as they were at the copy.
+3. **Test** the rekeying passkey (Admin → Passkeys → **Test**): its new wrap is untested until
+   it opens once, and new sets in the scope wait for that. Then **enable** your other passkeys
+   again from it, and test them.
 
 ## Lost every passkey
 
@@ -184,7 +187,9 @@ continuity cannot be proven. Do not use this flow on a suspect host.
    them. Finally sign the replacement plan: backup digest, serial high-water mark, scopes and
    the credentials it retires. Allow ten minutes; an expired or interrupted attempt needs a
    fresh local session.
-5. One transaction stores the new passkey and its wraps, deletes every old passkey (their
+5. One transaction **rekeys every scope** (the replacement's wraps are of new scope keys made
+   at step 2; every bucket gets a new key pair, every record is re-encrypted, every recovery
+   wrap is new), stores the new passkey and its wraps, deletes every old passkey (their
    wraps go with them), ends every session, pending request, grant, standing rule, env release,
    signing grant and host admission, and records the transition. The process writes
    `replacement-manifest.json` in the directory and exits.

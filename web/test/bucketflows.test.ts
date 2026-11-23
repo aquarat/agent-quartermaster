@@ -115,9 +115,15 @@ describe("approvals open their buckets (sealed mock)", () => {
     await expect(beginControl(api, v, "rekey", {}, rp)).rejects.toThrow(/Choose a scope/);
     const r = await beginControl(api, v, "rekey", { scope }, rp);
     expect(r.facts.some(([k, x]) => k === "scope" && x === scope)).toBe(true);
+    const packets = m.store.buckets.packets.length;
     await r.finish(auth);
+    // Two KEKs: the passkey's salt opens the old scope key, the fresh salt wraps the new one.
+    expect(m.store.buckets.packets.length).toBe(packets + 1);
+    expect(m.store.buckets.packets.at(-1)!.keks.length).toBe(2);
     const after = await api.sealStatus!();
     expect(after.passkeys!.filter((p) => !p.missing.includes(scope)).length).toBe(1); // only the tapping passkey keeps a wrap
+    const mine = after.passkeys!.find((p) => p.current)!.scopes.find((x) => x.scope === scope)!;
+    expect(mine.tested).toBe(false); // the new wrap is tested at its next open
     await expect(beginControl(api, v, "renew-leaf", {}, rp)).rejects.toThrow(/repair/i);
     await expect(beginControl(api, v, "activate", {}, rp)).rejects.toThrow(/manifest/);
   });

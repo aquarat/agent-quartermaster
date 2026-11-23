@@ -23,15 +23,20 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/seal"
+	"github.com/aquarat/agent-quartermaster/internal/server/store"
 	"github.com/aquarat/agent-quartermaster/internal/webui"
 )
 
-const recoveryEffects = "Replace all owner login keys and wraps. End every session, pending request, grant, standing rule and host admission; require new host enrollment. Preserve audit and SSH serials. Issued certificates, copied values and upstream children are not recalled."
+const recoveryEffects = "Replace all owner login keys and wraps, and rekey every scope and bucket. End every session, pending request, grant, standing rule and host admission; require new host enrollment. Preserve audit and SSH serials. Issued certificates, copied values and upstream children are not recalled."
 
-// recoveryScope is one scope key recovered from its recovery wrap, and the
-// replacement passkey's wrap of it once made.
+// recoveryScope is one scope key recovered from its recovery wrap (old), the
+// new scope key that replaces it at commit (key, pub: every scope is rekeyed,
+// so copies of the retired passkeys' wraps open nothing new), and the
+// replacement passkey's wrap of the new key once made.
 type recoveryScope struct {
 	name   string
+	oldPub []byte
+	old    *seal.Key
 	pub    []byte
 	key    *seal.Key
 	salt   seal.ID
@@ -58,7 +63,8 @@ type recoveryFlow struct {
 func (f *recoveryFlow) wipe() {
 	for _, sc := range f.scopes {
 		sc.key.Destroy()
-		sc.key = nil
+		sc.old.Destroy()
+		sc.key, sc.old = nil, nil
 	}
 }
 
@@ -103,7 +109,12 @@ func (s *Server) Recover(ctx context.Context, dir string, input io.Reader) error
 		if err != nil {
 			return errors.New("this is not the recovery key of this installation")
 		}
-		f.scopes = append(f.scopes, &recoveryScope{name: x.Scope, pub: x.Public, key: k})
+		nk, npub, err := seal.NewKeyPair()
+		if err != nil {
+			k.Destroy()
+			return err
+		}
+		f.scopes = append(f.scopes, &recoveryScope{name: x.Scope, oldPub: x.Public, old: k, pub: npub, key: nk})
 		n, err := s.drillScope(ctx, q, x, k)
 		if err != nil {
 			return errors.New("backup contains a missing or damaged bucket or record")
@@ -421,79 +432,99 @@ func (f *recoveryFlow) verify(b, digest []byte, ext protocol.AuthenticationExten
 
 func (f *recoveryFlow) commit(ctx context.Context, text string, assertion []byte) error {
 	s := f.s
-	tx, err := s.store.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	now := s.now().UnixMilli()
-	var prior string
-	if err = tx.QueryRowContext(ctx, `SELECT manifest FROM seal_active WHERE singleton=1`).Scan(&prior); err != nil || seal.Digest([]byte(prior)) != s.cfg.Seal.Manifest {
-		return errors.New("recovery pin changed")
-	}
-	var manifest map[string]json.RawMessage
-	if err = json.Unmarshal([]byte(prior), &manifest); err != nil {
-		return err
-	}
-	manifest["recovery_transition"], _ = json.Marshal(seal.Digest([]byte(text)))
-	next, err := json.Marshal(manifest)
-	if err != nil {
-		return err
-	}
-	if err = writeExclusive(filepath.Join(f.dir, "replacement-manifest.json"), next); err != nil {
-		return err
-	}
-	var seq int64
-	if err = tx.QueryRowContext(ctx, `SELECT max(coalesce((SELECT seq FROM sqlite_sequence WHERE name='grants'),0),coalesce((SELECT max(serial) FROM grants),0))`).Scan(&seq); err != nil || seq > *s.cfg.Seal.RecoverySerial {
-		return errors.New("operator serial record below restored allocator; reestablish high-water mark")
-	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name='grants'`); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO sqlite_sequence(name,seq) VALUES('grants',?)`, *s.cfg.Seal.RecoverySerial); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE seal_active SET manifest=?,canonical=?,assertion=? WHERE singleton=1`, string(next), text, assertion); err != nil {
-		return err
-	}
-	cj, err := json.Marshal(f.cred)
-	if err != nil {
-		return err
-	}
-	res, err := tx.ExecContext(ctx, `INSERT INTO passkeys(credential_id,credential_json,name,created_at) VALUES(?,?,?,?)`, f.cred.ID, string(cj), f.name, now)
-	if err != nil {
-		return err
-	}
-	row, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	for _, sc := range f.scopes {
-		if sc.wrap == nil || !sc.tested {
-			return errors.New("a scope key is not wrapped and tested")
+	z := s.seal
+	err := s.store.Tx(ctx, func(q *store.Q) error {
+		tx := q.Raw()
+		now := s.now().UnixMilli()
+		var prior string
+		if err := tx.QueryRowContext(ctx, `SELECT manifest FROM seal_active WHERE singleton=1`).Scan(&prior); err != nil || seal.Digest([]byte(prior)) != s.cfg.Seal.Manifest {
+			return errors.New("recovery pin changed")
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO scope_wraps(passkey,scope,salt,wrap,created,tested_at) VALUES(?,?,?,?,?,?)`, row, sc.name, sc.salt[:], sc.wrap, now, now); err != nil {
+		var manifest map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(prior), &manifest); err != nil {
 			return err
 		}
-	}
-	for _, stmt := range []string{`DELETE FROM web_sessions`, `DELETE FROM challenges`, `DELETE FROM enroll_codes`, `DELETE FROM env_drafts`, `UPDATE requests SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`, `UPDATE enrollments SET status='expired' WHERE status='pending'`, `UPDATE env_releases SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`, `UPDATE sign_requests SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`} {
-		if _, err = tx.ExecContext(ctx, stmt); err != nil {
+		manifest["recovery_transition"], _ = json.Marshal(seal.Digest([]byte(text)))
+		next, err := json.Marshal(manifest)
+		if err != nil {
 			return err
 		}
-	}
-	for _, table := range []string{"hosts", "grants", "standing"} {
-		if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET revoked_at=? WHERE revoked_at IS NULL`, now); err != nil {
+		if err = writeExclusive(filepath.Join(f.dir, "replacement-manifest.json"), next); err != nil {
 			return err
 		}
-	}
-	// The old passkeys' scope wraps go with them (ON DELETE CASCADE).
-	if _, err = tx.ExecContext(ctx, `DELETE FROM passkeys WHERE id!=?`, row); err != nil {
+		var seq int64
+		if err = tx.QueryRowContext(ctx, `SELECT max(coalesce((SELECT seq FROM sqlite_sequence WHERE name='grants'),0),coalesce((SELECT max(serial) FROM grants),0))`).Scan(&seq); err != nil || seq > *s.cfg.Seal.RecoverySerial {
+			return errors.New("operator serial record below restored allocator; reestablish high-water mark")
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name='grants'`); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO sqlite_sequence(name,seq) VALUES('grants',?)`, *s.cfg.Seal.RecoverySerial); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE seal_active SET manifest=?,canonical=?,assertion=? WHERE singleton=1`, string(next), text, assertion); err != nil {
+			return err
+		}
+		cj, err := json.Marshal(f.cred)
+		if err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `INSERT INTO passkeys(credential_id,credential_json,name,created_at) VALUES(?,?,?,?)`, f.cred.ID, string(cj), f.name, now)
+		if err != nil {
+			return err
+		}
+		row, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		for _, stmt := range []string{`DELETE FROM web_sessions`, `DELETE FROM challenges`, `DELETE FROM enroll_codes`, `DELETE FROM env_drafts`, `UPDATE requests SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`, `UPDATE enrollments SET status='expired' WHERE status='pending'`, `UPDATE env_releases SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`, `UPDATE sign_requests SET status=CASE WHEN status='approved' THEN 'revoked' ELSE 'expired' END WHERE status IN ('approved','pending')`} {
+			if _, err = tx.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+		}
+		// Rekey every scope (§10): the retired passkeys' wraps, and copies of
+		// them in old backups, open only the old scope keys. Every bucket gets
+		// a new key pair under the new scope key and every record is
+		// re-encrypted; the replacement passkey's wraps are of the new keys.
+		rekeyed := 0
+		for _, sc := range f.scopes {
+			if sc.wrap == nil || !sc.tested {
+				return errors.New("a scope key is not wrapped and tested")
+			}
+			rows, err := q.ScopeBuckets(ctx, sc.name)
+			if err != nil {
+				return err
+			}
+			for _, b := range rows {
+				if err := s.rekeyBucket(ctx, q, b, sc.old, sc.oldPub, sc.pub); err != nil {
+					return err
+				}
+			}
+			rekeyed += len(rows)
+			rec, err := seal.Scope{Installation: z.installation, Name: sc.name, Public: sc.pub}.RecoveryWrap(z.recipient, sc.key)
+			if err != nil {
+				return err
+			}
+			if err = q.ReplaceScope(ctx, store.ScopeRow{Scope: sc.name, Public: sc.pub, Recovery: rec}); err != nil {
+				return err
+			}
+			if _, err = tx.ExecContext(ctx, `INSERT INTO scope_wraps(passkey,scope,salt,wrap,created,tested_at) VALUES(?,?,?,?,?,?)`, row, sc.name, sc.salt[:], sc.wrap, now, now); err != nil {
+				return err
+			}
+		}
+		for _, table := range []string{"hosts", "grants", "standing"} {
+			if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET revoked_at=? WHERE revoked_at IS NULL`, now); err != nil {
+				return err
+			}
+		}
+		// The old passkeys' scope wraps go with them (ON DELETE CASCADE).
+		if _, err = tx.ExecContext(ctx, `DELETE FROM passkeys WHERE id!=?`, row); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO audit(at,actor,action,object,detail) VALUES(?,'owner','recovery_replace','seal',?)`, now, fmt.Sprintf("%s rekeyed_scopes=%d rekeyed_buckets=%d assertion=%s", text, len(f.scopes), rekeyed, assertion))
 		return err
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO audit(at,actor,action,object,detail) VALUES(?,'owner','recovery_replace','seal',?)`, now, fmt.Sprintf("%s assertion=%s", text, assertion)); err != nil {
-		return err
-	}
-	if err = tx.Commit(); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	_ = s.store.CheckpointWAL(ctx)

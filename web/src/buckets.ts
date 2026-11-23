@@ -117,6 +117,9 @@ export interface Descriptor {
   salts?: string[];
   /** scope-enrol, purpose "migrate": the format-1 unlock wrap the first PRF input opens. */
   legacy?: Legacy;
+  /** bucket-open of a rekey (one scope): the fresh salt of the second PRF evaluation; the new
+   * scope key is wrapped under the KEK derived from it, not under the passkey's old salt. */
+  rekey_salt?: string;
 }
 
 export const ENROL_PURPOSES = ["enrol", "test", "stage", "migrate"] as const;
@@ -166,6 +169,8 @@ export interface DescriptorExpectation {
   purposes?: readonly string[];
   installation?: string;
   epoch?: string;
+  /** A rekey: the descriptor must carry `rekey_salt` (and only then may it). */
+  rekey?: boolean;
 }
 
 /** Parse and validate a descriptor exactly per the wire contract; refuses anything else. */
@@ -188,6 +193,7 @@ export function parseDescriptor(textIn: string, want: DescriptorExpectation = {}
   const keys = [...OPEN_KEYS];
   if (object === "scope-enrol") keys.push("credential_id", "salts");
   if (d.purpose === "migrate") keys.push("legacy");
+  if (object === "bucket-open" && want.rekey) keys.push("rekey_salt");
   exactKeys(d, keys, "Open descriptor");
   rawB64(d.attempt_id, 32);
   rawB64(d.installation, 32);
@@ -198,6 +204,10 @@ export function parseDescriptor(textIn: string, want: DescriptorExpectation = {}
   if (want.epoch !== undefined && d.epoch !== want.epoch) fail("Open descriptor is from another broker start");
   const scopes = d.scopes;
   if (!Array.isArray(scopes) || scopes.length < 1 || scopes.length > 2 || !scopes.every(validScope) || new Set(scopes).size !== scopes.length) fail("Open descriptor must name one or two scopes");
+  if (want.rekey) {
+    if ((scopes as string[]).length !== 1) fail("A rekey opens exactly one scope");
+    rawB64(d.rekey_salt, 32);
+  }
   if (!Array.isArray(d.buckets) || d.buckets.length > 512) fail("Invalid bucket list");
   const ids = new Set<string>();
   for (const b of d.buckets as unknown[]) {
@@ -241,10 +251,18 @@ const HOLDS: Record<string, string> = {
   auto: "while auto-approval is on (until restart)",
   window: "while the approval window is open",
 };
+/** The broker's instant hold: its reason text ("instant (this approval only)") or its kind. */
+const isInstant = (part: string) => part === "instant" || part.startsWith("instant (");
+/** The card's words for a descriptor's `hold`: the broker joins the reasons of a bucket's holds
+ * with "; " (e.g. "instant (this approval only); Cloudflare grant"). A hold kind is spelled out;
+ * any other reason is shown as the broker wrote it; the instant part is dropped next to others. */
 export function holdWords(hold: string, until: string): string {
-  const base = HOLDS[hold] ?? hold;
+  const all = hold.split("; ").filter((p) => p !== "");
+  const lasting = all.filter((p) => !isInstant(p));
+  if (!lasting.length) return HOLDS.instant!;
+  const base = lasting.map((p) => HOLDS[p] ?? p).join("; ");
   if (!until) return base;
-  return hold === "instant" ? base : `${base}, until ${until.replace("T", " ").replace(/(\.\d+)?Z$/, " UTC")}`;
+  return `${base}, until ${until.replace("T", " ").replace(/(\.\d+)?Z$/, " UTC")}`;
 }
 
 /** One line per bucket, for the card before the tap. */
@@ -253,8 +271,9 @@ export function describeOpen(d: Descriptor): string[] {
     const verb = d.purpose === "test" ? "Tests" : d.purpose === "migrate" ? "Opens the format-1 key and creates" : "Creates";
     return [`${verb} this passkey's key for: ${d.scopes.join(", ")}. Opens no credential.`];
   }
-  if (!d.buckets.length) return [`Opens the scope key of ${d.scopes.join(" and ")} for the length of this tap (no credential stays open).`];
-  return d.buckets.map((b) => `Opens ${b.label}: ${holdWords(b.hold, b.until)}`);
+  const rekey = d.rekey_salt ? [`Rekeys ${d.scopes[0]}: your passkey's new key uses a fresh PRF input. Test it afterwards (Admin → Passkeys → Test).`] : [];
+  if (!d.buckets.length) return [`Opens the scope key of ${d.scopes.join(" and ")} for the length of this tap (no credential stays open).`, ...rekey];
+  return [...d.buckets.map((b) => `Opens ${b.label}: ${holdWords(b.hold, b.until)}`), ...rekey];
 }
 
 // ---- the tap ----
@@ -363,6 +382,13 @@ export async function prepareTap(r: ChallengeLike, rpId: string, want: TapExpect
         if (!allowed.has(id)) fail("PRF inputs for a passkey that may not answer");
         if (!isObject(v)) fail("Invalid PRF inputs");
         const e = v as Record<string, unknown>;
+        if (d.rekey_salt) {
+          // Rekey: first = the passkey's salt for the scope, second = the descriptor's fresh salt.
+          exactKeys(e, ["first", "second"], "PRF inputs");
+          if (e.second !== d.rekey_salt) fail("The rekey's second PRF input is not the descriptor's fresh salt");
+          salts.set(id, [rawB64(e.first, 32), rawB64(e.second, 32)]);
+          continue;
+        }
         exactKeys(e, d.scopes.length === 2 ? ["first", "second"] : ["first"], "PRF inputs");
         salts.set(id, d.scopes.map((_, i) => rawB64(i ? e.second : e.first, 32)));
       }
@@ -409,7 +435,7 @@ export async function prepareTap(r: ChallengeLike, rpId: string, want: TapExpect
       try {
         if (id !== cred.id) fail("Unexpected credential");
         const mine = salts.get(id);
-        const need = migrate ? 2 : d.scopes.length;
+        const need = migrate || d.rekey_salt ? 2 : d.scopes.length;
         const ok = !!mine && first?.length === 32 && (need === 1 || second?.length === 32);
         if (!ok) {
           if (d.object === "scope-enrol") fail("This passkey did not return a PRF result, so it cannot hold a scope key");
@@ -428,7 +454,9 @@ export async function prepareTap(r: ChallengeLike, rpId: string, want: TapExpect
             keks.push(await deriveKEK(second!, inst, rpId, rawCred, d.scopes[0]!, mine![1]!));
           } else {
             const outs = [first!, second!];
-            for (let i = 0; i < d.scopes.length; i++) keks.push(await deriveKEK(outs[i]!, inst, rpId, rawCred, d.scopes[i]!, mine![i]!));
+            // A rekey derives its second KEK for the same scope, at the fresh salt.
+            const scopes = d.rekey_salt ? [d.scopes[0]!, d.scopes[0]!] : d.scopes;
+            for (let i = 0; i < scopes.length; i++) keks.push(await deriveKEK(outs[i]!, inst, rpId, rawCred, scopes[i]!, mine![i]!));
           }
           const sealed = await sealKEKs(recipient, info, openAAD(attempt, epoch, challenge, rawCred), keks);
           return { attempt_id: d.attempt_id, ...sealed };

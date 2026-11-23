@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -370,7 +371,11 @@ func sealParams() SealParams {
 // activation builds what the import process records at activation: the manifest and the
 // owner's signature over the seal-control canonical that carries it.
 func activation(signer *vauth.Authenticator, recipient string) (manifest, digest, canonical string, assertion json.RawMessage) {
-	m, _ := json.Marshal(map[string]any{"seal_format": 2, "offline_recipient": recipient, "installation": "x"})
+	return activationOf(signer, recipient, map[string]any{"seal_format": 2, "offline_recipient": recipient, "installation": "inst"})
+}
+
+func activationOf(signer *vauth.Authenticator, recipient string, fields map[string]any) (manifest, digest, canonical string, assertion json.RawMessage) {
+	m, _ := json.Marshal(fields)
 	sum := sha256.Sum256(m)
 	c, _ := json.Marshal(map[string]any{"v": 3, "action": "activate", "object": "seal-control", "nonce": canon.NewNonce(), "issued_at": "2026-11-22T10:00:00Z", "id": "inst", "epoch": "e", "manifest": string(m)})
 	return string(m), hex.EncodeToString(sum[:]), string(c), signer.Assert(canon.Challenge(string(c)))
@@ -624,6 +629,19 @@ func TestActivationRecordIsStrict(t *testing.T) {
 	}
 	if err := check(text); err != nil {
 		t.Fatal(err)
+	}
+	// The manifest must be format 2 and name the installation the canonical names.
+	for name, fields := range map[string]map[string]any{
+		"format 1":             {"seal_format": 1, "offline_recipient": recipient, "installation": "inst"},
+		"no format":            {"offline_recipient": recipient, "installation": "inst"},
+		"no installation":      {"seal_format": 2, "offline_recipient": recipient},
+		"empty installation":   {"seal_format": 2, "offline_recipient": recipient, "installation": ""},
+		"another installation": {"seal_format": 2, "offline_recipient": recipient, "installation": "other"},
+	} {
+		_, d, c, _ := activationOf(signer, recipient, fields)
+		if err := verifyActivation(Facts{Schema: 9, Manifest: d, Activation: c, ActivationProof: signer.Assert(canon.Challenge(c))}, recipient, origin, pins); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 	for name, forged := range map[string]string{
 		"extra key":       strings.Replace(text, `{"action"`, `{"X":1,"action"`, 1),
@@ -1209,6 +1227,12 @@ func TestBuckets(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(b.l.Backups, "20260101T000000Z-seal", "state"), 0700); err != nil {
 		t.Fatal(err)
 	}
+	// An earlier format-1 rollback point of another task (same pin): deleted with the
+	// pre-migration backup. An unsealed copy and state set aside by a restore: kept.
+	b.write(0600, b.read("etc", "config.toml"), "backups", "20260102T000000Z-update", "config", "config.toml")
+	b.write(0600, "", "backups", "20260102T000000Z-update", "complete")
+	b.write(0600, strings.Replace(b.read("etc", "config.toml"), old, strings.Repeat("c", 64), 1), "backups", "20260103T000000Z-other", "config", "config.toml")
+	b.write(0600, "x", "data.displaced-20260104T000000Z", "aqmas.db")
 	var manifest string
 	b.queue(b.sign(TaskBuckets, BucketsParams{PurgeBackups: true}, nil))
 	owner := b.when("bucket-migrate", func() {
@@ -1233,9 +1257,16 @@ func TestBuckets(t *testing.T) {
 	case !strings.Contains(b.read("hook.log"), "start bucket-migrate"):
 		t.Fatal("migration mode never started")
 	}
+	var names []string
 	left, _ := os.ReadDir(b.l.Backups)
-	if len(left) != 1 || left[0].Name() != "sealed-"+manifest[:16] || b.read("backups", left[0].Name(), "manifest.json") == "" {
-		t.Fatalf("pre-migration and older backups not purged down to the new manifest: %v", left)
+	for _, e := range left {
+		names = append(names, e.Name())
+	}
+	if !slices.Equal(names, []string{"20260101T000000Z-seal", "20260103T000000Z-other", "sealed-" + manifest[:16]}) || b.read("backups", "sealed-"+manifest[:16], "manifest.json") == "" || s.Result["backups_deleted"] != "2" {
+		t.Fatalf("not exactly the format-1 backups purged: %v %v", names, s.Result)
+	}
+	if b.read("data.displaced-20260104T000000Z", "aqmas.db") != "x" || s.Result["displaced_kept"] == "" {
+		t.Fatal("state set aside by a restore was deleted or not reported")
 	}
 	if stages, _ := filepath.Glob(b.path("data", "seal-stage-*")); len(stages) != 0 {
 		t.Fatal("staging directory left")

@@ -117,7 +117,7 @@ export function bucketIndicator(v: SealView): HTMLElement {
 }
 
 export const REKEY_WARNING =
-  "Rekey replaces this scope's key and every bucket key in it, and re-encrypts every value. Do it after losing a passkey or a backup: removing a passkey does not revoke copies of its wraps in old backups. Afterwards only this passkey can open the scope: enable your other passkeys again from it. Open buckets of the scope close and their users pause until you Reopen them. Old copies then expose only values as they were at the copy.";
+  "Rekey replaces this scope's key and every bucket key in it, and re-encrypts every value. Do it after losing a passkey or a backup: removing a passkey does not revoke copies of its wraps in old backups. Your passkey's new key uses a fresh PRF input: test it right afterwards (Admin → Passkeys → Test). Afterwards only this passkey can open the scope: enable your other passkeys again from it. Open buckets of the scope close and their users pause until you Reopen them. Old copies then expose only values as they were at the copy.";
 
 export const CLOSE_ALL_TEXT = "Close all wipes every open bucket key and hold and ends every approval window, without a restart. Grants that need a bucket pause until you Reopen them.";
 
@@ -167,7 +167,7 @@ export async function prepareControl(v: SealView, action: ControlAction, b: Revi
       open = "optional";
       break;
   }
-  const tap = await prepareTap(b, rp, { installation: v.installation, epoch: v.epoch, allowOpen: open !== "none" });
+  const tap = await prepareTap(b, rp, { installation: v.installation, epoch: v.epoch, allowOpen: open !== "none", rekey: action === "rekey", requireOpen: action === "rekey" });
   if (tap.open && action === "reopen") {
     const ids = new Set(params.buckets);
     if (tap.open.descriptor.buckets.some((x) => !ids.has(x.id))) throw Error("The tap would open a bucket you did not choose");

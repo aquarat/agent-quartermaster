@@ -227,7 +227,8 @@ try {
     case 'create-scope': { // TITLE: Admin → Buckets "Create": the signed-in passkey creates an organisation's scope key
       const v=await api.sealStatus();const sc=(v.scopes??[]).find((x:any)=>x.title===args[0]||x.scope===args[0]);if(!sc)throw Error('no scope '+args[0]);
       const me=(await api.state()).passkeys.find((k:any)=>k.current);
-      let step=await (await import(`${web}/src/capabilities.ts`)).startCapability(api,v,{action:'enable',capability:'unlock',nickname:me.nickname,credential_id:me.raw_id,scopes:[sc.scope]},rp);
+      // Enable (two taps), then the test tap that lets the broker write into the new scope.
+      let step=await (await import(`${web}/src/capabilities.ts`)).startCapability(api,v,{action:'enable',capability:'unlock',nickname:me.nickname,credential_id:me.raw_id,scopes:[sc.scope]},rp,0,{thenTest:true});
       for(let n=0;step;n++){if(n>4)throw Error('create does not converge');step=(await step.tap(auth)) as any;}
       break;
     }

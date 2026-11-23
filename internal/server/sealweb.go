@@ -374,13 +374,16 @@ func (s *Server) sealControlBegin(ctx context.Context, r *http.Request, sess str
 	if err != nil {
 		return nil, err
 	}
-	if in.Action == "rekey" && len(needs) == 0 {
-		// A scope without buckets still needs its key opened to rekey it.
+	if in.Action == "rekey" {
+		// The tap opens the scope key (PRF first = the passkey's salt) and, at
+		// a fresh salt (second), yields the KEK the new scope key is wrapped
+		// under, so a KEK seen before the rekey does not open it (§7).
 		o, err := s.loadOwner(ctx)
 		if err != nil {
 			return nil, err
 		}
-		t, challenge, err := s.offerScopes(ctx, sess, text, nil, []string{in.Scope}, o)
+		salt := seal.RandomID()
+		t, challenge, err := s.offerScopesRekey(ctx, sess, text, needs, []string{in.Scope}, o, &salt)
 		if err != nil {
 			return nil, err
 		}
@@ -523,7 +526,7 @@ func (s *Server) closeAll() {
 func (s *Server) rekey(ctx context.Context, sess string, c *store.Challenge, in api.DecideRequest) (any, error) {
 	z := s.seal
 	t := z.taps.take(c.ID)
-	if t == nil || t.session != sess || !s.now().Before(t.expires) || len(t.scopes) != 1 {
+	if t == nil || t.session != sess || !s.now().Before(t.expires) || len(t.scopes) != 1 || t.rekeySalt == nil {
 		return nil, errConflict("stale approval; review again")
 	}
 	scope := t.scopes[0]
@@ -540,7 +543,7 @@ func (s *Server) rekey(ctx context.Context, sess string, c *store.Challenge, in 
 		return nil, err
 	}
 	defer destroyKeys(keks)
-	olds, err := s.unwrapScopes(ctx, row, t.scopes, keks)
+	olds, err := s.unwrapScopes(ctx, row, t.scopes, keks[:1])
 	if err != nil {
 		return nil, err
 	}
@@ -584,14 +587,15 @@ func (s *Server) rekey(ctx context.Context, sess string, c *store.Challenge, in 
 		if err != nil {
 			return err
 		}
-		w, err := s.passkeyScope(sw).Wrap(keks[0], newScope, pubS)
+		// The new wrap is under the fresh salt's KEK (the second evaluation of
+		// this tap). The broker cannot check that KEK before it is used, so the
+		// wrap is untested until it next opens (Admin → Passkeys → Test).
+		sw.Salt = bytes.Clone(t.rekeySalt[:])
+		w, err := s.passkeyScope(sw).Wrap(keks[1], newScope, pubS)
 		if err != nil {
 			return err
 		}
-		if err = q.PutScopeWrap(ctx, store.ScopeWrapRow{Passkey: row, Scope: scope, Salt: sw.Salt, Wrap: w, Created: s.now()}); err != nil {
-			return err
-		}
-		if err = q.MarkScopeWrapTested(ctx, sw.ID, s.now()); err != nil {
+		if err = q.RekeyScopeWrap(ctx, store.ScopeWrapRow{Passkey: row, Scope: scope, Salt: sw.Salt, Wrap: w, Created: s.now()}); err != nil {
 			return err
 		}
 		if err = q.DeleteScopeWraps(ctx, scope, row); err != nil {
@@ -608,7 +612,7 @@ func (s *Server) rekey(ctx context.Context, sess string, c *store.Challenge, in 
 	z.pool.evict(ids...)
 	_ = s.store.CheckpointWAL(ctx)
 	s.bcast.notify()
-	s.notify.Send("aqmas: rekey", fmt.Sprintf("Scope %s rekeyed: %d bucket(s); other passkeys must be enabled again", scope, count), s.cfg.PublicBaseURL+"/")
+	s.notify.Send("aqmas: rekey", fmt.Sprintf("Scope %s rekeyed: %d bucket(s); test the rekeying passkey, then enable the other passkeys again", scope, count), s.cfg.PublicBaseURL+"/")
 	return map[string]any{"ok": true, "buckets": count}, nil
 }
 

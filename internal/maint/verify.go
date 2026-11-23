@@ -141,9 +141,15 @@ func verifyActivation(f Facts, recipient, origin string, pins []KeyPin) error {
 	}
 	sum := sha256.Sum256([]byte(c.Manifest))
 	var m map[string]json.RawMessage
-	var named string
+	var named, inst string
+	var format int
 	if hex.EncodeToString(sum[:]) != f.Manifest || json.Unmarshal([]byte(c.Manifest), &m) != nil || json.Unmarshal(m["offline_recipient"], &named) != nil || named != recipient {
 		return errors.New("the signed activation does not match the stored manifest and your recovery key")
+	}
+	// Both tasks that end here produce per-credential buckets: a format-2
+	// manifest naming the installation the activation's canonical names.
+	if json.Unmarshal(m["seal_format"], &format) != nil || format != 2 || json.Unmarshal(m["installation"], &inst) != nil || inst == "" || inst != c.ID {
+		return errors.New("the signed activation is not of a per-credential-bucket store of this installation")
 	}
 	if err := verifyAssertion(f.Activation, f.ActivationProof, origin, pins); err != nil {
 		return errors.New("the activation was not signed by a pinned passkey: " + err.Error())

@@ -21,11 +21,12 @@ nothing is open, and nothing needs to be until it is used.
 | Event | Format 1 (v0.4.1) | Format 2 |
 |---|---|---|
 | Stolen disk, DB copy or backup | Nothing without a PRF tap or the recovery key | Same |
-| Memory dump / brief root while running | Everything while unlocked | The buckets open at that instant (§5), plus Go heap copies the broker cannot wipe (a parsed CA key, the Cloudflare token string during a proxied call). Scope keys live only for the length of a tap |
+| Memory dump / brief root while running | Everything while unlocked | The buckets open at that instant (§5), plus Go heap copies the broker cannot wipe until the garbage collector reuses them: a parsed CA key, the Cloudflare token string during a proxied call, env values as Go strings while a release is collected or a reveal is sealed, the recovery identity text and parsed age identity during a drill, a recovery enrol or `seal-recover`, format-1 entries decrypted during migration staging, and the staging drill key. Scope keys live only for the length of a tap (an abandoned passkey-enable stage: at most five minutes, §7) |
 | Malicious approval page (edge or browser) during one tap | KEK; with a DB copy, everything | KEKs of **at most two scopes**; with a DB copy, those scopes' buckets. It can also redirect the tap itself, e.g. turn it into a Reveal to a key it chose, as in format 1. Two "please retry" taps can cover four scopes |
 | Persistent root | Everything once unlocked | Every bucket as it is used, every scope a tap yields. **Buckets do not defend against persistent root.** |
 | DB writer (tampering) | Payload AEAD under the MK caught forged records | Records and bucket wraps are public-key encrypted: a DB writer can substitute ciphertexts, or a bucket or scope public key so later writes go to its key. A substituted key is refused the next time that bucket or scope is opened (the opened scalar must match), but values written in between were exposed. DB integrity was never a goal ([SEALED.md](SEALED.md)); this is stated, not fixed |
-| A removed or stolen passkey plus an old backup | MK | That passkey's scopes, as of the backup **and afterwards** until the scope is **rekeyed** (§7). Rekey after losing a passkey |
+| A removed or stolen passkey plus an old backup | MK | That passkey's scopes, as of the backup **and afterwards** until the scope is **rekeyed** (§7). Rekey after losing a passkey; `seal-recover` rekeys every scope itself (§10) |
+| Rollback to an older format-2 copy of the DB | Not detected | **Not detected either.** The root pin names only fixed fields (installation, recipient, CA pins, config digest), so any older format-2 copy of this installation boots. It brings back the wraps, records and grants of its time: passkeys removed since, wraps a rekey has replaced since (an old scope key, openable with a passkey lost since), revoked grants and rules. Restore only a copy you mean to; afterwards rekey every scope whose passkey was lost after the copy was taken (§11) |
 
 Buckets protect **snapshots** (a disk, a backup, a memory dump, a brief root), not against an
 attacker who stays. A window keeps the SSH CA open for its duration; what it may approve is
@@ -98,7 +99,13 @@ Every secret value is HPKE-encrypted to `pkB`, stored `enc ‖ ct`, with
 | `env-entry` | set, entry ID (32 random), entry name | value |
 | `signer-key` | set, scheme, public key | `{"scheme","private"}` JSON |
 
-A record cannot move between buckets, sets, names or roles. An env revision is a list of
+A record cannot move between buckets, sets, names or roles. A `cf-proxy` record also binds the
+configured Cloudflare `api_base` (issuer) and `account_id`: change either on a sealed store and
+the record no longer opens (proxied calls fail closed, the drill reports it). A rekey opens
+and re-seals with the values configured when it runs, so a rekey before the change keeps the
+old binding and one after it cannot open the record: neither carries it across. There is no
+in-place re-binding in format 2: treat `api_base` and `account_id` as fixed for the life of a
+sealed store; another account means a new parent token, which needs a new seal import. An env revision is a list of
 entry references; an unchanged entry keeps its ciphertext, so merges and unsets need no open
 bucket. A value's length is the record length minus 81, which is how size limits are checked
 without decrypting.
@@ -159,7 +166,9 @@ use, session-bound, two minutes), so a substituted recipient fails at the honest
 
 Options carry `extensions.prf.evalByCredential`: for each passkey with wraps for **all**
 the descriptor's scopes, `{first: salt(s1), second: salt(s2)}` in descriptor order, even when
-the buckets are open (a hold may end before the tap). `allowCredentials` is those passkeys,
+the buckets are open (a hold may end before the tap). A **rekey** names one scope and adds
+`"rekey_salt"` (a fresh 32-byte salt) to the descriptor; `second` is then that salt for every
+passkey and the packet carries a second KEK derived at it for the same scope (§7). `allowCredentials` is those passkeys,
 plus every other owner passkey when every needed bucket is open at challenge time.
 
 ### 4.3 Finish
@@ -181,14 +190,23 @@ approves anything whose buckets are already open (inside a window, for example).
 open a closed bucket; the card says which passkey can. This matches format 1, where such a
 passkey could not unlock.
 
+It also signs every action that opens no bucket, at any time. One difference from format 1
+follows: format 1 refused update approval (and Setup tasks) while locked, so in practice an
+update was signed after an unlock tap; format 2 has no lock, so an approve-only passkey that
+is a maintenance pin (`/etc/aqmas/update-passkeys.json`, [UPDATES.md](UPDATES.md)) can approve
+an update or a Setup task whenever it is signed in. The root runner checks only its pins,
+never PRF. Keep only passkeys you would trust with that in the pins.
+
 ## 5. Holds
 
 The broker keeps open buckets in one in-memory table: `B → (skB in a locked page, holds)`; the
 key is wiped when the last hold is gone and no operation is using it. A hold is
 `(kind, ref, until)`; kinds: **instant** (one operation), **grant** (Cloudflare proxy grant),
 **env** (env release; at most 10 minutes, then the release is paused), **sign** (signing
-grant), **standing**, **auto** (Cloudflare auto-approval, until restart, policy change or
-Close all), **window**. Holds end on their event (revoke, collect, last signature, window end)
+grant), **standing**, **auto** (Cloudflare auto-approval, until restart, Close all, or the
+set's policy no longer auto-approving any scope; added only by a tap whose card said
+"re-arms Cloudflare auto-approval", never by an auto-approval itself, which adds only its
+grant's hold), **window**. Holds end on their event (revoke, collect, last signature, window end)
 and in a reconcile pass every 15 s that drops holds whose grant, rule or window is no longer
 live. Approvals under a window add their own holds.
 
@@ -199,6 +217,9 @@ Approving a request that creates or matches one keeps the bucket open for the ru
 (auto: until restart). After a restart the first matching request waits for one tap, whose
 card says "re-arms standing rule … until …": one tap per restart per rule, none in between.
 Turning the rule off closes the bucket when idle.
+
+Cloudflare **snapshots** (`/v1/cf/snapshots`) are served only while the proxy parent's
+bucket is open (423 otherwise), as v0.4.1 served them only while unlocked.
 
 **Restart.** Everything is closed; nothing is restored. Grants that need a bucket (proxy
 grants, uncollected env releases, signing grants, standing rules, auto policies) are
@@ -231,7 +252,11 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
   1's flow) and, in the same tap, opens the scope keys (PRF, ≤ two scopes); the new passkey
   then taps once with fresh salts for those scopes; the broker wraps each open scope key under
   the new KEKs and wipes it. Repeat per two scopes. The new wraps are marked tested the first
-  time they open something; **Test** in Admin does that on demand.
+  time they open something; **Test** in Admin does that on demand. A **tested** wrap is never
+  replaced (the KEKs come from the page): enabling a passkey for a scope it already opens is
+  refused, and the store refuses the write. A stage holds the opened scope keys between the
+  two taps; it is wiped when it finishes, at its five-minute deadline (its own timer and the
+  15 s reconcile pass) and by Close all.
 * **Enrol with the recovery key** (when no passkey can open a scope any more): Admin, paste
   the identity; the page seals it to a fresh broker key; one tap by the target passkey signs
   `recovery enrol` with the packet digest and evaluates PRF for up to two scopes. The broker
@@ -242,14 +267,24 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
 * **New organisation:** it has no scope key until a passkey creates it: the first value
   written in it is refused with "create the scope first" and Admin offers **Create** (an
   enable of the signed-in passkey for that scope: one signing tap, then one enrol tap; fresh
-  `skS`, wrapped for that passkey and to the recovery key).
-* **Remove a passkey:** its wraps go with it (cascade). The broker refuses to remove the last
-  passkey that can open any scope. Removal does not revoke copies of its wraps in old backups:
+  `skS`, wrapped for that passkey and to the recovery key). That wrap is untested, so until a
+  passkey has opened the new scope once (**Test**: a third tap) no bucket is created in it: the
+  first write answers "test the new scope first".
+* **Remove a passkey:** its wraps go with it (cascade). The broker refuses to remove (or
+  disable for a scope) a passkey with a wrap of a scope for which no **other** passkey has a
+  **tested** wrap; an untested wrap does not count. The same rule, per scope, is the trigger
+  `keep_one_scope_passkey`, recreated at every boot. Removal does not revoke copies of its wraps in old backups:
   for a lost or stolen passkey, **Rekey** its scopes.
 * **Rekey a scope** (one tap by a passkey that opens it): new `skS'`; every bucket of the
   scope gets a new key pair and every record is re-encrypted; drafts are dropped; open
   buckets of the scope are closed (their users pause). Only the tapping passkey keeps a wrap;
-  others are enabled again from it. Old copies then expose only values as of the copy.
+  others are enabled again from it. Old copies then expose only values as of the copy. The
+  tap evaluates PRF twice: `first` at the passkey's salt opens the old `skS`; `second` at the
+  descriptor's fresh `rekey_salt` gives the KEK that `skS'` is wrapped under, with that salt.
+  So a KEK of the old salt (one malicious-page tap before the rekey) plus a later DB copy does
+  not open `skS'`. The broker cannot check the fresh KEK before it is used, so the new wrap is
+  **untested** until it next opens: test it at once (until then the recovery key is the only
+  proven way in, and new buckets in the scope wait for that test).
 * The store runs with `PRAGMA secure_delete=ON` and checkpoints the WAL after removals,
   migrations and rekeys, so freed pages do not keep old wraps.
 
@@ -274,8 +309,11 @@ afterwards.
    public key, the migrating passkey's wraps, and **every other format-1 unlock passkey, which
    becomes approve-only until enabled**. One transaction writes everything, drops the format-1
    tables, sets schema 9; then `VACUUM` and a WAL checkpoint. The runner verifies the signature,
-   pins the new manifest digest, restarts serve and, unless untold, deletes the pre-migration
-   and older backups (they hold format-1 data, openable with the old salts).
+   pins the new manifest digest, restarts serve and, unless untold, deletes the format-1
+   backups of this store: the pre-migration backup and any other backup whose configuration
+   pins the same format-1 manifest (they hold format-1 data, openable with the old salts).
+   Other backups (unsealed copies, other tasks' rollback points) and state a restore set aside
+   beside the data directory are kept and reported ([SETUP.md](SETUP.md)).
 
 An interruption before step 5 commits nothing (staging is in memory): the runner restores the
 config and restarts; the task can be run again from the backup state. After step 5 it only
@@ -308,8 +346,11 @@ config; then scope wraps (create, test), drill and activation as above.
 * **Lost one passkey:** remove it, rekey its scopes, enable a new passkey from another.
 * **Lost every passkey:** `aqmasd seal-recover DIRECTORY <identity.txt` in isolated
   maintenance ([SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)): it opens every scope key from its
-  recovery wrap, registers a replacement passkey, wraps every scope key for it (create and test
-  taps), and retires the old passkeys. There is no MK to transfer, so `seal-transfer` is gone
+  recovery wrap, generates a **new** key for every scope, registers a replacement passkey,
+  wraps every new scope key for it (create and test taps), and in one transaction rekeys every
+  scope (new bucket keys, every record re-encrypted, new recovery wraps), writes the
+  replacement's wraps and retires the old passkeys. Copies of the old passkeys' wraps (old
+  backups, a lost device) then open only the old scope keys. There is no MK to transfer, so `seal-transfer` is gone
   and the identity itself is piped to the recovery process.
 
 ## 11. Formats (schema 9)
@@ -325,6 +366,12 @@ config; then scope wraps (create, test), drill and activation as above.
 **Downgrade fence:** v0.4.1 refuses schema 9 (it requires schema 8 and its tables); the new
 binary refuses schema 8 except for the pinned migration. The only way back is the
 pre-migration backup with the v0.4.1 binary.
+
+**No rollback fence within format 2.** The pinned manifest describes the store at activation
+and boot checks only its fixed fields, because scopes, buckets and wraps change in normal use.
+Nothing records a monotonic state outside the DB, so an older format-2 copy of the same
+installation boots without complaint (§1). `seal-recover` writes a new pin (its
+`recovery_transition`), which a copy from before the recovery fails.
 
 ## 12. Tests
 

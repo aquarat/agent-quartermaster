@@ -49,13 +49,41 @@ type capStage struct {
 	target      int64
 	keys        map[string]*seal.Key // open scope keys, wiped at finish or expiry
 	created     map[string]store.ScopeRow
+	timer       *time.Timer // wipes an abandoned stage at its deadline
 }
 
 func (st *capStage) wipe() {
+	if st.timer != nil {
+		st.timer.Stop()
+	}
 	for k, v := range st.keys {
 		v.Destroy()
 		delete(st.keys, k)
 	}
+}
+
+// expire wipes every stage past its deadline. An abandoned enable would
+// otherwise keep its opened scope keys until the next authorize; the
+// reconcile pass calls this every 15 s, and each stage has its own timer.
+func (p *capabilityStages) expire(now time.Time) {
+	p.Lock()
+	defer p.Unlock()
+	for id, st := range p.entries {
+		if !now.Before(st.expires) {
+			st.wipe()
+			delete(p.entries, id)
+		}
+	}
+}
+
+// drop wipes and removes one stage if it is still pending (its timer).
+func (p *capabilityStages) drop(st *capStage) {
+	p.Lock()
+	defer p.Unlock()
+	if p.entries[st.id] == st {
+		delete(p.entries, st.id)
+	}
+	st.wipe()
 }
 func (p *capabilityStages) wipe() {
 	p.Lock()
@@ -152,6 +180,12 @@ func (s *Server) checkIntent(ctx context.Context, q *store.Q, in capIntent) (*st
 		switch in.Action {
 		case "enable":
 			if unlock {
+				// A tested wrap is never replaced (a page-supplied KEK could break it).
+				for _, w := range wraps {
+					if w.Tested != nil && slices.Contains(scopes, w.Scope) {
+						return nil, errConflict("this passkey already opens " + scopeName(ctx, q, w.Scope) + " (tested): nothing to enable")
+					}
+				}
 				return &all[i], nil
 			}
 		case "test":
@@ -433,6 +467,7 @@ func (s *Server) capAuthorize(ctx context.Context, r *http.Request, sess string)
 		return nil, errConflict("too many pending registrations")
 	}
 	pool.entries[st.id] = st
+	st.timer = time.AfterFunc(RegisterTTL, func() { pool.drop(st) })
 	stored = true
 	return result, nil
 }
@@ -600,7 +635,9 @@ func (s *Server) commitCapability(ctx context.Context, st *capStage, wraps []sto
 		}
 		for _, w := range wraps {
 			w.Passkey = row
-			if err := q.PutScopeWrap(ctx, w); err != nil {
+			if err := q.PutScopeWrap(ctx, w); errors.Is(err, store.ErrTestedWrap) {
+				return errConflict("this passkey already opens " + scopeName(ctx, q, w.Scope) + " (tested): its wrap was kept")
+			} else if err != nil {
 				return err
 			}
 		}

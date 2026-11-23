@@ -113,7 +113,7 @@ func sealBuckets(t *testing.T, e *env, logs *syncBuffer) *bucketFix {
 	return f
 }
 
-// wrapScope stores passkey row's wrap of a scope key under the software PRF.
+// wrapScope stores passkey row's tested wrap of a scope key under the software PRF.
 func (f *bucketFix) wrapScope(t *testing.T, s *Server, row int64, raw []byte, scope string, k *seal.Key, pub []byte) {
 	t.Helper()
 	salt := seal.RandomID()
@@ -124,6 +124,9 @@ func (f *bucketFix) wrapScope(t *testing.T, s *Server, row int64, raw []byte, sc
 	w, err := ps.Wrap(kek, k, pub)
 	requireNoError(t, err)
 	requireNoError(t, s.store.Q().PutScopeWrap(t.Context(), store.ScopeWrapRow{Passkey: row, Scope: scope, Salt: salt[:], Wrap: w, Created: s.now()}))
+	// What activation leaves: every wrap tested.
+	_, err = s.store.DB().Exec(`UPDATE scope_wraps SET tested_at=? WHERE passkey=? AND scope=?`, s.now().UnixMilli(), row, scope)
+	requireNoError(t, err)
 }
 
 func mustSessionHash(e *env) string {
@@ -162,6 +165,7 @@ type tapResp struct {
 	Canonical   string          `json:"canonical"`
 	PublicKey   json.RawMessage `json:"public_key"`
 	Open        *api.OpenOffer  `json:"open"`
+	oneKEK      bool            // test: a rekey packet without the fresh salt's KEK
 }
 
 type descriptor struct {
@@ -174,6 +178,7 @@ type descriptor struct {
 	Scopes       []string `json:"scopes"`
 	Salts        []string `json:"salts"`
 	Credential   string   `json:"credential_id"`
+	RekeySalt    string   `json:"rekey_salt"`
 	Buckets      []struct {
 		ID, Kind, Label, Scope, Hold, Until string
 	} `json:"buckets"`
@@ -222,7 +227,15 @@ func (f *bucketFix) tapWith(t *testing.T, s *Server, a *vauth.Authenticator, r t
 		return as, nil
 	}
 	var frames [][]byte
-	for i, sc := range d.Scopes {
+	scopes := d.Scopes
+	if d.RekeySalt != "" && !r.oneKEK {
+		// Rekey: the second evaluation is at the fresh salt, for the same scope.
+		if len(d.Scopes) != 1 || salts[1] != d.RekeySalt {
+			t.Fatal("rekey descriptor and PRF inputs disagree")
+		}
+		scopes = []string{d.Scopes[0], d.Scopes[0]}
+	}
+	for i, sc := range scopes {
 		raw, err := b64url(salts[i])
 		requireNoError(t, err)
 		var salt seal.ID

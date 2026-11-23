@@ -49,7 +49,11 @@ EOF
   # Enable covers every scope the passkey lacks, creating the organisations' scope keys (none existed yet).
   owner capability enable "$original" 2>/dev/null || fail 'enable the original passkey from the spare'
   owner buckets --json | bun -e 'const v=await Bun.stdin.json(); if(v.scopes.some(s=>!s.has_key)||v.passkeys.find(p=>!p.current).missing.length)process.exit(1)' || fail "scope keys after enable: $(owner buckets --json)"
-  owner use-passkey "$original" >/dev/null; owner login >/dev/null; owner remove-passkey 'Seal spare' >/dev/null
+  owner use-passkey "$original" >/dev/null; owner login >/dev/null
+  # Its wraps are untested until it opens them: until then the spare stays the last tested passkey.
+  if owner remove-passkey 'Seal spare' 2>/dev/null; then fail 'removed the last passkey with tested wraps'; fi
+  owner capability test "$original" 2>/dev/null || fail 'test the re-enabled original passkey'
+  owner remove-passkey 'Seal spare' >/dev/null
   owner close-all; nothing_open 'close all'
   [[ $(owner seal-status) == buckets ]] || fail 'close all stopped serving'
   seal_restart; [[ $(owner seal-status) == buckets ]] || fail 'restart'; nothing_open 'restart'

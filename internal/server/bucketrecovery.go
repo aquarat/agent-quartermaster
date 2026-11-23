@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -276,7 +277,9 @@ func (s *Server) recoveryFinish(ctx context.Context, r *http.Request, sess strin
 			return err
 		}
 		for _, w := range wraps {
-			if err := q.PutScopeWrap(ctx, w); err != nil {
+			if err := q.PutScopeWrap(ctx, w); errors.Is(err, store.ErrTestedWrap) {
+				return errConflict("this passkey already opens " + scopeName(ctx, q, w.Scope) + " (tested): disable it for that scope first")
+			} else if err != nil {
 				return err
 			}
 		}

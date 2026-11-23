@@ -188,7 +188,7 @@ export class MockBuckets {
   /** A challenge whose tap opens `need` (bucket ids with their holds) or, with no buckets,
    * the keys of `scopes` for the tap (passkey enable). Every needed bucket open and no
    * passkey able to open them → still offered, so a no-PRF passkey can approve. */
-  async bucketOffer(req: Request, text: string, canonical: Record<string, unknown>, session: string | undefined, need: { buckets: { id: string; hold: string; until: string }[]; scopes?: string[] }) {
+  async bucketOffer(req: Request, text: string, canonical: Record<string, unknown>, session: string | undefined, need: { buckets: { id: string; hold: string; until: string }[]; scopes?: string[]; rekey?: boolean }) {
     const list: OpenBucket[] = need.buckets.map((n) => {
       const b = this.bucket(n.id);
       return { hold: n.hold, id: b.id, kind: b.kind, label: b.label, scope: b.scope, until: n.until };
@@ -196,7 +196,9 @@ export class MockBuckets {
     const scopes = need.scopes ?? [...new Set(list.map((b) => b.scope))].sort((a, b) => (a === "installation" ? -1 : b === "installation" ? 1 : a < b ? -1 : 1));
     if (!scopes.length) return this.plainOffer(req, text, canonical, session);
     if (scopes.length > 2) this.deps.fail(409, "conflict", "one tap opens at most two scopes");
-    const { attempt, text: d } = this.newAttempt(session, { buckets: list, object: "bucket-open", purpose: "approve", scopes });
+    // A rekey: the second PRF evaluation is at a fresh salt, for the new scope key's wrap.
+    const rekeySalt = need.rekey ? b64url(randomBytes(32)) : undefined;
+    const { attempt, text: d } = this.newAttempt(session, { buckets: list, object: "bucket-open", purpose: "approve", scopes, ...(rekeySalt ? { rekey_salt: rekeySalt } : {}) });
     const challenge = Buffer.from(await openChallenge(text, d));
     attempt.challenge = challenge;
     const ch = this.deps.issue(text, canonical, session, challenge);
@@ -207,6 +209,7 @@ export class MockBuckets {
       const w = this.wraps.get(p.id);
       if (!w || !scopes.every((s) => w.has(s))) continue;
       const salts = scopes.map((s) => w.get(s)!.salt);
+      if (rekeySalt) salts.push(rekeySalt);
       attempt.salts.set(p.id, salts);
       by[p.id] = salts.length === 2 ? { first: salts[0]!, second: salts[1]! } : { first: salts[0]! };
     }
@@ -263,7 +266,7 @@ export class MockBuckets {
     const list = d.buckets as OpenBucket[];
     if (keks) {
       const w = this.wraps.get(cred);
-      if (!w || keks.length !== scopes.length) this.deps.fail(403, "forbidden", "this passkey cannot open these scopes");
+      if (!w || keks.length !== scopes.length + (d.rekey_salt ? 1 : 0)) this.deps.fail(403, "forbidden", "this passkey cannot open these scopes");
       scopes.forEach((s, i) => {
         const wrap = w!.get(s) ?? this.deps.fail(403, "forbidden", "this passkey cannot open " + s);
         const h = hex(keks![i]!);
@@ -352,8 +355,7 @@ export class MockBuckets {
           canonical.scope_title = s.title;
           canonical.bucket_count = this.buckets.filter((b) => b.scope === s.scope).length;
           need = this.buckets.filter((b) => b.scope === s.scope).map((b) => ({ id: b.id, hold: "instant", until: "" }));
-          if (!need.length) return this.bucketOffer(req, canonicalJSON(canonical), canonical, session, { buckets: [], scopes: [s.scope] });
-          break;
+          return this.bucketOffer(req, canonicalJSON(canonical), canonical, session, { buckets: need, scopes: [s.scope], rekey: true });
         }
         default:
           fail(400, "bad_request", "unknown control action");
@@ -391,8 +393,12 @@ export class MockBuckets {
             b.holds = [];
           }
           for (const [cred, m] of this.wraps) if (cred !== f.cred) m.delete(c.scope as string);
+          // The tapping passkey's new wrap is at the descriptor's fresh salt, untested.
           this.wraps.get(f.cred)?.forEach((w, s) => {
-            if (s === c.scope) delete w.kek;
+            if (s !== c.scope) return;
+            delete w.kek;
+            w.salt = f.attempt!.descriptor.rekey_salt as string;
+            w.tested = false;
           });
           this.deps.audit("seal_rekey", "scope:" + String(c.scope), "");
           break;

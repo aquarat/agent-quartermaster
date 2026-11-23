@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -13,7 +14,17 @@ const BucketDDL = `CREATE TABLE IF NOT EXISTS bucket_scopes(scope TEXT PRIMARY K
 CREATE TABLE IF NOT EXISTS scope_wraps(id INTEGER PRIMARY KEY,passkey INTEGER NOT NULL REFERENCES passkeys(id) ON DELETE CASCADE,scope TEXT NOT NULL REFERENCES bucket_scopes(scope) ON DELETE CASCADE,salt BLOB NOT NULL UNIQUE CHECK(length(salt)=32),wrap BLOB NOT NULL CHECK(length(wrap)=73),created INTEGER NOT NULL,tested_at INTEGER,UNIQUE(passkey,scope)) STRICT;
 CREATE TABLE IF NOT EXISTS buckets(id BLOB PRIMARY KEY CHECK(length(id)=32),scope TEXT NOT NULL REFERENCES bucket_scopes(scope),kind TEXT NOT NULL CHECK(kind IN ('ssh-ca','internal-ca','cf-proxy','env-set','signer')),ref TEXT NOT NULL,public_key BLOB NOT NULL CHECK(length(public_key)=65),wrap BLOB NOT NULL CHECK(length(wrap)=113),payload BLOB,created INTEGER NOT NULL,UNIQUE(kind,ref)) STRICT;
 CREATE TABLE IF NOT EXISTS notice_channel(singleton INTEGER PRIMARY KEY CHECK(singleton=1),topic_url TEXT NOT NULL) STRICT;
-CREATE TRIGGER IF NOT EXISTS keep_one_scope_passkey BEFORE DELETE ON passkeys WHEN EXISTS(SELECT 1 FROM scope_wraps WHERE passkey=OLD.id) AND NOT EXISTS(SELECT 1 FROM scope_wraps WHERE passkey!=OLD.id) BEGIN SELECT RAISE(ABORT,'last passkey that can open buckets'); END;`
+CREATE TRIGGER IF NOT EXISTS keep_one_scope_passkey BEFORE DELETE ON passkeys WHEN EXISTS(` + orphanedWhere + `) BEGIN SELECT RAISE(ABORT,'last passkey that can open buckets'); END;`
+
+// orphanedWhere selects the scopes this passkey (OLD.id) has a wrap of while no
+// other passkey has a tested one: removing it would leave only the recovery key.
+// The trigger and OrphanedScopes share it, so both are per scope and count only
+// tested wraps (docs/BUCKETS.md §7).
+const orphanedWhere = `SELECT w.scope FROM scope_wraps w WHERE w.passkey=OLD.id AND NOT EXISTS(SELECT 1 FROM scope_wraps x WHERE x.scope=w.scope AND x.passkey!=w.passkey AND x.tested_at IS NOT NULL)`
+
+// BucketTriggers recreates the guard triggers of a format-2 store at boot, so
+// a store made by an earlier build of schema 9 gets the current guard.
+const BucketTriggers = `DROP TRIGGER IF EXISTS keep_one_scope_passkey;`
 
 // SchemaBuckets is PRAGMA user_version of a format-2 store.
 const SchemaBuckets = 9
@@ -142,10 +153,37 @@ func (q *Q) ScopeWrap(ctx context.Context, passkey int64, scope string) (ScopeWr
 	return o, notFound(err)
 }
 
-// PutScopeWrap inserts or replaces one passkey's wrap of a scope key (untested).
+// ErrTestedWrap: a passkey's tested wrap of a scope is never replaced by an
+// untested one (a page-supplied KEK could make it unopenable).
+var ErrTestedWrap = errors.New("this passkey already opens that scope (tested)")
+
+// PutScopeWrap inserts one passkey's wrap of a scope key (untested), or
+// replaces an untested one. A tested wrap is kept and ErrTestedWrap returned.
 func (q *Q) PutScopeWrap(ctx context.Context, o ScopeWrapRow) error {
-	_, err := q.q.ExecContext(ctx, `INSERT INTO scope_wraps(passkey,scope,salt,wrap,created) VALUES(?,?,?,?,?) ON CONFLICT(passkey,scope) DO UPDATE SET salt=excluded.salt,wrap=excluded.wrap,created=excluded.created,tested_at=NULL`, o.Passkey, o.Scope, o.Salt, o.Wrap, ms(o.Created))
-	return err
+	res, err := q.q.ExecContext(ctx, `INSERT INTO scope_wraps(passkey,scope,salt,wrap,created) VALUES(?,?,?,?,?) ON CONFLICT(passkey,scope) DO UPDATE SET salt=excluded.salt,wrap=excluded.wrap,created=excluded.created,tested_at=NULL WHERE scope_wraps.tested_at IS NULL`, o.Passkey, o.Scope, o.Salt, o.Wrap, ms(o.Created))
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrTestedWrap
+	}
+	return nil
+}
+
+// RekeyScopeWrap replaces the rekeying passkey's wrap with its wrap of the new
+// scope key under a fresh salt (untested until it opens once). Only rekey calls
+// it: the old wrap holds a scope key that no longer exists.
+func (q *Q) RekeyScopeWrap(ctx context.Context, o ScopeWrapRow) error {
+	return one(q.q.ExecContext(ctx, `UPDATE scope_wraps SET salt=?,wrap=?,created=?,tested_at=NULL WHERE passkey=? AND scope=?`, o.Salt, o.Wrap, ms(o.Created), o.Passkey, o.Scope))
+}
+
+// ScopeTested reports whether any passkey has a tested wrap of the scope.
+func (q *Q) ScopeTested(ctx context.Context, scope string) (bool, error) {
+	var ok bool
+	err := q.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM scope_wraps WHERE scope=? AND tested_at IS NOT NULL)`, scope).Scan(&ok)
+	return ok, err
 }
 func (q *Q) MarkScopeWrapTested(ctx context.Context, id int64, now time.Time) error {
 	_, err := q.q.ExecContext(ctx, `UPDATE scope_wraps SET tested_at=? WHERE id=? AND tested_at IS NULL`, ms(now), id)
@@ -247,10 +285,11 @@ func (q *Q) DeletePasskeyScopeWraps(ctx context.Context, passkey int64, scopes [
 	return nil
 }
 
-// OrphanedScopes lists scopes whose only passkey wraps belong to this passkey.
+// OrphanedScopes lists the scopes this passkey has a wrap of while no other
+// passkey has a tested wrap (the same rule as trigger keep_one_scope_passkey).
 func (q *Q) OrphanedScopes(ctx context.Context, passkey int64) ([]string, error) {
 	var out []string
-	err := q.rows(ctx, `SELECT w.scope FROM scope_wraps w WHERE w.passkey=? AND NOT EXISTS(SELECT 1 FROM scope_wraps x WHERE x.scope=w.scope AND x.passkey!=w.passkey) ORDER BY w.scope`, func(r *sql.Rows) error {
+	err := q.rows(ctx, `SELECT * FROM (`+strings.Replace(orphanedWhere, "OLD.id", "?1", 1)+`) ORDER BY 1`, func(r *sql.Rows) error {
 		var s string
 		err := r.Scan(&s)
 		out = append(out, s)
@@ -280,3 +319,17 @@ func (q *Q) SignerKey(ctx context.Context, set string) (scheme string, public []
 
 // Raw is the underlying querier (the activation transaction's own statements).
 func (q *Q) Raw() querier { return q.q }
+
+// AutoScopes lists the scopes of a set whose current policy (its organisation's
+// revision) turns auto-approval on; empty when the set, service or organisation
+// is archived. The "auto" hold of a cf-proxy bucket lives only while it is not empty.
+func (q *Q) AutoScopes(ctx context.Context, set string) ([]string, error) {
+	var out []string
+	err := q.rows(ctx, `SELECT p.scope FROM set_policies p JOIN credential_sets s ON s.id=p.set_id JOIN services v ON v.id=s.service_id JOIN organisations o ON o.id=v.org_id WHERE p.set_id=? AND NOT s.archived AND NOT v.archived AND NOT o.archived AND p.revision=(SELECT max(revision) FROM set_policies WHERE set_id=p.set_id AND scope=p.scope AND revision<=o.revision) AND p.auto ORDER BY p.scope`, func(r *sql.Rows) error {
+		var sc string
+		err := r.Scan(&sc)
+		out = append(out, sc)
+		return err
+	}, set)
+	return out, err
+}

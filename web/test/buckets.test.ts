@@ -5,7 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { createECDH } from "node:crypto";
 import vector from "../../test/vectors/buckets.json";
-import { canonicalJSON, deriveKEK, kekInfo, openAAD, openChallenge, openInfo, parseDescriptor, prepareTap, t2, type ChallengeLike } from "../src/buckets";
+import { canonicalJSON, deriveKEK, holdWords, kekInfo, openAAD, openChallenge, openInfo, parseDescriptor, prepareTap, t2, type ChallengeLike } from "../src/buckets";
 import { decode, encode } from "../src/b64url";
 import { suite, wrapKeyBytes } from "../src/seal";
 import { fakeAuth, prfAuth, rnd } from "./helpers";
@@ -154,6 +154,44 @@ describe("descriptor validation", () => {
     expect(parseDescriptor(canonicalJSON({ ...base, purpose: "migrate", legacy }), { object: "scope-enrol" }).legacy).toEqual(legacy);
     expect(() => parseDescriptor(canonicalJSON({ ...base, purpose: "migrate", legacy, scopes: ["installation", "o"], salts: [b64(rnd(32)), b64(rnd(32))] }), { object: "scope-enrol" })).toThrow(/exactly one scope/);
     expect(() => parseDescriptor(canonicalJSON({ ...base, purpose: "test" }), { object: "scope-enrol", purposes: ["stage"] })).toThrow(/purpose/);
+  });
+});
+
+describe("hold wording", () => {
+  test("the broker's reason strings: instant dropped next to a lasting hold, kinds spelled out", () => {
+    expect(holdWords("instant (this approval only)", "")).toBe("for this action only");
+    expect(holdWords("instant", "")).toBe("for this action only");
+    expect(holdWords("instant (this approval only); Cloudflare grant", "2026-11-23T12:00:00Z")).toBe("Cloudflare grant, until 2026-11-23 12:00:00 UTC");
+    expect(holdWords("instant (this approval only); re-arms Cloudflare auto-approval until restart", "")).toBe("re-arms Cloudflare auto-approval until restart");
+    expect(holdWords("grant", "2026-11-23T12:00:00Z")).toBe("while the grant lasts, until 2026-11-23 12:00:00 UTC");
+  });
+});
+
+describe("rekey", () => {
+  const withSalt = (salt: Uint8Array) => (d: Record<string, unknown>) => ({ ...d, rekey_salt: b64(salt) });
+  test("the second PRF evaluation is at the descriptor's fresh salt; the packet carries both KEKs", async () => {
+    const auth = prfAuth(`https://${RP}`);
+    const old = rnd(32), fresh = rnd(32);
+    const o = await offer({ scopes: ["org-1"], creds: [{ id: auth.id, salts: [old, fresh] }], descriptor: withSalt(fresh), buckets: [] });
+    const tap = await prepareTap(o.res, RP, { rekey: true, requireOpen: true });
+    expect(tap.lines.some((l) => l.startsWith("Rekeys org-1"))).toBe(true);
+    const signed = await tap.sign(auth);
+    const plain = await openPacket(o.r.priv, o.inst, "approve", openAAD(o.attempt, o.epoch, o.ch, auth.rawId), signed.open!);
+    const k1 = await deriveKEK(await auth.evaluate(old), o.inst, RP, auth.rawId, "org-1", old);
+    const k2 = await deriveKEK(await auth.evaluate(fresh), o.inst, RP, auth.rawId, "org-1", fresh);
+    expect(hex(plain)).toBe("00000020" + hex(k1) + "00000020" + hex(k2));
+  });
+  test("refused: a rekey salt where no rekey was asked, none where one was, a second input that differs, two scopes", async () => {
+    const id = b64(rnd(16));
+    const fresh = rnd(32);
+    const o = await offer({ scopes: ["org-1"], creds: [{ id, salts: [rnd(32), fresh] }], descriptor: withSalt(fresh) });
+    await expect(prepareTap(o.res, RP)).rejects.toThrow(/unexpected fields/);
+    const plain = await offer({ scopes: ["org-1"], creds: [{ id, salts: [rnd(32)] }] });
+    await expect(prepareTap(plain.res, RP, { rekey: true })).rejects.toThrow(/unexpected fields/);
+    const other = await offer({ scopes: ["org-1"], creds: [{ id, salts: [rnd(32), rnd(32)] }], descriptor: withSalt(fresh) });
+    await expect(prepareTap(other.res, RP, { rekey: true })).rejects.toThrow(/fresh salt/);
+    const two = await offer({ scopes: ["installation", "org-1"], creds: [{ id, salts: [rnd(32), fresh] }], descriptor: withSalt(fresh) });
+    await expect(prepareTap(two.res, RP, { rekey: true })).rejects.toThrow(/exactly one scope/);
   });
 });
 

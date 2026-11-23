@@ -73,7 +73,10 @@ The passkeys that may approve updates are the maintenance pins
 (`/etc/aqmas/update-passkeys.json`, root 0600). `maint-init` takes the first set from the
 passkeys registered at that moment; afterwards they change only by the signed **Sync
 maintenance passkeys** task or `maint-init --repin` on the machine. **Rotation/removal is
-two operations:** update the broker's passkeys, then sync the pins. A compromised broker
+two operations:** update the broker's passkeys, then sync the pins.
+On a store sealed in per-credential buckets (format 2) there is no lock: a pinned passkey
+that is approve-only (no PRF wraps) can approve an update whenever it is signed in, where
+format 1 refused update approval until an unlock ([BUCKETS.md](BUCKETS.md) §4.4). A compromised broker
 can ignore its own credential revocation; it cannot change the pins.
 
 Only root may modify `/usr/local/bin/aqmasd`, `/usr/local/bin/aqmasd.prev`, the release

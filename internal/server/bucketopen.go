@@ -42,6 +42,9 @@ type tapOpen struct {
 	purpose string
 	cred    []byte
 	salts   []seal.ID
+	// rekey: the fresh salt of the PRF's second evaluation; the new scope key
+	// is wrapped under the KEK derived from it (descriptor "rekey_salt").
+	rekeySalt *seal.ID
 }
 type tapRegistry struct {
 	sync.Mutex
@@ -157,6 +160,12 @@ func (s *Server) offerOpen(ctx context.Context, sess, canonical string, needs []
 // offerScopes is offerOpen with extra scopes whose keys the tap must open
 // without any bucket (passkey enable: the stage wraps them for the target).
 func (s *Server) offerScopes(ctx context.Context, sess, canonical string, needs []bucketNeed, extra []string, o *owner) (*tapOpen, []byte, error) {
+	return s.offerScopesRekey(ctx, sess, canonical, needs, extra, o, nil)
+}
+
+// offerScopesRekey is offerScopes for a rekey when rekeySalt is set: exactly
+// one scope, and every passkey's second PRF input is the fresh salt.
+func (s *Server) offerScopesRekey(ctx context.Context, sess, canonical string, needs []bucketNeed, extra []string, o *owner, rekeySalt *seal.ID) (*tapOpen, []byte, error) {
 	if s.seal == nil || len(needs) == 0 && len(extra) == 0 {
 		return nil, nil, nil
 	}
@@ -174,11 +183,17 @@ func (s *Server) offerScopes(ctx context.Context, sess, canonical string, needs 
 	if len(scopes) > 2 {
 		return nil, nil, errBad("one approval can open buckets of at most two scopes; split the selection")
 	}
+	if rekeySalt != nil && len(scopes) != 1 {
+		return nil, nil, errBad("a rekey opens exactly one scope")
+	}
 	attempt, recipient, err := s.seal.opens.Begin(sess, "approve", "")
 	if err != nil {
 		return nil, nil, &apiErr{429, "rate_limited", err.Error()}
 	}
 	d := map[string]any{"v": 1, "object": "bucket-open", "purpose": "approve", "attempt_id": attempt, "installation": s.seal.installation, "epoch": s.seal.opens.Epoch(), "recipient": encodeID(recipient), "scopes": scopes}
+	if rekeySalt != nil {
+		d["rekey_salt"] = encodeID(rekeySalt[:])
+	}
 	allOpen := len(extra) == 0
 	var list []descriptorBucket
 	for _, n := range needs {
@@ -229,6 +244,8 @@ func (s *Server) offerScopes(ctx context.Context, sess, canonical string, needs 
 		v := protocol.PRFValues{First: salts[0]}
 		if len(salts) == 2 {
 			v.Second = salts[1]
+		} else if rekeySalt != nil {
+			v.Second = rekeySalt[:]
 		}
 		by[encodeID(c.ID)] = v
 		allowed = append(allowed, c)
@@ -241,7 +258,7 @@ func (s *Server) offerScopes(ctx context.Context, sess, canonical string, needs 
 		return nil, nil, &apiErr{423, "locked", "no passkey can open " + what + " yet: enable one in Admin → Passkeys, or use the recovery key"}
 	}
 	o.creds = allowed
-	t := &tapOpen{session: sess, attempt: attempt, descriptor: desc, needs: needs, scopes: scopes, expires: s.now().Add(ChallengeTTL)}
+	t := &tapOpen{session: sess, attempt: attempt, descriptor: desc, needs: needs, scopes: scopes, expires: s.now().Add(ChallengeTTL), rekeySalt: rekeySalt}
 	if len(by) > 0 {
 		t.ext = protocol.AuthenticationExtensions{PRF: &protocol.PRFInputs{EvalByCredential: by}}
 	}
@@ -351,8 +368,9 @@ func (s *Server) openTap(ctx context.Context, t *tapOpen, sess string, row int64
 		}
 	}
 	if len(closed) == 0 {
-		if pkt != nil {
+		if pkt != nil && pkt.AttemptID == t.attempt {
 			// The page evaluated PRF although nothing was closed: consume and discard.
+			// Only this tap's attempt: another pending tap's attempt is left alone.
 			if at, err := z.opens.Take(sess, "approve", pkt.AttemptID); err == nil {
 				enc, _ := strictB64(pkt.Enc, 65)
 				ct, _ := strictB64(pkt.Ciphertext, 512)
@@ -371,6 +389,11 @@ func (s *Server) openTap(ctx context.Context, t *tapOpen, sess string, row int64
 		return fail(err)
 	}
 	defer destroyKeys(scopeKeys)
+	// A rekey replaces bucket keys under scopeMu and evicts them before it
+	// unlocks: re-read each bucket under the same lock so a key from before a
+	// rekey is never installed after it.
+	z.scopeMu.Lock()
+	defer z.scopeMu.Unlock()
 	q := s.store.Q()
 	opened := 0
 	for i, scope := range t.scopes {
@@ -383,12 +406,15 @@ func (s *Server) openTap(ctx context.Context, t *tapOpen, sess string, row int64
 			if n.Bucket.Scope != scope {
 				continue
 			}
-			k, err := s.sealBucket(n.Bucket).UnwrapWith(skS, sc.Public, n.Bucket.Wrap)
+			cur, err := q.Bucket(ctx, n.Bucket.ID)
+			if err != nil || cur.Scope != scope || !bytes.Equal(cur.Public, n.Bucket.Public) {
+				return fail(errConflict(n.Bucket.Label + " changed since the review (rekeyed or removed); review again"))
+			}
+			k, err := s.sealBucket(cur).UnwrapWith(skS, sc.Public, cur.Wrap)
 			if err != nil {
-				skS.Destroy()
 				return fail(errForbidden(n.Bucket.Label + " did not open; nothing was applied"))
 			}
-			z.pool.install(bucketSealID(n.Bucket), k, instant)
+			z.pool.install(bucketSealID(cur), k, instant)
 			opened++
 		}
 	}
@@ -405,7 +431,7 @@ func (s *Server) tapScopeKeys(ctx context.Context, t *tapOpen, sess string, row 
 		return nil, nil, err
 	}
 	defer destroyKeys(keks)
-	out, err := s.unwrapScopes(ctx, row, t.scopes, keks)
+	out, err := s.unwrapScopes(ctx, row, t.scopes, keks[:len(t.scopes)])
 	return out, pk, err
 }
 
@@ -433,7 +459,11 @@ func (s *Server) tapKEKs(ctx context.Context, t *tapOpen, sess string, row int64
 	if err != nil {
 		return nil, nil, errForbidden("the passkey's keys could not be read; nothing was opened")
 	}
-	if len(keks) != len(t.scopes) {
+	want := len(t.scopes)
+	if t.rekeySalt != nil {
+		want++ // the second evaluation, at the fresh salt
+	}
+	if len(keks) != want {
 		destroyKeys(keks)
 		return nil, nil, errForbidden("wrong number of keys for this approval; nothing was opened")
 	}
