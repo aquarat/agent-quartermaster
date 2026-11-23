@@ -299,6 +299,84 @@ func (c *APIClient) ActiveGrants(ctx context.Context) (*api.GrantList, error) {
 	return &out, nil
 }
 
+// ---- the bastion itself (docs/BASTION-ACCESS.md) ----
+
+// BastionInfo asks what this host may request on the bastion (GET /v1/bastion; 404 while
+// access to the bastion is not installed).
+func (c *APIClient) BastionInfo(ctx context.Context) (*api.BastionInfo, error) {
+	var out api.BastionInfo
+	if err := c.do(ctx, http.MethodGet, "/v1/bastion", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CreateBastionRequest asks for a session on the bastion.
+func (c *APIClient) CreateBastionRequest(ctx context.Context, req *api.BastionRequest) (*api.RequestCreated, error) {
+	var out api.RequestCreated
+	if err := c.do(ctx, http.MethodPost, "/v1/bastion/requests", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// BastionRequestStatus long-polls a bastion request (wait 0 = no long-poll).
+func (c *APIClient) BastionRequestStatus(ctx context.Context, id string, wait time.Duration) (*api.RequestStatus, error) {
+	var out api.RequestStatus
+	if err := c.do(ctx, http.MethodGet, "/v1/bastion/requests/"+url.PathEscape(id)+waitQuery(wait), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CancelBastionRequest withdraws a pending bastion request.
+func (c *APIClient) CancelBastionRequest(ctx context.Context, id string) (*api.RequestStatus, error) {
+	var out api.RequestStatus
+	if err := c.do(ctx, http.MethodPost, "/v1/bastion/requests/"+url.PathEscape(id)+"/cancel", struct{}{}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CreateSetupRequest queues a routine maintenance task for the owner's approval.
+func (c *APIClient) CreateSetupRequest(ctx context.Context, req *api.SetupRequest) (*api.RequestCreated, error) {
+	var out api.RequestCreated
+	if err := c.do(ctx, http.MethodPost, "/v1/setup-requests", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SetupRequestStatus long-polls a queued task. after names the run state the caller has
+// already seen: once approved, the poll returns when the run has left it.
+func (c *APIClient) SetupRequestStatus(ctx context.Context, id string, wait time.Duration, after string) (*api.SetupRequestStatus, error) {
+	var out api.SetupRequestStatus
+	q := url.Values{}
+	if wait > 0 {
+		q.Set("wait", wait.String())
+	}
+	if after != "" {
+		q.Set("after", after)
+	}
+	path := "/v1/setup-requests/" + url.PathEscape(id)
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CancelSetupRequest withdraws a queued task that is still undecided.
+func (c *APIClient) CancelSetupRequest(ctx context.Context, id string) (*api.SetupRequestStatus, error) {
+	var out api.SetupRequestStatus
+	if err := c.do(ctx, http.MethodPost, "/v1/setup-requests/"+url.PathEscape(id)+"/cancel", struct{}{}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func waitQuery(wait time.Duration) string {
 	if wait <= 0 {
 		return ""

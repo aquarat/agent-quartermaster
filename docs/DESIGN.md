@@ -22,6 +22,11 @@ instead of holding long-lived keys.
 - A dedicated **bastion** host runs aqmasd and nothing agents use. It must
   only accept an owner key that agents never hold (prerequisite, done by the owner/operator,
   not by this code): otherwise an agent could SSH in, become root and approve itself.
+  The one exception is opt-in and owner-approved every time:
+  [access to the bastion itself](BASTION-ACCESS.md) through aqmas (a read-only inspect
+  account, root behind a red card from allowlisted hosts, and routine maintenance tasks run
+  by the root runner). It is off until the owner installs it, and the emergency key is never
+  touched.
 
 ## Milestone 1 scope
 
@@ -38,6 +43,7 @@ Cloudflare policy proxy + minted expiring child tokens; generic header-injecting
 SSH `ProxyJump` through aqmasd to cut sessions at expiry; KRL-based revocation.
 See [Organisations, services and credential sets](ORGANISATIONS.md) for organisation-scoped approvals and CLI delivery of application secrets.
 See [Sealed mode and approval UX](SEALED.md) for the proposed locked startup, exact-action batches and optional per-organisation approval windows.
+See [Access to the bastion itself](BASTION-ACCESS.md) for inspect and root sessions on the bastion and routine maintenance as Setup tasks.
 
 ## Key decisions
 
@@ -143,7 +149,8 @@ internal/testutil/fakecf/      M2: fake Cloudflare API for tests and interop (cl
 deploy/bastion/                aqmasd.service, install.sh, cloudflared unit + config template
 deploy/hosts/                  10-aqmas.conf, install-host-trust.sh, forgejo-ca.md
 test/interop/                  run.sh (real binaries end to end), owner.ts, softauthn.ts
-docs/                          DESIGN.md, API.md, HOSTS.md, CLOUDFLARE.md, UPDATES.md
+internal/inspect/              the bastion inspect account's forced command (`aqmasd inspect`)
+docs/                          DESIGN.md, API.md, HOSTS.md, CLOUDFLARE.md, UPDATES.md, BASTION-ACCESS.md
 ```
 
 Build and test: `make vet test build` (aqmasd linux/arm64; aqmas linux/arm64 and amd64, with

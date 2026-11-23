@@ -38,6 +38,9 @@ type Runner struct {
 	retryDelay time.Duration
 	interrupt  context.Context // cancelled when the unit is being stopped
 	pinned     []KeyPin        // the pins this run verified its request against
+	// after runs once the task's final status is written (the machine restart: the page
+	// must say what happened before the machine goes away).
+	after func(context.Context)
 	// Waits for the owner. Tests shorten them.
 	CutoverWait, SealWait time.Duration
 }
@@ -285,11 +288,39 @@ func (r *Runner) Run(ctx context.Context) error {
 		done, err = r.enableUpdates(ctx, p, secrets)
 	case PinsParams:
 		done, err = r.syncPins(ctx, p)
+	// Bastion access and routine maintenance: none of these keeps a journal; an
+	// interrupted one is simply approved and run again.
+	case BastionAccessParams:
+		done, err = r.bastionAccess(ctx, p)
+	case BastionRemoveParams:
+		done, err = r.bastionRemove(ctx)
+	case BastionAllowParams:
+		done, err = r.bastionAllow(ctx, p)
+	case OSUpdateParams:
+		done, err = r.osUpdate(ctx, p)
+	case RebootParams:
+		done, err = r.restartMachine(ctx)
+	case RestartTunnelParams:
+		done, err = r.restartTunnel(ctx)
+	case RestartBrokerParams:
+		done, err = r.restartBroker(ctx)
+	case DiskUsageParams:
+		done, err = r.diskUsage(ctx)
+	case JournalVacuumParams:
+		done, err = r.journalVacuum(ctx, p)
 	default:
+		if v.Task != TaskUpgrade {
+			// Verify accepted a task this switch does not know: never fall through to an upgrade.
+			done, err = "", errors.New("task is not implemented by this runner")
+			break
+		}
 		done, err = r.upgrade(ctx, v.Signed)
 	}
 	r.refreshInfo()
 	r.finish(err, done)
+	if err == nil && r.after != nil {
+		r.after(ctx)
+	}
 	if _, left := r.readJournal(); left && err != nil {
 		// Unfinished: the journal makes systemd start the runner again to recover.
 		time.Sleep(r.retryDelay)

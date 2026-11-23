@@ -70,6 +70,14 @@ func uiCheck(t *testing.T, cr challengeResp) map[string]any {
 		"grant":    append(slices.Clone(common), "requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"),
 	}
 	obj, _ := v["object"].(string)
+	if kind, _ := v["kind"].(string); kind == "bastion" && obj == "request" {
+		// web/src/canonical.ts: the bastion request's own key set (docs/BASTION-ACCESS.md §5).
+		allowed["request"] = append(slices.Clone(common), "kind", "level", "requesting_host", "host_id", "address", "target", "target_address", "target_port", "login_user", "principal",
+			"key_fingerprint", "ssh_ca", "host_key", "cert_profile", "ttl_seconds", "sealed", "open_buckets", "close_buckets", "alert_channel")
+		if len(keys) != len(allowed["request"]) {
+			t.Fatalf("ui: bastion request has keys %v", keys)
+		}
+	}
 	actions["host"] = []string{"revoke"}
 	actions["update"] = []string{"approve"}
 	al, ok := allowed[obj]

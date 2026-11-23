@@ -132,3 +132,49 @@ func repinSeal(raw []byte, old, manifest string) ([]byte, error) {
 	s = s[:loc[0][2]] + manifest + s[loc[0][3]:]
 	return checked(cfg, []byte(s), func(c *config.Config) { c.Seal.Manifest = manifest })
 }
+
+var bastionHeader = regexp.MustCompile(`(?m)^[ \t]*\[bastion\][ \t]*(#[^\n]*)?\n`)
+
+// removeBastion deletes the [bastion] table; the rest of the file is untouched.
+func removeBastion(raw []byte) ([]byte, error) {
+	old, err := config.Parse(raw)
+	if err != nil {
+		return nil, errConfigShape
+	}
+	if !old.Bastion.Enabled() {
+		return raw, nil
+	}
+	s := ensureNewline(raw)
+	loc := bastionHeader.FindAllStringIndex(s, -1)
+	if len(loc) != 1 {
+		return nil, errConfigShape
+	}
+	end := len(s)
+	if next := tableHeader.FindStringIndex(s[loc[0][1]:]); next != nil {
+		end = loc[0][1] + next[0]
+	}
+	s = s[:loc[0][0]] + s[end:]
+	return checked(old, []byte(s), func(c *config.Config) { c.Bastion = config.Bastion{} })
+}
+
+// addBastion records this machine as a destination: the old configuration plus exactly the
+// [bastion] table (replacing an earlier one). Parsing the result applies every rule of the
+// configuration, name and principal collisions included, before anything else is touched.
+func addBastion(raw []byte, b config.Bastion) ([]byte, error) {
+	raw, err := removeBastion(raw)
+	if err != nil {
+		return nil, err
+	}
+	old, err := config.Parse(raw)
+	if err != nil {
+		return nil, errConfigShape
+	}
+	q := strconv.Quote
+	out := ensureNewline(raw) + "\n[bastion]\nname = " + q(b.Name) + "\naddress = " + q(b.Address) + "\nport = " + strconv.Itoa(b.Port) +
+		"\nadmin_user = " + q(b.AdminUser) + "\nhost_key = " + q(b.HostKey) + "\n"
+	if _, err := config.Parse([]byte(out)); err != nil {
+		// Say why: a name or principal that collides with a target is the owner's to fix.
+		return nil, errors.New("the configuration would not be valid with this bastion entry: " + strings.TrimPrefix(err.Error(), "config: "))
+	}
+	return checked(old, []byte(out), func(c *config.Config) { c.Bastion = b })
+}

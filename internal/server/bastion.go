@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -671,10 +670,10 @@ func (s *Server) afterBastionDecision(ctx context.Context, sg canon.Signed) (api
 // writes it next to the configuration). The broker can read it and cannot change it; sshd
 // enforces the same addresses on the admin account's principals line.
 func (s *Server) bastionAllowList() []maint.AllowedHost {
-	if s.configPath == "" {
+	if s.bastionAllowFile == "" {
 		return nil
 	}
-	return maint.ReadAllow(maint.AllowPath(filepath.Dir(s.configPath)))
+	return maint.ReadAllow(s.bastionAllowFile)
 }
 
 // bastionAllowed: the enrollment is listed and the request came from its listed address.
@@ -719,7 +718,7 @@ func (s *Server) bastionWebRoutes(m *http.ServeMux) {
 func (s *Server) handleBastionView(w http.ResponseWriter, r *http.Request, _ string) {
 	ctx := r.Context()
 	v := api.BastionView{InspectUser: config.InspectUser, SSHCA: s.sshPin(), Sealed: s.seal != nil, Hosts: []api.BastionHost{}, Sessions: []api.BastionSession{},
-		Tasks: []string{maint.TaskBastionAccess, maint.TaskBastionRemove, maint.TaskOSUpdate, maint.TaskReboot, maint.TaskRestartTunnel, maint.TaskRestartBroker, maint.TaskDiskUsage, maint.TaskJournalVacuum}}
+		Tasks: []string{maint.TaskBastionAccess, maint.TaskBastionAllow, maint.TaskBastionRemove, maint.TaskOSUpdate, maint.TaskReboot, maint.TaskRestartTunnel, maint.TaskRestartBroker, maint.TaskDiskUsage, maint.TaskJournalVacuum}}
 	if !s.bastionOn {
 		writeJSON(w, http.StatusOK, v)
 		return

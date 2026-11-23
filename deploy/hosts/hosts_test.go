@@ -67,6 +67,14 @@ if [[ $1 == -t && -n ${FAKE_SSHD_FAIL:-} ]]; then echo "fake sshd: bad config" >
 if [[ $1 == -T ]]; then
   if [[ -n ${FAKE_SSHD_OTHER:-} ]]; then echo "trustedusercakeys /etc/ssh/other.pub"; else echo "trustedusercakeys /etc/ssh/aqmas_user_ca.pub"; fi
   echo "authorizedprincipalsfile /etc/ssh/aqmas_principals/%u"
+  # Like sshd: the Match block of the inspect drop-in applies to its user only.
+  conf=$(dirname "$3")/sshd_config.d/90-aqmas-inspect.conf
+  user=${5#user=}; user=${user%%,*}
+  if [[ -f $conf && -z ${FAKE_SSHD_NOMATCH:-} ]] && grep -qx "Match User $user" "$conf"; then
+    grep -E '^    ' "$conf" | sed 's/^ *//' | awk '{k=tolower($1); $1=""; sub(/^ /,""); print k" "$0}'
+  else
+    echo "forcecommand none"; echo "disableforwarding no"; echo "permittty yes"
+  fi
 fi
 exit 0
 `), 0o755))
@@ -399,4 +407,106 @@ func mustRead(t *testing.T, p string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// The maintenance runner on the bastion itself: --bastion-self skips the site's refuse rules
+// and installs the forced-command block for the inspect account (docs/BASTION-ACCESS.md).
+func TestBastionSelf(t *testing.T) {
+	f := newFixture(t, "bastion")
+	self := []string{"--bastion-self", "--inspect-user", "aqmas-inspect", "--inspect-command", "/usr/local/bin/aqmasd inspect"}
+	args := append(append([]string{}, self...), "--name", "bastion", "--ca-key", f.caKey, "--admin-user", "alice", "--sshd", f.sshd, "--apply")
+	// Without the flag the bastion is refused, as before.
+	if out, err := f.run(nil, "--name", "bastion", "--ca-key", f.caKey, "--user", "aqmas-inspect", "--sshd", f.sshd, "--apply"); err == nil || !strings.Contains(out, "refusing to run on bastion") {
+		t.Fatalf("bastion not refused: %v\n%s", err, out)
+	}
+	// The flag alone, or half of the inspect pair, is refused.
+	for _, bad := range [][]string{
+		{"--bastion-self", "--name", "bastion", "--ca-key", f.caKey, "--user", "alice", "--apply"},
+		{"--bastion-self", "--inspect-user", "aqmas-inspect", "--name", "bastion", "--ca-key", f.caKey, "--apply"},
+		{"--inspect-command", "/usr/local/bin/aqmasd inspect", "--name", "db-1", "--ca-key", f.caKey, "--user", "alice", "--apply"},
+		{"--bastion-self", "--inspect-user", "aqmas-inspect", "--inspect-command", "/bin/sh -c id;id", "--name", "bastion", "--ca-key", f.caKey, "--apply"},
+		{"--bastion-self", "--inspect-user", "aqmas-inspect", "--inspect-command", "aqmasd inspect", "--name", "bastion", "--ca-key", f.caKey, "--apply"},
+		{"--bastion-self", "--inspect-user", "aqmas-inspect", "--inspect-command", "/usr/../bin/sh", "--name", "bastion", "--ca-key", f.caKey, "--apply"},
+		{"--bastion-self", "--inspect-user", "root", "--inspect-command", "/usr/local/bin/aqmasd inspect", "--name", "bastion", "--ca-key", f.caKey, "--apply"},
+		{"--bastion-self", "--inspect-user", "aqmas-inspect", "--inspect-command", "/usr/local/bin/aqmasd inspect", "--admin-user", "aqmas-inspect", "--name", "bastion", "--ca-key", f.caKey, "--apply"},
+	} {
+		before := f.snapshot()
+		if out, err := f.run(nil, append(bad, "--sshd", f.sshd)...); err == nil || !equalMaps(before, f.snapshot()) {
+			t.Fatalf("%v accepted or changed files:\n%s", bad, out)
+		}
+	}
+	ak, _ := os.ReadFile(f.path("home/alice/.ssh/authorized_keys"))
+	out, err := f.run(nil, args...)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	want := "# managed by aqmas install-host-trust.sh (bastion inspect account)\nMatch User aqmas-inspect\n    ForceCommand /usr/local/bin/aqmasd inspect\n    AuthenticationMethods publickey\n" +
+		"    AuthorizedKeysFile none\n    AuthorizedKeysCommand none\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    DisableForwarding yes\n    PermitTTY no\n    PermitUserRC no\n"
+	if got, _ := os.ReadFile(f.path("etc/ssh/sshd_config.d/90-aqmas-inspect.conf")); string(got) != want {
+		t.Fatalf("inspect block:\n%s", got)
+	}
+	if got, _ := os.ReadFile(f.path("etc/ssh/aqmas_principals/aqmas-inspect")); string(got) != "aqmas-inspect@bastion\n" {
+		t.Fatalf("inspect principals: %q", got)
+	}
+	// The admin's principals file belongs to the runner (it carries from=), not to the script.
+	if f.exists("etc/ssh/aqmas_principals/alice") {
+		t.Fatal("the script wrote the admin's principals file")
+	}
+	for _, line := range []string{"site refuse rules not applied", "confines aqmas-inspect to the forced command", "for alice: CA trusted, no forced command"} {
+		if !strings.Contains(out, line) {
+			t.Errorf("output lacks %q:\n%s", line, out)
+		}
+	}
+	log, _ := os.ReadFile(f.sshLog)
+	for _, c := range []string{"user=aqmas-inspect,host=bastion", "user=alice,host=bastion"} {
+		if !strings.Contains(string(log), c) {
+			t.Errorf("sshd -T not asked about %s", c)
+		}
+	}
+	// Idempotent, and the second run is a pure check.
+	if out, err = f.run(nil, args...); err != nil || !strings.Contains(out, "nothing to change") {
+		t.Fatalf("second run: %v\n%s", err, out)
+	}
+	// If sshd no longer applies the block (another Match wins, a package replaced a file),
+	// the check fails: on an unchanged install nothing is touched, on a fresh one it is undone.
+	if out, err = f.run([]string{"FAKE_SSHD_NOMATCH=1"}, args...); err == nil || !strings.Contains(out, "does not show the forced command") {
+		t.Fatalf("lost confinement not noticed: %v\n%s", err, out)
+	}
+	// The runner writes the admin's file; uninstall for the inspect account leaves it alone.
+	if err := os.WriteFile(f.path("etc/ssh/aqmas_principals/alice"), []byte("from=\"192.0.2.21\" alice@bastion\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err = f.run(nil, append(append([]string{}, self...), "--uninstall", "--sshd", f.sshd, "--apply")...); err != nil {
+		t.Fatalf("uninstall: %v\n%s", err, out)
+	}
+	for _, p := range []string{"etc/ssh/aqmas_user_ca.pub", "etc/ssh/aqmas_principals/aqmas-inspect", "etc/ssh/sshd_config.d/10-aqmas.conf", "etc/ssh/sshd_config.d/90-aqmas-inspect.conf"} {
+		if f.exists(p) {
+			t.Errorf("%s left behind", p)
+		}
+	}
+	if !f.exists("etc/ssh/aqmas_principals/alice") {
+		t.Error("uninstall removed a file it did not write")
+	}
+	if now, _ := os.ReadFile(f.path("home/alice/.ssh/authorized_keys")); string(now) != string(ak) {
+		t.Error("authorized_keys changed")
+	}
+}
+
+func TestBastionSelfFreshInstallRestoresOnLostConfinement(t *testing.T) {
+	f := newFixture(t, "bastion")
+	before := f.snapshot()
+	out, err := f.run([]string{"FAKE_SSHD_NOMATCH=1"}, "--bastion-self", "--inspect-user", "aqmas-inspect", "--inspect-command", "/usr/local/bin/aqmasd inspect",
+		"--name", "bastion", "--ca-key", f.caKey, "--admin-user", "alice", "--sshd", f.sshd, "--apply")
+	if err == nil || !strings.Contains(out, "restored the previous files") {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	after := f.snapshot()
+	for k := range after {
+		if k == f.path("var") || strings.HasPrefix(k, f.path("var")+"/") {
+			delete(after, k)
+		}
+	}
+	if !equalMaps(before, after) {
+		t.Errorf("not restored:\n%s", out)
+	}
 }

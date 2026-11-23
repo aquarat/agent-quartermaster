@@ -37,6 +37,21 @@ Site policy comes from `/etc/aqmas/host-trust.conf` (or `--policy FILE`; format 
 configured, needs-approval hosts only with `--i-have-owner-approval`. The login user defaults to
 `$SUDO_USER`; pass `--user` otherwise.
 
+### The bastion itself
+
+Run by hand, the installer never configures the bastion: the site policy refuses it, and that
+stays so. The bastion's own sshd is configured only by the maintenance runner, through the
+Setup task **Allow aqmas access to the bastion** ([BASTION-ACCESS.md](BASTION-ACCESS.md) §3).
+The runner calls the same script with `--bastion-self`, which skips the refuse rules for that
+run and is accepted only together with `--inspect-user` and `--inspect-command`: it installs
+the CA and the principals file of the read-only `aqmas-inspect` account, plus
+`/etc/ssh/sshd_config.d/90-aqmas-inspect.conf`, a `Match User` block that forces that account
+into `aqmasd inspect` and disables forwarding, and it checks with `sshd -T -C user=…` that the
+forced command applies to the inspect account and not to the owner's (`--admin-user`). The
+owner's principals file on the bastion is written by the runner from root's allowlist, with a
+`from="…"` restriction. Nothing here touches `authorized_keys`: the emergency key remains the
+way in when aqmas is down.
+
 `AuthorizedPrincipalsFile` only affects **certificate** logins; existing `authorized_keys`
 logins keep working, so rollout is additive. Removing long-lived keys from agent sockets and
 `authorized_keys` is a later, separate step.

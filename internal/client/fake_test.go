@@ -131,7 +131,8 @@ type fakeServer struct {
 	created         int
 	unauthenticated int
 
-	cf fakeCF // milestone 2: Cloudflare (cf_fake_test.go)
+	cf      fakeCF      // milestone 2: Cloudflare (cf_fake_test.go)
+	bastion fakeBastion // the bastion itself (bastion_test.go)
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -184,6 +185,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 		writeJSON(w, 200, api.ResolvedTarget{Name: name, Address: f.targetAddress, Port: f.targetPort, MaxSeconds: 28800})
 	})
 	f.setupCF(mux)
+	f.setupBastion(mux)
 	f.srv = httptest.NewUnstartedServer(mux)
 	f.srv.Config.ErrorLog = log.New(io.Discard, "", 0) // handshake failures are expected in some tests
 

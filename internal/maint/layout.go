@@ -35,7 +35,11 @@ type Layout struct {
 	Libexec    string
 	KnownHosts string // forge host keys, used only by the broker's and the builder's git fetch
 	User       string // the broker's service account
-	// Hook replaces systemd in a test layout: `hook stop|start MODE|active`.
+	// Root prefixes the system paths the bastion tasks touch (/etc/ssh, /boot): empty on an
+	// installed bastion, a directory in a test layout.
+	Root string
+	// Hook replaces systemd in a test layout: `hook stop|start MODE|active`, and every
+	// system tool of the bastion and routine tasks: `hook sys NAME ARGS...` (see sys).
 	Hook string
 	test bool
 }
@@ -72,7 +76,7 @@ func TestLayout(dir, bin, hook string) (Layout, error) {
 	j := func(p ...string) string { return filepath.Join(append([]string{dir}, p...)...) }
 	return Layout{Bin: bin, Config: j("etc", "config.toml"), ConfigDir: j("etc"), UnitDir: j("systemd"), RunDropIn: j("run", "50-aqmas-maint.conf"),
 		Spool: j("spool"), Cache: j("releases"), State: j("maint"), Backups: j("backups"), Tools: j("tools"), AlertDir: j("alert"),
-		Libexec: j("libexec"), KnownHosts: j("etc", "known_hosts"), Hook: hook, test: true}, nil
+		Libexec: j("libexec"), KnownHosts: j("etc", "known_hosts"), Root: j("sysroot"), Hook: hook, test: true}, nil
 }
 
 func (l Layout) request() string { return filepath.Join(l.Spool, requestName) }
@@ -107,12 +111,16 @@ func AllowPath(configDir string) string { return filepath.Join(configDir, allowN
 // ReadAllow loads the bastion allowlist. Anything but a valid list written by the
 // "bastion-allow" task reads as empty: nobody may ask for root.
 func ReadAllow(path string) []AllowedHost {
-	var p BastionAllowParams
 	b, err := os.ReadFile(path)
-	if err != nil || len(b) > 64<<10 || json.Unmarshal(b, &p) != nil || p.validate() != nil {
+	if err != nil || len(b) > 64<<10 {
 		return nil
 	}
-	return p.Hosts
+	// Exactly the canonical text the task signs and writes: nothing looser is a list.
+	v, err := Parse(TaskBastionAllow, strings.TrimSuffix(string(b), "\n"))
+	if err != nil {
+		return nil
+	}
+	return v.(BastionAllowParams).Hosts
 }
 
 // StatusPath is where aqmasd reads the runner's public status.
@@ -200,6 +208,70 @@ func (l Layout) facts(ctx context.Context) (Facts, error) {
 		return f, errors.New("invalid broker facts")
 	}
 	return f, nil
+}
+
+// sysPath is a system path under Root ("/etc/ssh/x" on an installed bastion).
+func (l Layout) sysPath(p ...string) string {
+	return filepath.Join(append([]string{l.Root, "/"}, p...)...)
+}
+
+// maxSysOutput bounds what sysOut keeps of a tool's standard output.
+const maxSysOutput = 4 << 20
+
+// sysCmd builds the command for a system tool of the bastion and routine tasks. On an
+// installed bastion that is the tool itself, found on the fixed PATH of cleanEnv, with a
+// fixed argv. In a test layout it is the hook:
+//
+//	<Hook> sys NAME ARGS...
+//
+// with NAME the tool (useradd, usermod, userdel, passwd, getent, id, loginctl, rpm,
+// systemd-run, systemctl, journalctl, df, sshd) and ARGS exactly the production argv. The
+// hook's exit status and standard output stand in for the tool's; standard error goes to
+// the runner's log. The host-trust installer reaches sshd the same way, through a wrapper
+// that runs `<Hook> sys sshd -t|-T ...`.
+func (l Layout) sysCmd(ctx context.Context, name string, args ...string) *exec.Cmd {
+	var c *exec.Cmd
+	if l.test {
+		c = exec.CommandContext(ctx, l.Hook, append([]string{"sys", name}, args...)...)
+	} else {
+		c = exec.CommandContext(ctx, name, args...)
+	}
+	c.Env = cleanEnv
+	c.Dir = "/"
+	c.Stderr = os.Stderr
+	c.WaitDelay = 10 * time.Second
+	return c
+}
+
+// sys runs a system tool; its output goes to the service journal.
+func (l Layout) sys(ctx context.Context, name string, args ...string) error {
+	c := l.sysCmd(ctx, name, args...)
+	c.Stdout = os.Stderr
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("%s failed", name)
+	}
+	return nil
+}
+
+// sysOut runs a system tool and returns at most maxSysOutput bytes of its standard output.
+func (l Layout) sysOut(ctx context.Context, name string, args ...string) (string, error) {
+	c := l.sysCmd(ctx, name, args...)
+	out, err := c.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	if err = c.Start(); err != nil {
+		return "", fmt.Errorf("%s failed", name)
+	}
+	b, rerr := io.ReadAll(io.LimitReader(out, maxSysOutput+1))
+	_, _ = io.Copy(io.Discard, out)
+	if err = c.Wait(); err != nil || rerr != nil {
+		return string(b), fmt.Errorf("%s failed", name)
+	}
+	if len(b) > maxSysOutput {
+		return "", fmt.Errorf("%s printed too much", name)
+	}
+	return string(b), nil
 }
 
 func (l Layout) systemctl(ctx context.Context, args ...string) error {

@@ -12,9 +12,11 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/aquarat/agent-quartermaster/internal/inspect"
 	"github.com/aquarat/agent-quartermaster/internal/maint"
 	"github.com/aquarat/agent-quartermaster/internal/server"
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
@@ -54,11 +56,18 @@ as root (docs/SETUP.md):
                         optionally pin the release sources self-update may use
   maint-run             run one owner-approved maintenance request (started by aqmas-maint.path)
 
+as the bastion's inspect account (docs/BASTION-ACCESS.md; sshd's forced command, never a shell):
+  inspect               run the read-only command in $SSH_ORIGINAL_COMMAND (logs, status,
+                        failed, disk, version, help); reads no configuration
+
 Run every command as the aqmas user (sudo -u aqmas aqmasd ...).
 `
 
 func main() {
 	syscall.Umask(0o077)
+	if len(os.Args) > 1 && os.Args[1] == "inspect" {
+		os.Exit(inspectCommand(os.Args[2:], os.Getenv("SSH_ORIGINAL_COMMAND"), os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && (os.Args[1] == "maint-run" || os.Args[1] == "maint-init") {
 		if err := maintenance(os.Args[1], os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "aqmasd:", err)
@@ -336,4 +345,24 @@ func checkUser(dataDir string) error {
 		return fmt.Errorf("running as root but %s belongs to uid %d: use sudo -u aqmas aqmasd ...", dataDir, sys.Uid)
 	}
 	return nil
+}
+
+// inspectCommand is the forced command of the bastion's read-only account. It runs before
+// anything else in main: it reads no configuration (that account cannot) and takes its
+// request only from SSH_ORIGINAL_COMMAND. --bin DIR relocates the fixed tools for tests; it
+// gives a caller nothing they could not run themselves, and sshd's forced command line is
+// fixed by root.
+func inspectCommand(args []string, request string, out, errOut io.Writer) int {
+	bin := "/usr/bin"
+	switch {
+	case len(args) == 0:
+	case len(args) == 2 && args[0] == "--bin" && filepath.IsAbs(args[1]):
+		bin = args[1]
+	default:
+		fmt.Fprintln(errOut, "usage: aqmasd inspect   (the request is read from SSH_ORIGINAL_COMMAND)")
+		return 2
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return inspect.Run(ctx, request, bin, version, out, errOut)
 }

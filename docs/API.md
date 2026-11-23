@@ -409,6 +409,10 @@ maintenance runner. As **root**: `aqmasd maint-init [--repin]` installs the runn
 `aqmasd maint-run` (started by `aqmas-maint.path`) runs one owner-approved request. The
 Setup web API and the canonical `setup` object are in [SETUP.md](SETUP.md).
 
+`inspect` is the forced command of the bastion's read-only account
+([BASTION-ACCESS.md](BASTION-ACCESS.md) §8): sshd runs it for every session of
+`aqmas-inspect`; it reads `SSH_ORIGINAL_COMMAND`, never the configuration.
+
 Sealed stores ([Buckets](#buckets), [SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)):
 `seal-import` and `bucket-migrate` are the staging modes the runner starts;
 `seal-drill BACKUP.db RECIPIENT <identity` opens every scope key, bucket and record of a
@@ -1082,3 +1086,97 @@ read as LF. Errors name the line, never its content. Vectors:
 
 A key has one scheme for life, fixed in the signed `signer-create` and inside
 its sealed record.
+
+# Bastion access
+
+Design, rules and the owner's steps: [BASTION-ACCESS.md](BASTION-ACCESS.md). This is the wire
+summary. A bastion session is request kind `bastion`: it has endpoints of its own, and the
+generic request endpoints (`/v1/requests…`, batches, windows) answer 404 or refuse for it.
+
+## Agent API (client certificate required)
+
+* `GET /v1/bastion` → `{name, address, port, inspect_user, admin_user, root_allowed,
+  inspect_max_seconds, inspect_default_seconds, root_max_seconds, tasks[]}`; 404 while access
+  to the bastion is not installed.
+* `POST /v1/bastion/requests {level, public_key, reason, ttl_seconds, requester}` → 201
+  `RequestCreated`. `level`: `inspect` | `root`. `reason` is required. `ttl_seconds` 0 means
+  the default (inspect 3600, root 1800); it is clamped to the level's maximum (root 3600).
+  `root` from a host or address that is not on root's allowlist → 403, nothing queued.
+* `GET /v1/bastion/requests/{id}?wait=` → `RequestStatus`. The grant is `{id, kind:"bastion",
+  not_before, not_after, ssh{certificate, principals, target_host, target_address,
+  target_port, login_user, known_hosts_line}}`. Inspect: the certificate on every poll. Root:
+  the request reads `pending` until the alert attempt is recorded; the certificate is returned
+  by one poll only, from the requesting address, within 5 minutes of approval (later:
+  `revoked`); afterwards `certificate` is `""` and `decision_note` says why.
+* `POST /v1/bastion/requests/{id}/cancel`.
+* `POST /v1/setup-requests {task, params, reason, requester}` → 201 `RequestCreated`. Tasks:
+  `os-update` (`{"kernel":false}` only), `reboot`, `restart-cloudflared`, `restart-broker`,
+  `disk-usage`, `journal-vacuum` (`{"keep_days":7…365}`). 403 for any other task or
+  parameters only the owner may choose; 429 when one is already pending for the host, three
+  are pending in all, or the host asked three times in five minutes.
+* `GET /v1/setup-requests/{id}?wait=&after=` → `{id, task, status, decision_note, run?}` with
+  `status` `pending | approved | denied | expired | cancelled` and, once approved,
+  `run{state, step, message, log[], result{}, finished_at}`, `state` `queued | running |
+  waiting | done | failed | refused`. `after=<state>` makes the long poll wait until the run
+  leaves that state.
+* `POST /v1/setup-requests/{id}/cancel`.
+
+## Certificates
+
+| Level | Principal | Critical options | Extensions |
+|---|---|---|---|
+| inspect | `aqmas-inspect@<name>` | `source-address`, `force-command="/usr/local/bin/aqmasd inspect"` | none |
+| root | `<admin_user>@<name>` | `source-address` | `permit-pty` |
+
+Key id `aqmas:<grant-id>:<requesting-host>:bastion-<level>`; serial = grant row id.
+
+## Web API
+
+* `GET /api/ui/state`: pending items of kind `bastion` carry `bastion{level, target,
+  target_address, target_port, login_user, principal, key_fingerprint, host_id, ssh_ca,
+  host_key, cert_profile, sealed, open_buckets[], alert_channel}`; items of kind `setup` carry
+  `setup{task, title, summary, steps[], reversible, warning, params, blocked}`.
+  `bastion_root_until` is set while a root certificate is unexpired and unrevoked.
+* `POST /api/ui/requests/{id}/challenge {action, ttl_seconds, close_buckets}` and
+  `…/decide`, as for every request. `close_buckets` is required for a root approval of a
+  sealed store and refused everywhere else; standing and indefinite choices are refused.
+  Decide answers `{id, kind, status, level, closed_count, alert}` with `alert` `sent | failed
+  | off` (root) and stays open until the alert attempt is over (at most 10 s).
+* `GET /api/ui/bastion` → the Bastion access section (fields in BASTION-ACCESS.md §10).
+* Revoking a bastion grant: `POST /api/ui/grants/{id}/challenge|revoke`, as for every grant.
+* Queued maintenance: approve with the Setup flow ([SETUP.md](SETUP.md)) passing `request`;
+  drop with `POST /api/ui/setup-requests/{id}/dismiss`.
+
+## Canonical text
+
+`request` with `kind:"bastion"` (version 1 in every mode), besides the common keys:
+`kind, level, requesting_host, host_id, address, target, target_address, target_port,
+login_user, principal, key_fingerprint, ssh_ca, host_key, cert_profile, ttl_seconds, sealed,
+open_buckets, close_buckets, alert_channel`. Example (root, sealed store, one bucket open,
+"close first" chosen):
+
+```json
+{"action":"approve","address":"192.0.2.21","alert_channel":true,"cert_profile":"source-address;permit-pty","close_buckets":true,"host_id":"01JD…","host_key":"SHA256:…","id":"01JE…","issued_at":"2026-11-23T10:00:00Z","key_fingerprint":"SHA256:…","kind":"bastion","level":"root","login_user":"alice","nonce":"…","object":"request","open_buckets":"[\"SSH user CA\"]","principal":"alice@bastion","requesting_host":"dev-1","sealed":true,"ssh_ca":"SHA256:…","target":"bastion","target_address":"192.0.2.10","target_port":22,"ttl_seconds":1800,"v":1}
+```
+
+Rules both sides enforce when building and parsing: `level` is `inspect` or `root`;
+`cert_profile` is `source-address;force-command` for inspect and `source-address;permit-pty`
+for root; `principal` equals `login_user@target`; `open_buckets` is the JSON encoding
+(no whitespace, no HTML escaping) of a sorted array of distinct strings; a non-empty list,
+`close_buckets:true` and `alert_channel:true` occur only on a root `approve` (the first two
+only when `sealed`); `ttl_seconds` is 0 for `deny`, positive for `approve`, and at most 3600
+for root. There is no `standing_hours` key, and no `standing` object of this kind.
+
+## CLI
+
+```
+aqmas ssh bastion --why "…" [--level inspect|root] [--ttl D] [-- <inspect command>]
+aqmas cert bastion --why "…"                      # inspect only
+aqmas bastion                                     # what this host may ask for
+aqmas bastion task <task> --why "…" [--keep-days N]
+```
+
+Inspect reuses its cached certificate like any SSH grant. Root never touches the cache: key
+and certificate live in a private temporary directory for the one `ssh`, which runs as a
+child, and are deleted when it exits. `aqmas bastion task` exits 0 when the task is done, 1
+when it failed or the runner refused it, 3 when the owner dismissed it, 4 when it expired.

@@ -20,6 +20,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 
+	"github.com/aquarat/agent-quartermaster/internal/maint"
 	"github.com/aquarat/agent-quartermaster/internal/server/cfaccess"
 	"github.com/aquarat/agent-quartermaster/internal/server/cfproxy"
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
@@ -81,19 +82,21 @@ type Server struct {
 	// bastionOn: the bastion tables exist and the bastion endpoints serve (normal serving
 	// only: never during a cutover, a seal import, a migration or recovery).
 	bastionOn bool
-	updates   updateState
-	cfg       *config.Config
-	log       *slog.Logger
-	now       func() time.Time
-	store     *store.Store
-	pki       *pki.PKI
-	wa        *webauthn.WebAuthn
-	rpID      string
-	ownerID   []byte
-	notify    *notify.Notifier
-	access    *cfaccess.Verifier
-	bcast     broadcaster
-	cf        cfState // milestone 2; zero when cloudflare.enabled is false
+	// bastionAllowFile is root's allowlist next to the configuration ("" without one).
+	bastionAllowFile string
+	updates          updateState
+	cfg              *config.Config
+	log              *slog.Logger
+	now              func() time.Time
+	store            *store.Store
+	pki              *pki.PKI
+	wa               *webauthn.WebAuthn
+	rpID             string
+	ownerID          []byte
+	notify           *notify.Notifier
+	access           *cfaccess.Verifier
+	bcast            broadcaster
+	cf               cfState // milestone 2; zero when cloudflare.enabled is false
 }
 
 // DBPath returns the database path for a data dir.
@@ -246,6 +249,9 @@ func New(o Options) (*Server, error) {
 			return nil, err
 		}
 		s.bastionOn = true
+		if o.ConfigPath != "" {
+			s.bastionAllowFile = maint.AllowPath(filepath.Dir(o.ConfigPath))
+		}
 	}
 	if cfg.Cloudflare.Enabled && !s.maintenance && !o.SealSetup && !o.Recovery {
 		if err := s.setupCloudflare(o); err != nil {

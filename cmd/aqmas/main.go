@@ -37,6 +37,18 @@ Usage:
       Open mosh with the same certificate and host-key policy as ssh.
   aqmas cert [USER@]HOST [--ttl 30m] [--why "..."] [--fresh] [--quiet]
       Like ssh, but only make sure a certificate is cached and print its paths.
+  aqmas ssh BASTION --why "..." [--level inspect|root] [--ttl 30m] [-- INSPECT-COMMAND]
+      The bastion itself (aqmas bastion shows its name). Level inspect (default) runs one
+      read-only command: logs <unit> [since=2h] [lines=200] | status [<unit>] | failed |
+      disk | version | help. Level root asks for the owner's admin account: a red card
+      every time, at most one hour, only from hosts the owner allowed, and the
+      certificate is used for this one ssh and never cached. --why is always required.
+  aqmas bastion               what this host may ask for on the bastion
+  aqmas bastion task NAME --why "..." [--keep-days N]
+      Queue routine maintenance for the owner's tap and wait for the result. NAME:
+      os-update | reboot | restart-cloudflared | restart-broker | disk-usage |
+      journal-vacuum (--keep-days, default 14, at least 7). Kernel and boot-chain
+      updates are the owner's to start on the approval page. Exit 1 if the task failed.
   aqmas status [REQUEST-ID]   enrollment + cached certificates, or one request
   aqmas list [--json]         this host's active grants on the server
   aqmas ssh-config [USER@]HOST...  print an opt-in ~/.ssh/config snippet (read its notes)
@@ -226,6 +238,9 @@ func run(args []string) int {
 		}))
 	case "ssh", "cert", "mosh":
 		spec := map[string]bool{"ttl": true, "why": true, "fresh": false}
+		if cmd != "mosh" {
+			spec["level"] = true // the bastion itself (docs/BASTION-ACCESS.md)
+		}
 		if cmd == "cert" {
 			spec["quiet"] = false
 			spec["canonical-only"] = false // ssh-config reads a fixed cache path
@@ -255,7 +270,18 @@ func run(args []string) int {
 				return fail(err)
 			}
 		}
+		bo := client.BastionOptions{Host: target.Host, Level: f.str["level"], TTL: ttl, Why: f.str["why"], Fresh: f.bool["fresh"], Command: f.cmd}
+		if strings.Contains(f.pos[0], "@") {
+			bo.User = target.User
+		}
+		if _, given := f.str["level"]; given {
+			return runBastion(ctx, stop, env, cmd, bo, f.bool["quiet"])
+		}
 		p, err := env.EnsureSSHCert(ctx, client.SSHOptions{Target: target, TTL: ttl, Why: f.str["why"], Fresh: f.bool["fresh"], CanonicalOnly: f.bool["canonical-only"]})
+		if err != nil && cmd != "mosh" && !f.bool["canonical-only"] && client.NotATarget(err) && env.IsBastion(ctx, target.Host) {
+			// Not an SSH target, but the name of the bastion itself: an inspect session.
+			return runBastion(ctx, stop, env, cmd, bo, f.bool["quiet"])
+		}
 		if err != nil {
 			return fail(err)
 		}
@@ -282,6 +308,27 @@ func run(args []string) int {
 		stop()
 		err = syscall.Exec(sshPath, argv, os.Environ())
 		return fail(fmt.Errorf("exec %s: %w", sshPath, err))
+	case "bastion":
+		if len(rest) == 0 {
+			return fail(env.BastionShow(ctx))
+		}
+		if rest[0] != "task" {
+			return fail(&client.UsageError{Msg: "usage: aqmas bastion | aqmas bastion task NAME --why \"...\" [--keep-days N]"})
+		}
+		f, err := parseFlags(rest[1:], map[string]bool{"why": true, "keep-days": true})
+		if err != nil {
+			return fail(err)
+		}
+		if len(f.pos) != 1 || f.cmd != nil {
+			return fail(&client.UsageError{Msg: "usage: aqmas bastion task NAME --why \"...\" [--keep-days N]; tasks: " + strings.Join(client.BastionTasks, ", ")})
+		}
+		o := client.TaskOptions{Task: f.pos[0], Why: f.str["why"]}
+		if s, given := f.str["keep-days"]; given {
+			if o.KeepDays, err = strconv.Atoi(s); err != nil || o.KeepDays < 1 {
+				return fail(&client.UsageError{Msg: "--keep-days is a number of days"})
+			}
+		}
+		return fail(env.BastionTask(ctx, o))
 	case "status":
 		if len(rest) > 1 {
 			return fail(&client.UsageError{Msg: "usage: aqmas status [REQUEST-ID]"})
@@ -318,6 +365,54 @@ func run(args []string) int {
 	default:
 		return fail(&client.UsageError{Msg: fmt.Sprintf("unknown command %q (try aqmas help)", cmd)})
 	}
+}
+
+// runBastion handles `aqmas ssh|cert` for the bastion itself. Inspect is prepared like any
+// SSH grant and ssh replaces this process; root runs ssh as a child so that its key and
+// certificate can be deleted when it exits.
+func runBastion(ctx context.Context, stop context.CancelFunc, env *client.Env, cmd string, o client.BastionOptions, quiet bool) int {
+	if o.Level == client.LevelRoot {
+		if cmd != "ssh" {
+			return fail(&client.UsageError{Msg: "a root session on the bastion is never cached: use aqmas ssh"})
+		}
+		code, err := env.BastionRoot(ctx, o, func(argv []string) (int, error) {
+			stop() // from here on signals belong to ssh
+			return client.RunChild(argv)
+		})
+		if err != nil {
+			return fail(err)
+		}
+		return code
+	}
+	if cmd == "ssh" {
+		// Refuse a command the bastion would refuse before asking the owner for anything.
+		if _, err := client.InspectCommand(o.Command); err != nil {
+			return fail(err)
+		}
+	}
+	p, err := env.EnsureBastionInspect(ctx, o)
+	if err != nil {
+		return fail(err)
+	}
+	if cmd == "cert" {
+		if !quiet {
+			fmt.Printf("key          %s\ncertificate  %s\nknown_hosts  %s\naddress      %s port %d\nvalid until  %s\n",
+				p.KeyPath, p.CertPath, p.KnownHostsPath, p.Grant.TargetAddress, p.Grant.TargetPort,
+				p.ValidBefore.Local().Format(time.RFC3339))
+		}
+		return 0
+	}
+	argv, err := client.BuildInspectArgv(p, o.Command)
+	if err != nil {
+		return fail(err)
+	}
+	sshPath, err := exec.LookPath(argv[0])
+	if err != nil {
+		return fail(err)
+	}
+	stop()
+	err = syscall.Exec(sshPath, argv, os.Environ())
+	return fail(fmt.Errorf("exec %s: %w", sshPath, err))
 }
 
 func fail(err error) int {

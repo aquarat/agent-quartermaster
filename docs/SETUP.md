@@ -14,6 +14,24 @@ carries the task out. After the runner is installed there is nothing left to do 
 | **Sync maintenance passkeys** | Replaces the runner's pinned passkeys with the listed ones | Tap **Run** with an already pinned passkey | Run again. |
 | **Upgrade aqmas** | Rebuild in a sandbox, compare with both releases, install, restart ([UPDATES.md](UPDATES.md)) | Review the diff; tap **Approve** | The previous binary is restored if the new one is unhealthy. |
 
+**Admin → Bastion access** shows the tasks that concern the bastion machine itself
+([BASTION-ACCESS.md](BASTION-ACCESS.md)); they run through the same runner with the same
+rules:
+
+| Task | What it does | Your part | Reversible |
+|---|---|---|---|
+| **Allow aqmas access to the bastion** | Creates the read-only `aqmas-inspect` account, makes this machine's sshd accept aqmas certificates for it and for your admin account, records the machine as a destination in the configuration, restarts the broker | Name, address and your account; check the CA fingerprint; tap **Run** | Yes: the next task. Emergency keys are never touched. |
+| **Set who may ask for root on the bastion** | Replaces root's allowlist (enrolled hosts and their addresses); sshd accepts a root certificate only from those addresses | Tick hosts; tap **Run** | Run it again. |
+| **Remove aqmas access to the bastion** | Undoes the first task and deletes the inspect account | Tap **Run** | Yes: allow again. |
+| **Update system packages** | `dnf upgrade`, leaving the kernel and boot chain alone unless you allow them; reports what changed; fails if boot files changed without permission | Tap **Run** | No. |
+| **Reboot the bastion** | Restarts the machine; it comes back with nothing open | Tap **Run** | No. |
+| **Restart cloudflared**, **Restart aqmasd** | Restart one service (aqmasd comes back with nothing open) | Tap **Run** | n/a |
+| **Show disk and journal usage** | Reports free space and journal size | Tap **Run** | Read-only. |
+| **Rotate and trim the journal** | Rotates the journal and deletes entries older than the days you choose | Days; tap **Run** | No. |
+
+An enrolled host may **queue** one of the last six for you (`aqmas bastion task …`): it appears
+as a pending card with the host's reason, and nothing runs until you tap.
+
 A task refuses to start when its prerequisite is missing (sealing needs organisations; an
 upgrade needs self-update; the move to buckets needs a format-1 store) or when another task is
 running. While a format-1 store waits for the move, upgrades are refused. Every task can be
@@ -92,6 +110,13 @@ is make root run anything that is not compiled in, or install a build that the t
 sources pinned at the machine do not both publish. So the root boundary holds against a broker bug or a
 stolen database; against a broker you have reason to distrust, the defence is not to tap.
 Rebuild it instead.
+
+For the bastion and routine tasks the runner additionally creates and deletes the
+`aqmas-inspect` account, runs the embedded host-trust installer against this machine's sshd,
+writes root's bastion allowlist and the admin account's principals file, runs `dnf upgrade`
+in a transient unit, restarts the tunnel service or the machine, and reads and trims the
+journal: all with fixed arguments, the only request-derived values on a command line being
+one boolean (as the presence of fixed arguments) and one bounded integer.
 
 Things the runner does as root, all with fixed arguments: stop/start `aqmasd` (maintenance
 modes are selected by a drop-in under `/run`, gone after a reboot), copy and restore the state
@@ -174,8 +199,12 @@ All under a signed-in session. `GET` works in every mode, with every bucket clos
   host keys as the broker sees them, for you to compare. They only count once signed.
 * `POST /api/ui/setup/{task}/challenge {params, secrets_sha256}` → the usual
   `{challenge_id, canonical, public_key}`.
-* `POST /api/ui/setup/{task}/run {challenge_id, assertion, secrets}` → `{ok}`; the request is
-  now in the spool. A passkey that is not pinned is refused here with an explanation.
+* `POST /api/ui/setup/{task}/run {challenge_id, assertion, secrets, request?}` → `{ok}`; the
+  request is now in the spool. A passkey that is not pinned is refused here with an
+  explanation. `request` names a maintenance request an agent queued
+  ([BASTION-ACCESS.md](BASTION-ACCESS.md) §7): it is marked approved in the same transaction,
+  and only if it asked for exactly the signed task and parameters.
+* `POST /api/ui/setup-requests/{id}/dismiss {}`: drop a queued request. Unsigned, like cancel.
 * `POST /api/ui/setup/cancel {}`: ask a waiting task to give up. Unsigned on purpose: it can
   only return to the state before the task.
 * `POST /api/ui/seal/drill {packet}` (seal import or bucket migration): the sealed recovery
@@ -198,6 +227,11 @@ extra whitespace; `secrets_sha256` is the SHA-256 of the raw secrets packet, or 
 | `buckets` | `{"purge_backups"}` | none |
 | `enable-updates` | `{"repo","forgejo_api","github_api","known_hosts":[sorted lines],"forgejo_token":bool,"github_token":bool}` | `forgejo_token` and/or `github_token` as flagged |
 | `sync-passkeys` | `{"pins":[{"id","key_sha256"}]}` | none |
+| `bastion-access` | `{"name","address","port","admin_user","ssh_ca"}` | none |
+| `bastion-allow` | `{"hosts":[{"id","name","address"}]}` (sorted by `id`) | none |
+| `bastion-access-remove`, `reboot`, `restart-cloudflared`, `restart-broker`, `disk-usage` | `{}` | none |
+| `os-update` | `{"kernel"}` | none |
+| `journal-vacuum` | `{"keep_days"}` | none |
 
 A packet is `base64url(enc ‖ ciphertext)` of HPKE base mode with an empty AAD. The drill
 packet uses the same construction with the import process's `drill_key` and info

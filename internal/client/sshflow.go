@@ -217,6 +217,12 @@ func transient(err error) bool {
 }
 
 func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.RequestCreated) (*api.RequestStatus, error) {
+	return e.waitRequestWith(ctx, created, c.RequestStatus)
+}
+
+// waitRequestWith is waitRequest for a request whose status has an endpoint of its own
+// (a bastion session).
+func (e *Env) waitRequestWith(ctx context.Context, created *api.RequestCreated, status func(context.Context, string, time.Duration) (*api.RequestStatus, error)) (*api.RequestStatus, error) {
 	what := "request " + created.ID
 	// Local backstop in case the server never reports "expired": measured on the monotonic
 	// clock from now, so clock skew between this host and the bastion does not matter.
@@ -235,7 +241,7 @@ func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.Reques
 		}
 		first = false
 		start := time.Now()
-		st, err := c.RequestStatus(ctx, created.ID, wait)
+		st, err := status(ctx, created.ID, wait)
 		if err != nil {
 			var ae *APIError
 			if errors.As(err, &ae) && ae.HTTPStatus == 423 && ae.Code == "locked" {

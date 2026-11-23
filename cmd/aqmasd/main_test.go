@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -63,5 +65,46 @@ func TestExampleConfigCloudflare(t *testing.T) {
 		if !strings.Contains(string(unit), want) {
 			t.Errorf("aqmasd.service lacks %q", want)
 		}
+	}
+}
+
+// The forced command of the bastion's inspect account: fixed tools from one directory, the
+// request only from SSH_ORIGINAL_COMMAND, no configuration read.
+func TestInspectCommand(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "log")
+	for _, name := range []string{"journalctl", "systemctl", "df", "uname", "uptime"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\necho \"$(basename \"$0\") $*\" >>"+log+"\necho ran\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out, errOut bytes.Buffer
+	if code := inspectCommand([]string{"--bin", dir}, "logs aqmasd lines=5", &out, &errOut); code != 0 || out.String() != "ran\n" {
+		t.Fatal(code, out.String(), errOut.String())
+	}
+	b, _ := os.ReadFile(log)
+	if string(b) != "journalctl --no-pager --output=short-iso --since=-60min --lines=5 --unit=aqmasd.service\n" {
+		t.Fatalf("argv: %s", b)
+	}
+	os.Remove(log)
+	out.Reset()
+	// Anything outside the grammar runs nothing; a shell is never involved.
+	for _, req := range []string{"sh", "logs aqmasd; id", "cat /etc/aqmas/config.toml", "logs aqmasd --file=/var/lib/aqmas/aqmas.db", "scp -t /tmp"} {
+		if code := inspectCommand([]string{"--bin", dir}, req, &out, &errOut); code != 2 || out.Len() != 0 {
+			t.Fatalf("%q: exit %d, output %q", req, code, out.String())
+		}
+	}
+	if _, err := os.Stat(log); err == nil {
+		t.Fatal("a refused request ran a command")
+	}
+	// Arguments on the forced command line itself are not a way to pass a request.
+	for _, args := range [][]string{{"logs", "aqmasd"}, {"--bin"}, {"--bin", "relative"}, {"--bin", dir, "x"}, {"-config", "/etc/aqmas/config.toml"}} {
+		if code := inspectCommand(args, "help", &out, &errOut); code != 2 {
+			t.Fatalf("%v accepted", args)
+		}
+	}
+	out.Reset()
+	if code := inspectCommand(nil, "", &out, &errOut); code != 0 || !bytes.Contains(out.Bytes(), []byte("units: aqmasd")) {
+		t.Fatal(code, out.String())
 	}
 }

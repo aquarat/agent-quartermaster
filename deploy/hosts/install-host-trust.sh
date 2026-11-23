@@ -15,6 +15,10 @@
 #   /etc/ssh/aqmas_user_ca.pub             the CA public key given with --ca-key
 #   /etc/ssh/aqmas_principals/<user>       one line: <user>@<name>
 #   /etc/ssh/sshd_config.d/10-aqmas.conf   TrustedUserCAKeys + AuthorizedPrincipalsFile
+# On the aqmas bastion itself only the maintenance runner uses it, with --bastion-self (docs/
+# BASTION-ACCESS.md): the refuse rules are skipped for that run, and --inspect-user with
+# --inspect-command also installs
+#   /etc/ssh/sshd_config.d/90-aqmas-inspect.conf   Match block forcing the inspect account
 # Backs up whatever it replaces to /var/backups/aqmas-host-trust/<UTC time>/, validates with
 # `sshd -t` and checks `sshd -T` shows the new values before reloading sshd; on a failed check
 # it restores the backup. Keep a second root session open while running it with --apply.
@@ -41,6 +45,10 @@ CA_FP=
 USERS=()
 USERS_GIVEN=0
 OWNER_OK=0
+BASTION_SELF=0
+INSPECT_USER=
+INSPECT_CMD=
+ADMIN_USER=
 SSHD=
 SYSTEMCTL=${SYSTEMCTL:-systemctl}
 
@@ -62,6 +70,13 @@ Options:
                                when given; missing default file = no policy)
   --refuse NAME|ADDRESS        never configure this host (repeatable)
   --needs-approval NAME        require --i-have-owner-approval for this host (repeatable)
+  --bastion-self               this host is the aqmas bastion and the maintenance runner is
+                               configuring it: skip the refuse/needs-approval rules. Only
+                               valid with --inspect-user and --inspect-command
+  --inspect-user USER          also force every session of USER into --inspect-command
+                               (no shell, no forwarding, certificate logins only)
+  --inspect-command "PATH ARG" the forced command of --inspect-user
+  --admin-user USER            only checked: USER must see the CA and no forced command
   --root DIR                   operate on DIR instead of / (tests); never reloads sshd
   --sshd PATH                  sshd binary for -t/-T (default: sshd; skipped with --root unless given)
 EOF
@@ -93,6 +108,13 @@ while [[ $# -gt 0 ]]; do
 	--sshd) SSHD=${2:-}; shift ;;
 	--sshd=*) SSHD=${1#*=} ;;
 	--i-have-owner-approval) OWNER_OK=1 ;;
+	--bastion-self) BASTION_SELF=1 ;;
+	--inspect-user) INSPECT_USER=${2:-}; shift ;;
+	--inspect-user=*) INSPECT_USER=${1#*=} ;;
+	--inspect-command) INSPECT_CMD=${2:-}; shift ;;
+	--inspect-command=*) INSPECT_CMD=${1#*=} ;;
+	--admin-user) ADMIN_USER=${2:-}; shift ;;
+	--admin-user=*) ADMIN_USER=${1#*=} ;;
 	--policy) POLICY=${2:-}; POLICY_GIVEN=1; shift ;;
 	--policy=*) POLICY=${1#*=}; POLICY_GIVEN=1 ;;
 	--refuse) add_refuse "${2:-}"; shift ;;
@@ -104,6 +126,24 @@ while [[ $# -gt 0 ]]; do
 	esac
 	shift
 done
+if [[ $BASTION_SELF -eq 1 && (-z $INSPECT_USER || -z $INSPECT_CMD) ]]; then
+	die "--bastion-self is for the aqmas maintenance runner and needs --inspect-user and --inspect-command"
+fi
+if [[ -n $INSPECT_USER && -z $INSPECT_CMD || -z $INSPECT_USER && -n $INSPECT_CMD ]]; then
+	die "--inspect-user and --inspect-command go together"
+fi
+if [[ -n $INSPECT_USER ]]; then
+	[[ $INSPECT_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ && $INSPECT_USER != root ]] || die "--inspect-user '$INSPECT_USER' is not a valid login name"
+	# An absolute path and plain words: nothing sshd_config or a shell would read differently.
+	[[ $INSPECT_CMD =~ ^/[A-Za-z0-9._/-]+(\ [A-Za-z0-9._-]+)*$ && $INSPECT_CMD != *..* ]] || die "--inspect-command must be an absolute path and plain arguments"
+	seen=0
+	for u in ${USERS[@]+"${USERS[@]}"}; do [[ $u != "$INSPECT_USER" ]] || seen=1; done
+	[[ $seen -eq 1 ]] || USERS+=("$INSPECT_USER")
+	USERS_GIVEN=1
+fi
+if [[ -n $ADMIN_USER ]]; then
+	[[ $ADMIN_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ && $ADMIN_USER != root && $ADMIN_USER != "$INSPECT_USER" ]] || die "--admin-user '$ADMIN_USER' is not a valid login name"
+fi
 if [[ ${#USERS[@]} -eq 0 && -n ${SUDO_USER:-} && ${SUDO_USER} != root ]]; then
 	USERS=("$SUDO_USER")
 elif [[ ${#USERS[@]} -eq 0 && $MODE == install ]]; then
@@ -143,6 +183,7 @@ PRINC_DIR=$ETC_SSH/aqmas_principals
 CONF_DIR=$ETC_SSH/sshd_config.d
 CONF_DST=$CONF_DIR/10-aqmas.conf
 CONF_SRC=$SCRIPT_DIR/10-aqmas.conf
+INSPECT_DST=$CONF_DIR/90-aqmas-inspect.conf
 SSHD_CONFIG=$ETC_SSH/sshd_config
 BACKUP_ROOT=$R/var/backups/aqmas-host-trust
 
@@ -164,7 +205,12 @@ host_names=()
 if [[ -r $R/etc/hostname ]]; then host_names+=("$(head -n1 "$R/etc/hostname" | cut -d. -f1)"); fi
 # The machine we run on is checked even with --root.
 host_names+=("$(hostname -s 2>/dev/null || uname -n)")
-for h in "${host_names[@]}"; do
+if [[ $BASTION_SELF -eq 1 ]]; then
+	say "bastion    --bastion-self: site refuse rules not applied (maintenance runner on the bastion itself)"
+	host_names=()
+	HARD_DENY_ADDRS=()
+fi
+for h in ${host_names[@]+"${host_names[@]}"}; do
 	for d in ${HARD_DENY[@]+"${HARD_DENY[@]}"}; do
 		[[ $h != "$d" ]] || die "refusing to run on $d: the site policy refuses it (e.g. the aqmas bastion)"
 	done
@@ -273,6 +319,41 @@ sshd_check() {
 		fi
 	done
 	say "ok         sshd -T shows TrustedUserCAKeys and AuthorizedPrincipalsFile"
+	if [[ -n $INSPECT_USER ]]; then
+		eff=$("$SSHD" -T ${cfg[@]+"${cfg[@]}"} -C "user=$INSPECT_USER,host=${NAME},addr=192.0.2.50" 2>&1) || { say "sshd -T failed: $eff"; return 1; }
+		if ! grep -qxiF "forcecommand $INSPECT_CMD" <<<"$eff" || ! grep -qxi "disableforwarding yes" <<<"$eff" ||
+			! grep -qxi "permittty no" <<<"$eff" || ! grep -qxi "authorizedkeysfile none" <<<"$eff"; then
+			say "sshd -T for $INSPECT_USER does not show the forced command without forwarding, tty and key files:"
+			grep -iE "^(forcecommand|disableforwarding|permittty|authorizedkeysfile) " <<<"$eff" >&2 || true
+			return 1
+		fi
+		say "ok         sshd -T confines $INSPECT_USER to the forced command"
+	fi
+	if [[ -n $ADMIN_USER ]]; then
+		eff=$("$SSHD" -T ${cfg[@]+"${cfg[@]}"} -C "user=$ADMIN_USER,host=${NAME},addr=192.0.2.50" 2>&1) || { say "sshd -T failed: $eff"; return 1; }
+		if ! grep -qxi "trustedusercakeys /etc/ssh/aqmas_user_ca.pub" <<<"$eff" ||
+			! grep -qxi "authorizedprincipalsfile /etc/ssh/aqmas_principals/%u" <<<"$eff" || ! grep -qxi "forcecommand none" <<<"$eff"; then
+			say "sshd -T for $ADMIN_USER does not show the aqmas values without a forced command:"
+			grep -iE "^(trustedusercakeys|authorizedprincipals|forcecommand)" <<<"$eff" >&2 || true
+			return 1
+		fi
+		say "ok         sshd -T for $ADMIN_USER: CA trusted, no forced command"
+	fi
+}
+
+# The Match block that confines the inspect account (docs/BASTION-ACCESS.md).
+inspect_conf() {
+	printf '%s\n' "$MARKER (bastion inspect account)" \
+		"Match User $INSPECT_USER" \
+		"    ForceCommand $INSPECT_CMD" \
+		"    AuthenticationMethods publickey" \
+		"    AuthorizedKeysFile none" \
+		"    AuthorizedKeysCommand none" \
+		"    PasswordAuthentication no" \
+		"    KbdInteractiveAuthentication no" \
+		"    DisableForwarding yes" \
+		"    PermitTTY no" \
+		"    PermitUserRC no"
 }
 
 reload_sshd() {
@@ -333,7 +414,7 @@ check_conflicts() {
 	[[ -n $inc ]] || die "${SSHD_CONFIG#"$R"} has no 'Include /etc/ssh/sshd_config.d/*.conf' before its first Match block"
 	local f hits=""
 	for f in "$SSHD_CONFIG" "$CONF_DIR"/*.conf; do
-		[[ -f $f && $f != "$CONF_DST" ]] || continue
+		[[ -f $f && $f != "$CONF_DST" && $f != "$INSPECT_DST" ]] || continue
 		if grep -qiE '^[[:space:]]*(TrustedUserCAKeys|AuthorizedPrincipalsFile|AuthorizedPrincipalsCommand)[[:space:]]' "$f"; then
 			hits+=$'\n'"  ${f#"$R"}: $(grep -iE '^[[:space:]]*(TrustedUserCAKeys|AuthorizedPrincipalsFile|AuthorizedPrincipalsCommand)[[:space:]]' "$f" | tr '\n' ';')"
 		fi
@@ -377,6 +458,11 @@ do_install() {
 	conf=$(cat "$CONF_SRC")
 	plan_file "$CA_DST" "$key_line"
 	plan_file "$CONF_DST" "$conf"
+	local inspect=
+	if [[ -n $INSPECT_USER ]]; then
+		inspect=$(inspect_conf)
+		plan_file "$INSPECT_DST" "$inspect"
+	fi
 	local u
 	for u in ${USERS[@]+"${USERS[@]}"}; do
 		plan_file "$PRINC_DIR/$u" "$u@$NAME"
@@ -400,6 +486,7 @@ do_install() {
 	put "$CA_DST" "$key_line"
 	for u in ${USERS[@]+"${USERS[@]}"}; do put "$PRINC_DIR/$u" "$u@$NAME"; done
 	put "$CONF_DST" "$conf"
+	if [[ -n $INSPECT_USER ]]; then put "$INSPECT_DST" "$inspect"; fi
 	if ! sshd_check; then
 		restore
 		die "sshd config check failed; restored the previous files, sshd was not reloaded"
@@ -415,6 +502,10 @@ do_uninstall() {
 	if [[ -f $CONF_DST ]]; then
 		grep -qF "$MARKER" "$CONF_DST" || die "${CONF_DST#"$R"} was not written by this script; leaving it alone"
 		targets+=("$CONF_DST")
+	fi
+	if [[ -f $INSPECT_DST ]]; then
+		grep -qF "$MARKER" "$INSPECT_DST" || die "${INSPECT_DST#"$R"} was not written by this script; leaving it alone"
+		targets+=("$INSPECT_DST")
 	fi
 	if [[ -f $CA_DST ]]; then
 		[[ $(grep -cvE '^[[:space:]]*(#|$)' "$CA_DST") -eq 1 ]] &&

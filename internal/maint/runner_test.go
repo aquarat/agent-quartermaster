@@ -135,6 +135,7 @@ start) [ -e "$d/refuse-always" ] && exit 1
   [ -e "$d/refuse-migrated" ] && grep -q MIGRATED "$d/data/aqmas.db" && exit 1
   echo "$2" > "$d/active" ;;
 active) [ -e "$d/active" ] ;;
+sys) shift; [ -x "$d/sys" ] && exec "$d/sys" "$@"; exit 0 ;;
 upgrade) [ -e "$d/upgrade-fails" ] && { echo 'Update refused or build failed; see the journal.' > "$CACHE/status"; exit 1; }
   cp "$2" "$d/installed-metadata.json"; echo "Installed and health-checked." > "$CACHE/status" ;;
 esac
