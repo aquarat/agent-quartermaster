@@ -4,8 +4,8 @@
 # throwaway sshd. A legacy (schema 5) broker with an enrolled host is taken through every
 # Setup task from the web API alone:
 #
-#   cutover (cancel, then activate) → seal (wrong recovery key and cancel, then browser-made
-#   key, on-box drill, activation, cold unlock) → enable self-update (mismatching release
+#   cutover (cancel, then activate) → seal into per-credential buckets (wrong recovery key and
+#   cancel, then browser-made key, staging taps, on-box drill, activation, nothing open after) → enable self-update (mismatching release
 #   refused, then seeded) → sync maintenance passkeys
 #
 # with an SSH grant issued and used after each step. A loop stands in for aqmas-maint.path;
@@ -159,6 +159,7 @@ grant "legacy start"
 maint maint-init || { cat "$T/maint.log"; fail "maint-init"; }
 [[ $(stat -c %a "$L/etc/update-passkeys.json" "$L/etc/maint-secrets.key" | tr '\n' ' ') == "600 600 " ]] || fail "pins or secrets key are not private"
 [[ $(owner setup-state cutover) == available && $(owner setup-state seal) == blocked:*organisations* && $(owner setup-state upgrade) == blocked:*self-update* ]] || fail "initial queue: $(owner setup)"
+[[ $(owner setup-state buckets) == blocked:*"Not needed"* ]] || fail "buckets task on an unsealed store: $(owner setup-state buckets)"
 # Stand-in for aqmas-maint.path: start the runner whenever a request or a journal exists.
 (while :; do if [[ -e $L/spool/approved || -e $L/maint/journal.json ]]; then maint maint-run || true; fi; sleep 0.2; done) &
 PIDS+=($!)
@@ -191,7 +192,7 @@ SEAL_SECRETS="{\"ntfy_topic_url\":\"$NTFY_TOPIC\",\"ntfy_token\":\"$NTFY_TOKEN\"
 owner setup-run seal "$SEAL_PARAMS" "$SEAL_SECRETS" 2>"$T/sign-seal.err" || { cat "$T/sign-seal.err"; fail "sign seal"; }
 owner setup-wait seal waiting 30 >/dev/null
 [[ $(owner seal-status) == setup ]] || fail "import mode not offered"
-owner seal-eval; owner seal-eval
+owner stage >/dev/null 2>"$T/stage.err" || { cat "$T/stage.err"; fail "staging taps"; }
 if owner seal-activate 2>/dev/null; then fail "activated without a recovery drill"; fi
 if owner seal-drill "$T/other.identity" 2>"$T/drill.err"; then fail "drill accepted another key"; fi
 grep -q 'not the recovery key' "$T/drill.err" || { cat "$T/drill.err"; fail "wrong-key refusal"; }
@@ -205,22 +206,22 @@ grant "a cancelled seal (rollback)"
 
 owner setup-run seal "$SEAL_PARAMS" "$SEAL_SECRETS"
 owner setup-wait seal waiting 30 >/dev/null
-owner seal-eval; owner seal-eval
+owner stage >/dev/null 2>"$T/stage.err" || { cat "$T/stage.err"; fail "staging taps"; }
 owner seal-drill "$T/recovery.identity" || fail "on-box recovery drill"
 owner seal-activate || fail "seal activation"
 owner setup-wait seal done 60 >"$T/seal-result.json"
 grep -q 'manifest_sha256' "$T/seal-result.json" || fail "no manifest in the result"
-[[ $(owner seal-status) == locked ]] || fail "sealed broker did not start locked"
-[[ $(schema) == 8 ]] || fail "not sealed"
+[[ $(owner seal-status) == buckets ]] || fail "sealed broker does not serve buckets: $(owner seal-status)"
+[[ $(schema) == 9 ]] || fail "not sealed in format 2"
 grep -q '^manifest_sha256 = "[0-9a-f]\{64\}"' "$L/etc/config.toml" && grep -q '^topic_url = ""' "$L/etc/config.toml" && grep -q 'comments must survive' "$L/etc/config.toml" || fail "configuration not pinned: $(cat "$L/etc/config.toml")"
 [[ ! -e $L/data/ca/ssh_user_ca && ! -e $L/data/ca/client_ca.key && -s $L/data/ca/ssh_user_ca.pub ]] || fail "plaintext CA keys survive"
-[[ $(ls "$L/backups") == sealed-* && -s $(echo "$L"/backups/sealed-*/inventory.json) ]] || fail "old backups not purged: $(ls "$L/backups")"
+[[ $(ls "$L/backups") == sealed-* && -s $(echo "$L"/backups/sealed-*/manifest.json) ]] || fail "old backups not purged: $(ls "$L/backups")"
 [[ $(cat "$L/alert/topic-url") == "$NTFY_TOPIC" && $(stat -c %a "$L/alert/publish-token") == 600 ]] || fail "lock-alert credential not stored"
 owner login >/dev/null
-owner seal-eval
-[[ $(owner seal-status) == unlocked ]] || fail "cold unlock"
-[[ $(owner setup-state seal) == done ]] || fail "seal not shown as done"
-grant "sealing and a cold unlock"
+[[ -z $(owner open-buckets) ]] || fail "a bucket is open after the sealed restart: $(owner open-buckets)"
+[[ $(owner setup-state seal) == done && $(owner setup-state buckets) == done ]] || fail "seal not shown as done: $(owner setup-state buckets)"
+grant "sealing (the approval opens the SSH CA)"
+[[ -z $(owner open-buckets) ]] || fail "the SSH approval left a bucket open: $(owner open-buckets)"
 
 # --- 3. enable self-update: a release that is not the installed binary is refused ---
 mkdir -p "$T/rel-good" "$T/rel-bad"
@@ -243,6 +244,7 @@ HOSTKEY=$(owner setup-host-key "$REPO" | bun -e 'const r=await Bun.stdin.json();
 UP_PARAMS="{\"repo\":\"$REPO\",\"forgejo_api\":\"http://127.0.0.1:$PF/api/v1/repos/example/agent-quartermaster\",\"github_api\":\"http://127.0.0.1:$PG/repos/example/agent-quartermaster\",\"known_hosts\":[\"$HOSTKEY\"],\"forgejo_token\":true,\"github_token\":true}"
 UP_SECRETS="{\"forgejo_token\":\"$FJ_TOKEN\",\"github_token\":\"$GH_TOKEN\"}"
 cp "$L/etc/config.toml" "$T/config.before-updates"
+EPOCH=$(owner buckets --json | bun -e 'console.log((await Bun.stdin.json()).epoch)')
 serve_release "$T/rel-bad"
 # Where releases come from is decided at the machine (`maint-init --repo …`), never by a
 # request: until the sources are pinned the task is blocked.
@@ -254,7 +256,7 @@ grep -q 'fixed on this machine' "$T/moved.err" || { cat "$T/moved.err"; fail "pi
 owner setup-run enable-updates "$UP_PARAMS" "$UP_SECRETS"
 owner setup-wait enable-updates failed 60 | grep -q 'not the published' || fail "mismatching release not refused"
 cmp -s "$L/etc/config.toml" "$T/config.before-updates" || fail "refused enable-updates changed the configuration"
-[[ $(owner seal-status) == unlocked ]] || fail "a refused task restarted the broker"
+[[ $(owner buckets --json | bun -e 'console.log((await Bun.stdin.json()).epoch)') == "$EPOCH" ]] || fail "a refused task restarted the broker"
 grant "a refused enable-updates (rollback)"
 serve_release "$T/rel-good"
 owner setup-run enable-updates "$UP_PARAMS" "$UP_SECRETS"
@@ -264,12 +266,12 @@ grep -q "^repo = \"$REPO\"" "$L/etc/config.toml" && grep -q '^cache_dir' "$L/etc
 [[ $(cat "$L/etc/github-read-token") == "$GH_TOKEN" && $(cat "$L/etc/forgejo-read-token") == "$FJ_TOKEN" ]] || fail "tokens not stored"
 grep -qF "$HOSTKEY" "$L/etc/known_hosts" || fail "forge host key not trusted"
 [[ $(cat "$L/releases/$VERSION/aqmas-linux-amd64") == "cli aqmas-linux-amd64" ]] && grep -q "\"commit\":\"$COMMIT\"" "$L/releases/latest.json" || fail "release cache not seeded"
-[[ $(owner seal-status) == locked ]] || fail "restart after enable-updates did not relock"
-owner login >/dev/null; owner seal-eval
+owner login >/dev/null
+[[ $(owner seal-status) == buckets && -z $(owner open-buckets) ]] || fail "restart after enable-updates left something open"
 [[ $(owner setup-state enable-updates) == done && $(owner setup-state upgrade) == idle ]] || fail "queue after enable-updates: $(owner setup-state upgrade)"
 grant "enabling self-update"
 
-# --- 4. a new unlock passkey is not pinned until the owner signs the new list ---
+# --- 4. a new passkey that opens buckets is not pinned until the owner signs the new list ---
 owner capability register 'Setup spare' unlock
 PINS() { owner setup | bun -e 'const v=await Bun.stdin.json();console.log(v.passkeys.filter(k=>k.pinned).length+"/"+v.passkeys.length)'; }
 [[ $(PINS) == 1/2 && $(owner setup-state sync-passkeys) == available ]] || fail "new passkey pinned without a signature: $(PINS)"
@@ -281,6 +283,10 @@ ok "maintenance passkeys synced by a signed list"
 # --- nothing pasted in the UI may be anywhere but where the runner stores it ---
 leaks=$(grep -rlE 'SENTINEL(lockalert|forgejoREAD|githubREAD)' "$T" --exclude-dir=alert --exclude=forgejo-read-token --exclude=github-read-token --exclude='config.before-*' --exclude='sign-*.err' 2>/dev/null || true)
 [[ -z $leaks ]] || fail "pasted secrets leaked into: $leaks"
-if grep -rl 'SENTINELapprovalsTOPIC\|AGE-SECRET-KEY-1' "$L" 2>/dev/null | grep -q .; then fail "retired notification URL or the recovery key is on the broker's disk"; fi
+# Format 2 keeps the approval-notice topic readable in the database (notice_channel, docs/BUCKETS.md §9):
+# notices go out while everything is closed. It must have left the configuration, and the recovery key is nowhere.
+leaks=$( (grep -rl 'AGE-SECRET-KEY-1' "$L"; grep -rl 'SENTINELapprovalsTOPIC' "$L" --exclude='aqmas.db' --exclude='aqmas.db-wal') 2>/dev/null || true)
+[[ -z $leaks ]] || fail "retired notification URL or the recovery key is on the broker's disk: $leaks"
+grep -q 'SENTINELapprovalsTOPIC' "$L/data/aqmas.db" "$L/data/aqmas.db-wal" 2>/dev/null || fail "the approval-notice topic did not move into the database"
 ok "pasted secrets exist only in their root-owned files; the recovery key was never stored"
 echo "setup-interop: all checks passed"

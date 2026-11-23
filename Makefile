@@ -58,10 +58,13 @@ vet:
 test: vet
 	$(GO) test ./...
 
-# Real binaries end to end: aqmasd + aqmas + a throwaway sshd on 127.0.0.1 (test/interop/run.sh).
+# Real binaries end to end: aqmasd + aqmas + a throwaway sshd on 127.0.0.1 (test/interop/run.sh),
+# the Setup runner (run-setup.sh) and the move of a store sealed by the real v0.4.1 (built from its
+# tag in a temporary git worktree) to per-credential buckets (run-migrate.sh).
 interop:
 	test/interop/run.sh
 	test/interop/run-setup.sh
+	test/interop/run-migrate.sh
 
 # Milestone 2: real aqmasd + aqmas against the fake Cloudflare API (test/interop/run-cf.sh);
 # WRANGLER=1 also deploys with wrangler through `aqmas cf env` (installs wrangler with bun).

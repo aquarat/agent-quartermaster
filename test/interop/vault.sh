@@ -1,5 +1,5 @@
-# Sourced by run.sh; called from env_scenario while the sealed broker is
-# unlocked. The owner is the web UI's own vault code (web/src/vault.ts) with a
+# Sourced by run.sh; called from env_scenario on the sealed (format 2) broker: each
+# approval opens only its own bucket. The owner is the web UI's own vault code (web/src/vault.ts) with a
 # software passkey; the agent is the real CLI; signatures are checked by openssl.
 vault_scenario() {
   local path=client-a/paas/web-form w="$T/vault" pid sentinel=vault-$(openssl rand -hex 16)
@@ -18,6 +18,7 @@ vault_scenario() {
   # Reveal: decrypted by the asking process only; multi-line value intact.
   owner vault-reveal "$path" APP_KEY APP_SECRET APP_TOKEN >"$w/revealed.json"
   KEY="$key" SENTINEL="$sentinel" bun -e 'const e=await Bun.file(process.argv[1]).json(); const want=[["APP_KEY",process.env.KEY],["APP_SECRET",process.env.SENTINEL],["APP_TOKEN","second "+process.env.SENTINEL]]; if(JSON.stringify(e.map(x=>[x.name,x.value]))!==JSON.stringify(want))process.exit(1)' "$w/revealed.json" || fail 'reveal did not return what the form stored'
+  nothing_open 'reveal (instant hold)'
   owner vault-policy client-a off
   if owner vault-reveal "$path" APP_SECRET >/dev/null 2>"$T/vault-noreveal.err"; then fail 'reveal with the organisation policy off'; fi
   owner vault-policy client-a on
@@ -42,6 +43,7 @@ vault_scenario() {
   "$AQMAS" sign "$s1" --why 'interop release' "$w/image.bin" "$w/notes.txt" >"$T/vault-sign1.out" 2>"$T/vault-sign1.err" & pid=$!
   owner vault-sign approve; wait "$pid" || { cat "$T/vault-sign1.err"; fail 'aqmas sign (single use)'; }
   grep -q "$(sha256sum "$w/image.bin" | cut -d' ' -f1)" "$T/vault-sign1.err" || fail 'CLI did not print the digest to compare with the card'
+  nothing_open 'single-use signing grant spent'
   for f in image.bin notes.txt; do
     openssl dgst -sha256 -binary "$w/$f" >"$w/$f.digest"
     openssl pkeyutl -verify -pubin -inkey "$w/pub1.pem" -rawin -in "$w/$f.digest" -sigfile "$w/$f.sig" >/dev/null || fail "openssl rejected the Ed25519 signature of $f"
@@ -58,6 +60,7 @@ vault_scenario() {
   "$AQMAS" sign "$s2" --why 'interop grant' --ttl 10m --count 5 "$w/a.bin" >"$T/vault-sign2.out" 2>"$T/vault-sign2.err" & pid=$!
   owner vault-sign approve 300 3; wait "$pid" || { cat "$T/vault-sign2.err"; fail 'aqmas sign (grant)'; }
   owner vault-state | bun -e 'const r=(await Bun.stdin.json()).requests; if(r.length!==1||r[0].used!==1||r[0].max_signatures!==3||r[0].ttl_seconds!==300||r[0].status!=="approved")process.exit(1)' || fail 'grant accounting'
+  [[ $(open_kinds) == signer ]] || fail "a signing grant opened more than its signer: $(owner open-buckets)"
   "$AQMAS" sign "$s2" "$w/b.bin" "$w/c.bin" </dev/null >"$T/vault-sign3.out" 2>"$T/vault-sign3.err" || { cat "$T/vault-sign3.err"; fail 'second call under the signing grant'; }
   for f in a b c; do openssl dgst -sha256 -verify "$w/pub2.pem" -signature "$w/$f.bin.sig" "$w/$f.bin" >/dev/null || fail "openssl rejected the ECDSA signature of $f.bin"; done
   owner vault-state | bun -e 'if((await Bun.stdin.json()).requests.length)process.exit(1)' || fail 'a spent grant is still listed'
@@ -65,6 +68,7 @@ vault_scenario() {
   owner vault-sign approve 600 20; wait "$pid" || fail 'second signing grant'
   "$AQMAS" sign "$s2" --end || fail 'ending the signing grant'
   owner vault-state | bun -e 'if((await Bun.stdin.json()).requests.length)process.exit(1)' || fail 'an ended grant is still listed'
+  nothing_open 'ended signing grant'
 
   # An imported Ed25519 seed signing a small manifest itself (pure Ed25519), from stdin, hex on stdout.
   local s3=client-a/paas/manifest-key seed; seed=$(openssl rand -hex 32)

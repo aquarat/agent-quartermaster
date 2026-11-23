@@ -135,12 +135,15 @@ func holdText(h bucketHold) string {
 	return h.Kind
 }
 
+// descriptorBucket fields are in sorted key order: encoding/json writes a
+// struct's fields in declaration order, and the descriptor is canonical JSON
+// (sorted keys) that the page re-serialises and compares.
 type descriptorBucket struct {
+	Hold  string `json:"hold"`
 	ID    string `json:"id"`
 	Kind  string `json:"kind"`
 	Label string `json:"label"`
 	Scope string `json:"scope"`
-	Hold  string `json:"hold"`
 	Until string `json:"until"`
 }
 
@@ -191,7 +194,7 @@ func (s *Server) offerScopes(ctx context.Context, sess, canonical string, needs 
 		if len(until) > 0 {
 			u = until[len(until)-1]
 		}
-		list = append(list, descriptorBucket{ID: encodeID(n.Bucket.ID), Kind: n.Bucket.Kind, Label: n.Bucket.Label, Scope: n.Bucket.Scope, Hold: strings.Join(holds, "; "), Until: u})
+		list = append(list, descriptorBucket{Hold: strings.Join(holds, "; "), ID: encodeID(n.Bucket.ID), Kind: n.Bucket.Kind, Label: n.Bucket.Label, Scope: n.Bucket.Scope, Until: u})
 		allOpen = allOpen && s.seal.pool.isOpen(bucketSealID(n.Bucket))
 	}
 	if list == nil {

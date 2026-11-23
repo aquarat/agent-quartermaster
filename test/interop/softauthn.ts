@@ -115,13 +115,19 @@ export async function softAuthenticator(origin: string, saved?: SavedAuthenticat
       if (!key) throw new Error("no credential");
       if (o.rpId && o.rpId !== rpId) throw new Error("credential belongs to another RP");
       if (o.allowCredentials?.length && !o.allowCredentials.some(d => b64url(d.id as ArrayBuffer) === b64url(credId))) throw new Error("credential not allowed");
-      const salt = o.extensions?.prf?.eval?.first;
-      // Model the authenticator's credential-specific UV hmac-secret. The
+      // PRF: `eval`, or `evalByCredential` (only the entry of the answering credential counts,
+      // as in WebAuthn L3). Model the authenticator's credential-specific UV hmac-secret: the
       // PRF extension hashes its domain prefix and input before evaluation.
-      let first: ArrayBuffer | undefined;
-      if (salt && prfSecret) {
-        const secret = await crypto.subtle.importKey("raw", ab(prfSecret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-        first = await crypto.subtle.sign("HMAC", secret, ab(await sha256(cat(te.encode("WebAuthn PRF\0"), u8(salt as ArrayBuffer)))));
+      const prfIn = o.extensions?.prf as { eval?: { first?: BufferSource; second?: BufferSource }; evalByCredential?: Record<string, { first?: BufferSource; second?: BufferSource }> } | undefined;
+      const inputs = prfIn?.evalByCredential?.[b64url(credId)] ?? prfIn?.eval;
+      const evalPRF = async (salt: BufferSource) => {
+        const secret = await crypto.subtle.importKey("raw", ab(prfSecret!), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        return crypto.subtle.sign("HMAC", secret, ab(await sha256(cat(te.encode("WebAuthn PRF\0"), u8(salt as ArrayBuffer)))));
+      };
+      let first: ArrayBuffer | undefined, second: ArrayBuffer | undefined;
+      if (inputs?.first && prfSecret) {
+        first = await evalPRF(inputs.first);
+        if (inputs.second) second = await evalPRF(inputs.second);
       }
       if (o.userVerification !== "required") throw new Error("UI did not require UV");
       counter++;
@@ -133,7 +139,7 @@ export async function softAuthenticator(origin: string, saved?: SavedAuthenticat
         rawId: ab(credId),
         type: "public-key",
         authenticatorAttachment: "platform",
-        getClientExtensionResults: () => first ? {prf:{results:{first}}} : {},
+        getClientExtensionResults: () => (first ? { prf: { results: second ? { first, second } : { first } } } : {}),
         response: { clientDataJSON: ab(cd), authenticatorData: ab(authData), signature: ab(der(p1363)), userHandle: ab(userHandle) },
       };
     },

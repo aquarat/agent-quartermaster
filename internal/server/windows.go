@@ -378,7 +378,7 @@ func (s *Server) windowNeeds(ctx context.Context, q *store.Q, t windowTerms) ([]
 }
 
 // stageWindow runs INSIDE the issuing transaction; publication is under the
-// same window mutex only after commit (also for combined unlock).
+// same window mutex only after commit.
 func (s *Server) stageWindow(ctx context.Context, q *store.Q, sess string, pk int64, t windowTerms, evidence string) (*window, windowReceipt, error) {
 	var rec windowReceipt
 	raw, err := strictB64(t.Credential, 1023)

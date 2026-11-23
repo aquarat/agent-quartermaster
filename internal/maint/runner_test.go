@@ -381,7 +381,6 @@ func activation(signer *vauth.Authenticator, recipient string) (manifest, digest
 func (b *lab) activateSeal() string { return b.activateSealAs(b.auth, sealParams().Recipient) }
 
 func (b *lab) activateSealAs(signer *vauth.Authenticator, recipient string) string {
-	b.write(0600, `{"inventory":true}`, "data", "seal-stage-1", "inventory.json")
 	b.write(0600, `{"manifest":true}`, "data", "seal-stage-1", "manifest.json")
 	b.write(0600, "proof", "data", "seal-stage-1", "recovery.proof")
 	var digest string
@@ -428,7 +427,7 @@ func TestSeal(t *testing.T) {
 		t.Fatal("lock-alert credentials not stored")
 	}
 	left, _ := os.ReadDir(b.l.Backups)
-	if len(left) != 1 || !strings.HasPrefix(left[0].Name(), "sealed-") || b.read("backups", left[0].Name(), "inventory.json") == "" {
+	if len(left) != 1 || !strings.HasPrefix(left[0].Name(), "sealed-") || b.read("backups", left[0].Name(), "manifest.json") == "" {
 		t.Fatalf("backups not purged down to the recovery bundle: %v", left)
 	}
 	if stages, _ := filepath.Glob(b.path("data", "seal-stage-*")); len(stages) != 0 {
@@ -763,14 +762,14 @@ func TestHostileSpoolAndStaging(t *testing.T) {
 		t.Fatal("the runner blocked on a FIFO in the spool")
 	}
 
-	// Staging: a FIFO where the inventory should be, and a link out of the data directory.
+	// Staging: a FIFO where the manifest should be, and a link out of the data directory.
 	b.setFacts(7, "")
-	b.write(0600, `{"secret":"ROOT ONLY"}`, "outside", "inventory.json")
+	b.write(0600, `{"secret":"ROOT ONLY"}`, "outside", "manifest.json")
 	b.queue(b.sign(TaskSeal, sealParams(), map[string]string{"ntfy_topic_url": secretTopic, "ntfy_token": secretToken}))
 	owner := b.when("seal-import", func() {
 		b.activateSeal()
-		_ = os.Remove(b.path("data", "seal-stage-1", "inventory.json"))
-		_ = syscall.Mkfifo(b.path("data", "seal-stage-1", "inventory.json"), 0600)
+		_ = os.Remove(b.path("data", "seal-stage-1", "manifest.json"))
+		_ = syscall.Mkfifo(b.path("data", "seal-stage-1", "manifest.json"), 0600)
 		_ = os.Symlink(b.path("outside"), b.path("data", "seal-stage-2"))
 	})
 	go func() { done <- b.runner().Run(context.Background()) }()
@@ -783,13 +782,13 @@ func TestHostileSpoolAndStaging(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the runner blocked on a FIFO in the staging directory")
 	}
-	kept, _ := filepath.Glob(b.path("backups", "sealed-*", "inventory.json"))
+	kept, _ := filepath.Glob(b.path("backups", "sealed-*", "manifest.json"))
 	for _, k := range kept {
 		if x, _ := os.ReadFile(k); strings.Contains(string(x), "ROOT ONLY") {
 			t.Fatal("root copied a file from outside the data directory")
 		}
 	}
-	if b.read("outside", "inventory.json") == "" {
+	if b.read("outside", "manifest.json") == "" {
 		t.Fatal("root deleted through a link out of the data directory")
 	}
 }
@@ -1361,7 +1360,7 @@ func TestBucketsParams(t *testing.T) {
 			t.Errorf("accepted %s", bad)
 		}
 	}
-	if spec, ok := Lookup(TaskBuckets); !ok || !strings.HasPrefix(spec.Reversible, "No: one-way") {
+	if spec, ok := Lookup(TaskBuckets); !ok || !strings.HasPrefix(spec.Reversible, "No — one-way") {
 		t.Fatal("spec")
 	}
 }

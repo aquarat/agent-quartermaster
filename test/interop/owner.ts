@@ -24,6 +24,18 @@
 //   remove-passkey NAME           sign and apply a remove; prints the PasskeyChange
 //   use-passkey NAME              make NAME the active passkey (then `login`)
 //
+// Seal format 2 (docs/BUCKETS.md), through web/src/{setup,sealPanel,capabilities,recoveryPanel}.ts:
+//   stage                         every staging tap of the active passkey (open-legacy, create, test)
+//   seal-drill FILE               the on-box recovery drill of a stage (identity sealed to the broker)
+//   seal-activate | close-all | rekey SCOPE | repair-leaf   signed seal control actions
+//   reopen                        reopen every bucket that has paused users (prints the taps)
+//   buckets [--json] | open-buckets   bucket status; the open buckets as "kind:label ..."
+//   recovery-drill FILE           Admin → Recovery drill with the identity in FILE
+//   create-scope TITLE            create an organisation's scope key (signed-in passkey)
+//   capability ACTION NAME [CAP]  register|enable|test|disable a passkey's scope keys
+//   window SECONDS COUNT MARKER   open a personal approval window, approve COUNT SSH requests
+//                                 under it, keep it open while MARKER exists, then close it
+//
 // Every signed action prints its canonical text on stderr ("owner: signing ...").
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -100,11 +112,18 @@ async function findPending(id: string) {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const rp = new URL(origin).hostname;
+/** A seal control action (Admin → Buckets, Setup activation) exactly as the page signs it. */
+async function control(action: string, params: Record<string, unknown> = {}) {
+  const c = await (await import(`${web}/src/sealPanel.ts`)).beginControl(api, await api.sealStatus(), action as never, params, rp);
+  console.error(`owner: signing seal ${action}${action === "activate" ? "" : " " + c.detail}${c.lines.length ? " · " + c.lines.join(" ") : ""}`);
+  await c.finish(auth);
+}
 const [cmd, ...args] = process.argv.slice(2);
 try {
   switch (cmd) {
     case 'recover':{const [dir,pin]=args;const post=async(path:string,token:string,body:unknown)=>{const res=await fetch('http://localhost/recovery/'+path,{unix:`${dir}/broker.sock`,method:'POST',headers:{'X-Aqmas-Recovery':token,'X-Aqmas':'1','Content-Type':'application/json',origin},body:JSON.stringify(body)});if(!res.ok)throw Error('recovery '+path+': '+res.status);return res.json()};const fresh=await softAuthenticator(origin);let step=await (await import(`${web}/src/recovery.ts`)).recoverSteps(post,readFileSync(dir+'/ticket','utf8'),'Replacement',pin,new URL(origin).hostname);while(step)step=await step.apply(fresh);auth=fresh;active='Replacement';cookie='';break;}
-    case 'repair-leaf':{const v=await api.sealStatus();const b=await api.sealPost('control/challenge',{action:'renew-leaf'});const opts=await (await import(`${web}/src/sealPanel.ts`)).prepareControl(v,'renew-leaf',b,new URL(origin).hostname);const {encodeAssertion}=await import(`${web}/src/webauthn.ts`);await api.sealPost('control/finish',{challenge_id:b.challenge_id,assertion:encodeAssertion(await auth.get(opts))});break;}
+    case 'repair-leaf': await control('renew-leaf');break;
     case 'env-ticket':{const cat=await api.catalogue();const host=cat.organisations.find((o:any)=>o.slug==='client-a').hosts.find((h:any)=>h.active&&h.class==='owner-device');console.log((await api.envPost('ticket',{path:'client-a/paas/staging',operation:args[0],enrollment:host.enrollment})).ticket);break}
     case 'env-decide':{const [action,mode]=args;for(let n=0;;n++){const state=await api.envState();const item=action==='commit'?state.drafts[0]:state.releases.find((r:any)=>r.mode===mode&&r.status===(action==='revoke'?'approved':'pending'));if(item){const review=await (await import(`${web}/src/envsets.ts`)).envReview(api,await api.sealStatus(),item,action,action==='approve'?300:0,new URL(origin).hostname);await review.tap(auth);break}if(n>=150)throw Error('no env decision queued');await Bun.sleep(100)}break}
     case 'vault-state': console.log(JSON.stringify(await api.vaultState()));break;
@@ -170,25 +189,84 @@ try {
     case 'setup-preview': console.log(JSON.stringify(await api.setupGet!('/cutover/preview')));break;
     case 'setup-host-key': console.log(JSON.stringify(await api.setupPost!('/host-key',{repo:args[0]})));break;
     case 'age-keygen': {const k=await (await import(`${web}/src/setup.ts`)).generateAgeIdentity();writeFileSync(args[0]!,k.identity+'\n',{mode:0o600});console.log(k.recipient);break;}
-    case 'seal-drill': {const v=await api.sealStatus();await (await import(`${web}/src/setup.ts`)).sendDrill(api,v,readFileSync(args[0]!,'utf8'));break;}
-    case 'capability': {
-      const [action,name,capability]=args, v=await api.sealStatus(), key=action==='register'?null:await findPasskey(name!);
-      const flow=await (await import(`${web}/src/capabilities.ts`)).startCapability(api,v,{action,nickname:name,credential_id:key?.raw_id??'',capability},new URL(origin).hostname);
-      let step=await flow.approve(auth);const device=action==='register'?await softAuthenticator(origin):await softAuthenticator(origin,keys[name!]);
-      while(step)step=await step.tap(device);if(action!=='disable')keys[name!]=await device.save();break;
+    case 'seal-drill': {const v=await api.sealStatus();await (await import(`${web}/src/setup.ts`)).sendDrill(api,{drill_key:v.stage?.drill_key,installation:v.installation},readFileSync(args[0]!,'utf8'));break;}
+    // ---- seal format 2 (docs/BUCKETS.md): staging, control, passkeys, recovery ----
+    case 'stage': { // every staging tap the active passkey can make: open-legacy, create, test (two scopes per tap)
+      const setup=await import(`${web}/src/setup.ts`);let taps=0;
+      for(;;){const v=await api.sealStatus();if(v.mode!=='setup'||!v.stage)throw Error('nothing is staged: '+v.mode);
+        const plan=setup.stagePlan(v.stage);if(!plan.next)break;
+        const choice=v.stage.choices.find((c:any)=>c.name===active);if(!choice)throw Error('no staging choice for '+active);
+        const step=await setup.stageStep(api,v,plan.next.step,choice,plan.next.scopes,rp);console.error(`owner: staging ${plan.next.step} ${plan.next.scopes.join(',')}: ${step.lines.join(' ')}`);
+        await step.finish(auth);if(++taps>12)throw Error('staging does not converge');}
+      console.log(taps);break;
     }
-    case 'seal-eval': {
-      const v=await api.sealStatus();const choice=v.choices.find((c:any)=>c.name===active);if(!choice)throw Error('no choice for active credential');
-      const b=await api.sealPost('unlock/challenge',{credential:choice.id,registration_id:choice.selection.registration_id});
-      const prepared=await (await import(`${web}/src/seal.ts`)).prepareSeal(choice.selection,b,new URL(origin).hostname);
-      const packet=await prepared.finish(auth);await api.sealPost('unlock/finish',packet);
-      let refused=false;try{await api.sealPost('unlock/finish',packet)}catch{refused=true}if(!refused)throw Error('replayed seal packet');break;
+    case 'seal-activate': await control('activate');break;
+    case 'close-all': await control('close-all');break;
+    case 'rekey': await control('rekey',{scope:args[0]});break;
+    case 'reopen': { // every bucket with paused users, at most two scopes per tap; prints the number of taps
+      let taps=0;for(;;){const v=await api.sealStatus();const paused=(v.buckets??[]).filter((b:any)=>b.paused.length&&!b.open);if(!paused.length)break;
+        const scopes=[...new Set(paused.map((b:any)=>b.scope))].slice(0,2);const ids=paused.filter((b:any)=>scopes.includes(b.scope)).map((b:any)=>b.id).sort();
+        await control('reopen',{buckets:ids});if(++taps>8)throw Error('reopen does not converge');}
+      console.log(taps);break;
     }
-    case 'seal-lock':case 'seal-activate': {
-      const action=cmd==='seal-lock'?'lock':'activate',v=await api.sealStatus();const b=await api.sealPost('control/challenge',{action});
-      const opts=await (await import(`${web}/src/sealPanel.ts`)).prepareControl(v,action,b,new URL(origin).hostname);
-      const {encodeAssertion}=await import(`${web}/src/webauthn.ts`);
-      await api.sealPost('control/finish',{challenge_id:b.challenge_id,assertion:encodeAssertion(await auth.get(opts))});break;
+    case 'buckets': { // [--json] which buckets are open, with their holds and paused users
+      const v=await api.sealStatus();
+      if(args[0]==='--json'){console.log(JSON.stringify(v));break;}
+      console.log(JSON.stringify((v.buckets??[]).map((b:any)=>({kind:b.kind,label:b.label,scope:b.scope,open:b.open,holds:b.holds.map((h:any)=>h.kind).sort(),paused:b.paused.length}))));break;
+    }
+    case 'open-buckets': { // "kind:label kind:label" of the open buckets, sorted ("" when nothing is open)
+      const v=await api.sealStatus();console.log((v.buckets??[]).filter((b:any)=>b.open).map((b:any)=>`${b.kind}:${b.label}`).sort().join(' '));break;
+    }
+    case 'open-kinds': { // the kinds of the open buckets, sorted, unique, space-separated
+      const v=await api.sealStatus();console.log([...new Set((v.buckets??[]).filter((b:any)=>b.open).map((b:any)=>b.kind))].sort().join(' '));break;
+    }
+    case 'recovery-drill': { // IDENTITY-FILE: Admin → Recovery drill; prints {ok,scopes,buckets}
+      const v=await api.sealStatus();const r=await (await import(`${web}/src/recoveryPanel.ts`)).beginRecovery(api,v,{mode:'drill'},readFileSync(args[0]!,'utf8'),rp);
+      console.log(JSON.stringify(await r.finish(auth)));break;
+    }
+    case 'create-scope': { // TITLE: Admin → Buckets "Create": the signed-in passkey creates an organisation's scope key
+      const v=await api.sealStatus();const sc=(v.scopes??[]).find((x:any)=>x.title===args[0]||x.scope===args[0]);if(!sc)throw Error('no scope '+args[0]);
+      const me=(await api.state()).passkeys.find((k:any)=>k.current);
+      let step=await (await import(`${web}/src/capabilities.ts`)).startCapability(api,v,{action:'enable',capability:'unlock',nickname:me.nickname,credential_id:me.raw_id,scopes:[sc.scope]},rp);
+      for(let n=0;step;n++){if(n>4)throw Error('create does not converge');step=(await step.tap(auth)) as any;}
+      break;
+    }
+    case 'capability': { // register|enable|test|disable NAME [unlock|approve-only]
+      const [action,name,capability]=args;const v=await api.sealStatus();
+      const key=action==='register'?null:await findPasskey(name!);const pk=key?(v.passkeys??[]).find((p:any)=>p.id===key.id):null;
+      const keyed=(v.scopes??[]).filter((s:any)=>s.has_key).map((s:any)=>s.scope);
+      const scopes=action==='register'?(capability==='approve-only'?[]:keyed):action==='enable'?pk.missing:pk.scopes.map((s:any)=>s.scope);
+      const caps=await import(`${web}/src/capabilities.ts`);
+      let step=await caps.startCapability(api,v,{action,nickname:name,credential_id:key?.raw_id??'',capability:capability??(action==='disable'?'approve-only':'unlock'),scopes},rp);
+      // The signed-in passkey approves each round; the passkey being enabled (or tested) answers the rest.
+      let device:any=action==='register'?await softAuthenticator(origin):name===active?auth:await softAuthenticator(origin,keys[name!]);
+      for(let n=0;step;n++){if(n>12)throw Error('capability flow does not converge');const mine=/signed-in passkey/.test(step.progress??'')||(action==='disable');
+        console.error(`owner: ${step.title} · ${step.progress??''}`);step=(await step.tap(mine?auth:device)) as any;}
+      if(device!==auth&&action!=='disable')keys[name!]=await device.save();
+      break;
+    }
+    case 'window': { // SECONDS COUNT MARKER: open a personal approval window, approve COUNT SSH requests under it, close it
+      const [secs,count,marker]=args;(globalThis as any).window??=globalThis;
+      const ap=await import(`${web}/src/approvals.ts`);const {checkReview,checkTap}=await import(`${web}/src/review.ts`);const {encodeAssertion}=await import(`${web}/src/webauthn.ts`);
+      let v=await api.sealStatus();let p=(v.profiles??[]).find((x:any)=>x.personal);if(!p)throw Error('no personal window profile');
+      const settings={enabled:true,max_seconds:Math.max(Number(secs),p.settings.max_seconds),idle_seconds:p.settings.idle_seconds,sets:[...new Set(p.eligible.filter((r:any)=>r.kind==='ssh-ca').map((r:any)=>r.set))].sort()};
+      const pb=await api.sealPost!<any>('windows/policy/challenge',{org:p.org,settings});
+      const popts=await checkReview(pb,{object:'window-policy',action:'replace',v:3,id:p.org,installation:v.installation,epoch:v.epoch,old:JSON.stringify(p),new:JSON.stringify(settings)},rp);
+      await api.sealPost!('windows/policy/finish',{challenge_id:pb.challenge_id,assertion:encodeAssertion(await auth.get(popts))});
+      v=await api.sealStatus();p=(v.profiles??[]).find((x:any)=>x.personal);if(!v.verified_access)throw Error('windows need a verified Access identity');
+      const me=(await api.state()).passkeys.find((k:any)=>k.current);const op=await ap.makeOpening(p,me.raw_id,Number(secs));
+      const b=await api.sealPost!<any>('windows/open/challenge',op.input);const id=JSON.parse(b.canonical).id;
+      const tap=await checkTap(b,{object:'window',action:'open',v:3,id,installation:v.installation,epoch:v.epoch,terms:op.terms(id)},rp,{selected:me.raw_id});
+      console.error('owner: window opens: '+tap.lines.join(' '));
+      const tab=new ap.TabWindow();tab.start(api,op,await api.sealPost!<any>('windows/open/finish',{challenge_id:b.challenge_id,...(await tap.sign(auth))}),id,v.installation);
+      await persist();writeFileSync(marker!,'open\n');
+      try{for(let done=0;done<Number(count);){const st=await api.state();const it=(st.pending??[]).find((x:any)=>x.kind==='ssh');
+          if(!it){await sleep(200);continue}
+          const prep=await tab.prepare({item:it,action:'approve',ttl_seconds:Math.min(300,it.ttl_requested)});await prep.confirm();done++;writeFileSync(marker!,`approved ${done}\n`);}
+        // Held open until the caller removes the marker (it checks the buckets meanwhile).
+        for(let n=0;existsSync(marker!)&&n<600;n++)await sleep(200);
+      }finally{tab.end();await sleep(500);}
+      break;
     }
     case 'catalogue':{const {exerciseCatalogue}=await import('./catalogue');await exerciseCatalogue(api,auth,args[0]??'create');break;}
     case 'activate-personal': {

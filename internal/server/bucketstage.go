@@ -401,10 +401,13 @@ type stageScopeView struct {
 	Wrapped bool   `json:"wrapped"`
 	Tested  bool   `json:"tested"`
 }
+
+// legacyView is also the descriptor's "legacy" object: fields in sorted key
+// order, as canonical JSON needs (encoding/json keeps declaration order).
 type legacyView struct {
+	Installation string `json:"installation"`
 	MKVersion    uint64 `json:"mk_version"`
 	PRFSalt      string `json:"prf_salt"`
-	Installation string `json:"installation"`
 }
 type stageChoice struct {
 	ID         string      `json:"id"`

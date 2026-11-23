@@ -244,7 +244,7 @@ func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.Reques
 					lockNotice = true
 				}
 				if !deadline.IsZero() && time.Now().After(deadline) {
-					return nil, &DecisionError{Status: api.StatusExpired, What: what, Note: "deadline passed while locked"}
+					return nil, &DecisionError{Status: api.StatusExpired, What: what, Note: "deadline passed while the credential was closed"}
 				}
 				if err = sleepCtx(ctx, 2*time.Second); err != nil {
 					return nil, err

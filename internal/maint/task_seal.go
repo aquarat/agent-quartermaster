@@ -284,7 +284,7 @@ func (r *Runner) unseal(ctx context.Context, j journal, cause error) error {
 }
 
 // finishSeal is everything after the signed activation. It only moves forward and can be
-// repeated: the journal stays until the broker is serving locked.
+// repeated: the journal stays until the broker serves the sealed store.
 func (r *Runner) finishSeal(ctx context.Context, j journal) (string, error) {
 	fail := func(err error) (string, error) {
 		return "", errors.New("Activated, but finishing failed (" + err.Error() + "). The runner retries by itself.")
@@ -328,13 +328,13 @@ func (r *Runner) finishSeal(ctx context.Context, j journal) (string, error) {
 	r.result("manifest_sha256", f.Manifest)
 	r.result("recipient", r.cfg.Seal.Recipient)
 
-	r.step("Keeping the encrypted recovery bundle and removing staging files")
+	r.step("Keeping the activation manifest and removing staging files")
 	for _, stage := range r.stageDirs() {
 		keep := filepath.Join(r.l.Backups, "sealed-"+f.Manifest[:16])
 		if err := os.MkdirAll(keep, 0700); err != nil {
 			return fail(err)
 		}
-		for _, name := range []string{"inventory.json", "manifest.json"} {
+		for _, name := range []string{"manifest.json"} {
 			// Service-owned files: read without following links or blocking on a FIFO.
 			b, err := readRooted(r.cfg.DataDir, filepath.Join(stage, name), 1<<20)
 			if err == nil {

@@ -418,10 +418,16 @@ ok 'stale policy refused, explicit indefinite scope approval, sensitive cap and 
 source "$ROOT/test/interop/seal.sh"
 seal_cutover
 "$AQMAS" cf scopes --json >/dev/null || fail 'locked public catalogue'
-"$AQMAS" cf request cf.read --ttl 5m --why 'queue while locked' --json >"$T/locked-cf.out" 2>"$T/locked-cf.err" &
-RPID=$!; RID=$(owner wait cloudflare interop-host 20); owner seal-eval; owner approve "$RID" 300 >/dev/null; wait "$RPID"
+"$AQMAS" cf request cf.read --ttl 5m --why 'queue while closed' --json >"$T/locked-cf.out" 2>"$T/locked-cf.err" &
+RPID=$!; RID=$(owner wait cloudflare interop-host 20); owner approve "$RID" 300 >/dev/null; wait "$RPID"
+[[ $(open_kinds) == cf-proxy ]] || fail "the proxy approval opened other buckets: $(owner open-buckets)"
 cfapi GET /zones --why 'sealed proxy parent' >/dev/null || fail 'sealed proxy forward'
+owner close-all; nothing_open 'close all'
+if timeout 60 "$AQMAS" cf api GET /zones --why 'after close all' </dev/null >/dev/null 2>"$T/closed-cf.err"; then fail 'proxied with the parent bucket closed'; fi
+[[ $(owner reopen) == 1 ]] || fail 'reopen the proxy parent'
+cfapi GET /zones --why 'after reopen' >/dev/null || fail 'proxy after reopen'
+ok 'sealed proxy parent: the approval opens only its bucket (grant hold); close all pauses the grant; reopen resumes it'
 for token in "$PROXY_TOK" "$MINTER_TOK"; do
-  if grep -aFl "$token" "$T/data/aqmas.db" "$T/data/aqmas.db-wal" "$T"/seal-*.log "$T"/locked-cf.* "$T/data"/seal-stage-*/inventory.json 2>/dev/null | grep -q .; then fail 'sealed parent leaked'; fi
+  if grep -aFl "$token" "$T/data/aqmas.db" "$T/data/aqmas.db-wal" "$T"/seal-*.log "$T"/locked-cf.* "$T/data"/seal-stage-*/manifest.json "$T"/closed-cf.err 2>/dev/null | grep -q .; then fail 'sealed parent leaked'; fi
 done
 echo "interop-cf: ALL OK"

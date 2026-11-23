@@ -313,9 +313,16 @@ ok 'signed catalogue creation, identical sibling paths and remove/re-admit isola
 
 source "$ROOT/test/interop/seal.sh"
 seal_cutover
-"$AQMAS" ssh testhost --fresh --why "while locked" -- echo ok </dev/null >"$T/locked.out" 2>"$T/locked.err" &
-RPID=$!; RID=$(owner wait ssh interop-host 20); if owner approve "$RID" 300 >/dev/null 2>&1; then fail 'approved while locked'; fi
-owner seal-eval; owner batch "$RID" >/dev/null; wait "$RPID"; grep -qx ok "$T/locked.out" || fail 'sealed SSH signer with exact-action batch'
+# After a restart nothing is open: the approval tap itself opens the SSH CA (batch and single card).
+"$AQMAS" ssh testhost --fresh --why "after restart" -- echo ok </dev/null >"$T/closed.out" 2>"$T/closed.err" &
+RPID=$!; RID=$(owner wait ssh interop-host 20); owner batch "$RID" >/dev/null 2>"$T/batch.err" || { cat "$T/batch.err"; fail 'batch approval that opens the SSH CA'; }
+wait "$RPID"; grep -qx ok "$T/closed.out" || fail 'sealed SSH signer with exact-action batch'
+nothing_open 'batch approval (instant hold)'
+"$AQMAS" ssh testhost --fresh --why "single card" -- echo ok </dev/null >"$T/closed2.out" 2>"$T/closed2.err" &
+RPID=$!; RID=$(owner wait ssh interop-host 20); owner approve "$RID" 300 >/dev/null 2>"$T/single.err" || { cat "$T/single.err"; fail 'single approval that opens the SSH CA'; }
+wait "$RPID"; grep -qx ok "$T/closed2.out" || fail 'single-card SSH approval'
+nothing_open 'single approval (instant hold)'
+ok 'approvals open the SSH CA for the instant only (batch and single card)'
 source "$ROOT/test/interop/vault.sh"
 source "$ROOT/test/interop/envsets.sh"
 env_scenario
