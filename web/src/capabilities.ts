@@ -306,7 +306,7 @@ export function capabilityForm(api: Api, auth: Authenticator, v: SealView, pks: 
       "div",
       { class: "pk-buckets", "data-passkey": p.id },
       h("p", null, h("strong", null, vt(nick)), " · ", `Opens ${p.opens} of ${p.of} buckets`, p.current ? " · signed in" : ""),
-      !p.prf ? h("p", { class: "muted" }, "Sign and approve only: this passkey has no PRF, so it opens nothing. It can approve while a bucket is already open.") : null,
+      !p.prf ? h("p", { class: "warn" }, "Not enabled for any bucket yet: it can sign in and approve, but not open your credentials. Use Enable below (you tap with a passkey that already opens buckets, then with this one). If this authenticator has no PRF support, Enable will say so.") : null,
       p.scopes.length ? h("p", { class: "muted" }, "Enabled for: ", p.scopes.map((s) => `${titleOf(v, s.scope)} (${s.tested ? "tested" : untestedWords(v, s.scope)})`).join(", ")) : null,
       p.missing.length ? h("p", { class: "warn" }, "Not enabled for ", p.missing.map((s) => titleOf(v, s)).join(", ")) : null,
     );
@@ -314,7 +314,8 @@ export function capabilityForm(api: Api, auth: Authenticator, v: SealView, pks: 
     // Enable covers scopes it lacks and scopes whose wrap is not tested yet (an untested wrap
     // may be replaced), then tests them in the same flow.
     const todo = keyed.filter((s) => !p.scopes.some((x) => x.scope === s && x.tested));
-    if (raw && p.prf && todo.length)
+    // p.prf only means "has at least one wrap"; whether the authenticator supports PRF is learnt during Enable.
+    if (raw && todo.length)
       acts.append(btn("Enable…", async () => runSteps(review, auth, await startCapability(api, v, { action: "enable", capability: "unlock", nickname: nick, credential_id: raw, scopes: todo }, location.hostname, 0, { thenTest: true, skip: testedScopes(v, pks, raw) }), refresh)));
     if (raw && p.scopes.length) {
       acts.append(btn("Test…", start({ action: "test", capability: "unlock", nickname: nick, credential_id: raw, scopes: p.scopes.map((s) => s.scope) })));
