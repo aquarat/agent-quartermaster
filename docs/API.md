@@ -600,14 +600,15 @@ format-1 store awaiting migration, and 409 while a stage is in progress (except 
 drill, stage and the `activate` control action). An operation that needs a closed bucket
 answers **423 with error code `locked`**: agents get "*label* is closed: waiting for the owner
 to reopen it" and keep their deadline; an approval that must open a bucket but carries no
-`open` gets "this approval must open *labels*". At most 60 open attempts a minute and 64
-pending (429 `rate_limited`).
+`open` gets "this approval must open *labels*" (for a passkey that opens only from remembered
+browsers: "… this browser is no longer remembered for this passkey …"). At most 60 open
+attempts a minute and 64 pending (429 `rate_limited`).
 
 ## Open descriptor and bound challenge
 
 A challenge whose action needs buckets returns `ChallengeResponse {challenge_id, canonical,
-public_key, open: {descriptor}}`; its finish takes `open` next to `challenge_id` and
-`assertion`:
+public_key, open: {descriptor, browsers?}}`; its finish takes `open` next to `challenge_id`
+and `assertion` (`browsers`: [Remembered browsers](#remembered-browsers)):
 
 | Challenge | Actions that carry `open` | Finish |
 |---|---|---|
@@ -618,7 +619,7 @@ public_key, open: {descriptor}}`; its finish takes `open` next to `challenge_id`
 | `POST /api/ui/seal/env/challenge` | `approve` | `POST /api/ui/seal/env/finish` |
 | `POST /api/ui/seal/vault/challenge` | `reveal`, `sign-approve` | `POST /api/ui/seal/vault/finish` |
 | `POST /api/ui/seal/control/challenge` | `renew-leaf`, `reopen`, `rekey` | `POST /api/ui/seal/control/finish` |
-| `POST /api/ui/seal/passkeys/challenge` | `register`, `enable` (scopes that already have a key) | `POST /api/ui/seal/passkeys/authorize` |
+| `POST /api/ui/seal/passkeys/challenge` | `register`, `enable`, `remember` (scopes that already have a key) | `POST /api/ui/seal/passkeys/authorize` |
 
 Every other challenge keeps `challenge = SHA-256(canonical)`. The descriptor is canonical JSON
 (sorted keys, no whitespace, no HTML escaping) with exactly these keys:
@@ -709,7 +710,8 @@ the second the scope KEK.
      "buckets":  [{"id","kind","label","scope","scope_title","open","opened_at"?,
                    "holds":[{"kind","ref","reason","until"?,"since"}],
                    "paused":[{"kind","ref","reason"}]}],
-     "passkeys": [{"id","name","current","prf","scopes":[{"scope","tested"}],"opens","of","missing"}],
+     "passkeys": [{"id","name","current","prf","mode","scopes":[{"scope","tested"}],"opens","of","missing",
+                   "browsers":[{"id","key","label","created_at","last_used_at"?,"scopes":[{"scope","tested"}]}]}],
      "active_windows"?, "profiles"?, "verified_access"?, "leaf_expires"?, "leaf_repair"?,
      "stage"?}
 
@@ -724,8 +726,14 @@ the second the scope KEK.
   added only by a tap whose card said "re-arms Cloudflare auto-approval"; ends at restart,
   Close all, or when the set's policy no longer auto-approves any scope) or `window`. `paused` lists live users of the bucket (grants, env releases,
   signing grants, standing rules) without a hold on it: they wait for a **Reopen**.
-* Per passkey: `id` as in `PasskeyInfo`; `prf` true when it holds any scope wrap; `opens` the
+* Per passkey: `id` as in `PasskeyInfo`; `prf` true when it holds any PRF scope wrap; `opens` the
   number of buckets in its scopes, `of` all buckets; `missing` the scopes it has no wrap for.
+  `mode` says how it opens buckets: `prf` (its own secret), `browser` (only from the
+  remembered browsers in `browsers`; `scopes` is then the union over them, `tested` when some
+  browser's wrap is) or `""` (nothing). `browsers[]`: `id` the key's fingerprint
+  (`hex(SHA-256(public key)[0:16])`), `key` its public half (65 bytes, base64url), `label`,
+  `created_at`, `last_used_at` (the last tap that opened from it), and the scopes it has a
+  wrap of.
 * `stage` (mode `setup`, owner session): `{source: "unsealed"|"format-1", scopes:[{scope,
   title, buckets, wrapped, tested}], drilled, drill_key, manifest?, legacy_unlocked,
   dropped?, choices:[{id, name, credential_id, legacy?: {mk_version, prf_salt,
@@ -743,7 +751,7 @@ the second the scope KEK.
 | `close-all` | nothing | `open_buckets` (count) | nothing | Wipes every open bucket and hold, ends every window, drops pending attempts and capability stages |
 | `renew-leaf` | nothing | `repair` (JSON string: `ca_pin`, `configured_sans`, `effect`) | `internal-ca`, instant | Renews the agent TLS leaf; the broker then restarts (everything closes) |
 | `reopen` | `buckets`: 1–16 sorted, unique bucket IDs | `buckets` `[{id, label}]` | those buckets | Keeps each open with the holds of its live users |
-| `rekey` | `scope` (with a key) | `scope`, `scope_title`, `bucket_count` | every bucket of the scope (an empty scope: its key alone) | New scope key and bucket keys, records re-encrypted, drafts dropped, the scope's buckets closed, only the tapping passkey keeps a wrap: of the new key, at the descriptor's `rekey_salt`, **untested** until it next opens (test it: `test` below). Requires `open` with both KEKs; returns `{ok, buckets}` |
+| `rekey` | `scope` (with a key) | `scope`, `scope_title`, `bucket_count` | every bucket of the scope (an empty scope: its key alone) | New scope key and bucket keys, records re-encrypted, drafts dropped, the scope's buckets closed, only the tapping passkey keeps a wrap (a remembered browser: only that passkey with that browser key): of the new key, at the descriptor's `rekey_salt`, **untested** until it next opens (test it: `test` below). Requires `open` with both KEKs; returns `{ok, buckets}` |
 | `activate` | nothing (mode `setup`, stage ready) | `manifest` (the format-2 manifest JSON string) | nothing | Commits the stage; the process exits. A plain signature: challenge `SHA-256(canonical)`, `open` refused, a passkey not pinned by the runner refused |
 
 ## Passkey capabilities
@@ -778,6 +786,67 @@ for a new organisation's scope is `enable` of the signed-in passkey for that sco
 taps). Until some passkey's wrap of a new scope has opened once (`test`, three taps in all),
 creating its first bucket is refused (409 "test the new scope first").
 
+## Remembered browsers
+
+A passkey without PRF opens buckets from a browser profile that holds a key of its own
+(BUCKETS.md §13). The browser key is a P-256 key pair whose private half never leaves the
+browser; `browser_key` below is its public half (65 bytes, uncompressed SEC1, base64url) and
+`browser_key_id` its fingerprint, lowercase hex of the first 16 bytes of its SHA-256.
+
+**Passkey-capability actions** (the routes of [Passkey capabilities](#passkey-capabilities);
+`challenge` takes two more fields, `browser_key` and `browser_label`):
+
+| `action` | Input | Canonical adds | Tap | Effect |
+|---|---|---|---|---|
+| `remember` | `capability: "unlock"`, one or two `scopes`, `browser_key`, `browser_label` (1–64 printable characters, single spaces; it replaces the label of a browser already remembered for that passkey) | `browser_key`, `browser_key_id`, `browser_label` | as `enable`: open descriptor for the scopes that have a key, signed by a passkey that opens them | `authorize` → `{registration_id}`; then `evaluate` and `finish` as for `enable` |
+| `test` with `browser_key` | the scopes that browser has a wrap of | `browser_key`, `browser_key_id` | scope-enrol descriptor, purpose `test`, with `browser_key`; `salts` are the wrap IDs | `authorize` → `{ok, scopes}` after a [release](#release) by the same tap |
+| `forget` | `capability: "unlock"`, `scopes: []`, `browser_key` | `browser_key`, `browser_key_id` | plain (`SHA-256(canonical)`), any passkey | `authorize` → `{ok}`: deletes the browser key record and its wraps |
+
+The canonical of the three, in full (sorted keys; `browser_label` only for `remember`):
+
+    {"action","browser_key","browser_key_id","browser_label","capability":"unlock",
+     "credential_id","epoch","id","installation","issued_at","nickname","nonce",
+     "object":"passkey-capability","scopes":[…],"v":3}
+
+`evaluate` for a `remember` returns canonical object `passkey-enrol` with `browser_key` and
+`browser_key_id` added, and a scope-enrol descriptor (purpose `enrol`) that carries
+`"browser_key"`; its `salts` are the new wrap IDs. The PRF inputs are still sent: a passkey
+that answers them has PRF and the page stops (BUCKETS.md §13.4). `finish` takes `open` with
+one fresh random 32-byte KEK per scope in the usual packet; the broker stores the scope key
+wrapped under it and the KEK sealed to `browser_key`.
+
+Refusals: `remember` for a passkey that has a PRF wrap (409), or naming a scope that browser
+already opens with a tested wrap (409); `enable` for a passkey that has remembered browsers
+(409); `forget` of the only tested wrap of a scope (409); a malformed key or label, a
+`browser_key` on another action, a label on anything but `remember` (400).
+
+**Offer.** `open.browsers` on a bucket-open challenge: `[{credential_id, key_id, label}]`, the
+passkeys (raw credential ID) and browser keys (fingerprint) that have a wrap of every scope
+of the descriptor. Not signed: a hint for the card. Such passkeys are in `allowCredentials`.
+
+### Release
+
+`POST /api/ui/seal/browser/release {challenge_id, assertion, browser_key}` →
+`{wraps: [{scope, id, sealed_kek}]}`, in the descriptor's scope order.
+
+* `challenge_id`: a pending challenge of this session that carries an open (bucket-open, or
+  a scope-enrol of purpose `test` naming this `browser_key`). It stays pending.
+* `assertion`: the tap's assertion, as the finish will send it. It is verified against the
+  tap's bound challenge like a finish (signature, origin, user verification, owner session),
+  but nothing is consumed and no sign count or last use is recorded.
+* The wraps returned are those of the **asserting passkey** and `browser_key`: `id` the wrap
+  ID (32 bytes), `sealed_kek` (113 bytes) = HPKE base mode to the browser key,
+  `info = T2("browser-kek", raw installation, rpId, raw credential ID, scope, raw wrap ID,
+  raw browser key)`, empty AAD, plaintext the 32-byte KEK.
+* Errors: 409 for an unknown, expired, finished or already released tap; 403 for an
+  assertion that does not verify; 423 `locked` when this browser is not remembered for the
+  asserting passkey or for one of the scopes; 429 after three attempts on one tap.
+
+The finish that follows takes the usual `open` packet: `F(KEK1) ‖ F(KEK2 or "")` with the
+KEKs opened from `sealed_kek` (a rekey: the old KEK, then a fresh random one). A browser-key
+passkey's packet without a release on the same tap is refused (423), as is a finish signed
+by another passkey than the release was for (403).
+
 ## Recovery (Security tab, rare path)
 
 1. `POST /api/ui/seal/recovery/key {}` → `{attempt_id, recipient}`: a fresh broker key (two
@@ -786,9 +855,14 @@ creating its first bucket is refused (409 "test the new scope first").
    `aad = T2("open-aad", raw attempt ID, raw epoch, "", "")`; `packet` =
    base64url(`enc ‖ ciphertext`).
 2. `POST /api/ui/seal/recovery/challenge {mode, attempt_id, packet_sha256, credential_id?,
-   scopes?}`: `mode` `drill` (plain challenge) or `enrol` (target `credential_id`, one or two
+   scopes?, browser_key?, browser_label?}`: `mode` `drill` (plain challenge) or `enrol` (target `credential_id`, one or two
    `scopes` with a key; scope-enrol descriptor, purpose `enrol`, fresh salts, the target
-   taps). `packet_sha256` is the lowercase hex SHA-256 of the raw packet.
+   taps). `packet_sha256` is the lowercase hex SHA-256 of the raw packet. With `browser_key`
+   and `browser_label` the enrol is for a passkey without PRF from that browser
+   ([Remembered browsers](#remembered-browsers)): the canonical adds `browser_key`,
+   `browser_key_id` and `browser_label`, the descriptor carries `browser_key`, and the wraps
+   written are browser wraps. Refused (409) for a passkey that has a PRF wrap; an enrol
+   without `browser_key` is refused (409) for a passkey that has remembered browsers.
 3. `POST /api/ui/seal/recovery/finish {challenge_id, assertion, packet, open?}` →
    `{ok, scopes, buckets}`: drill opens every scope key from its recovery wrap and every bucket
    and record, then wipes them; enrol wraps the recovered scope keys for the target.

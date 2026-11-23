@@ -265,6 +265,7 @@ export class MockBuckets {
       b = { key: browserKey, id: browserKeyId(raw(browserKey)), label, created_at: nowISO(), wraps: new Map() };
       list.push(b);
     }
+    b.label = label; // as the broker: the label of the latest signed action
     for (let i = 0; i < scopes.length; i++) {
       const sc = this.scopes.find((x) => x.scope === scopes[i])!;
       sc.has_key = true;

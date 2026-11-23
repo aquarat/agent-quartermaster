@@ -4,6 +4,8 @@ package server
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
 	"strings"
@@ -12,9 +14,11 @@ import (
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/envset"
+	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
 	"github.com/aquarat/agent-quartermaster/internal/server/vauth"
+	"github.com/aquarat/agent-quartermaster/internal/signer"
 )
 
 // Remembered browsers (docs/BUCKETS.md §13). testBrowser plays one browser
@@ -688,4 +692,141 @@ func TestBrowserKeyExistingStoreStartsUnchanged(t *testing.T) {
 	}
 	as, pkt := v.ownerTap(r)
 	mustStatus(t, "the PRF path is unchanged", v.web("POST", "/api/ui/requests/"+rc.ID+"/decide", api.DecideRequest{ChallengeID: r.ChallengeID, Assertion: as, Open: pkt}, nil), 200)
+}
+
+// Every kind of tap that opens a bucket works from a remembered browser, with
+// the passkey without PRF signed in: an approval window, a signing approval,
+// an env release, a reopen.
+func TestBrowserKeyEveryKindOfTap(t *testing.T) {
+	v := newVault(t)
+	v.commit(envset.Edit{Op: "merge", Entries: []envset.Entry{{Name: "APP_TOKEN", Value: "v1"}}}, nil)
+	f := v.createSigner("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "release-key", "ed25519", "")
+	spare := v.registerSpare("approve-only", []string{}, nil)
+	b := newTestBrowser(t)
+	v.remember(spare, b, []string{"installation", v.org}, v.ownerTap)
+	v.auth = spare
+	v.login()
+	s, ctx := v.s, t.Context()
+	sess := ids.Hash(v.sess)
+	browserTap := func(r tapResp) (json.RawMessage, *api.OpenPacket) {
+		t.Helper()
+		as, pkt, st := v.tapBrowser(spare, b, r)
+		mustStatus(t, "release", st, 200)
+		return as, pkt
+	}
+	// An approval window that holds the SSH CA open.
+	pk, err := s.store.Q().SessionPasskeyID(ctx, sess)
+	requireNoError(t, err)
+	actx := withAccess(ctx, s, sess)
+	profiles, err := s.windowProfiles(actx, s.store.Q(), sess, pk)
+	requireNoError(t, err)
+	var org string
+	for _, p := range profiles {
+		if p.Personal {
+			org = p.Org
+		}
+	}
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	public, _ := key.PublicKey.Bytes()
+	res, err := s.windowOpenBegin(actx, jsonReq(windowOpen{org, 300, encodeID(public), encodeID(spare.CredID)}), sess)
+	requireNoError(t, err)
+	cr := res.(api.ChallengeResponse)
+	opts, _ := json.Marshal(cr.PublicKey)
+	restoreAccess(s, sess) // the release goes over HTTP, as the page sends it
+	as, pkt := browserTap(tapResp{ChallengeID: cr.ChallengeID, Canonical: cr.Canonical, PublicKey: opts, Open: cr.Open})
+	actx = withAccess(ctx, s, sess)
+	_, err = s.windowOpenFinish(actx, jsonReq(api.DecideRequest{ChallengeID: cr.ChallengeID, Assertion: as, Open: pkt}), sess)
+	requireNoError(t, err)
+	restoreAccess(s, sess)
+	if ob := openBuckets(t, s); len(ob) != 1 || ob["ssh-ca:installation"].Holds[0].Kind != "window" {
+		t.Fatalf("window from a remembered browser: %+v", ob)
+	}
+	v.lock()
+	// A signing approval: the signer's bucket opens and signs.
+	req, _ := v.askSign(v.agent, f, 0, 0, signItemFor(f.scheme, "a", []byte("a")))
+	sr, st := v.signChallenge(f, req, "sign-approve", 0, 1)
+	mustStatus(t, "sign challenge", st, 200)
+	as, pkt = browserTap(sr.tap())
+	mustStatus(t, "sign approve", v.web("POST", "/api/ui/seal/vault/finish", map[string]any{"challenge_id": sr.ChallengeID, "assertion": as, "open": pkt}, nil), 200)
+	var got signer.Request
+	mustStatus(t, "approved status", v.host(v.agent, "GET", "/v2/sign/requests/"+req.ID, nil, &got), 200)
+	if _, st := v.sign(v.agent, got.Grant, signItemFor(f.scheme, "a", []byte("a"))); st != 200 {
+		t.Fatal("signing after an approval from a remembered browser")
+	}
+	// An env release, then Close all and a Reopen of the paused bucket.
+	rel := v.envRelease()
+	var er tapResp
+	mustStatus(t, "env challenge", v.web("POST", "/api/ui/seal/env/challenge", map[string]any{"id": rel.ID, "action": "approve", "ttl_seconds": 600}, &er), 200)
+	as, pkt = browserTap(er)
+	mustStatus(t, "env approve", v.web("POST", "/api/ui/seal/env/finish", map[string]any{"challenge_id": er.ChallengeID, "assertion": as, "open": pkt}, nil), 200)
+	if len(openBuckets(t, s)) != 1 {
+		t.Fatal("env release from a remembered browser opened nothing")
+	}
+	v.lock()
+	var status struct {
+		Buckets []struct {
+			ID     string
+			Paused []struct{ Ref string }
+		}
+	}
+	mustStatus(t, "status", v.web("GET", "/api/ui/seal/status", nil, &status), 200)
+	var paused []string
+	for _, x := range status.Buckets {
+		if len(x.Paused) > 0 {
+			paused = append(paused, x.ID)
+		}
+	}
+	var rr tapResp
+	mustStatus(t, "reopen challenge", v.web("POST", "/api/ui/seal/control/challenge", map[string]any{"action": "reopen", "buckets": paused}, &rr), 200)
+	as, pkt = browserTap(rr)
+	mustStatus(t, "reopen", v.web("POST", "/api/ui/seal/control/finish", map[string]any{"challenge_id": rr.ChallengeID, "assertion": as, "open": pkt}, nil), 200)
+	if len(paused) != 1 || len(openBuckets(t, s)) != 1 {
+		t.Fatalf("reopen from a remembered browser: paused=%v open=%v", paused, openBuckets(t, s))
+	}
+	if p := v.statusOf(spare); p.Mode != "browser" || p.Browsers[0].LastUsed == "" {
+		t.Fatalf("status: %+v", p)
+	}
+}
+
+// A passkey that opens only from a remembered browser creates a new
+// organisation's scope key (Security → Buckets → Create): no key exists, so
+// the approving tap opens nothing; the enrol tap makes the first wrap.
+func TestBrowserKeyCreatesAScope(t *testing.T) {
+	v := newVault(t)
+	spare := v.registerSpare("approve-only", []string{}, nil)
+	b := newTestBrowser(t)
+	v.remember(spare, b, []string{"installation"}, v.ownerTap)
+	const org = "0123456789abcdef0123456789abcdef"
+	for _, q := range []string{
+		`INSERT INTO organisations(id,slug,title,revision) VALUES('` + org + `','client-b','Client B',1)`,
+		`INSERT INTO org_policies VALUES('` + org + `',1,3600,86400,1,3600,86400,1)`,
+		`INSERT INTO org_approvers SELECT '` + org + `',id,'approver',1 FROM people WHERE owner=1`,
+	} {
+		_, err := v.s.store.DB().Exec(q)
+		requireNoError(t, err)
+	}
+	if _, err := v.s.store.Q().Scope(t.Context(), org); err == nil {
+		t.Fatal("the new organisation already has a scope key")
+	}
+	// The passkey approves its own remember: a plain signature (nothing to open).
+	v.remember(spare, b, []string{org}, func(r tapResp) (json.RawMessage, *api.OpenPacket) {
+		if r.Open != nil {
+			t.Fatal("creating a scope offered an open")
+		}
+		return spare.Assert(sha256Bytes(r.Canonical)), nil
+	})
+	sc, err := v.s.store.Q().Scope(t.Context(), org)
+	requireNoError(t, err)
+	if ok, _ := v.s.store.Q().ScopeTested(t.Context(), org); !ok {
+		t.Fatal("the new scope is not tested after the browser's test tap")
+	}
+	// The recovery key opens it too.
+	k, err := seal.Scope{Installation: v.fix.inst, Name: org, Public: sc.Public}.Recover(v.fix.identity, v.fix.recipient, sc.Recovery)
+	requireNoError(t, err)
+	k.Destroy()
+	var n int
+	requireNoError(t, v.s.store.DB().QueryRow(`SELECT count(*) FROM scope_wraps WHERE scope=?`, org).Scan(&n))
+	if n != 0 || len(v.browserWraps(spare)) != 2 {
+		t.Fatal("the new scope's only wrap should be the remembered browser's")
+	}
 }

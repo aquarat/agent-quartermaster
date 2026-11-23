@@ -439,4 +439,23 @@ describe("remember this browser", () => {
     expect(tap.open!.browsers).toEqual([]);
     await expect(api.sealPost!("control/finish", { challenge_id: b.challenge_id, ...(await tap.sign(bw)) })).rejects.toThrow(/closed/);
   });
+  test("recovery enrol for a passkey without PRF writes this browser's wraps", async () => {
+    const { beginRecovery } = await import("../src/recoveryPanel");
+    const { generateAgeIdentity } = await import("../src/setup");
+    const v = await status();
+    const identity = (await generateAgeIdentity()).identity;
+    // Without the choice, the passkey's enrol tap has no PRF result: the page says what to tick.
+    const plain = await beginRecovery(api, v, { mode: "enrol", credential_id: bw.id, scopes: ["installation"] }, identity, rp);
+    await expect(plain.finish(bw)).rejects.toThrow(/Remember this browser/);
+    const made = await keys.ensure();
+    const r = await beginRecovery(api, v, { mode: "enrol", credential_id: bw.id, scopes: ["installation"], browser: { key: made.key.public, label: "Recovered laptop" } }, identity, rp);
+    expect(JSON.parse(r.canonical)).toMatchObject({ object: "recovery", action: "enrol", browser_key: made.key.public, browser_key_id: made.key.id, browser_label: "Recovered laptop" });
+    expect(r.lines.join(" ")).toMatch(/Creates this browser's keys/);
+    await r.finish(bw);
+    const p = await pk(bw.id);
+    expect(p.mode).toBe("browser");
+    expect(p.browsers![0]!).toMatchObject({ id: made.key.id, label: "Recovered laptop" });
+    // A PRF passkey is not offered this path by the broker.
+    await expect(beginRecovery(api, v, { mode: "enrol", credential_id: me.id, scopes: ["installation"], browser: { key: made.key.public, label: "x" } }, identity, rp)).rejects.toThrow(/only for passkeys without PRF/);
+  });
 });

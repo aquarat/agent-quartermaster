@@ -273,9 +273,9 @@ func (q *Q) BrowserKey(ctx context.Context, passkey int64, public []byte) (Brows
 }
 
 // PutBrowserKey registers a browser key for a passkey, or returns the row it
-// already has (its label is kept).
+// already has, with the label of this (signed) action.
 func (q *Q) PutBrowserKey(ctx context.Context, o BrowserKeyRow) (int64, error) {
-	if _, err := q.q.ExecContext(ctx, `INSERT INTO browser_keys(passkey,public_key,label,created) VALUES(?,?,?,?) ON CONFLICT(passkey,public_key) DO NOTHING`, o.Passkey, o.Public, o.Label, ms(o.Created)); err != nil {
+	if _, err := q.q.ExecContext(ctx, `INSERT INTO browser_keys(passkey,public_key,label,created) VALUES(?,?,?,?) ON CONFLICT(passkey,public_key) DO UPDATE SET label=excluded.label`, o.Passkey, o.Public, o.Label, ms(o.Created)); err != nil {
 		return 0, err
 	}
 	var id int64
