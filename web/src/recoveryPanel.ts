@@ -4,7 +4,9 @@
 
 import { type Api } from "./api";
 import { type SealView } from "./sealPanel";
-import { canonicalJSON, openAAD, openInfo, prepareTap, rawB64, sealTo, sha256 } from "./buckets";
+import { canonicalJSON, NoPrfError, openAAD, openInfo, prepareTap, rawB64, sealTo, sha256 } from "./buckets";
+import { defaultLabel, normalizeLabel, TRADE_OFF } from "./browserKey";
+import { type BrowserContext } from "./capabilities";
 import { decode, encode } from "./b64url";
 import { binary32, type Review } from "./review";
 import { h, replace } from "./dom";
@@ -24,6 +26,8 @@ export interface RecoveryChoice {
   /** enrol: the target passkey's raw credential ID and at most two scopes. */
   credential_id?: string;
   scopes?: string[];
+  /** enrol a passkey without PRF for this browser (§13): its key's public half and a label. */
+  browser?: { key: string; label: string };
 }
 export interface RecoveryResult {
   ok: boolean;
@@ -53,7 +57,7 @@ export async function beginRecovery(api: Api, v: SealView, choice: RecoveryChoic
   if (!binary32(key.attempt_id)) throw Error("Invalid recovery key response");
   const { packet, packet_sha256 } = await sealIdentity(v, key, text + "\n");
   const body: Record<string, unknown> = { mode: choice.mode, attempt_id: key.attempt_id, packet_sha256 };
-  if (choice.mode === "enrol") Object.assign(body, { credential_id: choice.credential_id, scopes: choice.scopes });
+  if (choice.mode === "enrol") Object.assign(body, { credential_id: choice.credential_id, scopes: choice.scopes }, choice.browser ? { browser_key: choice.browser.key, browser_label: choice.browser.label } : {});
   const b = await api.sealPost!<Review>("recovery/challenge", body);
   const c = JSON.parse(b.canonical) as Record<string, unknown>;
   if (
@@ -64,13 +68,15 @@ export async function beginRecovery(api: Api, v: SealView, choice: RecoveryChoic
     c.installation !== v.installation ||
     c.epoch !== v.epoch ||
     c.packet_sha256 !== packet_sha256 ||
-    (choice.mode === "enrol" && c.credential_id !== choice.credential_id)
+    (choice.mode === "enrol" && c.credential_id !== choice.credential_id) ||
+    c.browser_key !== choice.browser?.key ||
+    c.browser_label !== choice.browser?.label
   )
     throw Error("The recovery text differs from what you chose");
   const bind = { installation: v.installation, epoch: v.epoch };
   const tap =
     choice.mode === "enrol"
-      ? await prepareTap(b, rp, { ...bind, object: "scope-enrol", purposes: ["enrol"], selected: choice.credential_id, requireOpen: true })
+      ? await prepareTap(b, rp, { ...bind, object: "scope-enrol", purposes: ["enrol"], selected: choice.credential_id, requireOpen: true, ...(choice.browser ? { browserKey: choice.browser.key } : {}) })
       : await prepareTap(b, rp, { ...bind, allowOpen: false });
   const d = tap.open?.descriptor;
   if (d && (d.credential_id !== choice.credential_id || [...d.scopes].sort().join() !== [...choice.scopes!].sort().join())) throw Error("The enrolment is for another passkey or other scopes");
@@ -80,14 +86,17 @@ export async function beginRecovery(api: Api, v: SealView, choice: RecoveryChoic
     lines: tap.lines,
     /** Call from the tap: the prompt starts before any other await. */
     async finish(auth: Authenticator): Promise<RecoveryResult> {
-      const s = await tap.sign(auth);
+      const s = await tap.sign(auth).catch((e: unknown) => {
+        if (e instanceof NoPrfError) throw Error("This passkey returned no PRF result, so it cannot hold a scope key itself. Paste the key again and tick “Remember this browser for it”.");
+        throw e;
+      });
       if (choice.mode === "enrol" && !s.open) throw Error("This passkey returned no PRF result, so it cannot hold a scope key");
       return api.sealPost!<RecoveryResult>("recovery/finish", { challenge_id: b.challenge_id, packet, ...s });
     },
   };
 }
 
-export function recoveryPanel(api: Api, auth: Authenticator, v: SealView, pks: PasskeyInfo[], refresh: () => void): HTMLElement {
+export function recoveryPanel(api: Api, auth: Authenticator, v: SealView, pks: PasskeyInfo[], refresh: () => void, browser?: BrowserContext): HTMLElement {
   const review = h("div", { role: "status" });
   const identity = h("textarea", { placeholder: "AGE-SECRET-KEY-1…", autocomplete: "off", spellcheck: "false", "aria-label": "Recovery key (secret)" }) as HTMLTextAreaElement;
   const mode = h("select", { "aria-label": "What to do" }, h("option", { value: "drill" }, "Drill: prove the key opens every scope (writes nothing)"), h("option", { value: "enrol" }, "Enrol a passkey from the recovery key")) as HTMLSelectElement;
@@ -96,6 +105,21 @@ export function recoveryPanel(api: Api, auth: Authenticator, v: SealView, pks: P
     const el = h("input", { type: "checkbox", value: s.scope });
     return { el, label: h("label", null, el, " ", vt(s.title || s.scope)) };
   });
+  // A passkey without PRF is enrolled for this browser instead (§13): an explicit choice,
+  // fixed for a passkey that already opens one way or the other.
+  const remember = h("input", { type: "checkbox" }) as HTMLInputElement;
+  const label = h("input", { type: "text", maxlength: "64", value: defaultLabel(), "aria-label": "Name for this browser" }) as HTMLInputElement;
+  const modeOf = () => (v.passkeys ?? []).find((p) => p.id === pks.find((x) => x.raw_id === target.value)?.id)?.mode;
+  const sync = () => {
+    const m = modeOf();
+    if (m === "browser") remember.checked = true;
+    if (m === "prf") remember.checked = false;
+    remember.disabled = m === "browser" || m === "prf" || !browser;
+    label.disabled = !remember.checked;
+  };
+  target.addEventListener("change", sync);
+  remember.addEventListener("change", sync);
+  sync();
   const err = h("p", { class: "error", role: "alert" });
   const go = h("button", { type: "button", class: "btn" }, "Review…");
   go.addEventListener("click", async () => {
@@ -106,6 +130,14 @@ export function recoveryPanel(api: Api, auth: Authenticator, v: SealView, pks: P
     go.disabled = true;
     try {
       const choice: RecoveryChoice = mode.value === "enrol" ? { mode: "enrol", credential_id: target.value, scopes: boxes.filter((b) => b.el.checked).map((b) => b.el.value) } : { mode: "drill" };
+      if (choice.mode === "enrol" && remember.checked && browser) {
+        const wanted = normalizeLabel(label.value);
+        const made = await browser.keys.ensure();
+        browser.local = made.key;
+        // A browser that is already remembered keeps the label it has.
+        const known = (v.passkeys ?? []).flatMap((p) => p.browsers ?? []).find((b) => b.id === made.key.id);
+        choice.browser = { key: made.key.public, label: known?.label ?? wanted };
+      }
       const r = await beginRecovery(api, v, choice, text, location.hostname);
       const sign = h("button", { type: "button", class: "btn approve confirm" }, choice.mode === "drill" ? "Run the drill with passkey" : "Enrol with passkey");
       sign.addEventListener("click", () => {
@@ -137,7 +169,16 @@ export function recoveryPanel(api: Api, auth: Authenticator, v: SealView, pks: P
     { class: "card recovery" },
     h("p", { class: "warn" }, RECOVERY_WARNING),
     h("label", null, "Action ", mode),
-    h("div", { class: "recovery-enrol" }, h("label", null, "Passkey ", target), h("p", { class: "muted" }, "Scopes (one or two per tap):"), boxes.map((b) => b.label)),
+    h(
+      "div",
+      { class: "recovery-enrol" },
+      h("label", null, "Passkey ", target),
+      h("p", { class: "muted" }, "Scopes (one or two per tap):"),
+      boxes.map((b) => b.label),
+      h("label", { class: "recovery-browser" }, remember, " This passkey has no PRF: remember this browser for it"),
+      h("p", { class: "muted" }, TRADE_OFF),
+      h("label", null, "Name for this browser ", label),
+    ),
     h("label", null, "Recovery key ", identity),
     h("div", { class: "actions" }, go),
     err,

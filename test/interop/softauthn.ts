@@ -70,7 +70,9 @@ export interface SoftAuthenticator {
   save(): Promise<SavedAuthenticator>;
 }
 
-export async function softAuthenticator(origin: string, saved?: SavedAuthenticator): Promise<SoftAuthenticator> {
+/** `opts.prf: false` makes a passkey without PRF (as some password managers have): it ignores
+ * the PRF extension at registration and returns no PRF result (docs/BUCKETS.md §4.4, §13). */
+export async function softAuthenticator(origin: string, saved?: SavedAuthenticator, opts: { prf?: boolean } = {}): Promise<SoftAuthenticator> {
   let key: CryptoKeyPair | undefined;
   let credId: Uint8Array = new Uint8Array();
   let userHandle: Uint8Array = new Uint8Array();
@@ -95,7 +97,7 @@ export async function softAuthenticator(origin: string, saved?: SavedAuthenticat
       key = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
       const raw = new Uint8Array(await crypto.subtle.exportKey("raw", key.publicKey));
       credId = crypto.getRandomValues(new Uint8Array(32));
-      prfSecret = o.extensions?.prf ? crypto.getRandomValues(new Uint8Array(32)) : undefined;
+      prfSecret = o.extensions?.prf && opts.prf !== false ? crypto.getRandomValues(new Uint8Array(32)) : undefined;
       userHandle = u8(o.user.id as ArrayBuffer);
       rpId = o.rp.id!;
       const cose = cMap([[cInt(1), cInt(2)], [cInt(3), cInt(-7)], [cInt(-1), cInt(1)], [cInt(-2), cBytes(raw.slice(1, 33))], [cInt(-3), cBytes(raw.slice(33))]]);

@@ -970,7 +970,7 @@ export function startMock(opts: MockOptions = {}) {
       const out = await store.passkeyFlows.handle(req, url, body, session);
       if (out !== undefined) return json(out);
     }
-    if (/^\/api\/ui\/seal\/(status|control\/)/.test(p)) {
+    if (/^\/api\/ui\/seal\/(status|control\/|browser\/)/.test(p)) {
       needSession();
       const out = await store.buckets.handle(req, url, body, session);
       if (out !== undefined) return json(out);
@@ -1094,6 +1094,10 @@ export function startMock(opts: MockOptions = {}) {
       }
       if (store.passkeys.length <= 1) throw new HttpError(409, "conflict", "refusing to remove the last passkey");
       store.passkeys = store.passkeys.filter((x) => x !== pk);
+      // Its wraps go with it, of both kinds (ON DELETE CASCADE in the broker).
+      store.buckets.wraps.delete(pk.id);
+      store.buckets.browsers.delete(pk.id);
+      store.buckets.hadPrf.delete(pk.id);
       let signedOut = false;
       for (const [sid, pid] of store.sessionPasskey) {
         if (pid !== id) continue;

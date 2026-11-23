@@ -16,6 +16,11 @@ the signed card lists, wipes the scope key at once and keeps each bucket only as
 the card says (an instant, a grant, a window). There is no global unlock: after a restart
 nothing is open, and nothing needs to be until it is used.
 
+A passkey without PRF holds no such secret. It can be given one opt-in substitute: a key kept by
+one browser profile (**Remember this browser**, §13). That is weaker than PRF, and §13 says by
+how much: in short, that browser profile plus the passkey opens the remembered scopes, and so
+does that browser profile plus a copy of the broker's database, with no passkey at all.
+
 ## 1. Threat model
 
 | Event | Format 1 (v0.4.1) | Format 2 |
@@ -26,6 +31,7 @@ nothing is open, and nothing needs to be until it is used.
 | Persistent root | Everything once unlocked | Every bucket as it is used, every scope a tap yields. **Buckets do not defend against persistent root.** |
 | DB writer (tampering) | Payload AEAD under the MK caught forged records | Records and bucket wraps are public-key encrypted: a DB writer can substitute ciphertexts, or a bucket or scope public key so later writes go to its key. A substituted key is refused the next time that bucket or scope is opened (the opened scalar must match), but values written in between were exposed. DB integrity was never a goal ([SEALED.md](SEALED.md)); this is stated, not fixed |
 | A removed or stolen passkey plus an old backup | MK | That passkey's scopes, as of the backup **and afterwards** until the scope is **rekeyed** (§7). Rekey after losing a passkey; `seal-recover` rekeys every scope itself (§10) |
+| A copy of a **remembered browser's profile** (§13) | Not applicable | Nothing by itself. With an assertion by the passkey that browser is remembered for (the passkey itself, or its password manager's vault): every scope that browser has a wrap of. With a DB copy as well, no broker is needed. Forget the browser and rekey its scopes when a profile may have been copied |
 | Rollback to an older format-2 copy of the DB | Not detected | **Not detected either.** The root pin names only fixed fields (installation, recipient, CA pins, config digest), so any older format-2 copy of this installation boots. It brings back the wraps, records and grants of its time: passkeys removed since, wraps a rekey has replaced since (an old scope key, openable with a passkey lost since), revoked grants and rules. Restore only a copy you mean to; afterwards rekey every scope whose passkey was lost after the copy was taken (§11) |
 
 Buckets protect **snapshots** (a disk, a backup, a memory dump, a brief root), not against an
@@ -186,9 +192,15 @@ the broker in `clientExtensionResults`.
 ### 4.4 Passkeys without PRF
 
 A passkey without PRF ("sign and approve only") signs in, denies, revokes, commits values and
-approves anything whose buckets are already open (inside a window, for example). It cannot
-open a closed bucket; the card says which passkey can. This matches format 1, where such a
-passkey could not unlock.
+approves anything whose buckets are already open (inside a window, for example). By itself it
+cannot open a closed bucket; the card says which passkey can. This matches format 1, where
+such a passkey could not unlock.
+
+The owner may let such a passkey open buckets **from a browser it chooses to remember** (§13):
+the missing secret then lives in that browser profile instead of in the passkey. It is opt-in
+per passkey and per browser, signed, shown under Security, and never applied to a passkey
+that has PRF. From a browser that is not remembered the passkey is what this section
+describes, and the card names the browser that can open.
 
 It also signs every action that opens no bucket, at any time. One difference from format 1
 follows: format 1 refused update approval (and Setup tasks) while locked, so in practice an
@@ -248,11 +260,17 @@ state, and **Enable the other N…**, which runs the enable-then-test sequence o
 after the other (the signed-in passkey approves, the passkey being enabled taps to create its keys
 and to test them; a passkey that is not at hand can be skipped). The status's `prf` field only
 says that a passkey has a wrap already, so every passkey that opens too little is offered; an
-authenticator without PRF fails at its own tap and says so.
+authenticator without PRF says so at its own tap and offers **Remember this browser** (§13)
+or to skip it. A passkey that opens only from remembered browsers is marked **Browser key**
+in the list, with the browsers' labels, and a scope that only remembered browsers open is
+called out (if those browsers lose their storage, only the recovery key is left).
 
 **Security → Buckets** lists every bucket (kind, path, scope), whether it is open, each hold (why,
 ref, until), paused users with **Reopen**, per-scope **Rekey**, and **Close all**. Per passkey:
-**Opens N of M buckets**, scopes enabled and tested, **Not enabled for …**. A keyed scope no
+**Opens N of M buckets**, how it opens them (**PRF**: "with its own secret", or **Browser
+key**: "only from remembered browsers", each with its label, when it was added and last used,
+**this browser** where that applies, and **Forget**; §13.5), scopes enabled and tested,
+**Not enabled for …**. A keyed scope no
 passkey has opened since it was created or rekeyed carries `tested: false` and the badge
 **Not tested yet** (empty) or **Untested after rekey** (with buckets).
 `GET /api/ui/seal/status` returns `{mode, installation, epoch, scopes[], buckets[],
@@ -284,15 +302,17 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
   `skS`, wrapped for that passkey and to the recovery key). That wrap is untested, so until a
   passkey has opened the new scope once (**Test**: a third tap) no bucket is created in it: the
   first write answers "test the new scope first".
-* **Remove a passkey:** its wraps go with it (cascade). The broker refuses to remove (or
+* **Remove a passkey:** its wraps go with it (cascade), and so do its remembered browsers and
+  their wraps (§13). The broker refuses to remove (or
   disable for a scope) a passkey with a wrap of a scope for which no **other** passkey has a
-  **tested** wrap; an untested wrap does not count (the refusal then says which passkey to
+  **tested** wrap (of either kind); an untested wrap does not count (the refusal then says which passkey to
   test). The same rule, per scope, is the trigger
   `keep_one_scope_passkey`, recreated at every boot. Removal does not revoke copies of its wraps in old backups:
   for a lost or stolen passkey, **Rekey** its scopes.
 * **Rekey a scope** (one tap by a passkey that opens it): new `skS'`; every bucket of the
   scope gets a new key pair and every record is re-encrypted; drafts are dropped; open
-  buckets of the scope are closed (their users pause). Only the tapping passkey keeps a wrap;
+  buckets of the scope are closed (their users pause). Only the tapping passkey keeps a wrap
+  (a remembered browser that rekeys: only that passkey with that browser, §13.3);
   others are enabled again from it. Old copies then expose only values as of the copy. The
   tap evaluates PRF twice: `first` at the passkey's salt opens the old `skS`; `second` at the
   descriptor's fresh `rekey_salt` gives the KEK that `skS'` is wrapped under, with that salt.
@@ -374,11 +394,21 @@ config; then scope wraps (create, test), drill and activation as above.
 
     bucket_scopes(scope PK, public_key BLOB65, recovery BLOB, created)
     scope_wraps(id PK, passkey → passkeys ON DELETE CASCADE, scope → bucket_scopes, salt BLOB32 UNIQUE, wrap BLOB73, created, tested_at, UNIQUE(passkey, scope))
+    browser_keys(id PK, passkey → passkeys ON DELETE CASCADE, public_key BLOB65, label, created, last_used, UNIQUE(passkey, public_key))          -- §13
+    browser_wraps(id BLOB32 PK, browser_key → browser_keys ON DELETE CASCADE, scope → bucket_scopes, wrap BLOB73, sealed_kek BLOB113, created, tested_at, UNIQUE(browser_key, scope))
+    scope_openers = VIEW(passkey, scope, tested_at) over scope_wraps and browser_wraps   -- what "another passkey opens this scope" is asked of
+    passkey_prf(passkey PK → passkeys ON DELETE CASCADE, since)   -- sticky: has had a PRF wrap (§13.4); set by trigger mark_passkey_prf and at boot
+    UNIQUE(passkey, label) on browser_keys
     buckets(id BLOB32 PK, scope → bucket_scopes, kind, ref, public_key BLOB65, wrap BLOB113, payload BLOB NULL, created, UNIQUE(kind, ref))
     env_revisions.payload / env_drafts.payload = JSON [{"n":name,"i":entry-id,"c":record}…] (unset drafts: names only); .wrap = bucket ID
     signer_keys.payload = record, .wrap = bucket ID
     seal_active(manifest = format-2 manifest, inventory = '{}', canonical, assertion)   -- root-pinned activation
     notice_channel(singleton, topic_url)
+
+`browser_keys`, `browser_wraps`, `scope_openers` and `passkey_prf` came after schema 9 shipped. They are
+created empty at every boot (`CREATE … IF NOT EXISTS`, as the guard trigger is), so an
+existing store starts unchanged with nothing enabled and the schema version stays 9; an
+older build of schema 9 ignores them.
 
 **Downgrade fence:** v0.4.1 refuses schema 9 (it requires schema 8 and its tables); the new
 binary refuses schema 8 except for the pinned migration. The only way back is the
@@ -401,3 +431,223 @@ recovery open of every bucket; passkey enable, remove and rekey; sentinel scans 
 WAL and output; canonical binding of every new action. Interop: migrate a store made by the
 v0.4.1 binary, then SSH grant, `aqmas run`, Reveal, `aqmas sign`, a window, restart, recovery
 drill.
+
+Remembered browsers (§13): Go round-trips and every binding of the two ciphertexts; the
+sealed KEKs are released only inside a valid tap by their own passkey, once, never for
+another passkey or browser key, never after the tap; a KEK without the release opens
+nothing; canonical binding of `remember` and `forget`; rekey by a remembered browser and by
+a PRF passkey; removal and Forget; recovery enrol; a store from before the feature boots
+unchanged; the sticky PRF mark (after Disable, after a rekey by another passkey, set at boot
+for an existing store); unique labels; every refusal of a release (attempt cap, enrol and
+PRF test taps, another session, expired, consumed, concurrent, Forget or removal before the
+finish); no KEK and no browser private key in the DB, WAL, logs, audit or responses. Web:
+the browser key against the broker's vector, generation (non-extractable), unusable storage,
+the enable flow, an approval, rekey, a lost key, Forget, and the PRF path unchanged, against
+a mock that seals for real. Interop: a software authenticator without PRF through the page's
+own code and the real broker.
+
+## 13. Remembered browsers (passkeys without PRF)
+
+Some passkeys return no PRF result (a password manager that does not implement the
+extension, for example). Such a passkey can sign, but it has no secret to derive a KEK from
+(§4.4). **Remember this browser** gives it one, kept by a browser profile instead of by the
+authenticator. It is opt-in, per passkey and per browser.
+
+### 13.1 Construction
+
+* **The browser key.** A P-256 key pair `(skK, pkK)` made in the browser with WebCrypto as a
+  **non-extractable** ECDH key and kept in IndexedDB as a `CryptoKey`. The private half
+  cannot be exported by any script and is never sent; the public half (65 bytes) is
+  registered with the broker. Its **fingerprint** is `hex(SHA-256(pkK)[0:16])`. One profile
+  has one key (per origin); it may be remembered for several passkeys, each with its own
+  records.
+* **The KEK.** 32 random bytes made by that browser when it is remembered (and again at a
+  rekey). It takes the place of the PRF-derived KEK and reaches the broker the same way: in
+  the tap's HPKE packet (§4.3).
+* **What the broker stores**, per passkey, browser key and scope, with a random 32-byte
+  **wrap ID** `W` (the role a PRF salt has):
+
+      wrap       = 0x01 ‖ nonce24 ‖ XChaCha20-Poly1305(KEK, nonce, skS,
+                     aad = T2("scope-wrap-browser", inst, rp, cred, scope, W, pkK, pkS))
+      sealed_kek = HPKE(pkK, info = T2("browser-kek", inst, rp, cred, scope, W, pkK), KEK)
+
+  `wrap` is the passkey wrap of §3.1 with its own label (a browser wrap is never read as a
+  PRF wrap, or the other way round). `sealed_kek` is single-shot HPKE with an empty AAD, 113
+  bytes. Both bind the installation, the RP, the passkey, the scope, the wrap ID and the
+  browser key. The broker holds `pkK`, `wrap` and `sealed_kek` and **nothing that opens
+  them**: it adds no key of its own. It sees the KEK (as it sees a PRF-derived one) only
+  inside a tap, in a locked page, and wipes it when the tap ends.
+
+So the browser key is one more recipient of the scope key, by the same two-step design:
+the scope key is under a KEK; where a PRF passkey re-derives the KEK from its authenticator,
+a remembered browser re-opens it with `skK`.
+
+### 13.2 A tap from a remembered browser
+
+Still one passkey prompt.
+
+1. The challenge is the usual one (§4.2). The offer carries, next to the descriptor,
+   `browsers: [{credential_id, key_id, label}]`: the passkey and browser pairs that have a
+   wrap of every scope. It is a hint (not signed): the page compares it with the key its own
+   profile holds, so the card can say "from this browser" or name the browser that can.
+   Such a passkey is in `allowCredentials`. No `sealed_kek` is in the challenge.
+2. The passkey signs the bound challenge. If it returned no PRF result and this browser is
+   remembered for it, the page sends that assertion and its browser key to
+   `POST /api/ui/seal/browser/release`. The broker checks the assertion exactly as a finish
+   would (signature over this pending tap's bound challenge, origin, user verification, the
+   session's owner) **without consuming or recording anything**, finds the wraps of **that
+   passkey and that browser key**, and returns their wrap IDs and `sealed_kek`s. One release
+   per tap, at most three attempts; a finished, expired or unknown tap releases nothing: the
+   release is recorded under the lock the finish takes the tap with, and only while the
+   tap's challenge is still unused, so a release that races the finish loses.
+3. The page opens each `sealed_kek` with `skK` and sends the KEKs in the usual packet
+   (HPKE to the ceremony's recipient, bound to the attempt, epoch, challenge and credential).
+4. The finish verifies the assertion again, consumes the challenge and the attempt, unwraps
+   the scope keys with the released browser's wraps and proceeds as in §4.3. It refuses a
+   packet from a browser-key passkey whose tap released nothing, and a signer other than the
+   one the release was for.
+
+Opening therefore needs **both** the browser profile's key **and** a fresh assertion by that
+passkey over this challenge. A wrap belongs to exactly one passkey and one browser key:
+another passkey's assertion finds no row for that browser key, and the ciphertexts bind the
+credential, so they would not open for it either.
+
+### 13.3 Enable, Test, Rekey, Forget
+
+* **Enable.** Security → Passkeys → Enable (or the guided sequence) runs as in §7. When the
+  passkey being enabled returns no PRF result, the page offers **Remember this browser for
+  *name***, with the trade-off in plain words and a label (default from the user agent,
+  editable). Nothing is created until the owner accepts. Then: the browser makes its key
+  (if it has none), asks `navigator.storage.persist()` (a refusal is said, not fatal), and a
+  passkey that already opens the scopes approves the signed action `passkey-capability` /
+  `remember`, which names the passkey (`credential_id`, `nickname`), the browser key
+  (`browser_key`, `browser_key_id` = its fingerprint), `browser_label` and the scopes (one
+  passkey's browsers have different labels: a taken label is refused; the cards and the
+  Security row also show the start of the key's fingerprint, computed by the page); the
+  same tap opens the scope keys, as for a PRF enable. The passkey being enabled then taps
+  the `passkey-enrol` action (which names the browser key too); the page sends fresh random
+  KEKs; the broker wraps each open scope key and seals each KEK to `pkK`. The audit entry
+  `passkey_remember_browser` holds the signed text and the approving passkey. The notice
+  sent afterwards names the passkey's nickname and the start of the key's fingerprint, never
+  the label the owner typed.
+* **Test** proves the wraps open: the same release and packet, for exactly the wraps the
+  test names. Enable ends with it. As in §7 a tested wrap is never replaced.
+* **Everything a PRF passkey does** works from a remembered browser: approvals, batches,
+  windows, reveal, signing approvals, reopen, rekey, creating an organisation's scope key,
+  and approving and opening for the enable of **another** passkey (PRF or browser). The
+  recovery drill is a plain signature and needs nothing; recovery **enrol** takes
+  `browser_key` and `browser_label` and writes browser wraps.
+* **Rekey.** A remembered browser that rekeys sends the old KEK and a fresh random one; its
+  new wrap gets the descriptor's `rekey_salt` as wrap ID and the fresh KEK sealed to the
+  same `pkK`, untested until the chained test tap. Exactly as for a PRF rekey (§7) **nothing
+  else keeps a wrap**: other passkeys, and the same passkey's other browsers, are enabled
+  again. A rekey by another passkey likewise drops every browser wrap of the scope. The
+  broker could seal a new KEK to a stored `pkK` without that browser being present; it does
+  not, for the reason §3.1 gives for PRF: a wrap is only ever made in a tap by its own
+  passkey with its own key material, so a DB writer who plants a public key receives
+  nothing at the next rekey.
+* **Forget** (Security → Passkeys, per browser; signed action `passkey-capability` /
+  `forget` naming the passkey and the browser key, by any passkey, opening nothing): the
+  broker deletes the browser key record and its wraps (and checkpoints the WAL); the page
+  deletes the key from IndexedDB when it is this browser's and no other passkey is
+  remembered for it. Refused when that browser holds the only tested wrap of a scope (enable
+  something else first, or enrol with the recovery key). Removing the passkey removes its
+  browsers.
+
+### 13.4 Only for passkeys without PRF
+
+A passkey opens buckets **one way**: with its own secret, or from remembered browsers.
+
+* **A passkey that has, or ever had, a PRF wrap** carries a sticky mark (`passkey_prf`, §11).
+  A trigger sets it in the transaction that writes the passkey's first PRF wrap (enable,
+  recovery enrol, activation, `seal-recover`), and every boot marks the passkeys that have a
+  PRF wrap at that moment, so an installation from before the mark existed is covered.
+  Nothing clears it except removing the passkey. While it is set the broker refuses
+  `remember` and recovery enrol for a browser, also after a Disable or a rekey by another
+  passkey took the wraps away. Status reports it as `had_prf` and the page does not offer
+  the browser path for such a passkey.
+* **A passkey with remembered browsers** is refused a PRF `enable` (forget them first).
+* **A passkey that was never enabled** has no mark, and the broker cannot tell whether its
+  authenticator has PRF: PRF results never reach the broker (§4.3). Here the only check is
+  the page's: it still sends the PRF inputs at the enrol tap, and when the passkey answers
+  them it refuses to finish `remember` and says to use Enable. **This one rule is enforced
+  by the page only.** A modified page, or a tap in a browser that hides PRF from an
+  authenticator that has it, can put a PRF-capable passkey that has never been enabled on
+  the browser path. The owner sees the result (the **Browser key** mark, the signed
+  `remember` in the audit log) and undoes it with Forget.
+
+It is not allowed at all for a PRF passkey, even on request, because it could only weaken
+it: the browser path would be a second way in that needs less than the authenticator's own
+secret, and a passkey with two ways in is as strong as the weaker one. There is no switch
+that turns a PRF passkey into a browser-key passkey, and nothing does it silently.
+
+### 13.5 Threat model
+
+**The short version.** A remembered browser's secret is not in the passkey. Two things open
+the remembered scopes: (1) that browser profile **and** that passkey, through the broker;
+(2) that browser profile **and** a copy of the broker's database or of any backup of it,
+**with no passkey and no tap**, because the wrap and the sealed KEK are in the database and
+the browser key opens the sealed KEK. The offer says both before anything is signed.
+
+What an attacker needs to open a scope's buckets (beyond what §1 already says):
+
+| | Passkey with PRF | Passkey without PRF, remembered browser |
+|---|---|---|
+| Through the broker | one tap by the passkey on a page the attacker controls (§1) | the same tap **and** that browser profile's key |
+| With a copy of the DB | the passkey's PRF output at the wrap's salt (one malicious-page tap, or the authenticator) | `skK`: code running in that origin in that profile at any time, or a copy of the profile on a browser that does not bind the key to hardware. **No passkey needed** |
+| Without the DB | the passkey | the profile's key **and** an assertion by the passkey |
+
+Stated plainly:
+
+* **Before** (no PRF, not remembered): the passkey opens nothing. An attacker with the
+  passkey and a session can approve only what is already open.
+* **After**: anyone who has **this browser profile and this passkey** can open the
+  credentials of the scopes that browser is remembered for. With PRF the authenticator alone
+  holds the secret and releases it only on a tap; here the secret half lives in browser
+  storage, where malware on that machine, a cloned profile directory, or script injected
+  into the origin can use it. Non-extractable means script cannot **read** the scalar; it
+  can still **use** the key while it runs there, and a browser that stores the key unbound
+  to hardware protects it only as well as the profile directory on disk.
+* **What the broker holds:** `pkK`, `wrap`, `sealed_kek`. Nothing that unwraps. A stolen DB
+  or backup is as before: ciphertext. The broker gains no way to open a bucket on its own;
+  a KEK is in its memory only during a tap, as a PRF-derived one is.
+* **What a stolen browser profile gives:** nothing by itself and nothing with the broker
+  alone: the release needs the passkey's assertion over a fresh challenge. With the passkey
+  (for a password-manager passkey: the unlocked vault, or its sync account) it gives the
+  remembered scopes. With a DB copy it gives them without the passkey. This is why the
+  owner should not run agents, or anything else untrusted, in a profile that is remembered.
+* **Malicious page during one tap** (§1): unchanged in kind. The page gets the KEKs of at
+  most two scopes; they are useless without the DB. It can also *use* `skK` for that tap,
+  as it can use PRF outputs.
+* **Rollback and old backups** (§1): a forgotten browser's wraps survive in copies of the DB
+  taken before the Forget; rekey the scopes if the profile may be in other hands.
+
+A possible later hardening, **not built**: wrap `sealed_kek` once more at rest under a key
+the broker host keeps outside the database (a file or a TPM), so that a database copy or
+backup alone is not enough together with the profile and the attacker would also need the
+host's key. It would not change case (1), and it would make the host key one more thing a
+restore needs.
+
+A scope that **only** remembered browsers can open is one storage eviction away from needing
+the recovery key; Security says so and recommends a PRF passkey for it too.
+
+### 13.6 Storage loss
+
+A browser may drop the key: a private window (some refuse storage, some discard it at
+close), "clear site data", a new profile, or storage eviction (Safari removes script-written
+storage of sites not visited for a while; other browsers evict under disk pressure unless
+`persist()` was granted). **A lost key is harmless.** Nothing fails obscurely:
+
+* the page reads its key before every tap and at every refresh; with none, it says "this
+  browser is no longer remembered; enable it again" on the passkey's row and offers
+  **Remember this browser** (a new key, a new entry; forget the old entry);
+* the approval card says which passkey opens from which remembered browser, and "not from
+  this browser";
+* a tap by that passkey sends no packet; if a needed bucket is closed the broker answers
+  423 "this browser is no longer remembered for this passkey …"; if everything needed is
+  open the approval goes through, as for any approve-only passkey;
+* a browser that cannot keep a key at all is told so when it tries to remember, before
+  anything is signed.
+
+The broker cannot tell that a browser lost its key: the entry stays listed, with its "last
+used" date, until it is forgotten.

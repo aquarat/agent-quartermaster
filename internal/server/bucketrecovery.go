@@ -48,6 +48,9 @@ type recoveryChoice struct {
 	PacketHash string   `json:"packet_sha256"`
 	Credential string   `json:"credential_id,omitempty"`
 	Scopes     []string `json:"scopes,omitempty"`
+	// Enrol a passkey without PRF for the browser holding this key (§13).
+	Browser string `json:"browser_key,omitempty"`
+	Label   string `json:"browser_label,omitempty"`
 }
 
 // recoveryPlan validates a choice and returns the canonical's own fields and
@@ -62,7 +65,7 @@ func (s *Server) recoveryPlan(ctx context.Context, q *store.Q, sess string, c re
 	f := map[string]any{"packet_sha256": c.PacketHash}
 	switch c.Mode {
 	case "drill":
-		if c.Credential != "" || len(c.Scopes) > 0 {
+		if c.Credential != "" || len(c.Scopes) > 0 || c.Browser != "" || c.Label != "" {
 			return nil, nil, errBad("a drill names no passkey or scope")
 		}
 		return f, nil, nil
@@ -85,6 +88,43 @@ func (s *Server) recoveryPlan(ctx context.Context, q *store.Q, sess string, c re
 			return nil, nil, err
 		}
 		f["credential_id"], f["nickname"], f["scopes"] = c.Credential, pk.Name, scopes
+		// A passkey opens buckets one way only: with its own secret, or from
+		// remembered browsers (§13.4).
+		wraps, err := q.ScopeWraps(ctx, pk.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		keys, err := q.BrowserKeys(ctx, pk.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if c.Browser == "" {
+			if c.Label != "" {
+				return nil, nil, errBad("only remembering a browser takes a label")
+			}
+			if len(keys) > 0 {
+				return nil, nil, errConflict("this passkey opens buckets only from remembered browsers: enrol it for this browser, or forget its browsers first")
+			}
+			return f, pk, nil
+		}
+		pub, err := parseBrowserKey(c.Browser)
+		if err != nil {
+			return nil, nil, err
+		}
+		if l, err := normalizeBrowserLabel(c.Label); err != nil || l != c.Label {
+			return nil, nil, errBad("a browser label has 1 to 64 printable characters, single spaces")
+		}
+		if had, err := q.PasskeyHadPRF(ctx, pk.ID); err != nil {
+			return nil, nil, err
+		} else if had || len(wraps) > 0 {
+			return nil, nil, errConflict("this passkey has PRF (it opens, or has opened, buckets with its own secret): a remembered browser is only for passkeys without PRF")
+		}
+		for _, k := range keys {
+			if k.Label == c.Label && !bytes.Equal(k.Public, pub) {
+				return nil, nil, errConflict("another remembered browser of this passkey is already called " + c.Label + ": choose another name")
+			}
+		}
+		f["browser_key"], f["browser_key_id"], f["browser_label"] = c.Browser, seal.BrowserKeyID(pub), c.Label
 		return f, pk, nil
 	}
 	return nil, nil, errBad("mode must be drill or enrol")
@@ -124,7 +164,13 @@ func (s *Server) recoveryChallenge(ctx context.Context, r *http.Request, sess st
 	for i := range salts {
 		salts[i] = seal.RandomID()
 	}
-	opts, t, err := s.enrolTap(sess, "enrol", text, target.cred, in.Scopes, salts)
+	var browser []byte
+	if in.Browser != "" {
+		if browser, err = parseBrowserKey(in.Browser); err != nil {
+			return nil, err
+		}
+	}
+	opts, t, err := s.enrolTap(sess, "enrol", text, target.cred, in.Scopes, salts, browser)
 	if err != nil {
 		return nil, err
 	}
@@ -249,6 +295,16 @@ func (s *Server) recoveryFinish(ctx context.Context, r *http.Request, sess strin
 	z.scopeMu.Lock()
 	defer z.scopeMu.Unlock()
 	var wraps []store.ScopeWrapRow
+	var bwraps []store.BrowserWrapRow
+	var browser []byte
+	if m.Browser != "" {
+		if browser, err = parseBrowserKey(m.Browser); err != nil {
+			return nil, err
+		}
+	}
+	if !bytes.Equal(browser, t.browserPub) {
+		return nil, errConflict("stale recovery enrolment; start again")
+	}
 	for i, sc := range t.scopes {
 		j := slices.IndexFunc(scopes, func(x store.ScopeRow) bool { return x.Scope == sc })
 		if j < 0 {
@@ -257,6 +313,26 @@ func (s *Server) recoveryFinish(ctx context.Context, r *http.Request, sess strin
 		k, err := recoverScope(scopes[j])
 		if err != nil {
 			return nil, err
+		}
+		if browser != nil {
+			bs := seal.BrowserScope{Installation: z.installation, RPID: s.rpID, RawID: t.cred, Scope: sc, WrapID: t.salts[i], Browser: browser}
+			w, err := bs.Wrap(keks[i], k, scopes[j].Public)
+			k.Destroy()
+			if err != nil {
+				return nil, err
+			}
+			sealed, err := bs.SealKEK(keks[i])
+			if err != nil {
+				return nil, err
+			}
+			bwraps = append(bwraps, store.BrowserWrapRow{ID: bytes.Clone(t.salts[i][:]), Scope: sc, Wrap: w, SealedKEK: sealed, Created: s.now()})
+			bs2, err := q.ScopeBuckets(ctx, sc)
+			if err != nil {
+				return nil, err
+			}
+			nScopes++
+			nBuckets += len(bs2)
+			continue
 		}
 		ps := seal.PasskeyScope{Installation: z.installation, RPID: s.rpID, RawID: t.cred, Scope: sc, Salt: t.salts[i]}
 		w, err := ps.Wrap(keks[i], k, scopes[j].Public)
@@ -281,6 +357,20 @@ func (s *Server) recoveryFinish(ctx context.Context, r *http.Request, sess strin
 				return errConflict("this passkey already opens " + scopeName(ctx, q, w.Scope) + " (tested): disable it for that scope first")
 			} else if err != nil {
 				return err
+			}
+		}
+		if len(bwraps) > 0 {
+			key, err := q.PutBrowserKey(ctx, store.BrowserKeyRow{Passkey: row, Public: browser, Label: m.Label, Created: s.now()})
+			if err != nil {
+				return err
+			}
+			for _, w := range bwraps {
+				w.Key = key
+				if err := q.PutBrowserWrap(ctx, w); errors.Is(err, store.ErrTestedWrap) {
+					return errConflict("this browser is already remembered for " + scopeName(ctx, q, w.Scope) + " (tested): forget it first")
+				} else if err != nil {
+					return err
+				}
 			}
 		}
 		return q.Audit(ctx, s.now(), "owner", "recovery_enrol", "passkey:"+target.id, c.Canonical)

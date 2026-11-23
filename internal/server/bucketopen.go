@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
@@ -45,6 +46,24 @@ type tapOpen struct {
 	// rekey: the fresh salt of the PRF's second evaluation; the new scope key
 	// is wrapped under the KEK derived from it (descriptor "rekey_salt").
 	rekeySalt *seal.ID
+	// canonical is the action text the challenge binds (set by storeChallenge):
+	// the release of a remembered browser's sealed KEKs verifies the assertion
+	// over it before the challenge is consumed (browserkey.go).
+	canonical string
+	// browsers: the (passkey, remembered browser) pairs that can open the scopes.
+	browsers []api.BrowserOpener
+	// browserPub: a scope-enrol tap for a remembered browser (enrol, test).
+	browserPub []byte
+	// released: the browser key whose sealed KEKs this tap's assertion released.
+	released atomic.Pointer[tapRelease]
+	tries    atomic.Int32
+}
+
+// tapRelease records which passkey's remembered browser a tap released the
+// sealed KEKs of: the finish then unwraps with that browser's wraps.
+type tapRelease struct {
+	row int64
+	key int64
 }
 type tapRegistry struct {
 	sync.Mutex
@@ -70,6 +89,20 @@ func (r *tapRegistry) take(id string) *tapOpen {
 	t := r.m[id]
 	delete(r.m, id)
 	return t
+}
+func (r *tapRegistry) peek(id string) *tapOpen {
+	r.Lock()
+	defer r.Unlock()
+	return r.m[id]
+}
+
+// release records, under the lock take uses, which remembered browser a still
+// pending tap released its sealed KEKs to. It fails once the tap was taken (its
+// finish has begun) or already released: a finish never races a late release.
+func (r *tapRegistry) release(id string, t *tapOpen, rel *tapRelease) bool {
+	r.Lock()
+	defer r.Unlock()
+	return r.m[id] == t && t.released.CompareAndSwap(nil, rel)
 }
 func (r *tapRegistry) clear() {
 	r.Lock()
@@ -224,6 +257,37 @@ func (s *Server) offerScopesRekey(ctx context.Context, sess, canonical string, n
 	if err != nil {
 		return nil, nil, err
 	}
+	bkeys, err := s.store.Q().BrowserKeys(ctx, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	bwraps, err := s.store.Q().BrowserWraps(ctx, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	// A passkey without PRF opens from a remembered browser that has a wrap of
+	// every needed scope (§13). The server cannot tell which browser is asking:
+	// the page compares this list with the key its profile holds.
+	var browsers []api.BrowserOpener
+	remembered := func(c webauthn.Credential) bool {
+		found := false
+		for _, k := range bkeys {
+			if !bytes.Equal(k.RawID, c.ID) {
+				continue
+			}
+			n := 0
+			for _, sc := range scopes {
+				if slices.ContainsFunc(bwraps, func(w store.BrowserWrapRow) bool { return w.Key == k.ID && w.Scope == sc }) {
+					n++
+				}
+			}
+			if n == len(scopes) {
+				browsers = append(browsers, api.BrowserOpener{CredentialID: encodeID(c.ID), KeyID: seal.BrowserKeyID(k.Public), Label: k.Label})
+				found = true
+			}
+		}
+		return found
+	}
 	by := map[string]protocol.PRFValues{}
 	var allowed []webauthn.Credential
 	for _, c := range o.creds {
@@ -236,7 +300,7 @@ func (s *Server) offerScopesRekey(ctx context.Context, sess, canonical string, n
 			}
 		}
 		if len(salts) != len(scopes) {
-			if allOpen {
+			if remembered(c) || allOpen {
 				allowed = append(allowed, c)
 			}
 			continue
@@ -258,7 +322,7 @@ func (s *Server) offerScopesRekey(ctx context.Context, sess, canonical string, n
 		return nil, nil, &apiErr{423, "locked", "no passkey can open " + what + " yet: enable one in Security → Passkeys, or use the recovery key"}
 	}
 	o.creds = allowed
-	t := &tapOpen{session: sess, attempt: attempt, descriptor: desc, needs: needs, scopes: scopes, expires: s.now().Add(ChallengeTTL), rekeySalt: rekeySalt}
+	t := &tapOpen{session: sess, attempt: attempt, descriptor: desc, needs: needs, scopes: scopes, expires: s.now().Add(ChallengeTTL), rekeySalt: rekeySalt, browsers: browsers}
 	if len(by) > 0 {
 		t.ext = protocol.AuthenticationExtensions{PRF: &protocol.PRFInputs{EvalByCredential: by}}
 	}
@@ -306,7 +370,7 @@ func (t *tapOpen) offer() *api.OpenOffer {
 	if t == nil {
 		return nil
 	}
-	return &api.OpenOffer{Descriptor: t.descriptor}
+	return &api.OpenOffer{Descriptor: t.descriptor, Browsers: t.browsers}
 }
 
 // verifyTap checks the assertion over the (possibly bound) challenge of c and,
@@ -382,6 +446,9 @@ func (s *Server) openTap(ctx context.Context, t *tapOpen, sess string, row int64
 		return settle, nil
 	}
 	if pkt == nil {
+		if keys, err := s.store.Q().BrowserKeys(ctx, row); err == nil && len(keys) > 0 {
+			return fail(&apiErr{423, "locked", "this approval must open " + needLabels(closed) + ": this browser is no longer remembered for this passkey (or never was). Enable it again in Security → Passkeys, or approve from a remembered browser"})
+		}
 		return fail(&apiErr{423, "locked", "this approval must open " + needLabels(closed) + ": use a passkey that can open it"})
 	}
 	scopeKeys, pk, err := s.tapScopeKeys(ctx, t, sess, row, challenge, pkt)
@@ -431,7 +498,7 @@ func (s *Server) tapScopeKeys(ctx context.Context, t *tapOpen, sess string, row 
 		return nil, nil, err
 	}
 	defer destroyKeys(keks)
-	out, err := s.unwrapScopes(ctx, row, t.scopes, keks[:len(t.scopes)])
+	out, err := s.unwrapScopes(ctx, t, row, keks[:len(t.scopes)])
 	return out, pk, err
 }
 
@@ -470,10 +537,39 @@ func (s *Server) tapKEKs(ctx context.Context, t *tapOpen, sess string, row int64
 	return keks, pk, nil
 }
 
-// unwrapScopes opens the passkey's wraps of these scopes with its KEKs.
-func (s *Server) unwrapScopes(ctx context.Context, row int64, scopes []string, keks []*seal.Key) ([]*seal.Key, error) {
+// unwrapScopes opens the passkey's wraps of the tap's scopes with its KEKs:
+// its PRF wraps or, when this tap's assertion released a remembered browser's
+// sealed KEKs, that browser's wraps (§13).
+func (s *Server) unwrapScopes(ctx context.Context, t *tapOpen, row int64, keks []*seal.Key) ([]*seal.Key, error) {
 	q := s.store.Q()
+	scopes := t.scopes
 	var out []*seal.Key
+	if rel := t.released.Load(); rel != nil {
+		if rel.row != row {
+			return nil, errForbidden("another passkey signed than the one whose remembered browser was asked; nothing was opened")
+		}
+		for i, scope := range scopes {
+			bw, err := q.BrowserWrap(ctx, rel.key, scope)
+			if err != nil || bw.Passkey != row {
+				destroyKeys(out)
+				return nil, &apiErr{423, "locked", "this browser is no longer remembered for " + scopeName(ctx, q, scope) + ": enable it again in Security → Passkeys"}
+			}
+			sc, err := q.Scope(ctx, scope)
+			if err != nil {
+				destroyKeys(out)
+				return nil, err
+			}
+			skS, err := s.browserScope(bw).Unwrap(keks[i], bw.Wrap, sc.Public)
+			if err != nil {
+				destroyKeys(out)
+				return nil, errForbidden("this browser's key for " + scopeName(ctx, q, scope) + " did not open; nothing was opened")
+			}
+			out = append(out, skS)
+			_ = q.MarkBrowserWrapTested(ctx, bw.ID, s.now())
+		}
+		_ = q.TouchBrowserKey(ctx, rel.key, s.now())
+		return out, nil
+	}
 	for i, scope := range scopes {
 		sw, err := q.ScopeWrap(ctx, row, scope)
 		if err != nil {
@@ -519,6 +615,12 @@ func (s *Server) passkeyScope(w store.ScopeWrapRow) seal.PasskeyScope {
 	return o
 }
 
+func (s *Server) browserScope(w store.BrowserWrapRow) seal.BrowserScope {
+	o := seal.BrowserScope{Installation: s.seal.installation, RPID: s.rpID, RawID: w.RawID, Scope: w.Scope, Browser: w.Public}
+	copy(o.WrapID[:], w.ID)
+	return o
+}
+
 func (s *Server) passkeyRow(ctx context.Context, row int64) (*store.Passkey, error) {
 	all, err := s.store.Q().Passkeys(ctx)
 	if err != nil {
@@ -553,7 +655,12 @@ func closedErr(row store.BucketRow) *apiErr {
 // named credential evaluates PRF at explicit salts, one per scope. The page
 // derives the KEKs and seals them to the descriptor's recipient as for an
 // approval (contract "Enrolment / stage descriptors").
-func (s *Server) enrolTap(sess, purpose, canonical string, cred webauthn.Credential, scopes []string, salts []seal.ID) (protocol.PublicKeyCredentialRequestOptions, *tapOpen, error) {
+//
+// With browser set (a remembered browser's public key, §13) the descriptor
+// names it as "browser_key": the salts are then wrap IDs, the KEKs are random
+// bytes made by that browser (enrol) or read from its sealed KEKs (test), and
+// the PRF inputs only prove that this passkey returns no PRF result.
+func (s *Server) enrolTap(sess, purpose, canonical string, cred webauthn.Credential, scopes []string, salts []seal.ID, browser []byte) (protocol.PublicKeyCredentialRequestOptions, *tapOpen, error) {
 	var opts protocol.PublicKeyCredentialRequestOptions
 	if len(scopes) == 0 || len(scopes) > 2 || len(salts) != len(scopes) {
 		return opts, nil, errBad("name one or two scopes")
@@ -568,6 +675,9 @@ func (s *Server) enrolTap(sess, purpose, canonical string, cred webauthn.Credent
 	}
 	d := map[string]any{"v": 1, "object": "scope-enrol", "purpose": purpose, "attempt_id": attempt, "installation": s.seal.installation, "epoch": s.seal.opens.Epoch(),
 		"recipient": encodeID(recipient), "scopes": scopes, "salts": list, "credential_id": encodeID(cred.ID), "buckets": []descriptorBucket{}}
+	if browser != nil {
+		d["browser_key"] = encodeID(browser)
+	}
 	desc, err := reviewJSON(d)
 	if err != nil {
 		return opts, nil, err
@@ -583,7 +693,7 @@ func (s *Server) enrolTap(sess, purpose, canonical string, cred webauthn.Credent
 	}
 	ext := protocol.AuthenticationExtensions{PRF: &protocol.PRFInputs{Eval: v}}
 	opts.Extensions = ext
-	t := &tapOpen{session: sess, attempt: attempt, descriptor: desc, scopes: scopes, expires: s.now().Add(ChallengeTTL), ext: ext, purpose: purpose, cred: bytes.Clone(cred.ID), salts: salts}
+	t := &tapOpen{session: sess, attempt: attempt, descriptor: desc, scopes: scopes, expires: s.now().Add(ChallengeTTL), ext: ext, purpose: purpose, cred: bytes.Clone(cred.ID), salts: salts, browserPub: browser}
 	return opts, t, nil
 }
 

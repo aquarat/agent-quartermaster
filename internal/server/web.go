@@ -631,6 +631,13 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 		s.writeErr(w, r, err)
 		return
 	}
+	var bwraps []store.BrowserWrapRow
+	if s.sealServing() {
+		if bwraps, err = q.BrowserWraps(ctx, 0); err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+	}
 	out.Passkeys = make([]api.PasskeyInfo, 0, len(pks))
 	for i := range pks {
 		p := pks[i].info(cur)
@@ -646,6 +653,11 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 				for _, w := range wraps {
 					if w.Tested != nil && (p.TestedAt == nil || w.Tested.After(*p.TestedAt)) {
 						p.TestedAt = w.Tested
+					}
+				}
+				for _, bw := range bwraps {
+					if bw.Passkey == pks[i].ID && bw.Tested != nil && (p.TestedAt == nil || bw.Tested.After(*p.TestedAt)) {
+						p.TestedAt = bw.Tested
 					}
 				}
 			}
@@ -920,6 +932,7 @@ func (s *Server) challengeHandler(object string) func(http.ResponseWriter, *http
 			return
 		}
 		if t != nil {
+			t.canonical = text
 			s.seal.taps.put(c.ID, t, now)
 		}
 		writeJSON(w, http.StatusOK, api.ChallengeResponse{ChallengeID: c.ID, Canonical: text, PublicKey: opts, Open: t.offer()})

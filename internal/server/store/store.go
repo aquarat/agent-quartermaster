@@ -1143,6 +1143,13 @@ func (q *Q) ConsumeChallenge(ctx context.Context, id, purpose string, now time.T
 	return &c, nil
 }
 
+// ChallengePending reports whether a challenge is still unused and unexpired.
+func (q *Q) ChallengePending(ctx context.Context, id string, now time.Time) (bool, error) {
+	var ok bool
+	err := q.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM challenges WHERE id=? AND used=0 AND expires_at>?)`, id, ms(now)).Scan(&ok)
+	return ok, err
+}
+
 // ---- enroll codes ----
 
 // InsertEnrollCode stores the hash of a one-time passkey enroll code.

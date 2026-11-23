@@ -49,10 +49,26 @@ export interface PasskeyScopes {
   name: string;
   current: boolean;
   prf: boolean;
+  /** How it opens buckets: "prf" (its own secret), "browser" (only from the remembered
+   * browsers listed, §13) or "" (nothing yet). Absent from an older server. */
+  mode?: "prf" | "browser" | "";
+  /** Sticky: it has, or once had, a PRF wrap. Never offered the remembered-browser path. */
+  had_prf?: boolean;
+  browsers?: RememberedBrowser[];
   scopes: { scope: string; tested: boolean }[];
   opens: number;
   of: number;
   missing: string[];
+}
+/** One remembered browser of a passkey without PRF. `id` is the fingerprint of its key. */
+export interface RememberedBrowser {
+  id: string;
+  /** The key's public half (base64url): what Forget and Test name. */
+  key: string;
+  label: string;
+  created_at: string;
+  last_used_at?: string;
+  scopes: { scope: string; tested: boolean }[];
 }
 export interface StageScope {
   scope: string;
@@ -110,7 +126,7 @@ export function openSummary(v: SealView): string {
 }
 
 export const REKEY_WARNING =
-  "Rekey replaces this scope's key and every bucket key in it, and re-encrypts every value. Do it after losing a passkey or a backup: removing a passkey does not revoke copies of its wraps in old backups. Your passkey's new key uses a fresh PRF input that the broker cannot check in advance, so it taps once more right afterwards to test it; if that fails, the recovery key (Security → Recovery key) is the way back in. Afterwards only this passkey can open the scope: enable your other passkeys again from it. Open buckets of the scope close and their users pause until you Reopen them. Old copies then expose only values as they were at the copy.";
+  "Rekey replaces this scope's key and every bucket key in it, and re-encrypts every value. Do it after losing a passkey or a backup: removing a passkey does not revoke copies of its wraps in old backups. Your passkey's new key uses a fresh PRF input that the broker cannot check in advance, so it taps once more right afterwards to test it; if that fails, the recovery key (Security → Recovery key) is the way back in. Afterwards only this passkey can open the scope (a passkey that opens from a remembered browser: only from this browser): enable your other passkeys, and remember other browsers, again from it. Open buckets of the scope close and their users pause until you Reopen them. Old copies then expose only values as they were at the copy.";
 
 export const CLOSE_ALL_TEXT = "Close all wipes every open bucket key and hold and ends every approval window, without a restart. Grants that need a bucket pause until you Reopen them.";
 

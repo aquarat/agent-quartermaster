@@ -303,3 +303,134 @@ func TestBucketVectors(t *testing.T) {
 		k.Destroy()
 	}
 }
+
+func TestBrowserScopeRoundTripAndBinding(t *testing.T) {
+	inst := RandomID()
+	scope, scopePub, err := NewKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scope.Destroy()
+	browser, browserPub, _ := NewKeyPair()
+	defer browser.Destroy()
+	other, otherPub, _ := NewKeyPair()
+	defer other.Destroy()
+	kek, _ := ImportKEK(bytes.Repeat([]byte{9}, 32))
+	defer kek.Destroy()
+	o := BrowserScope{Installation: inst, RPID: "aqmas.example.com", RawID: []byte("cred-a"), Scope: ScopeInstallation, WrapID: RandomID(), Browser: browserPub}
+	wrap, err := o.Wrap(kek, scope, scopePub)
+	if err != nil || len(wrap) != 73 {
+		t.Fatalf("wrap: %v %d", err, len(wrap))
+	}
+	sealed, err := o.SealKEK(kek)
+	if err != nil || len(sealed) != 113 {
+		t.Fatalf("seal: %v %d", err, len(sealed))
+	}
+	if bytes.Contains(wrap, kek.Bytes()) || bytes.Contains(sealed, kek.Bytes()) || bytes.Contains(wrap, scope.Bytes()) {
+		t.Fatal("a ciphertext contains its plaintext")
+	}
+	// The browser's half: open the KEK, then the broker unwraps the scope key with it.
+	got, err := o.OpenKEK(browser, sealed)
+	if err != nil || !bytes.Equal(got.Bytes(), kek.Bytes()) {
+		t.Fatal("the browser key did not open its sealed KEK")
+	}
+	sk, err := o.Unwrap(got, wrap, scopePub)
+	got.Destroy()
+	if err != nil || !sk.Matches(scopePub) {
+		t.Fatal("unwrap")
+	}
+	sk.Destroy()
+	// Every binding: another passkey, scope, wrap ID, browser key or installation opens nothing.
+	for what, x := range map[string]BrowserScope{
+		"passkey":      {Installation: inst, RPID: o.RPID, RawID: []byte("cred-b"), Scope: o.Scope, WrapID: o.WrapID, Browser: browserPub},
+		"scope":        {Installation: inst, RPID: o.RPID, RawID: o.RawID, Scope: "org-1", WrapID: o.WrapID, Browser: browserPub},
+		"wrap id":      {Installation: inst, RPID: o.RPID, RawID: o.RawID, Scope: o.Scope, WrapID: RandomID(), Browser: browserPub},
+		"rp":           {Installation: inst, RPID: "other.example.com", RawID: o.RawID, Scope: o.Scope, WrapID: o.WrapID, Browser: browserPub},
+		"installation": {Installation: RandomID(), RPID: o.RPID, RawID: o.RawID, Scope: o.Scope, WrapID: o.WrapID, Browser: browserPub},
+	} {
+		if _, err := x.OpenKEK(browser, sealed); err == nil {
+			t.Fatalf("sealed KEK opened under another %s", what)
+		}
+		if _, err := x.Unwrap(kek, wrap, scopePub); err == nil {
+			t.Fatalf("wrap opened under another %s", what)
+		}
+	}
+	x := o
+	x.Browser = otherPub
+	if _, err := x.OpenKEK(other, sealed); err == nil {
+		t.Fatal("sealed KEK opened by another browser key")
+	}
+	if _, err := x.Unwrap(kek, wrap, scopePub); err == nil {
+		t.Fatal("wrap opened under another browser key")
+	}
+	if _, err := o.OpenKEK(other, sealed); err == nil {
+		t.Fatal("sealed KEK opened with the wrong private key")
+	}
+	// A PRF wrap and a browser wrap are different objects under the same KEK.
+	p := PasskeyScope{Installation: inst, RPID: o.RPID, RawID: o.RawID, Scope: o.Scope, Salt: o.WrapID}
+	if _, err := p.Unwrap(kek, wrap, scopePub); err == nil {
+		t.Fatal("a browser wrap opened as a PRF wrap")
+	}
+	wrap[20] ^= 1
+	if _, err := o.Unwrap(kek, wrap, scopePub); err == nil {
+		t.Fatal("tampered wrap opened")
+	}
+	if len(BrowserKeyID(browserPub)) != 32 || BrowserKeyID(browserPub) == BrowserKeyID(otherPub) {
+		t.Fatal("fingerprint")
+	}
+}
+
+// test/vectors/browserkey.json pins what the browser derives for a remembered
+// browser (web/test/browserKey.test.ts): the HPKE info of a sealed KEK and a
+// sealed KEK made here that the page's code must open.
+func TestBrowserKeyVectors(t *testing.T) {
+	const path = "../../../test/vectors/browserkey.json"
+	rep := func(n byte) []byte { return bytes.Repeat([]byte{n}, 32) }
+	var inst, wrapID ID
+	copy(inst[:], rep(1))
+	copy(wrapID[:], rep(2))
+	priv := rep(7)
+	bk, err := ecdh.P256().NewPrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := bk.PublicKey().Bytes()
+	o := BrowserScope{Installation: inst, RPID: "aqmas.example.com", RawID: []byte("raw credential id"), Scope: ScopeInstallation, WrapID: wrapID, Browser: pub}
+	kek, _ := ImportKEK(rep(8))
+	defer kek.Destroy()
+	type vectors struct{ Installation, RPID, Cred, Scope, WrapID, BrowserPriv, BrowserPub, KeyID, KEKInfo, KEK, SealedKEK string }
+	h := hex.EncodeToString
+	want := vectors{Installation: h(inst[:]), RPID: o.RPID, Cred: h(o.RawID), Scope: o.Scope, WrapID: h(wrapID[:]), BrowserPriv: h(priv), BrowserPub: h(pub), KeyID: BrowserKeyID(pub), KEKInfo: h(o.KEKInfo()), KEK: h(kek.Bytes())}
+	if os.Getenv("AQMAS_UPDATE_VECTORS") != "" {
+		sealed, err := o.SealKEK(kek)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want.SealedKEK = h(sealed)
+		out, _ := json.MarshalIndent(want, "", "  ")
+		if err := os.WriteFile(path, append(out, '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	var got vectors
+	b, err := os.ReadFile(path)
+	if err == nil {
+		err = json.Unmarshal(b, &got)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	want.SealedKEK = got.SealedKEK
+	if got != want {
+		t.Fatalf("vectors differ:\n got %+v\nwant %+v", got, want)
+	}
+	sealed, _ := hex.DecodeString(got.SealedKEK)
+	browser, _ := ImportKEK(priv) // a P-256 scalar in a locked page
+	defer browser.Destroy()
+	k, err := o.OpenKEK(browser, sealed)
+	if err != nil || !bytes.Equal(k.Bytes(), kek.Bytes()) {
+		t.Fatal("the committed sealed KEK does not open")
+	}
+	k.Destroy()
+}

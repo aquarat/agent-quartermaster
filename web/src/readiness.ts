@@ -4,8 +4,9 @@
 // owner through enabling the others, one after the other. It adds no ceremony of its own:
 // every tap is a step of capabilities.ts (enable, then test), with the same signed text.
 import { type Api } from "./api";
-import { runSteps, startCapability, testedScopes } from "./capabilities";
+import { browserTested, howItOpens, noPrfSeen, rememberOffer, runSteps, startCapability, testedScopes, type BrowserContext } from "./capabilities";
 import { h, replace } from "./dom";
+import { shortKey } from "./browserKey";
 import { visibleText as vt } from "./format";
 import { serving, type PasskeyScopes, type SealView } from "./sealPanel";
 import type { PasskeyInfo } from "./types";
@@ -22,6 +23,9 @@ export interface Readiness {
   fixable: { passkey: PasskeyScopes; todo: string[] }[];
   /** The signed-in passkey, when it is one of `ready` (it has to open the keys it shares). */
   opener?: PasskeyScopes;
+  /** Keyed scopes that no PRF passkey opens (tested): only remembered browsers do (§13). If
+   * those browsers lose their storage, only the recovery key is left. */
+  browserOnly: string[];
 }
 
 /** undefined: not a format-2 store, or nothing to open yet. */
@@ -29,7 +33,9 @@ export function readiness(v: SealView | undefined): Readiness | undefined {
   if (!serving(v) || !v?.passkeys?.length) return undefined;
   const keyed = (v.scopes ?? []).filter((s) => s.has_key).map((s) => s.scope);
   if (!keyed.length) return undefined;
-  const out: Readiness = { keyed, ready: [], fixable: [] };
+  const out: Readiness = { keyed, ready: [], fixable: [], browserOnly: [] };
+  const opens = (mode: string, s: string) => v.passkeys!.some((p) => (mode === "browser" ? p.mode === "browser" : p.mode !== "browser") && p.scopes.some((x) => x.scope === s && x.tested));
+  out.browserOnly = keyed.filter((s) => opens("browser", s) && !opens("prf", s));
   for (const p of v.passkeys) {
     const todo = keyed.filter((s) => !p.scopes.some((x) => x.scope === s && x.tested));
     if (todo.length) out.fixable.push({ passkey: p, todo });
@@ -54,6 +60,8 @@ export interface ReadinessHost {
   /** The current passkey list (nicknames and raw credential ids). */
   passkeys(): PasskeyInfo[];
   refresh(): void;
+  /** This profile's browser key store and key: without it "Remember this browser" is not offered. */
+  browser?: BrowserContext;
 }
 
 /** The status card: the sentence, each passkey's state, and "Enable the other N…". */
@@ -63,8 +71,22 @@ export function readinessPanel(host: ReadinessHost, v: SealView, r: Readiness): 
   const all = r.fixable.length === 0;
   const box = h("article", { class: `card readiness${all ? " ok" : " attention"}` });
   const flow = h("div", { class: "readiness-flow" });
-  const row = (p: PasskeyScopes, state: string, cls: string, note?: string) =>
-    h("li", { class: cls }, h("strong", null, h("bdi", null, vt(nick(p)))), p.current ? h("span", { class: "badge this" }, "signed in") : null, h("span", { class: "badge" }, state), note ? h("span", { class: "muted" }, " ", vt(note)) : null);
+  const local = host.browser?.local;
+  const row = (p: PasskeyScopes, state: string, cls: string, note?: string) => {
+    const how = howItOpens(p);
+    // A passkey without PRF opens only from the browsers named here: say so in words.
+    const from = p.mode === "browser" ? `${how!.text}: ${(p.browsers ?? []).map((b) => b.label + ` (key ${shortKey(b.id)})` + (local && b.id === local.id ? " (this browser)" : "")).join(", ")}${(p.browsers ?? []).some((b) => local && b.id === local.id) ? "" : ". Not this browser"}.` : undefined;
+    return h(
+      "li",
+      { class: cls, "data-mode": p.mode ?? "" },
+      h("strong", null, h("bdi", null, vt(nick(p)))),
+      p.current ? h("span", { class: "badge this" }, "signed in") : null,
+      h("span", { class: "badge state" }, state),
+      p.mode === "browser" ? h("span", { class: how!.cls }, how!.mark) : null,
+      note ? h("span", { class: "muted" }, " ", vt(note)) : null,
+      from ? h("span", { class: "muted how-from" }, " ", vt(from)) : null,
+    );
+  };
   const start = h("button", { class: "btn approve", type: "button" }, r.fixable.length === 1 ? `Enable ${vt(nick(r.fixable[0]!.passkey))}…` : `Enable the other ${r.fixable.length}…`);
   start.addEventListener("click", () => {
     start.hidden = true;
@@ -82,8 +104,10 @@ export function readinessPanel(host: ReadinessHost, v: SealView, r: Readiness): 
       r.fixable.map((f) => row(f.passkey, f.passkey.scopes.some((x) => x.tested) ? "opens some" : "opens nothing yet", "todo", `not enabled for ${names(v, f.todo)}`)),
     ),
   );
+  if (r.browserOnly.length)
+    box.append(h("p", { class: "warn browser-only" }, `${names(v, r.browserOnly)}: only remembered browsers open ${r.browserOnly.length === 1 ? "it" : "them"}. If those browsers lose their storage, only the recovery key is left: enable a passkey with PRF for ${r.browserOnly.length === 1 ? "it" : "them"} too.`));
   if (!all) {
-    if (r.opener) box.append(h("p", { class: "muted" }, "You need each passkey at hand: ", h("bdi", null, vt(nick(r.opener))), " approves (one tap per passkey), then the passkey being enabled taps to create its own keys and once more to prove they work. If an authenticator has no PRF support, its step says so: skip it (it stays able to sign in and approve)."), h("div", { class: "actions start" }, start));
+    if (r.opener) box.append(h("p", { class: "muted" }, "You need each passkey at hand: ", h("bdi", null, vt(nick(r.opener))), " approves (one tap per passkey), then the passkey being enabled taps to create its own keys and once more to prove they work. If an authenticator has no PRF support, its step says so and offers to remember this browser for it instead (weaker: the step says how), or skip it (it stays able to sign in and approve)."), h("div", { class: "actions start" }, start));
     else
       box.append(
         h(
@@ -147,7 +171,15 @@ async function enableAll(host: ReadinessHost, flow: HTMLElement, idle: () => voi
       return;
     }
     try {
-      const step = await startCapability(host.api, v, { action: "enable", capability: "unlock", nickname: info.nickname, credential_id: info.raw_id, scopes }, location.hostname, 0, { thenTest: true, skip: testedScopes(v, pks, info.raw_id) });
+      // A passkey that already opens only from remembered browsers is never sent down the
+      // PRF path, and the other way round: the offer is explicit either way.
+      const offerable = !p.prf && !p.had_prf ? host.browser : undefined;
+      const step =
+        p.mode === "browser" && host.browser
+          ? rememberOffer(host.api, v, { nickname: info.nickname, credential_id: info.raw_id, scopes }, location.hostname, host.browser, `${info.nickname} has no PRF and opens only from remembered browsers.`, { skip: browserTested(p, host.browser.local) })
+          : offerable && noPrfSeen.has(info.raw_id)
+            ? rememberOffer(host.api, v, { nickname: info.nickname, credential_id: info.raw_id, scopes }, location.hostname, offerable, `${info.nickname} returned no PRF result earlier, so it cannot hold the secret itself.`)
+            : await startCapability(host.api, v, { action: "enable", capability: "unlock", nickname: info.nickname, credential_id: info.raw_id, scopes }, location.hostname, 0, { thenTest: true, skip: testedScopes(v, pks, info.raw_id), browser: offerable });
       runSteps(review, host.auth, step, () => {
         done++;
         void next();

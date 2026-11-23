@@ -11,6 +11,7 @@
 import { decode, encode } from "./b64url";
 import { frames, suite, wrapKeyBytes } from "./seal";
 import { decodeRequestOptions, encodeAssertion, unwrapPublicKey, type AssertionCredentialLike, type AssertionJSON, type Authenticator } from "./webauthn";
+import { NOT_REMEMBERED, type BrowserKeys, type LocalBrowserKey } from "./browserKey";
 
 const utf8 = new TextEncoder();
 type Bytes = Uint8Array<ArrayBuffer>;
@@ -18,6 +19,9 @@ type Bytes = Uint8Array<ArrayBuffer>;
 export class OpenError extends Error {
   override name = "OpenError";
 }
+/** The passkey that was to hold a scope key returned no PRF result. The enable flow offers
+ * "Remember this browser" instead (§13); everywhere else it is an error like any other. */
+export class NoPrfError extends OpenError {}
 const fail = (why: string): never => {
   throw new OpenError(why);
 };
@@ -52,6 +56,9 @@ export async function openChallenge(canonical: string, descriptor: string): Prom
 
 export const kekInfo = (inst: Uint8Array, rpId: string, cred: Uint8Array, scope: string, salt: Uint8Array) =>
   t2("scope-kek", inst, utf8.encode(rpId), cred, utf8.encode(scope), salt);
+/** HPKE info of a remembered browser's sealed KEK (§13): T2("browser-kek", inst, rp, cred, scope, wrap id, browser key). */
+export const browserKekInfo = (inst: Uint8Array, rpId: string, cred: Uint8Array, scope: string, wrapId: Uint8Array, browserKey: Uint8Array) =>
+  t2("browser-kek", inst, utf8.encode(rpId), cred, utf8.encode(scope), wrapId, browserKey);
 export const openInfo = (inst: Uint8Array, purpose: string) => t2("hpke-open", inst, utf8.encode(purpose));
 export const openAAD = (attempt: Uint8Array, epoch: Uint8Array, challenge: Uint8Array, cred: Uint8Array) => t2("open-aad", attempt, epoch, challenge, cred);
 
@@ -117,6 +124,9 @@ export interface Descriptor {
   salts?: string[];
   /** scope-enrol, purpose "migrate": the format-1 unlock wrap the first PRF input opens. */
   legacy?: Legacy;
+  /** scope-enrol for a remembered browser (§13): that browser key's public half. The salts are
+   * then wrap IDs and the KEKs come from the browser, not from PRF. */
+  browser_key?: string;
   /** bucket-open of a rekey (one scope): the fresh salt of the second PRF evaluation; the new
    * scope key is wrapped under the KEK derived from it, not under the passkey's old salt. */
   rekey_salt?: string;
@@ -171,6 +181,9 @@ export interface DescriptorExpectation {
   epoch?: string;
   /** A rekey: the descriptor must carry `rekey_salt` (and only then may it). */
   rekey?: boolean;
+  /** scope-enrol for a remembered browser: the descriptor must name exactly this browser key
+   * (base64url public half), and only then may it name one. */
+  browserKey?: string;
 }
 
 /** Parse and validate a descriptor exactly per the wire contract; refuses anything else. */
@@ -194,6 +207,10 @@ export function parseDescriptor(textIn: string, want: DescriptorExpectation = {}
   if (object === "scope-enrol") keys.push("credential_id", "salts");
   if (d.purpose === "migrate") keys.push("legacy");
   if (object === "bucket-open" && want.rekey) keys.push("rekey_salt");
+  if (want.browserKey !== undefined) {
+    if (object !== "scope-enrol" || (d.purpose !== "enrol" && d.purpose !== "test")) fail("A browser key is named only when a browser is remembered or tested");
+    keys.push("browser_key");
+  }
   exactKeys(d, keys, "Open descriptor");
   rawB64(d.attempt_id, 32);
   rawB64(d.installation, 32);
@@ -226,6 +243,10 @@ export function parseDescriptor(textIn: string, want: DescriptorExpectation = {}
     rawB64(d.credential_id, 1, 1023);
     if (!Array.isArray(d.salts) || d.salts.length !== (scopes as string[]).length) fail("Salts do not match the scopes");
     for (const s of d.salts as unknown[]) rawB64(s, 32);
+    if (want.browserKey !== undefined) {
+      const k = rawB64(d.browser_key, 65);
+      if (k[0] !== 4 || d.browser_key !== want.browserKey) fail("This step is for another browser's key");
+    }
     if (d.purpose === "migrate") {
       if ((scopes as string[]).length !== 1) fail("Migration stages exactly one scope per tap");
       const l = d.legacy;
@@ -267,6 +288,13 @@ export function holdWords(hold: string, until: string): string {
 
 /** One line per bucket, for the card before the tap. */
 export function describeOpen(d: Descriptor): string[] {
+  if (d.object === "scope-enrol" && d.browser_key) {
+    return [
+      d.purpose === "test"
+        ? `Tests that this browser can open: ${d.scopes.join(", ")}. Opens no credential.`
+        : `Creates this browser's keys for: ${d.scopes.join(", ")}. From then on this passkey opens them only together with this browser. Opens no credential.`,
+    ];
+  }
   if (d.object === "scope-enrol") {
     const verb = d.purpose === "test" ? "Tests" : d.purpose === "migrate" ? "Opens the format-1 key and creates" : "Creates";
     return [`${verb} this passkey's key for: ${d.scopes.join(", ")}. Opens no credential.`];
@@ -274,7 +302,7 @@ export function describeOpen(d: Descriptor): string[] {
   if (d.rekey_salt) {
     // A rekey opens the old keys only to re-encrypt: every bucket of the scope ends closed.
     const re = d.buckets.length ? [`Re-keys ${d.buckets.map((b) => b.label).join(", ")} (closes them; users pause until you Reopen them).`] : [];
-    return [...re, `Rekeys ${d.scopes[0]}: your passkey's new key uses a fresh PRF input. It taps once more right afterwards to test it.`];
+    return [...re, `Rekeys ${d.scopes[0]}: your passkey's new key uses a fresh PRF input (a remembered browser: a fresh key). It taps once more right afterwards to test it.`];
   }
   if (!d.buckets.length) return [`Opens the scope key of ${d.scopes.join(" and ")} for the length of this tap (no credential stays open).`];
   return d.buckets.map((b) => `Opens ${b.label}: ${holdWords(b.hold, b.until)}`);
@@ -292,12 +320,36 @@ export interface PreparedOpen {
   text: string;
   /** The bound challenge (raw). */
   challenge: Bytes;
-  /** Raw credential IDs (base64url) whose PRF can open the descriptor's scopes. */
+  /** Raw credential IDs (base64url) that can open the descriptor's scopes from here: those
+   * whose PRF can, and those remembered for this browser (§13). */
   canOpen: string[];
+  /** Passkeys without PRF that open these scopes from a remembered browser; `here` when that
+   * is this browser. */
+  browsers: BrowserOpener[];
   lines: string[];
-  /** After the tap: the KEK packet, or undefined when this passkey returned no PRF result. */
-  finish(cred: AssertionCredentialLike): Promise<OpenPacket | undefined>;
+  /** After the tap: the KEK packet, or undefined when this passkey returned no PRF result and
+   * this browser is not remembered for it. `assertion` is what the tap signed: a remembered
+   * browser shows it to the broker to be handed its sealed KEKs. */
+  finish(cred: AssertionCredentialLike, assertion?: AssertionJSON): Promise<OpenPacket | undefined>;
 }
+export interface BrowserOpener {
+  credential_id: string;
+  key_id: string;
+  label: string;
+  here: boolean;
+}
+export interface ReleasedWrap {
+  scope: string;
+  id: string;
+  sealed_kek: string;
+}
+/** How a tap reaches this profile's browser key and the broker's release endpoint. The app
+ * sets it once at start (main.ts); with nothing set, the remembered-browser path is off and
+ * everything behaves as before. */
+export const browserPath: {
+  keys?: BrowserKeys;
+  release?: (body: { challenge_id: string; assertion: AssertionJSON; browser_key: string }) => Promise<{ wraps?: unknown }>;
+} = {};
 
 /** What every approval card needs: options to pass to navigator.credentials.get, the open
  * (if any) and a signer that sends PRF-derived keys only inside the HPKE packet. */
@@ -310,6 +362,8 @@ export interface Tap {
 }
 
 export interface ChallengeLike {
+  /** Needed for the remembered-browser path: the release names the pending challenge. */
+  challenge_id?: string;
   canonical: string;
   public_key: unknown;
   open?: unknown;
@@ -359,13 +413,28 @@ export async function prepareTap(r: ChallengeLike, rpId: string, want: TapExpect
   }
   if (want.allowOpen === false) fail("Unexpected open descriptor");
   if (!isObject(sent)) return fail("Invalid open descriptor");
-  exactKeys(sent, ["descriptor"], "Open");
+  exactKeys(sent, sent.browsers === undefined ? ["descriptor"] : ["browsers", "descriptor"], "Open");
   const textIn = sent.descriptor as string;
+  // This profile's browser key, read before the tap: the passkey prompt must start inside the
+  // click, with no storage round trip in between.
+  const local: LocalBrowserKey | undefined = await browserPath.keys?.current();
   const d = parseDescriptor(textIn, want);
   const challenge = await openChallenge(r.canonical, textIn);
   if (o.challenge !== encode(challenge)) fail("The passkey challenge does not bind the action and the buckets shown");
   const inst = rawB64(d.installation, 32), epoch = rawB64(d.epoch, 32), attempt = rawB64(d.attempt_id, 32), recipient = rawB64(d.recipient, 65);
   const allowed = new Set((allow as { id: string }[]).map((x) => x.id));
+  const browsers: BrowserOpener[] = [];
+  if (sent.browsers !== undefined) {
+    if (d.object !== "bucket-open" || !Array.isArray(sent.browsers) || sent.browsers.length > 256) fail("Invalid remembered-browser list");
+    for (const x of sent.browsers as unknown[]) {
+      if (!isObject(x)) return fail("Invalid remembered-browser list");
+      exactKeys(x, ["credential_id", "key_id", "label"], "Remembered browser");
+      rawB64(x.credential_id, 1, 1023);
+      if (typeof x.key_id !== "string" || !/^[0-9a-f]{32}$/.test(x.key_id) || !text(x.label, 256)) fail("Invalid remembered-browser list");
+      if (!allowed.has(x.credential_id as string)) fail("A remembered browser for a passkey that may not answer");
+      browsers.push({ credential_id: x.credential_id as string, key_id: x.key_id as string, label: x.label as string, here: !!local && local.id === x.key_id });
+    }
+  }
   const ext = o.extensions;
   // Per credential: the PRF inputs, aligned with the descriptor's scopes.
   const salts = new Map<string, Bytes[]>();
@@ -420,14 +489,39 @@ export async function prepareTap(r: ChallengeLike, rpId: string, want: TapExpect
     }
   }
   const info = openInfo(inst, d.purpose);
+  /** The remembered-browser path (§13): show the broker this tap's assertion, be handed the
+   * sealed KEKs of this passkey and this browser key, open them with the browser key. */
+  const released = async (rawCred: Bytes, assertion: AssertionJSON | undefined, key: LocalBrowserKey): Promise<Bytes[]> => {
+    if (!browserPath.keys || !browserPath.release || !assertion || typeof r.challenge_id !== "string") return fail("This page cannot ask for a remembered browser's keys here");
+    const res = await browserPath.release({ challenge_id: r.challenge_id, assertion, browser_key: key.public });
+    const wraps = res?.wraps;
+    if (!Array.isArray(wraps) || wraps.length !== d.scopes.length) return fail("The broker did not release this browser's keys for every scope");
+    const out: Bytes[] = [];
+    try {
+      for (let i = 0; i < wraps.length; i++) {
+        const w = wraps[i] as unknown;
+        if (!isObject(w)) return fail("Invalid released key");
+        exactKeys(w, ["id", "scope", "sealed_kek"], "Released key");
+        if (w.scope !== d.scopes[i]) fail("The released keys are for other scopes");
+        if (d.object === "scope-enrol" && w.id !== d.salts![i]) fail("The released key is not the one this test names");
+        const id = rawB64(w.id, 32), sealed = rawB64(w.sealed_kek, 113);
+        out.push(await browserPath.keys.openKEK(key, browserKekInfo(inst, rpId, rawCred, d.scopes[i]!, id, key.publicKey), sealed));
+      }
+    } catch (e) {
+      for (const k of out) k.fill(0);
+      throw e;
+    }
+    return out;
+  };
   let used = false;
   const open: PreparedOpen = {
     descriptor: d,
     text: textIn,
     challenge,
-    canOpen: [...salts.keys()],
+    canOpen: d.object === "bucket-open" ? [...new Set([...salts.keys(), ...browsers.filter((b) => b.here).map((b) => b.credential_id)])] : [...salts.keys()],
+    browsers,
     lines: describeOpen(d),
-    async finish(cred) {
+    async finish(cred, assertion) {
       if (used) fail("Ceremony already used");
       used = true;
       const id = encode(cred.rawId);
@@ -441,11 +535,35 @@ export async function prepareTap(r: ChallengeLike, rpId: string, want: TapExpect
         const mine = salts.get(id);
         const need = migrate || d.rekey_salt ? 2 : d.scopes.length;
         const ok = !!mine && first?.length === 32 && (need === 1 || second?.length === 32);
-        if (!ok) {
-          if (d.object === "scope-enrol") fail("This passkey did not return a PRF result, so it cannot hold a scope key");
-          return undefined;
-        }
         const rawCred = new Uint8Array(cred.rawId);
+        const fresh = () => crypto.getRandomValues(new Uint8Array(32)) as Bytes;
+        const send = async (keks: Bytes[]) => {
+          try {
+            return { attempt_id: d.attempt_id, ...(await sealKEKs(recipient, info, openAAD(attempt, epoch, challenge, rawCred), keks)) };
+          } finally {
+            for (const k of keks) k.fill(0);
+          }
+        };
+        if (d.object === "scope-enrol" && d.browser_key) {
+          // Remember or test this browser (§13). Its key must be the one the step names.
+          if (!local || local.public !== d.browser_key) fail(NOT_REMEMBERED);
+          if (d.purpose === "enrol") {
+            // No silent downgrade: a passkey that returns a PRF result holds its own secret.
+            if (first?.length === 32) fail("This passkey returned a PRF result: it can hold the secret itself, which is stronger. Use Enable instead of remembering this browser.");
+            return await send(d.scopes.map(fresh));
+          }
+          return await send(await released(rawCred, assertion, local!));
+        }
+        if (!ok) {
+          if (d.object === "scope-enrol") throw new NoPrfError("This passkey did not return a PRF result, so it cannot hold a scope key");
+          // A passkey without PRF opens from this browser when it is remembered for it. A
+          // rekey adds a fresh KEK made here, as PRF's second evaluation does.
+          const here = browsers.some((b) => b.credential_id === id && b.here);
+          if (!here || !local) return undefined;
+          const keks = await released(rawCred, assertion, local);
+          if (d.rekey_salt) keks.push(fresh());
+          return await send(keks);
+        }
         const keks: Bytes[] = [];
         try {
           if (migrate) {
@@ -479,7 +597,7 @@ export async function prepareTap(r: ChallengeLike, rpId: string, want: TapExpect
     async sign(auth) {
       const cred = await auth.get(options);
       const assertion = encodeAssertion(cred);
-      const packet = await open.finish(cred);
+      const packet = await open.finish(cred, assertion);
       return packet ? { assertion, open: packet } : { assertion };
     },
   };

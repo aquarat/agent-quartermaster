@@ -6,7 +6,7 @@
 // signatures are not verified, as in the rest of the mock.
 
 import { createECDH, createHash, randomBytes } from "node:crypto";
-import { canonicalJSON, openAAD, openChallenge, openInfo, type OpenBucket } from "../src/buckets";
+import { browserKekInfo, canonicalJSON, openAAD, openChallenge, openInfo, type OpenBucket } from "../src/buckets";
 import { suite } from "../src/seal";
 
 const b64url = (b: Uint8Array | Buffer) => Buffer.from(b).toString("base64url");
@@ -36,7 +36,21 @@ export interface MockWrap {
   /** SHA-256 of the KEK first seen (mock stand-in for the XChaCha wrap). */
   kek?: string;
 }
+/** One remembered browser of a passkey without PRF (docs/BUCKETS.md §13). As the broker: the
+ * key's public half, a label, and per scope a wrap ID with the KEK sealed to that key (real
+ * HPKE, so the page's opening is exercised) and the KEK's hash (the stand-in for the wrap). */
+export interface MockBrowser {
+  key: string;
+  id: string;
+  label: string;
+  created_at: string;
+  last_used_at?: string;
+  wraps: Map<string, { id: string; sealed: string; kek: string; tested: boolean }>;
+}
+export const browserKeyId = (pub: Uint8Array) => createHash("sha256").update(pub).digest("hex").slice(0, 32);
 export interface OpenAttempt {
+  /** The remembered browser whose sealed KEKs this tap's assertion released. */
+  released?: { cred: string; key: string };
   id: string;
   session: string | undefined;
   priv: Buffer;
@@ -75,6 +89,12 @@ export class MockBuckets {
   wraps = new Map<string, Map<string, MockWrap>>();
   /** Passkeys (raw base64url) that return no PRF result. */
   noPrf = new Set<string>();
+  /** Sticky, as the broker's passkey_prf: passkeys that have, or once had, a PRF wrap. */
+  hadPrf = new Set<string>();
+  /** Release attempts per pending tap (attempt id): three, as the broker. */
+  private releaseTries = new Map<string, number>();
+  /** credential (raw base64url) -> its remembered browsers */
+  browsers = new Map<string, MockBrowser[]>();
   attempts = new Map<string, OpenAttempt>();
   /** challenge id -> attempt id */
   private byChallenge = new Map<string, string>();
@@ -123,6 +143,7 @@ export class MockBuckets {
     const m = this.wraps.get(cred) ?? new Map<string, MockWrap>();
     for (const s of this.scopes) if (s.has_key && !m.has(s.scope)) m.set(s.scope, { salt: b64url(randomBytes(32)), tested: true });
     this.wraps.set(cred, m);
+    if (m.size) this.hadPrf.add(cred);
   }
 
   bucket(id: string): MockBucket {
@@ -144,16 +165,29 @@ export class MockBuckets {
       buckets: this.buckets.map((b) => ({ ...b, scope_title: this.scopes.find((s) => s.scope === b.scope)?.title ?? b.scope })),
       passkeys: this.deps.passkeys().map((p) => {
         const w = this.wraps.get(p.id) ?? new Map<string, MockWrap>();
-        const scopes = [...w.entries()].map(([scope, x]) => ({ scope, tested: x.tested }));
+        let scopes = [...w.entries()].map(([scope, x]) => ({ scope, tested: x.tested }));
+        const prf = scopes.length > 0; // as the server: "has a wrap", not authenticator capability
+        const list = this.browsers.get(p.id) ?? [];
+        const browsers = list.map((b) => ({ id: b.id, key: b.key, label: b.label, created_at: b.created_at, ...(b.last_used_at ? { last_used_at: b.last_used_at } : {}), scopes: [...b.wraps.entries()].map(([scope, x]) => ({ scope, tested: x.tested })) }));
+        const mode = prf ? "prf" : browsers.length ? "browser" : "";
+        // A passkey without PRF: the union over its remembered browsers, in scope order.
+        if (mode === "browser")
+          scopes = this.scopes
+            .filter((s) => browsers.some((b) => b.scopes.some((x) => x.scope === s.scope)))
+            .map((s) => ({ scope: s.scope, tested: browsers.some((b) => b.scopes.some((x) => x.scope === s.scope && x.tested)) }));
+        const has = (s: string) => scopes.some((x) => x.scope === s);
         return {
           id: p.hex,
           name: p.name,
           current: p.hex === cur,
-          prf: scopes.length > 0, // as the server: "has a wrap", not authenticator capability
+          prf,
+          mode,
+          had_prf: prf || this.hadPrf.has(p.id),
+          browsers,
           scopes,
-          opens: this.buckets.filter((b) => w.has(b.scope)).length,
+          opens: this.buckets.filter((b) => has(b.scope)).length,
           of: this.buckets.length,
-          missing: keyed.filter((s) => !w.has(s)),
+          missing: keyed.filter((s) => !has(s)),
         };
       }),
       active_windows: [],
@@ -205,22 +239,88 @@ export class MockBuckets {
     this.byChallenge.set(ch.id, attempt.id);
     const opts = this.deps.requestOptions(req, ch.challenge);
     const by: Record<string, Record<string, string>> = {};
+    const browsers: { credential_id: string; key_id: string; label: string }[] = [];
     for (const p of this.deps.passkeys()) {
       const w = this.wraps.get(p.id);
-      if (!w || !scopes.every((s) => w.has(s))) continue;
+      if (!w || !scopes.every((s) => w.has(s))) {
+        for (const b of this.browsers.get(p.id) ?? []) if (scopes.every((s) => b.wraps.has(s))) browsers.push({ credential_id: p.id, key_id: b.id, label: b.label });
+        continue;
+      }
       const salts = scopes.map((s) => w.get(s)!.salt);
       if (rekeySalt) salts.push(rekeySalt);
       attempt.salts.set(p.id, salts);
       by[p.id] = salts.length === 2 ? { first: salts[0]!, second: salts[1]! } : { first: salts[0]! };
     }
     if (Object.keys(by).length) opts.publicKey.extensions = { prf: { evalByCredential: by } };
-    return { challenge_id: ch.id, canonical: text, public_key: opts, open: { descriptor: d } };
+    return { challenge_id: ch.id, canonical: text, public_key: opts, open: { descriptor: d, ...(browsers.length ? { browsers } : {}) } };
+  }
+
+  /** The KEK sealed to a browser key, exactly as the broker's seal.BrowserScope.SealKEK. */
+  async sealKEK(host: string, cred: string, scope: string, wrapId: string, browserKey: string, kek: Uint8Array): Promise<string> {
+    const pub = raw(browserKey);
+    const sender = await suite.createSenderContext({ recipientPublicKey: await suite.kem.deserializePublicKey(ab(pub)), info: ab(browserKekInfo(raw(this.installation), host, raw(cred), scope, raw(wrapId), pub)) });
+    const ct = new Uint8Array(await sender.seal(ab(kek)));
+    return b64url(Buffer.concat([Buffer.from(sender.enc), ct]));
+  }
+
+  /** Store a remembered browser's wraps from the KEKs its page sent (remember, rekey, recovery). */
+  async rememberBrowser(host: string, cred: string, browserKey: string, label: string, scopes: string[], ids: string[], keks: Buffer[]): Promise<void> {
+    const list = this.browsers.get(cred) ?? [];
+    let b = list.find((x) => x.key === browserKey);
+    if (!b) {
+      b = { key: browserKey, id: browserKeyId(raw(browserKey)), label, created_at: nowISO(), wraps: new Map() };
+      list.push(b);
+    }
+    b.label = label; // as the broker: the label of the latest signed action
+    for (let i = 0; i < scopes.length; i++) {
+      const sc = this.scopes.find((x) => x.scope === scopes[i])!;
+      sc.has_key = true;
+      b.wraps.set(scopes[i]!, { id: ids[i]!, sealed: await this.sealKEK(host, cred, scopes[i]!, ids[i]!, browserKey, keks[i]!), kek: hex(keks[i]!), tested: false });
+    }
+    this.browsers.set(cred, list);
+  }
+
+  /** POST /api/ui/seal/browser/release: the sealed KEKs of (this passkey, this browser key) for
+   * a pending tap whose assertion is over the tap's bound challenge. One release per tap. */
+  release(body: Record<string, unknown>, session: string | undefined): unknown {
+    const fail = this.deps.fail;
+    const aid = typeof body.challenge_id === "string" ? this.byChallenge.get(body.challenge_id) : undefined;
+    const attempt = aid ? this.attempts.get(aid) : undefined;
+    if (!attempt || attempt.session !== session) return fail(409, "conflict", "stale approval; review again");
+    if (attempt.released) return fail(409, "conflict", "this approval was finished or its keys were already released; review again");
+    const tries = (this.releaseTries.get(attempt.id) ?? 0) + 1;
+    this.releaseTries.set(attempt.id, tries);
+    if (tries > 3) return fail(429, "rate_limited", "too many attempts for this approval; review again");
+    const d = attempt.descriptor;
+    const key = String(body.browser_key ?? "");
+    if (d.object === "scope-enrol" && (d.purpose !== "test" || d.browser_key !== key)) return fail(409, "conflict", "this step releases nothing to a browser");
+    const a = body.assertion as { rawId?: unknown; response?: { clientDataJSON?: unknown } } | undefined;
+    let signed = "";
+    try {
+      signed = JSON.parse(raw(a?.response?.clientDataJSON).toString("utf8")).challenge;
+    } catch {
+      return fail(400, "bad_request", "assertion required");
+    }
+    if (signed !== b64url(attempt.challenge)) return fail(403, "forbidden", "passkey assertion rejected");
+    const cred = String(a?.rawId ?? "");
+    if (d.object === "scope-enrol" && cred !== d.credential_id) return fail(403, "forbidden", "passkey assertion rejected");
+    const b = (this.browsers.get(cred) ?? []).find((x) => x.key === key);
+    if (!b) return fail(423, "locked", "this browser is not remembered for this passkey: enable it again in Security → Passkeys");
+    const scopes = d.scopes as string[];
+    const wraps = scopes.map((s, i) => {
+      const w = b.wraps.get(s);
+      if (!w || (d.object === "scope-enrol" && w.id !== (d.salts as string[])[i])) return fail(423, "locked", `this browser is not remembered for ${s}: enable it again in Security → Passkeys`);
+      return { scope: s, id: w.id, sealed_kek: w.sealed };
+    });
+    attempt.released = { cred, key };
+    return { wraps };
   }
 
   /** A scope-enrol challenge for one named passkey with explicit salts (enable, test, stage). */
-  async enrolOffer(req: Request, text: string, canonical: Record<string, unknown>, session: string | undefined, e: { purpose: "enrol" | "test" | "stage" | "migrate"; credential: string; scopes: string[]; salts?: string[]; legacy?: { mk_version: number; prf_salt: string; installation: string } }) {
+  async enrolOffer(req: Request, text: string, canonical: Record<string, unknown>, session: string | undefined, e: { purpose: "enrol" | "test" | "stage" | "migrate"; credential: string; scopes: string[]; salts?: string[]; legacy?: { mk_version: number; prf_salt: string; installation: string }; browser?: string }) {
     const salts = e.salts ?? e.scopes.map(() => b64url(randomBytes(32)));
     const desc: Record<string, unknown> = { buckets: [], object: "scope-enrol", purpose: e.purpose, scopes: e.scopes, credential_id: e.credential, salts };
+    if (e.browser) desc.browser_key = e.browser;
     if (e.legacy) desc.legacy = e.legacy;
     const { attempt, text: d } = this.newAttempt(session, desc);
     const challenge = Buffer.from(await openChallenge(text, d));
@@ -264,7 +364,18 @@ export class MockBuckets {
       return { canonical, cred, attempt, keks };
     }
     const list = d.buckets as OpenBucket[];
-    if (keks) {
+    const rel = attempt.released;
+    if (keks && rel) {
+      // A remembered browser's tap: its KEKs must be the ones its wraps were made with.
+      const b = rel.cred === cred ? (this.browsers.get(cred) ?? []).find((x) => x.key === rel.key) : undefined;
+      if (!b || keks.length !== scopes.length + (d.rekey_salt ? 1 : 0)) this.deps.fail(403, "forbidden", "this browser cannot open these scopes");
+      scopes.forEach((s, i) => {
+        const wrap = b!.wraps.get(s) ?? this.deps.fail(423, "locked", "this browser is no longer remembered for " + s);
+        if (wrap.kek !== hex(keks![i]!)) this.deps.fail(403, "forbidden", "this browser's key did not open the scope key");
+        wrap.tested = true;
+      });
+      b!.last_used_at = nowISO();
+    } else if (keks) {
       const w = this.wraps.get(cred);
       if (!w || keks.length !== scopes.length + (d.rekey_salt ? 1 : 0)) this.deps.fail(403, "forbidden", "this passkey cannot open these scopes");
       scopes.forEach((s, i) => {
@@ -276,6 +387,8 @@ export class MockBuckets {
       });
     } else {
       const closed = list.filter((b) => !this.bucket(b.id).open);
+      if (closed.length && this.browsers.get(cred)?.length)
+        this.deps.fail(423, "locked", `this approval must open ${closed.map((b) => b.label).join(", ")}: this browser is no longer remembered for this passkey (or never was). Enable it again in Security → Passkeys, or approve from a remembered browser`);
       if (closed.length) this.deps.fail(423, "locked", `${closed.map((b) => b.label).join(", ")} is closed: approve with a passkey that can open it`);
     }
     const since = nowISO();
@@ -328,6 +441,7 @@ export class MockBuckets {
     const p = url.pathname, post = req.method === "POST", fail = this.deps.fail;
     if (p === "/api/ui/seal/status" && !post) return this.status(session, extra());
     if (this.mode !== "buckets") return undefined;
+    if (p === "/api/ui/seal/browser/release" && post) return this.release(body, session);
     if (p === "/api/ui/seal/control/challenge" && post) {
       const action = body.action;
       const canonical: Record<string, unknown> = { v: 3, object: "seal-control", action, id: this.installation, epoch: this.epoch, nonce: b64url(randomBytes(32)), issued_at: nowISO() };
@@ -392,7 +506,18 @@ export class MockBuckets {
             b.open = false;
             b.holds = [];
           }
-          for (const [cred, m] of this.wraps) if (cred !== f.cred) m.delete(c.scope as string);
+          for (const [cred, m] of this.wraps) if (cred !== f.cred || f.attempt!.released) m.delete(c.scope as string);
+          // Remembered browsers: only the one that rekeyed keeps a wrap, made with the fresh
+          // KEK its page sent (the packet's second key), at the descriptor's fresh wrap ID.
+          for (const [cred, list] of this.browsers)
+            for (const b of list) {
+              const mine = f.attempt!.released && cred === f.cred && b.key === f.attempt!.released.key;
+              if (!mine) b.wraps.delete(c.scope as string);
+              else {
+                const id = f.attempt!.descriptor.rekey_salt as string;
+                b.wraps.set(c.scope as string, { id, sealed: await this.sealKEK(new URL(req.url).hostname, cred, c.scope as string, id, b.key, f.keks![1]!), kek: hex(f.keks![1]!), tested: false });
+              }
+            }
           // The tapping passkey's new wrap is at the descriptor's fresh salt, untested.
           this.wraps.get(f.cred)?.forEach((w, s) => {
             if (s !== c.scope) return;

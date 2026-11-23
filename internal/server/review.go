@@ -53,6 +53,7 @@ func (s *Server) storeChallenge(ctx context.Context, sess, obj, objectID, text s
 		return "", err
 	}
 	if t != nil {
+		t.canonical = text
 		s.seal.taps.put(c.ID, t, now)
 	}
 	return c.ID, nil

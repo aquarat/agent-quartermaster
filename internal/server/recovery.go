@@ -316,7 +316,7 @@ func (f *recoveryFlow) step(r *http.Request, step string) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		opts, t, err := s.enrolTap(f.session, purpose, text, *f.cred, names, salts)
+		opts, t, err := s.enrolTap(f.session, purpose, text, *f.cred, names, salts, nil)
 		if err != nil {
 			return nil, err
 		}

@@ -36,6 +36,10 @@ type capIntent struct {
 	Capability string   `json:"capability"`
 	Target     string   `json:"credential_id"`
 	Scopes     []string `json:"scopes"`
+	// Remembered browsers (§13): the browser key's public half (base64url) for
+	// remember, forget and the test of a browser's wraps; its label for remember.
+	Browser string `json:"browser_key,omitempty"`
+	Label   string `json:"browser_label,omitempty"`
 }
 type capStage struct {
 	session, id string
@@ -153,8 +157,12 @@ func (s *Server) checkIntent(ctx context.Context, q *store.Q, in capIntent) (*st
 		return nil, errBad("invalid scopes")
 	}
 	unlock := in.Capability == "unlock"
-	if unlock != (len(scopes) > 0) && in.Action != "disable" {
+	if unlock != (len(scopes) > 0) && in.Action != "disable" && in.Action != "forget" {
 		return nil, errBad("an unlock capability names one or two scopes; approve-only names none")
+	}
+	browser, err := intentBrowser(in)
+	if err != nil {
+		return nil, err
 	}
 	all, err := loadPasskeys(ctx, q)
 	if err != nil {
@@ -177,9 +185,67 @@ func (s *Server) checkIntent(ctx context.Context, q *store.Q, in capIntent) (*st
 		has := func(sc string) bool {
 			return slices.ContainsFunc(wraps, func(w store.ScopeWrapRow) bool { return w.Scope == sc })
 		}
+		keys, err := q.BrowserKeys(ctx, p.ID)
+		if err != nil {
+			return nil, err
+		}
+		// This passkey's remembered browser with the intent's key, and its wraps.
+		var key *store.BrowserKeyRow
+		var keyWraps []store.BrowserWrapRow
+		for j := range keys {
+			if browser != nil && bytes.Equal(keys[j].Public, browser) {
+				key = &keys[j]
+				if keyWraps, err = q.BrowserWraps(ctx, key.ID); err != nil {
+					return nil, err
+				}
+			}
+		}
+		keyHas := func(sc string) bool {
+			return slices.ContainsFunc(keyWraps, func(w store.BrowserWrapRow) bool { return w.Scope == sc })
+		}
 		switch in.Action {
+		case "remember":
+			// Only for a passkey without PRF: one that has PRF wraps keeps using
+			// its own secret and is never moved to the weaker path (§13.4).
+			// The mark is sticky: a passkey that ever had a PRF wrap stays refused
+			// after a Disable or a rekey took its wraps away.
+			if had, err := q.PasskeyHadPRF(ctx, p.ID); err != nil {
+				return nil, err
+			} else if had || len(wraps) > 0 {
+				return nil, errConflict("this passkey has PRF (it opens, or has opened, buckets with its own secret): a remembered browser is only for passkeys without PRF. Use Enable")
+			}
+			for _, k := range keys {
+				if k.Label == in.Label && !bytes.Equal(k.Public, browser) {
+					return nil, errConflict("another remembered browser of this passkey is already called " + in.Label + ": choose another name")
+				}
+			}
+			for _, w := range keyWraps {
+				if w.Tested != nil && slices.Contains(scopes, w.Scope) {
+					return nil, errConflict("this browser is already remembered for " + scopeName(ctx, q, w.Scope) + " (tested): nothing to do")
+				}
+			}
+			return &all[i], nil
+		case "forget":
+			if key == nil {
+				return nil, errConflict("this browser is not remembered for that passkey")
+			}
+			orphans, err := q.BrowserOrphanedScopes(ctx, key.ID)
+			if err != nil {
+				return nil, err
+			}
+			if len(orphans) > 0 {
+				var names []string
+				for _, sc := range orphans {
+					names = append(names, scopeName(ctx, q, sc))
+				}
+				return nil, errConflict("this remembered browser is the only thing that can open " + strings.Join(names, ", ") + ": remember another browser or enable another passkey for it first, or enrol with the recovery key (Security → Recovery key)")
+			}
+			return &all[i], nil
 		case "enable":
 			if unlock {
+				if len(keys) > 0 {
+					return nil, errConflict("this passkey opens buckets only from remembered browsers: use Remember this browser, or forget its browsers first to enable it with PRF")
+				}
 				// A tested wrap is never replaced (a page-supplied KEK could break it).
 				for _, w := range wraps {
 					if w.Tested != nil && slices.Contains(scopes, w.Scope) {
@@ -189,6 +255,12 @@ func (s *Server) checkIntent(ctx context.Context, q *store.Q, in capIntent) (*st
 				return &all[i], nil
 			}
 		case "test":
+			if browser != nil {
+				if unlock && key != nil && !slices.ContainsFunc(scopes, func(sc string) bool { return !keyHas(sc) }) {
+					return &all[i], nil
+				}
+				return nil, errConflict("this browser is not remembered for those scopes")
+			}
 			if unlock && !slices.ContainsFunc(scopes, func(sc string) bool { return !has(sc) }) {
 				return &all[i], nil
 			}
@@ -260,14 +332,27 @@ func (s *Server) orphanErr(ctx context.Context, q *store.Q, row int64, orphans [
 		}
 		return "the other passkey"
 	}
+	bwraps, err := q.BrowserWraps(ctx, 0)
+	if err != nil {
+		return err
+	}
 	var names, untested []string
 	for _, sc := range orphans {
 		names = append(names, scopeName(ctx, q, sc))
+		hint := ""
 		for _, w := range wraps {
 			if w.Scope == sc && w.Passkey != row && w.Tested == nil {
-				untested = append(untested, "test passkey "+nick(w.Passkey)+" for "+scopeName(ctx, q, sc))
+				hint = "test passkey " + nick(w.Passkey) + " for " + scopeName(ctx, q, sc)
 				break
 			}
+		}
+		for _, w := range bwraps {
+			if hint == "" && w.Scope == sc && w.Passkey != row && w.Tested == nil {
+				hint = "test passkey " + nick(w.Passkey) + " from its remembered browser for " + scopeName(ctx, q, sc)
+			}
+		}
+		if hint != "" {
+			untested = append(untested, hint)
 		}
 	}
 	if len(untested) == len(orphans) {
@@ -290,6 +375,7 @@ func (s *Server) capCanonical(action, id string, in capIntent) (string, error) {
 		scopes = []string{}
 	}
 	m["scopes"] = scopes
+	capBrowserFields(m, in)
 	return reviewJSON(m)
 }
 
@@ -329,7 +415,25 @@ func (s *Server) capChallenge(ctx context.Context, r *http.Request, sess string)
 				}
 			}
 		}
-		opts, t, err := s.enrolTap(sess, "test", text, target.cred, scopes, salts)
+		browser, _ := intentBrowser(in)
+		if browser != nil {
+			// A remembered browser's wraps: the "salts" are its wrap IDs.
+			key, err := q.BrowserKey(ctx, target.ID, browser)
+			if err != nil {
+				return nil, err
+			}
+			salts = nil
+			for _, sc := range scopes {
+				bw, err := q.BrowserWrap(ctx, key.ID, sc)
+				if err != nil {
+					return nil, err
+				}
+				var x seal.ID
+				copy(x[:], bw.ID)
+				salts = append(salts, x)
+			}
+		}
+		opts, t, err := s.enrolTap(sess, "test", text, target.cred, scopes, salts, browser)
 		if err != nil {
 			return nil, err
 		}
@@ -338,7 +442,7 @@ func (s *Server) capChallenge(ctx context.Context, r *http.Request, sess string)
 			return nil, err
 		}
 		return api.ChallengeResponse{ChallengeID: id, Canonical: text, PublicKey: opts, Open: t.offer()}, nil
-	case "register", "enable":
+	case "register", "enable", "remember":
 		// The approving tap opens the keys of the listed scopes that have one.
 		var extra []string
 		for _, sc := range scopes {
@@ -461,12 +565,24 @@ func (s *Server) capAuthorize(ctx context.Context, r *http.Request, sess string)
 			}
 			return q.Audit(ctx, s.now(), "owner", "passkey_disable_unlock", "passkey:"+target.id, c.Canonical)
 		}
+		if plan.Action == "forget" {
+			// The wraps go with the key (cascade): the broker keeps nothing of it.
+			pub, _ := intentBrowser(plan.capIntent)
+			key, err := q.BrowserKey(ctx, target.ID, pub)
+			if err != nil {
+				return err
+			}
+			if err = q.DeleteBrowserKey(ctx, key.ID); err != nil {
+				return err
+			}
+			return q.Audit(ctx, s.now(), "owner", "passkey_forget_browser", "passkey:"+target.id, c.Canonical+" signer="+passkeyID(signer.CredentialID))
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	if plan.Action == "disable" {
+	if plan.Action == "disable" || plan.Action == "forget" {
 		_ = s.store.CheckpointWAL(ctx)
 		s.bcast.notify()
 		return api.OK{OK: true}, nil
@@ -524,6 +640,7 @@ func (s *Server) capCanonicalFrom(text string, plan capPlan) (string, error) {
 	if plan.Scopes == nil {
 		m["scopes"] = []string{}
 	}
+	capBrowserFields(m, plan.capIntent)
 	return reviewJSON(m)
 }
 
@@ -551,6 +668,38 @@ func (s *Server) capTest(ctx context.Context, sess string, c *store.Challenge, t
 	}
 	defer destroyKeys(keks)
 	var done []string
+	if t.browserPub != nil {
+		// A remembered browser's wraps: this tap's assertion must have released
+		// the sealed KEKs of exactly that browser key (browserkey.go).
+		rel := t.released.Load()
+		key, err := q.BrowserKey(ctx, row, t.browserPub)
+		if err != nil || rel == nil || rel.row != row || rel.key != key.ID {
+			return nil, errConflict("this browser's wraps changed; start again")
+		}
+		for i, scope := range t.scopes {
+			bw, err := q.BrowserWrap(ctx, key.ID, scope)
+			if err != nil || !bytes.Equal(bw.ID, t.salts[i][:]) {
+				return nil, errConflict("this browser's wraps changed; start again")
+			}
+			sc, err := q.Scope(ctx, scope)
+			if err != nil {
+				return nil, err
+			}
+			k, err := s.browserScope(bw).Unwrap(keks[i], bw.Wrap, sc.Public)
+			if err != nil {
+				return nil, errForbidden("this browser's key for " + scopeName(ctx, q, scope) + " did not open")
+			}
+			k.Destroy()
+			if err = q.MarkBrowserWrapTested(ctx, bw.ID, s.now()); err != nil {
+				return nil, err
+			}
+			done = append(done, scope)
+		}
+		_ = q.TouchBrowserKey(ctx, key.ID, s.now())
+		_ = q.Audit(ctx, s.now(), "owner", "passkey_test", "passkey:"+passkeyID(pk.CredentialID), "browser="+seal.BrowserKeyID(t.browserPub)+" scopes="+strings.Join(done, ","))
+		s.bcast.notify()
+		return map[string]any{"ok": true, "scopes": done}, nil
+	}
 	for i, scope := range t.scopes {
 		sw, err := q.ScopeWrap(ctx, row, scope)
 		if err != nil || !bytes.Equal(sw.Salt, t.salts[i][:]) {
@@ -639,14 +788,14 @@ func (s *Server) capCreate(ctx context.Context, r *http.Request, sess string) (a
 	st.credential = cred
 	if st.intent.Capability == "approve-only" {
 		defer func() { st.wipe(); delete(pool.entries, st.id) }()
-		return api.OK{OK: true}, s.commitCapability(ctx, st, nil)
+		return api.OK{OK: true}, s.commitCapability(ctx, st, nil, nil)
 	}
 	return api.OK{OK: true}, nil
 }
 
 // commitCapability inserts a registered passkey and/or its new scope wraps,
 // with any scope key created in this stage, in one transaction.
-func (s *Server) commitCapability(ctx context.Context, st *capStage, wraps []store.ScopeWrapRow) error {
+func (s *Server) commitCapability(ctx context.Context, st *capStage, wraps []store.ScopeWrapRow, browser []store.BrowserWrapRow) error {
 	return s.store.Tx(ctx, func(q *store.Q) error {
 		if err := s.checkStage(ctx, q, st.session, st); err != nil {
 			return err
@@ -677,6 +826,24 @@ func (s *Server) commitCapability(ctx context.Context, st *capStage, wraps []sto
 			} else if err != nil {
 				return err
 			}
+		}
+		if len(browser) > 0 {
+			// The remembered browser's key (public half) and its wraps. The signed
+			// canonical in the audit entry names the passkey and the key's fingerprint.
+			pub, _ := intentBrowser(st.intent)
+			key, err := q.PutBrowserKey(ctx, store.BrowserKeyRow{Passkey: row, Public: pub, Label: st.intent.Label, Created: now})
+			if err != nil {
+				return err
+			}
+			for _, w := range browser {
+				w.Key = key
+				if err := q.PutBrowserWrap(ctx, w); errors.Is(err, store.ErrTestedWrap) {
+					return errConflict("this browser is already remembered for " + scopeName(ctx, q, w.Scope) + " (tested): its wrap was kept")
+				} else if err != nil {
+					return err
+				}
+			}
+			return q.Audit(ctx, now, "owner", "passkey_remember_browser", "passkey:"+passkeyID(st.credential.ID), st.canonical+" signer="+passkeyID(st.signerRaw))
 		}
 		return q.Audit(ctx, now, "owner", "passkey_capability", "passkey:"+passkeyID(st.credential.ID), st.canonical+" signer="+passkeyID(st.signerRaw))
 	})
@@ -730,7 +897,14 @@ func (s *Server) capEvaluate(ctx context.Context, r *http.Request, sess string) 
 	if err != nil {
 		return nil, err
 	}
-	opts, t, err := s.enrolTap(sess, "enrol", text, *st.credential, st.intent.Scopes, salts)
+	browser, _ := intentBrowser(st.intent)
+	if browser != nil {
+		m["browser_key"], m["browser_key_id"] = st.intent.Browser, seal.BrowserKeyID(browser)
+		if text, err = reviewJSON(m); err != nil {
+			return nil, err
+		}
+	}
+	opts, t, err := s.enrolTap(sess, "enrol", text, *st.credential, st.intent.Scopes, salts, browser)
 	if err != nil {
 		return nil, err
 	}
@@ -766,7 +940,8 @@ func (s *Server) capFinish(ctx context.Context, r *http.Request, sess string) (a
 	if err := s.checkStage(ctx, s.store.Q(), sess, st); err != nil {
 		return nil, err
 	}
-	if st.credential == nil || !bytes.Equal(st.credential.ID, t.cred) || !slices.Equal(t.scopes, st.intent.Scopes) {
+	browser, _ := intentBrowser(st.intent)
+	if st.credential == nil || !bytes.Equal(st.credential.ID, t.cred) || !slices.Equal(t.scopes, st.intent.Scopes) || !bytes.Equal(t.browserPub, browser) {
 		return nil, errConflict("stale passkey enrolment; start again")
 	}
 	challenge := seal.OpenChallenge([]byte(c.Canonical), []byte(t.descriptor))
@@ -796,6 +971,7 @@ func (s *Server) capFinish(ctx context.Context, r *http.Request, sess string) (a
 	}
 	defer destroyKeys(keks)
 	var wraps []store.ScopeWrapRow
+	var bwraps []store.BrowserWrapRow
 	for i, sc := range t.scopes {
 		pub := st.created[sc].Public
 		if pub == nil {
@@ -805,6 +981,21 @@ func (s *Server) capFinish(ctx context.Context, r *http.Request, sess string) (a
 			}
 			pub = row.Public
 		}
+		if browser != nil {
+			// The KEK is random bytes from the browser being remembered: the scope
+			// key is wrapped under it and the KEK is sealed to that browser's key.
+			bs := seal.BrowserScope{Installation: s.seal.installation, RPID: s.rpID, RawID: t.cred, Scope: sc, WrapID: t.salts[i], Browser: browser}
+			w, err := bs.Wrap(keks[i], st.keys[sc], pub)
+			if err != nil {
+				return nil, errConflict("could not wrap the scope key; start again")
+			}
+			sealed, err := bs.SealKEK(keks[i])
+			if err != nil {
+				return nil, errConflict("could not seal to the browser key; start again")
+			}
+			bwraps = append(bwraps, store.BrowserWrapRow{ID: bytes.Clone(t.salts[i][:]), Scope: sc, Wrap: w, SealedKEK: sealed, Created: s.now()})
+			continue
+		}
 		ps := seal.PasskeyScope{Installation: s.seal.installation, RPID: s.rpID, RawID: t.cred, Scope: sc, Salt: t.salts[i]}
 		w, err := ps.Wrap(keks[i], st.keys[sc], pub)
 		if err != nil {
@@ -813,11 +1004,17 @@ func (s *Server) capFinish(ctx context.Context, r *http.Request, sess string) (a
 		wraps = append(wraps, store.ScopeWrapRow{Scope: sc, Salt: bytes.Clone(t.salts[i][:]), Wrap: w, Created: s.now()})
 	}
 	defer func() { st.wipe(); delete(pool.entries, st.id) }()
-	if err = s.commitCapability(ctx, st, wraps); err != nil {
+	if err = s.commitCapability(ctx, st, wraps, bwraps); err != nil {
 		return nil, err
 	}
 	s.bcast.notify()
-	s.notify.Send("aqmas: passkey", "A passkey can now open "+strings.Join(t.scopes, ", ")+" [ref "+ref(st.id)+"]", s.cfg.PublicBaseURL+"/")
+	how := ""
+	if browser != nil {
+		// No free text in a notice: the passkey's nickname (normalised) and the
+		// browser key's fingerprint, never the label the owner typed.
+		how = " (" + st.intent.Name + ") from a remembered browser, key " + seal.BrowserKeyID(browser)[:12]
+	}
+	s.notify.Send("aqmas: passkey", "A passkey can now open "+strings.Join(t.scopes, ", ")+how+" [ref "+ref(st.id)+"]", s.cfg.PublicBaseURL+"/")
 	return map[string]any{"ok": true, "scopes": t.scopes}, nil
 }
 
