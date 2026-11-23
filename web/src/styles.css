@@ -2742,3 +2742,126 @@ dialog.search-dialog::backdrop {
   gap: 8px;
   overflow-wrap: anywhere;
 }
+
+/* Remembered browsers (docs/BUCKETS.md §13). How a passkey opens buckets is said in words;
+   the mark is a squared label (the pills are states), dashed for the weaker browser-key mode. */
+.how-mark {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: 0.8125rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.how-mark.browser {
+  border: 2px dashed var(--high);
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+}
+.how-line {
+  margin: 4px 0;
+}
+.pk-buckets {
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.pk-buckets > p {
+  margin: 4px 0;
+}
+.pk-buckets .warn {
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+.browsers {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.browsers li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 4px dashed var(--high);
+  border-radius: 6px;
+  min-width: 0;
+}
+.browsers .browser-what {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+.browsers li .btn {
+  margin-left: auto;
+}
+.remember-offer {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 2px dashed var(--high);
+  border-radius: 8px;
+  min-width: 0;
+}
+.remember-offer h3,
+.remember-offer p {
+  margin: 0;
+}
+.remember-offer .tradeoff {
+  padding: 10px 12px;
+  border-radius: 6px;
+}
+.remember-offer .browser-label,
+.recovery-enrol .recovery-browser {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+.remember-offer .browser-label input {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+.readiness .browser-only {
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+.readiness-list li.ok .badge.state {
+  background: var(--risk-low-bg);
+  color: var(--risk-low);
+  border-color: transparent;
+}
+.readiness-list li .how-from {
+  flex-basis: 100%;
+}
+.not-here {
+  display: block;
+  margin-top: 4px;
+}
+/* The recovery card's long select option used to push the Security page 34 px wider than a
+   phone screen. */
+.recovery select,
+.recovery textarea,
+.recovery input[type="text"] {
+  max-width: 100%;
+  min-width: 0;
+}
+.recovery label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+}

@@ -56,7 +56,9 @@ import type { SetupView } from './setup';
 import { helpPage, type HelpConfig } from './help';
 import { admissionButton, policyForm, type Catalogue } from './catalogue';
 import { bucketsPanel, sealBanner, serving, type SealView } from './sealPanel';
-import { capabilityForm, createScope, testAfterRekey } from './capabilities';
+import { capabilityForm, createScope, howItOpens, testAfterRekey, type BrowserContext } from './capabilities';
+import { BrowserKeys } from './browserKey';
+import { browserPath, type BrowserOpener } from './buckets';
 import { recoveryPanel } from './recoveryPanel';
 import { opensList } from './approvals';
 import {TabWindow,multiPanel,windowAdmin} from './approvals';
@@ -111,7 +113,7 @@ export class App {
       auth: this.auth,
       changed: () => this.changed(),
       propose: (t, c) => this.sheet.openCatalogue(t, c),
-      createScope: (scope, review) => createScope(this.api, this.auth, this.seal!, this.state?.passkeys ?? [], scope, review, () => this.changed()),
+      createScope: (scope, review) => createScope(this.api, this.auth, this.seal!, this.state?.passkeys ?? [], scope, review, () => this.changed(), this.browser),
       readinessNote: () => this.readinessNote(),
     };
   }
@@ -150,10 +152,18 @@ export class App {
   private expanded = new Set<string>();
   private evSeq = 0;
 
-  constructor(root: HTMLElement, api: Api = createApi(), auth: Authenticator = browserAuthenticator()) {
+  /** This profile's browser key (docs/BUCKETS.md §13): read at every refresh, so a key lost
+   * to cleared site data or storage eviction shows as "not remembered" at once. */
+  private browser: BrowserContext;
+
+  constructor(root: HTMLElement, api: Api = createApi(), auth: Authenticator = browserAuthenticator(), keys: BrowserKeys = new BrowserKeys()) {
     this.root = root;
     this.api = api;
     this.auth = auth;
+    this.browser = { keys };
+    // Every tap in the app can take the remembered-browser path through these two.
+    browserPath.keys = keys;
+    browserPath.release = (body) => this.api.sealPost!('browser/release', body);
     this.sheet = new Sheet(this);
     this.focusId = route().focus ?? null;
   }
@@ -196,6 +206,7 @@ export class App {
     try {
       const s = await this.api.state();
       this.seal=s.seal_enabled?await this.api.sealStatus!():undefined;
+      this.browser.local=await this.browser.keys.current();
       this.envState=serving(this.seal)?await this.api.envState!():undefined;
       this.vaultState=serving(this.seal)&&s.catalogue_enabled&&this.api.vaultState?await this.api.vaultState().catch((e)=>{if(e instanceof ApiError&&e.status===404)return undefined;throw e;}):undefined;
       if(this.tab.id()&&!this.seal?.active_windows?.some(w=>w.id===this.tab.id()))this.tab.forget();
@@ -612,11 +623,11 @@ export class App {
         break;
       case "security": {
         // A step waiting for its tap (the guided Enable, Create's or Rekey's follow-up test) keeps its panel until it is done.
-        this.section('readiness',[seal?.passkeys,seal?.scopes,s.passkeys],()=>ready?[readinessPanel({api:this.api,auth:this.auth,passkeys:()=>this.state?.passkeys??[],refresh:()=>this.changed()},seal!,ready)]:[],!ready,!!this.root.querySelector('#sec-readiness .wizard'),0);
+        this.section('readiness',[seal?.passkeys,seal?.scopes,s.passkeys,this.browser.local?.id],()=>ready?[readinessPanel({api:this.api,auth:this.auth,passkeys:()=>this.state?.passkeys??[],refresh:()=>this.changed(),browser:this.browser},seal!,ready)]:[],!ready,!!this.root.querySelector('#sec-readiness .wizard'),0);
         this.section('passkeys',[s.owner,s.passkeys,seal?.passkeys,seal?.scopes,seal?.mode],()=>this.passkeys(s),false,!!this.root.querySelector('#sec-passkeys .capabilities button.confirm'),s.passkeys?.length??0);
         const stepping=!!this.root.querySelector('#sec-buckets .buckets-review button.confirm');
-        this.section('buckets',[seal,s.passkeys,this.tab.id()],()=>live?[bucketsPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed(),this.tab,{createScope:(scope,review)=>createScope(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed()),testAfterRekey:(scope,review)=>testAfterRekey(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed())}),windowAdmin(this.api,this.auth,seal!,this.tab,s.passkeys??[],()=>this.changed())]:[h('p',{class:'empty'},seal?.mode==='migration-required'?'Available after the move to per-credential buckets (Settings → Setup).':'Available once the store is sealed (Settings → Setup).')],!seal,stepping,0);
-        this.section('recovery',[seal?.mode,seal?.installation,seal?.epoch,seal?.scopes,s.passkeys],()=>live?[recoveryPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed())]:[],!live,false,0);
+        this.section('buckets',[seal,s.passkeys,this.tab.id()],()=>live?[bucketsPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed(),this.tab,{createScope:(scope,review)=>createScope(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed(),this.browser),testAfterRekey:(scope,review)=>testAfterRekey(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed(),this.browser)}),windowAdmin(this.api,this.auth,seal!,this.tab,s.passkeys??[],()=>this.changed())]:[h('p',{class:'empty'},seal?.mode==='migration-required'?'Available after the move to per-credential buckets (Settings → Setup).':'Available once the store is sealed (Settings → Setup).')],!seal,stepping,0);
+        this.section('recovery',[seal?.mode,seal?.installation,seal?.epoch,seal?.scopes,s.passkeys],()=>live?[recoveryPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed(),this.browser)]:[],!live,false,0);
         break;
       }
       case "settings":
@@ -885,7 +896,7 @@ export class App {
     return [
       h("div", { class: "tiles" }, list.map((p) => this.passkeyTile(p, only))),
       only ? h("p", { class: "muted" }, "Add a second passkey (another password manager or a hardware key) so you can still get in if you lose this one.") : null,
-      h("div", { class: "pk-foot" }, this.seal ? serving(this.seal) ? capabilityForm(this.api, this.auth, this.seal, list, () => this.changed()) : "Passkeys are managed here again after the move to per-credential buckets (Setup)." : add, signedIn),
+      h("div", { class: "pk-foot" }, this.seal ? serving(this.seal) ? capabilityForm(this.api, this.auth, this.seal, list, () => this.changed(), this.browser) : "Passkeys are managed here again after the move to per-credential buckets (Setup)." : add, signedIn),
     ];
   }
 
@@ -893,7 +904,12 @@ export class App {
   private bucketBadge(p: PasskeyInfo): HTMLElement | null {
     const k = serving(this.seal) ? this.seal!.passkeys?.find((x) => x.id === p.id) : undefined;
     if (!k) return null;
-    if (!k.prf || k.opens === 0) return h("span", { class: "badge", title: "Not enabled for any scope yet: Passkeys → Enable" }, "Opens nothing yet");
+    if ((!k.prf && k.mode !== "browser") || k.opens === 0) return h("span", { class: "badge", title: "Not enabled for any scope yet: Passkeys → Enable" }, "Opens nothing yet");
+    if (k.mode === "browser") {
+      const how = howItOpens(k)!;
+      const here = (k.browsers ?? []).some((b) => b.id === this.browser.local?.id);
+      return h("span", { class: how.cls, title: `${how.text}: ${(k.browsers ?? []).map((b) => b.label).join(", ")}` }, `${how.mark}: opens ${k.opens} of ${k.of} buckets${here ? " from this browser" : ", not from this browser"}`);
+    }
     return h("span", { class: "badge", title: k.missing.length ? "Not enabled for " + k.missing.map((m) => this.seal!.scopes?.find((x) => x.scope === m)?.title ?? m).join(", ") : "Enabled for every scope" }, `Opens ${k.opens} of ${k.of} buckets`);
   }
 
@@ -1513,10 +1529,17 @@ class Sheet {
   }
 
   /** Which passkeys can open what this tap needs (§4.4: a passkey without PRF cannot). */
-  private whoCanOpen(raw: string[]): HTMLElement {
+  private whoCanOpen(raw: string[], browsers: BrowserOpener[] = []): HTMLElement {
     const names = this.app.passkeyNames(raw);
-    if (!raw.length) return h("p", { class: "warn" }, "No passkey can open these buckets: this works only while they are already open.");
-    return h("p", { class: "muted" }, names.length ? `A passkey that can open them: ${names.map((n) => vt(n)).join(", ")}. Another passkey only approves if they are already open.` : "Only some of your passkeys can open them.");
+    // Passkeys without PRF open only from a remembered browser (§13): name the browser, and
+    // say when that is not this one.
+    const elsewhere = browsers.filter((b) => !b.here && !raw.includes(b.credential_id));
+    const away = [...new Set(elsewhere.map((b) => b.credential_id))].map((c) => `${vt(this.app.passkeyNames([c])[0] ?? "a passkey")} only from ${elsewhere.filter((b) => b.credential_id === c).map((b) => `“${vt(b.label)}”`).join(" or ")}`);
+    const note = away.length ? h("span", { class: "not-here" }, ` Not from this browser: ${away.join("; ")}. If this browser was remembered, its key is gone: enable it again in Security → Passkeys.`) : null;
+    if (!raw.length) return h("p", { class: "warn" }, away.length ? "No passkey can open these buckets from this browser: this works only while they are already open." : "No passkey can open these buckets: this works only while they are already open.", note);
+    const here = browsers.filter((b) => b.here && raw.includes(b.credential_id)).map((b) => b.credential_id);
+    const words = names.length ? `A passkey that can open them: ${raw.map((r) => { const n = this.app.passkeyNames([r])[0]; return n ? vt(n) + (here.includes(r) ? " (with this remembered browser)" : "") : ""; }).filter(Boolean).join(", ")}. Another passkey only approves if they are already open.` : "Only some of your passkeys can open them.";
+    return h("p", { class: "muted" }, words, note);
   }
 
   private cancelButton(): HTMLButtonElement {
@@ -1777,7 +1800,7 @@ class Sheet {
       p.canonical.plan ? h('dl',{class:'facts'},d.fields.map(([k,v])=>fact(vt(k),h('bdi',null,vt(v))))) : null,
       removingCurrent ? h("p", { class: "warn" }, "This is the passkey you signed in with: you will be signed out here.") : null,
       p.open ? opensList(p.open.lines) : null,
-      p.open ? this.whoCanOpen(p.open.canOpen) : null,
+      p.open ? this.whoCanOpen(p.open.canOpen, p.open.browsers) : null,
       h(
         "details",
         { class: "signed" },

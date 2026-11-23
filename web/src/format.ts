@@ -58,6 +58,8 @@ const AUDIT_LABELS: Record<string, string> = {
   cf_token_mint: "Cloudflare token minted",
   cf_token_delete: "Cloudflare token deleted",
   cf_token_orphan: "stray Cloudflare token deleted",
+  passkey_remember_browser: "browser remembered for a passkey",
+  passkey_forget_browser: "remembered browser forgotten",
 };
 
 /** Plain words for an audit action (unknown ones are shown as they are). */

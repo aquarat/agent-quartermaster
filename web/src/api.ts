@@ -40,6 +40,7 @@ export type SealPath =
   | `control/${"challenge" | "finish"}`
   | `passkeys/${"challenge" | "authorize" | "create" | "evaluate" | "finish"}`
   | `recovery/${"key" | "challenge" | "finish"}`
+  | "browser/release"
   | `stage/${"challenge" | "finish"}`
   | `batch/${"challenge" | "finish"}`
   | "drill"

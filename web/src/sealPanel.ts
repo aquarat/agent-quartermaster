@@ -49,10 +49,24 @@ export interface PasskeyScopes {
   name: string;
   current: boolean;
   prf: boolean;
+  /** How it opens buckets: "prf" (its own secret), "browser" (only from the remembered
+   * browsers listed, §13) or "" (nothing yet). Absent from an older server. */
+  mode?: "prf" | "browser" | "";
+  browsers?: RememberedBrowser[];
   scopes: { scope: string; tested: boolean }[];
   opens: number;
   of: number;
   missing: string[];
+}
+/** One remembered browser of a passkey without PRF. `id` is the fingerprint of its key. */
+export interface RememberedBrowser {
+  id: string;
+  /** The key's public half (base64url): what Forget and Test name. */
+  key: string;
+  label: string;
+  created_at: string;
+  last_used_at?: string;
+  scopes: { scope: string; tested: boolean }[];
 }
 export interface StageScope {
   scope: string;

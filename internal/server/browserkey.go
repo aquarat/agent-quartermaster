@@ -168,7 +168,8 @@ func (s *Server) browserRelease(ctx context.Context, r *http.Request, sess strin
 
 // browserView is one remembered browser in GET /api/ui/seal/status.
 type browserView struct {
-	ID       string          `json:"id"` // fingerprint of the public half
+	ID       string          `json:"id"`  // fingerprint of the public half
+	Key      string          `json:"key"` // the public half (base64url): what a Forget names
 	Label    string          `json:"label"`
 	Created  string          `json:"created_at"`
 	LastUsed string          `json:"last_used_at,omitempty"`
@@ -182,7 +183,7 @@ func browserViews(keys []store.BrowserKeyRow, wraps []store.BrowserWrapRow, pass
 		if k.Passkey != passkey {
 			continue
 		}
-		v := browserView{ID: seal.BrowserKeyID(k.Public), Label: k.Label, Created: k.Created.UTC().Format("2006-01-02T15:04:05Z"), Scopes: []coverageScope{}}
+		v := browserView{ID: seal.BrowserKeyID(k.Public), Key: encodeID(k.Public), Label: k.Label, Created: k.Created.UTC().Format("2006-01-02T15:04:05Z"), Scopes: []coverageScope{}}
 		if k.LastUsed != nil {
 			v.LastUsed = k.LastUsed.UTC().Format("2006-01-02T15:04:05Z")
 		}
