@@ -67,6 +67,10 @@ type scopeView struct {
 	Title   string `json:"title"`
 	Buckets int    `json:"buckets"`
 	HasKey  bool   `json:"has_key"`
+	// Tested: some passkey has opened the scope key since it was created or
+	// rekeyed. A keyed scope that is not tested opens only from the passkey
+	// that made it (untested) or the recovery key.
+	Tested bool `json:"tested"`
 }
 type pausedView struct {
 	Kind   string `json:"kind"`
@@ -196,10 +200,17 @@ func (s *Server) sealView(ctx context.Context, sess string) (sealView, error) {
 		return slices.ContainsFunc(scopes, func(x store.ScopeRow) bool { return x.Scope == sc })
 	}
 	titles := map[string]string{seal.ScopeInstallation: "Installation"}
-	v.Scopes = append(v.Scopes, scopeView{seal.ScopeInstallation, "Installation", count[seal.ScopeInstallation], has(seal.ScopeInstallation)})
+	v.Scopes = append(v.Scopes, scopeView{Scope: seal.ScopeInstallation, Title: "Installation", Buckets: count[seal.ScopeInstallation], HasKey: has(seal.ScopeInstallation)})
 	for _, o := range orgs {
 		titles[o.ID] = o.Title
-		v.Scopes = append(v.Scopes, scopeView{o.ID, o.Title, count[o.ID], has(o.ID)})
+		v.Scopes = append(v.Scopes, scopeView{Scope: o.ID, Title: o.Title, Buckets: count[o.ID], HasKey: has(o.ID)})
+	}
+	for i := range v.Scopes {
+		if v.Scopes[i].HasKey {
+			if v.Scopes[i].Tested, err = q.ScopeTested(ctx, v.Scopes[i].Scope); err != nil {
+				return v, err
+			}
+		}
 	}
 	open := z.pool.snapshot()
 	for _, b := range buckets {

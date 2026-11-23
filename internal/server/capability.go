@@ -215,12 +215,13 @@ func (s *Server) keepScopes(ctx context.Context, q *store.Q, row int64, scopes [
 	if err != nil {
 		return err
 	}
+	var hit []string
 	for _, sc := range scopes {
 		if slices.Contains(orphans, sc) {
-			return errConflict("this is the only passkey that can open " + scopeName(ctx, q, sc) + ": enable another passkey for it first")
+			hit = append(hit, sc)
 		}
 	}
-	return nil
+	return s.orphanErr(ctx, q, row, hit)
 }
 
 // keepUnlock refuses to take away the last passkey that can open a scope
@@ -233,14 +234,50 @@ func (s *Server) keepUnlock(ctx context.Context, q *store.Q, row int64) error {
 	if err != nil {
 		return err
 	}
-	if len(orphans) > 0 {
-		var names []string
-		for _, sc := range orphans {
-			names = append(names, scopeName(ctx, q, sc))
-		}
-		return errConflict("this is the only passkey that can open " + strings.Join(names, ", ") + ": enable another passkey for it first")
+	return s.orphanErr(ctx, q, row, orphans)
+}
+
+// orphanErr says why taking the passkey away would orphan these scopes. When
+// another passkey is enabled for one but not tested yet, it says to test that
+// passkey rather than to enable one (only tested wraps count).
+func (s *Server) orphanErr(ctx context.Context, q *store.Q, row int64, orphans []string) error {
+	if len(orphans) == 0 {
+		return nil
 	}
-	return nil
+	wraps, err := q.ScopeWraps(ctx, 0)
+	if err != nil {
+		return err
+	}
+	all, err := loadPasskeys(ctx, q)
+	if err != nil {
+		return err
+	}
+	nick := func(id int64) string {
+		for _, p := range all {
+			if p.ID == id {
+				return p.Name
+			}
+		}
+		return "the other passkey"
+	}
+	var names, untested []string
+	for _, sc := range orphans {
+		names = append(names, scopeName(ctx, q, sc))
+		for _, w := range wraps {
+			if w.Scope == sc && w.Passkey != row && w.Tested == nil {
+				untested = append(untested, "test passkey "+nick(w.Passkey)+" for "+scopeName(ctx, q, sc))
+				break
+			}
+		}
+	}
+	if len(untested) == len(orphans) {
+		return errConflict("no other passkey has opened " + strings.Join(names, ", ") + " yet: " + strings.Join(untested, "; ") + " first (Admin → Passkeys → Test)")
+	}
+	msg := "this is the only passkey that can open " + strings.Join(names, ", ") + ": enable another passkey for it first"
+	if len(untested) > 0 {
+		msg += " (" + strings.Join(untested, "; ") + ")"
+	}
+	return errConflict(msg)
 }
 
 func (s *Server) capCanonical(action, id string, in capIntent) (string, error) {

@@ -89,6 +89,18 @@ func TestReviewScopeWrapGuards(t *testing.T) {
 	if !bytes.Equal(after.Wrap, before.Wrap) || after.Tested == nil {
 		t.Fatal("the tested wrap changed")
 	}
+	// After a rekey the wrap is untested, and recovery enrol (PutScopeWrap) may
+	// replace it: the way back in when the rekeying passkey's test fails.
+	salt2 := seal.RandomID()
+	requireNoError(t, q.RekeyScopeWrap(ctx, store.ScopeWrapRow{Passkey: owner, Scope: seal.ScopeInstallation, Salt: salt2[:], Wrap: bytes.Repeat([]byte{2}, 73), Created: v.clock.Now()}))
+	if w, _ := q.ScopeWrap(ctx, owner, seal.ScopeInstallation); w.Tested != nil {
+		t.Fatal("a rekeyed wrap reads as tested")
+	}
+	requireNoError(t, q.PutScopeWrap(ctx, store.ScopeWrapRow{Passkey: owner, Scope: seal.ScopeInstallation, Salt: before.Salt, Wrap: before.Wrap, Created: v.clock.Now()}))
+	requireNoError(t, q.MarkScopeWrapTested(ctx, before.ID, v.clock.Now()))
+	if w, _ := q.ScopeWrap(ctx, owner, seal.ScopeInstallation); !bytes.Equal(w.Wrap, before.Wrap) || w.Tested == nil {
+		t.Fatal("recovery enrol did not replace the untested wrap")
+	}
 	// An untested wrap of the organisation (enable, not yet tested).
 	spare := v.registerSpare("unlock", []string{v.org}, []byte("spare-secret"))
 	sw := v.wraps(spare)
@@ -110,6 +122,10 @@ func TestReviewScopeWrapGuards(t *testing.T) {
 	// Its untested wrap of the organisation does not count: the owner stays the last.
 	if o, err := q.OrphanedScopes(ctx, owner); err != nil || !slices.Equal(o, []string{v.org}) {
 		t.Fatalf("orphaned scopes %v %v", o, err)
+	}
+	// Removal says to test the other passkey, not to enable one.
+	if err := v.s.keepUnlock(ctx, q, owner); err == nil || !strings.Contains(err.Error(), "test passkey") {
+		t.Fatalf("removal refusal text: %v", err)
 	}
 	if _, err := db.Exec(`DELETE FROM passkeys WHERE id=?`, owner); err == nil || !strings.Contains(err.Error(), "last passkey") {
 		t.Fatalf("the trigger let the last tested passkey of a scope go: %v", err)

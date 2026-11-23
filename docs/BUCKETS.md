@@ -242,7 +242,9 @@ session starts and shows the list on its red card.
 
 **Admin → Buckets** lists every bucket (kind, path, scope), whether it is open, each hold (why,
 ref, until), paused users with **Reopen**, per-scope **Rekey**, and **Close all**. Per passkey:
-**Opens N of M buckets**, scopes enabled and tested, **Not enabled for …**.
+**Opens N of M buckets**, scopes enabled and tested, **Not enabled for …**. A keyed scope no
+passkey has opened since it was created or rekeyed carries `tested: false` and the badge
+**Not tested yet** (empty) or **Untested after rekey** (with buckets).
 `GET /api/ui/seal/status` returns `{mode, installation, epoch, scopes[], buckets[],
 passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
 
@@ -252,9 +254,11 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
   1's flow) and, in the same tap, opens the scope keys (PRF, ≤ two scopes); the new passkey
   then taps once with fresh salts for those scopes; the broker wraps each open scope key under
   the new KEKs and wipes it. Repeat per two scopes. The new wraps are marked tested the first
-  time they open something; **Test** in Admin does that on demand. A **tested** wrap is never
-  replaced (the KEKs come from the page): enabling a passkey for a scope it already opens is
-  refused, and the store refuses the write. A stage holds the opened scope keys between the
+  time they open something; **Enable** in Admin ends with that test round (so "enable B,
+  then remove A" needs no separate step) and **Test** does it on demand. A **tested** wrap is
+  never replaced (the KEKs come from the page): the page skips scopes the passkey already
+  opens tested, the broker refuses an enable naming one, and the store refuses the write. An
+  untested wrap may be replaced by an enable or a recovery enrol. A stage holds the opened scope keys between the
   two taps; it is wiped when it finishes, at its five-minute deadline (its own timer and the
   15 s reconcile pass) and by Close all.
 * **Enrol with the recovery key** (when no passkey can open a scope any more): Admin, paste
@@ -272,7 +276,8 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
   first write answers "test the new scope first".
 * **Remove a passkey:** its wraps go with it (cascade). The broker refuses to remove (or
   disable for a scope) a passkey with a wrap of a scope for which no **other** passkey has a
-  **tested** wrap; an untested wrap does not count. The same rule, per scope, is the trigger
+  **tested** wrap; an untested wrap does not count (the refusal then says which passkey to
+  test). The same rule, per scope, is the trigger
   `keep_one_scope_passkey`, recreated at every boot. Removal does not revoke copies of its wraps in old backups:
   for a lost or stolen passkey, **Rekey** its scopes.
 * **Rekey a scope** (one tap by a passkey that opens it): new `skS'`; every bucket of the
@@ -283,8 +288,10 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
   descriptor's fresh `rekey_salt` gives the KEK that `skS'` is wrapped under, with that salt.
   So a KEK of the old salt (one malicious-page tap before the rekey) plus a later DB copy does
   not open `skS'`. The broker cannot check the fresh KEK before it is used, so the new wrap is
-  **untested** until it next opens: test it at once (until then the recovery key is the only
-  proven way in, and new buckets in the scope wait for that test).
+  **untested** until it next opens: the page chains a **Test** tap of the same passkey right
+  after the rekey, and Admin shows the scope as **Untested after rekey** until a test passes.
+  If it fails, the way back in is the recovery key: recovery enrol may replace an untested
+  wrap (never a tested one), so it can re-wrap the rekeying passkey itself.
 * The store runs with `PRAGMA secure_delete=ON` and checkpoints the WAL after removals,
   migrations and rekeys, so freed pages do not keep old wraps.
 

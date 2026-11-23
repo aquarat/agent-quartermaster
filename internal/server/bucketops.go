@@ -654,9 +654,10 @@ func (s *Server) holdLive(ctx context.Context, q *store.Q, h bucketHold) (bool, 
 	case "tap":
 		return true, nil
 	case "auto":
-		// Until restart, Close all, or the policy no longer auto-approving.
+		// Until restart, Close all, or the policy no longer auto-approving. Fails
+		// closed: a policy that cannot be read drops the hold.
 		on, err := s.cfAutoOn(ctx, q, id)
-		return on || err != nil, nil
+		return on && err == nil, nil
 	case "request":
 		g, err := q.GrantByRequest(ctx, id)
 		if err != nil {

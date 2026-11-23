@@ -103,7 +103,10 @@ describe("buckets in the UI", () => {
     // Rekey warns before anything is signed.
     button(sec.querySelector<HTMLElement>(".scope")!, /^Rekey…$/)!.click();
     await until(() => sec.querySelector(".buckets-review")!.textContent!.includes(REKEY_WARNING));
-    expect(sec.querySelector(".buckets-review .open-lines")!.textContent).toContain("Opens SSH user CA");
+    // A rekey closes its buckets: they are re-keyed, not listed as opened.
+    expect(sec.querySelector(".buckets-review .open-lines")!.textContent).toContain("Re-keys SSH user CA");
+    expect(sec.querySelector(".buckets-review .open-lines")!.textContent).not.toContain("Opens SSH user CA");
+    expect(REKEY_WARNING).toContain("Admin → Recovery");
     // Close all: one signed tap, opens nothing, closes everything.
     button(sec, /^Close all…$/)!.click();
     await until(() => sec.querySelector(".buckets-review")!.textContent!.includes(CLOSE_ALL_TEXT));

@@ -271,9 +271,13 @@ export function describeOpen(d: Descriptor): string[] {
     const verb = d.purpose === "test" ? "Tests" : d.purpose === "migrate" ? "Opens the format-1 key and creates" : "Creates";
     return [`${verb} this passkey's key for: ${d.scopes.join(", ")}. Opens no credential.`];
   }
-  const rekey = d.rekey_salt ? [`Rekeys ${d.scopes[0]}: your passkey's new key uses a fresh PRF input. Test it afterwards (Admin → Passkeys → Test).`] : [];
-  if (!d.buckets.length) return [`Opens the scope key of ${d.scopes.join(" and ")} for the length of this tap (no credential stays open).`, ...rekey];
-  return [...d.buckets.map((b) => `Opens ${b.label}: ${holdWords(b.hold, b.until)}`), ...rekey];
+  if (d.rekey_salt) {
+    // A rekey opens the old keys only to re-encrypt: every bucket of the scope ends closed.
+    const re = d.buckets.length ? [`Re-keys ${d.buckets.map((b) => b.label).join(", ")} (closes them; users pause until you Reopen them).`] : [];
+    return [...re, `Rekeys ${d.scopes[0]}: your passkey's new key uses a fresh PRF input. It taps once more right afterwards to test it.`];
+  }
+  if (!d.buckets.length) return [`Opens the scope key of ${d.scopes.join(" and ")} for the length of this tap (no credential stays open).`];
+  return d.buckets.map((b) => `Opens ${b.label}: ${holdWords(b.hold, b.until)}`);
 }
 
 // ---- the tap ----

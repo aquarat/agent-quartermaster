@@ -56,7 +56,7 @@ import type { SetupView } from './setup';
 import { helpPage, type HelpConfig } from './help';
 import {cataloguePage,type Catalogue} from './catalogue';
 import { bucketIndicator, bucketsPanel, sealBanner, serving, type SealView } from './sealPanel';
-import { capabilityForm, createScope } from './capabilities';
+import { capabilityForm, createScope, testAfterRekey } from './capabilities';
 import { recoveryPanel } from './recoveryPanel';
 import { opensList } from './approvals';
 import {TabWindow,multiPanel,windowAdmin} from './approvals';
@@ -461,11 +461,13 @@ export class App {
     this.renderIndicator();
     if(this.page!=='queue'){
       document.title=`${this.page==='admin'?'Admin':this.page==='setup'?'Setup':'Help'} · aqmas`;
-      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys,this.seal?.passkeys,this.seal?.scopes,this.seal?.mode],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);}
+      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys,this.seal?.passkeys,this.seal?.scopes,this.seal?.mode],()=>this.passkeys(s),false,!!this.root.querySelector('#sec-passkeys .capabilities button.confirm'));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);}
       else if(this.page==='help'&&this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
       if(this.page==='admin'){
         const seal=this.seal, live=serving(seal);
-        this.section('buckets',[seal,s.passkeys,this.tab.id()],()=>live?[bucketsPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed(),this.tab,{createScope:(scope,review)=>createScope(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed())}),windowAdmin(this.api,this.auth,seal!,this.tab,s.passkeys??[],()=>this.changed())]:[h('p',{class:'empty'},seal?.mode==='migration-required'?'Available after the move to per-credential buckets (Setup).':'Available once the store is sealed (Setup).')],!seal);
+        // A step waiting for its tap (Create's or Rekey's follow-up test) keeps the panel until it is done.
+        const stepping=!!this.root.querySelector('#sec-buckets .buckets-review button.confirm');
+        this.section('buckets',[seal,s.passkeys,this.tab.id()],()=>live?[bucketsPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed(),this.tab,{createScope:(scope,review)=>createScope(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed()),testAfterRekey:(scope,review)=>testAfterRekey(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed())}),windowAdmin(this.api,this.auth,seal!,this.tab,s.passkeys??[],()=>this.changed())]:[h('p',{class:'empty'},seal?.mode==='migration-required'?'Available after the move to per-credential buckets (Setup).':'Available once the store is sealed (Setup).')],!seal,stepping);
         this.section('recovery',[seal?.mode,seal?.installation,seal?.epoch,seal?.scopes,s.passkeys],()=>live?[recoveryPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed())]:[],!live);
       }
       if(this.page==='admin')this.section('orgs',this.catalogue,()=>this.catalogue?[cataloguePage(this.catalogue,(t,c)=>this.sheet.openCatalogue(t,c))]:['Available after personal activation.']);

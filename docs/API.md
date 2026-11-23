@@ -701,7 +701,7 @@ the second the scope KEK.
 `GET /api/ui/seal/status` (session):
 
     {"mode", "installation", "epoch",
-     "scopes":   [{"scope","title","buckets","has_key"}],
+     "scopes":   [{"scope","title","buckets","has_key","tested"}],
      "buckets":  [{"id","kind","label","scope","scope_title","open","opened_at"?,
                    "holds":[{"kind","ref","reason","until"?,"since"}],
                    "paused":[{"kind","ref","reason"}]}],

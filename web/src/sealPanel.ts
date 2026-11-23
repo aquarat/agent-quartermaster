@@ -40,6 +40,8 @@ export interface ScopeInfo {
   title: string;
   buckets: number;
   has_key: boolean;
+  /** Some passkey has opened the key since it was created or rekeyed (absent: older server). */
+  tested?: boolean;
 }
 export interface PasskeyScopes {
   /** The passkey's id as in UIState.passkeys (hex). */
@@ -117,7 +119,7 @@ export function bucketIndicator(v: SealView): HTMLElement {
 }
 
 export const REKEY_WARNING =
-  "Rekey replaces this scope's key and every bucket key in it, and re-encrypts every value. Do it after losing a passkey or a backup: removing a passkey does not revoke copies of its wraps in old backups. Your passkey's new key uses a fresh PRF input: test it right afterwards (Admin → Passkeys → Test). Afterwards only this passkey can open the scope: enable your other passkeys again from it. Open buckets of the scope close and their users pause until you Reopen them. Old copies then expose only values as they were at the copy.";
+  "Rekey replaces this scope's key and every bucket key in it, and re-encrypts every value. Do it after losing a passkey or a backup: removing a passkey does not revoke copies of its wraps in old backups. Your passkey's new key uses a fresh PRF input that the broker cannot check in advance, so it taps once more right afterwards to test it; if that fails, the recovery key (Admin → Recovery) is the way back in. Afterwards only this passkey can open the scope: enable your other passkeys again from it. Open buckets of the scope close and their users pause until you Reopen them. Old copies then expose only values as they were at the copy.";
 
 export const CLOSE_ALL_TEXT = "Close all wipes every open bucket key and hold and ends every approval window, without a restart. Grants that need a bucket pause until you Reopen them.";
 
@@ -231,6 +233,8 @@ function untilEl(iso: string | undefined): Child {
 export interface BucketsHooks {
   /** Start the passkey flow that creates an organisation's scope key (capabilities.ts). */
   createScope?(scope: string, review: HTMLElement): Promise<void>;
+  /** After a successful rekey: chain the rekeying passkey's test tap (capabilities.ts). */
+  testAfterRekey?(scope: string, review: HTMLElement): Promise<void>;
 }
 
 /** Admin → Buckets: every bucket, what holds it open, what waits for a Reopen, per-scope
@@ -262,12 +266,18 @@ export function bucketsPanel(api: Api, auth: Authenticator, v: SealView, pks: Pa
       label,
     );
   /** Review → one tap. The tap button calls the passkey prompt before any other await. */
-  const confirm = (title: string, warning: string | null, c: Awaited<ReturnType<typeof beginControl>>) => {
+  const confirm = (title: string, warning: string | null, c: Awaited<ReturnType<typeof beginControl>>, after?: () => Promise<void>) => {
     const sign = h("button", { type: "button", class: "btn approve confirm" }, title + " with passkey");
     sign.addEventListener("click", () => {
       sign.disabled = true;
       c.finish(auth).then(
-        () => {
+        async () => {
+          if (after)
+            // The follow-up renders its own step; refresh only once it is done.
+            return after().catch((e) => {
+              err(e);
+              refresh();
+            });
           replace(review, h("p", null, "Done."));
           refresh();
         },
@@ -318,9 +328,14 @@ export function bucketsPanel(api: Api, auth: Authenticator, v: SealView, pks: Pa
           }),
         );
     } else if (info) {
+      if (info.tested === false)
+        head.append(
+          h("span", { class: "badge warn", title: "No passkey has opened this scope key yet: Admin → Passkeys → Test, or Admin → Recovery" }, mine.length ? "Untested after rekey" : "Not tested yet"),
+        );
+      const after = hooks.testAfterRekey ? () => hooks.testAfterRekey!(s, review) : undefined;
       head.append(
         button("Rekey…", async () => {
-          confirm(`Rekey ${info.title || s}`, REKEY_WARNING, await beginControl(api, v, "rekey", { scope: s }));
+          confirm(`Rekey ${info.title || s}`, REKEY_WARNING, await beginControl(api, v, "rekey", { scope: s }), after);
         }, "btn deny small"),
       );
     }

@@ -102,6 +102,16 @@ describe("passkeys and scopes", () => {
     expect(after.scopes.every((s) => !s.tested)).toBe(true);
   });
 
+  test("enable skips scopes already tested; with all of them tested there is nothing to enable", async () => {
+    const v = await status();
+    const y = await pk(yk.id);
+    const [a, b] = y.scopes.map((s) => s.scope);
+    const title = (s: string) => v.scopes!.find((x) => x.scope === s)!.title;
+    const one = await startCapability(api, v, intent({ action: "enable", credential_id: yk.id, scopes: [a!, b!] }), rp, 0, { skip: [a!] });
+    expect(one.title).toBe(`Enable ${m.store.passkeys[2]!.info.nickname} for ${title(b!)}`);
+    await expect(startCapability(api, v, intent({ action: "enable", credential_id: yk.id, scopes: [a!] }), rp, 0, { skip: [a!] })).rejects.toThrow(/nothing to enable/);
+  });
+
   test("test marks the wraps tested, one tap per two scopes by the target", async () => {
     const y = await pk(yk.id);
     const steps = await run(await startCapability(api, await status(), intent({ action: "test", credential_id: yk.id, scopes: y.scopes.map((s) => s.scope) }), rp), () => yk);

@@ -396,6 +396,9 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 	// is queued for the owner instead of failing: the transaction is retried
 	// once without standing rules.
 	skipStanding := false
+	// The retry starts from the request as built above: the rolled-back attempt
+	// may have set any field (TTL, status, decision), and ttl.
+	base, baseTTL := *req, ttl
 	tx := func(q *store.Q) error {
 		if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
 			return err
@@ -472,7 +475,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 	err = s.store.Tx(ctx, tx)
 	if errors.Is(err, errStandingClosed) {
 		skipStanding, standingUsed = true, nil
-		req.Status, req.StandingID, req.DecidedAt, req.DecisionNote = api.StatusPending, "", nil, ""
+		*req, ttl = base, baseTTL
 		err = s.store.Tx(ctx, tx)
 	}
 	if err != nil {

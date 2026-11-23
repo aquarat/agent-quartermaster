@@ -87,15 +87,26 @@ export function checkCapability(text: string, v: SealView, i: Intent, scopes: st
 
 const titleOf = (v: SealView, s: string) => v.scopes?.find((x) => x.scope === s)?.title || s;
 
+/** The scopes this passkey already opens with a tested wrap: an enable skips them (the broker
+ * never replaces a tested wrap). */
+export function testedScopes(v: SealView, pks: PasskeyInfo[], raw: string): string[] {
+  const id = pks.find((p) => p.raw_id === raw)?.id;
+  return (v.passkeys ?? []).find((p) => p.id === id)?.scopes.filter((s) => s.tested).map((s) => s.scope) ?? [];
+}
+
 /** The whole loop for one intent: rounds of at most two scopes. Nothing is signed until a
  * step's tap(auth). With `thenTest`, an enable ends with test rounds of the same scopes (a
- * new scope takes no value until a passkey has opened it once). */
-export async function startCapability(api: Api, v: SealView, i: Intent, rp: string, round = 0, opts: { thenTest?: boolean } = {}): Promise<Step> {
-  const all = [...new Set(i.scopes)];
+ * new scope takes no value until a passkey has opened it once, and only a tested wrap lets
+ * another passkey be removed). An enable skips `opts.skip` (scopes already tested). */
+export async function startCapability(api: Api, v: SealView, i: Intent, rp: string, round = 0, opts: { thenTest?: boolean; skip?: string[] } = {}): Promise<Step> {
+  const skip = i.action === "enable" ? (opts.skip ?? []) : [];
+  const all = [...new Set(i.scopes)].filter((s) => !skip.includes(s));
+  if (i.action === "enable" && i.scopes.length && !all.length) throw Error(`${i.nickname} already opens ${i.scopes.map((s) => titleOf(v, s)).join(", ")} (tested): nothing to enable`);
   const perRound = 2;
   const rounds = Math.max(1, Math.ceil(all.length / perRound));
   const mine = all.slice(round * perRound, round * perRound + perRound);
   const body = { ...i, scopes: mine };
+  i = { ...i, scopes: all };
   const b = await api.sealPost!<Review>("passkeys/challenge", body);
   const { id, facts } = checkCapability(b.canonical, v, i, mine);
   const keyed = new Set((v.scopes ?? []).filter((s) => s.has_key).map((s) => s.scope));
@@ -228,6 +239,27 @@ export function runSteps(review: HTMLElement, auth: Authenticator, first: Step, 
   show(first);
 }
 
+/** A keyed scope no passkey has opened since it was made: with buckets in it, only a rekey
+ * gets it there. `tested` is absent from an older server: then it reads as tested. */
+export const untestedAfterRekey = (v: SealView, scope: string) => {
+  const s = v.scopes?.find((x) => x.scope === scope);
+  return !!s && s.has_key && s.tested === false && s.buckets > 0;
+};
+const untestedWords = (v: SealView, scope: string) => (untestedAfterRekey(v, scope) ? "untested after rekey: Test it now" : "not tested yet");
+
+export const REKEY_TEST_FAILED = "The rekeyed scope did not open from this passkey. Try the test again; if it keeps failing, use the recovery key: Admin → Recovery.";
+
+/** Right after a rekey: the rekeying passkey tests its new wrap (one tap). Until it does, the
+ * scope opens only from the recovery key. A failed test says so. */
+export async function testAfterRekey(api: Api, auth: Authenticator, v: SealView, pks: PasskeyInfo[], scope: string, review: HTMLElement, refresh: () => void): Promise<void> {
+  const me = pks.find((p) => p.current);
+  if (!me?.raw_id) throw Error("Sign in with the passkey that rekeyed, then Admin → Passkeys → Test. " + REKEY_TEST_FAILED);
+  const step = await startCapability(api, v, { action: "test", capability: "unlock", nickname: me.nickname, credential_id: me.raw_id, scopes: [scope] }, location.hostname);
+  runSteps(review, auth, { ...step, title: `Rekey done: test ${me.nickname}'s new key for ${titleOf(v, scope)}`, tap: (a) => step.tap(a).catch((e: unknown) => {
+    throw Error(`${(e as Error).message}. ${REKEY_TEST_FAILED}`);
+  }) }, refresh);
+}
+
 /** Admin → Buckets "Create": the signed-in passkey creates an organisation's scope key, then
  * tests it (three taps): the broker writes nothing into a scope no passkey has opened yet. */
 export async function createScope(api: Api, auth: Authenticator, v: SealView, pks: PasskeyInfo[], scope: string, review: HTMLElement, refresh: () => void): Promise<void> {
@@ -275,11 +307,15 @@ export function capabilityForm(api: Api, auth: Authenticator, v: SealView, pks: 
       { class: "pk-buckets", "data-passkey": p.id },
       h("p", null, h("strong", null, vt(nick)), " · ", `Opens ${p.opens} of ${p.of} buckets`, p.current ? " · signed in" : ""),
       !p.prf ? h("p", { class: "muted" }, "Sign and approve only: this passkey has no PRF, so it opens nothing. It can approve while a bucket is already open.") : null,
-      p.scopes.length ? h("p", { class: "muted" }, "Enabled for: ", p.scopes.map((s) => `${titleOf(v, s.scope)} (${s.tested ? "tested" : "not tested yet"})`).join(", ")) : null,
+      p.scopes.length ? h("p", { class: "muted" }, "Enabled for: ", p.scopes.map((s) => `${titleOf(v, s.scope)} (${s.tested ? "tested" : untestedWords(v, s.scope)})`).join(", ")) : null,
       p.missing.length ? h("p", { class: "warn" }, "Not enabled for ", p.missing.map((s) => titleOf(v, s)).join(", ")) : null,
     );
     const acts = h("div", { class: "actions" });
-    if (raw && p.prf && p.missing.length) acts.append(btn("Enable…", start({ action: "enable", capability: "unlock", nickname: nick, credential_id: raw, scopes: p.missing })));
+    // Enable covers scopes it lacks and scopes whose wrap is not tested yet (an untested wrap
+    // may be replaced), then tests them in the same flow.
+    const todo = keyed.filter((s) => !p.scopes.some((x) => x.scope === s && x.tested));
+    if (raw && p.prf && todo.length)
+      acts.append(btn("Enable…", async () => runSteps(review, auth, await startCapability(api, v, { action: "enable", capability: "unlock", nickname: nick, credential_id: raw, scopes: todo }, location.hostname, 0, { thenTest: true, skip: testedScopes(v, pks, raw) }), refresh)));
     if (raw && p.scopes.length) {
       acts.append(btn("Test…", start({ action: "test", capability: "unlock", nickname: nick, credential_id: raw, scopes: p.scopes.map((s) => s.scope) })));
       acts.append(btn("Disable…", start({ action: "disable", capability: "approve-only", nickname: nick, credential_id: raw, scopes: p.scopes.map((s) => s.scope) })));

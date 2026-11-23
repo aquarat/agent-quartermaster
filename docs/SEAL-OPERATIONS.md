@@ -150,9 +150,12 @@ Prove the recovery identity opens a real backup. Do both from time to time.
    **Reopen**). Only the tapping passkey keeps a wrap, of the new key at a fresh PRF salt
    (the same tap's second evaluation). Copies of the old wraps in backups then expose only
    values as they were at the copy.
-3. **Test** the rekeying passkey (Admin → Passkeys → **Test**): its new wrap is untested until
-   it opens once, and new sets in the scope wait for that. Then **enable** your other passkeys
-   again from it, and test them.
+3. **Test** the rekeying passkey: the page asks for this tap right after the rekey (later:
+   Admin → Passkeys → **Test**). Its new wrap is untested until it opens once, Admin shows the
+   scope as **Untested after rekey**, and new sets in the scope wait for that. If the test
+   fails, use the recovery key (Admin → Recovery: enrol that passkey for the scope; it may
+   replace the untested wrap). Then **enable** your other passkeys again from it (Enable ends
+   with their test).
 
 ## Lost every passkey
 
