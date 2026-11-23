@@ -123,7 +123,12 @@ describe("buckets in the UI", () => {
     await until(() => !!root.querySelector("#sec-passkeys .pk"));
     const tiles = [...root.querySelectorAll<HTMLElement>("#sec-passkeys .pk")];
     expect(tiles.some((t) => /Opens \d+ of \d+ buckets/.test(t.textContent!))).toBe(true);
-    expect(tiles.some((t) => t.textContent!.includes("Approve only"))).toBe(true);
+    expect(tiles.some((t) => t.textContent!.includes("Opens nothing yet"))).toBe(true);
+    // A passkey with no scope yet is offered Enable (regression: it used to be hidden).
+    const rows = [...root.querySelectorAll<HTMLElement>("#sec-passkeys .pk-buckets")];
+    const empty = rows.find((r) => r.textContent!.includes("Not enabled for any bucket yet"));
+    expect(empty).toBeTruthy();
+    expect([...empty!.querySelectorAll("button")].some((b) => /^Enable…$/.test(b.textContent!))).toBe(true);
   });
 
   test("no unlock wording anywhere on the page", () => {

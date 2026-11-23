@@ -52,7 +52,7 @@ func (s *Server) pollUpdates(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(15 * time.Minute):
+		case <-time.After(s.cfg.Updates.CheckInterval()):
 		}
 	}
 }

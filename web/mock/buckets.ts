@@ -149,7 +149,7 @@ export class MockBuckets {
           id: p.hex,
           name: p.name,
           current: p.hex === cur,
-          prf: !this.noPrf.has(p.id),
+          prf: scopes.length > 0, // as the server: "has a wrap", not authenticator capability
           scopes,
           opens: this.buckets.filter((b) => w.has(b.scope)).length,
           of: this.buckets.length,

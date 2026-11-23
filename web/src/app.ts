@@ -695,11 +695,11 @@ export class App {
     ];
   }
 
-  /** "Opens N of M buckets" / "Approve only" from the seal status (format 2). */
+  /** "Opens N of M buckets" / "Opens nothing yet" from the seal status (format 2). */
   private bucketBadge(p: PasskeyInfo): HTMLElement | null {
     const k = serving(this.seal) ? this.seal!.passkeys?.find((x) => x.id === p.id) : undefined;
     if (!k) return null;
-    if (!k.prf || k.opens === 0) return h("span", { class: "badge", title: k.prf ? "Not enabled for any scope yet" : "This passkey has no PRF: it signs and approves, but cannot open a closed bucket" }, "Approve only");
+    if (!k.prf || k.opens === 0) return h("span", { class: "badge", title: "Not enabled for any scope yet: Passkeys → Enable" }, "Opens nothing yet");
     return h("span", { class: "badge", title: k.missing.length ? "Not enabled for " + k.missing.map((m) => this.seal!.scopes?.find((x) => x.scope === m)?.title ?? m).join(", ") : "Enabled for every scope" }, `Opens ${k.opens} of ${k.of} buckets`);
   }
 
