@@ -114,6 +114,7 @@ const NAV_GLYPHS: Record<string, Shape[]> = {
   settings: [{ d: "M4 7h10M18 7h2M4 17h2M10 17h10" }, { c: [16, 7, 2] }, { c: [8, 17, 2] }],
   help: [{ c: [12, 12, 9] }, { d: "M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.4-1 1-1 1.7" }, { d: "M12 17v.01" }],
   search: [{ c: [11, 11, 6.5] }, { d: "M16 16l4.5 4.5" }],
+  signout: [{ d: "M14 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8" }, { d: "M10 12h10" }, { d: "M16.5 8.5 20 12l-3.5 3.5" }],
 };
 export function navIcon(name: string): SVGSVGElement {
   return draw(own(NAV_GLYPHS, name) ?? NAV_GLYPHS["help"]!, "glyph nav-glyph");

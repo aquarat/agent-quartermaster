@@ -48,7 +48,7 @@ import {
   visibleText as vt,
 } from "./format";
 import { CF_RISKS, cfScope, paramPairs, parseScopeParams, riskLabel, sentenceCase, unusualParams, type CFScopeDesc } from "./cfscopes";
-import { chevronIcon, cloudIcon, eventIcon, passkeyIcon, syncIcon } from "./icons";
+import { chevronIcon, cloudIcon, eventIcon, navIcon, passkeyIcon, syncIcon } from "./icons";
 import type { AuditEntry, GrantSummary, PasskeyChange, PasskeyInfo, PendingCloudflare, PendingItem, RegisterResult, StandingApproval, UIState } from "./types";
 import { hostCard, type HostInfo } from './admin';
 import { SetupPage, setupSummary } from './setupPage';
@@ -326,7 +326,36 @@ export class App {
     this.showSignin(message);
   }
 
-  private showSignin(message?: string): void {
+  /** Header button: ends this session on the server (its windows close, held values drop) and
+   * shows the sign-in page. A failure says so and leaves the session as it is. */
+  private signOutButton(): HTMLButtonElement {
+    const b = h("button", { class: "signout", type: "button", title: "Sign out of aqmas in this browser", "aria-label": "Sign out" }, navIcon("signout"), h("span", { class: "signout-label" }, "Sign out")) as HTMLButtonElement;
+    b.addEventListener("click", async () => {
+      b.disabled = true;
+      try {
+        await this.api.logout();
+      } catch (e) {
+        if (!(e instanceof ApiError && e.code === "unauthenticated")) {
+          b.disabled = false;
+          const el = this.root.querySelector("#status");
+          if (el) {
+            el.textContent = `Could not sign out (${vt(explainError(e))}). You are still signed in.`;
+            el.classList.add("bad");
+            el.setAttribute("role", "alert");
+          }
+          return;
+        }
+      }
+      this.sheet.close(true);
+      this.vaultView?.clearSecrets();
+      this.vaultView = undefined;
+      this.tab.forget();
+      this.showSignin(undefined, "Signed out. Your approval windows are closed.");
+    });
+    return b;
+  }
+
+  private showSignin(message?: string, note?: string): void {
     this.tab.end();
     this.setupPage?.stop();
     this.setupPage = undefined;
@@ -352,6 +381,7 @@ export class App {
         h("h1", { class: "brand" }, "aqmas"),
         h("p", { class: "lede" }, "Approve and refuse access requests from your fleet."),
         signBtn,
+        note ? h("p", { class: "muted signin-note", role: "status" }, note) : null,
         status,
         regDetails,
       ),
@@ -492,7 +522,7 @@ export class App {
     }
     replace(
       this.root,
-      h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Approvals')), navBar(), h("div", { class: "top-tools" }, this.search.button, this.tray.el, h("p", { class: "status", id: "status" }))),
+      h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Approvals')), navBar(), h("div", { class: "top-tools" }, this.search.button, this.tray.el, this.signOutButton(), h("p", { class: "status", id: "status" }))),
       main,
     );
     if(this.sealOnTop())this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));

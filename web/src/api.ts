@@ -82,6 +82,8 @@ export interface Api {
   apply(object: ObjectKind, id: string, challengeId: string, assertion: unknown, action?: string, open?: unknown): Promise<unknown>;
   loginBegin(): Promise<BeginResponse>;
   loginFinish(challengeId: string | undefined, assertion: unknown): Promise<unknown>;
+  /** Ends this browser session (and its approval windows and held vault values). */
+  logout(): Promise<unknown>;
   registerBegin(body: { enroll_code?: string; challenge_id?: string; assertion?: unknown }): Promise<BeginResponse>;
   /** `name`: the nickname (omitted = the server names it after the authenticator). */
   registerFinish(challengeId: string | undefined, credential: unknown, name?: string): Promise<unknown>;
@@ -170,6 +172,7 @@ export function createApi(opts: ApiOptions = {}): Api {
       return call<unknown>("POST", `/api/ui/${p.path}/${seg(id)}/${p.apply}`, open ? { challenge_id: challengeId, assertion, open } : { challenge_id: challengeId, assertion });
     },
     loginBegin: () => call<BeginResponse>("POST", "/api/ui/login/begin", {}),
+    logout: () => call<unknown>("POST", "/api/ui/logout", {}),
     loginFinish: (challengeId, assertion) =>
       call<unknown>("POST", "/api/ui/login/finish", challengeId ? { challenge_id: challengeId, assertion } : { assertion }),
     registerBegin: (body) => call<BeginResponse>("POST", "/api/ui/passkeys/register/begin", body),

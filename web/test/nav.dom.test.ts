@@ -256,4 +256,19 @@ describe("navigation", () => {
     expect(k.scopes.every((s) => s.tested)).toBe(true);
     await until(() => root.querySelector('.tab[data-tab="security"] .tab-count')!.textContent === "");
   });
+
+  // Last: it ends the session the other tests use.
+  test("Sign out ends the session on the server and shows the sign-in page", async () => {
+    go("#/");
+    await until(() => !!root.querySelector("header button.signout"));
+    const b = root.querySelector<HTMLButtonElement>("header button.signout")!;
+    expect(b.getAttribute("aria-label")).toBe("Sign out");
+    b.click();
+    await until(() => !!root.querySelector("button.primary") && !root.querySelector("header.topbar"));
+    expect(f.log.some((x) => x.url.endsWith("/api/ui/logout") && x.method === "POST")).toBe(true);
+    expect(root.querySelector(".signin-note")!.textContent).toContain("Signed out.");
+    expect(m.store.sessions.size).toBe(0);
+    // The old cookie no longer works.
+    await expect(api.state()).rejects.toMatchObject({ code: "unauthenticated" });
+  });
 });

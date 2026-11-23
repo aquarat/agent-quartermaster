@@ -1006,6 +1006,13 @@ export function startMock(opts: MockOptions = {}) {
       if (!item) throw new HttpError(404, "not_found", "no such pending request");
       return json(store.bastion.refresh(item));
     }
+    if (p === "/api/ui/logout" && isPost) {
+      needSession();
+      store.sessions.delete(session!);
+      store.sessionPasskey.delete(session!);
+      store.audit("owner", "logout", "session", "");
+      return json({ ok: true }, 200, { "Set-Cookie": "aqmas_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" });
+    }
     if (p === "/api/ui/login/begin" && isPost) {
       if (store.passkeys.length === 0) throw new HttpError(409, "conflict", "no passkey registered yet: use the enroll code");
       const { id, rec } = issue("login");
