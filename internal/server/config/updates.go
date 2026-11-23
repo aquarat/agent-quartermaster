@@ -1,6 +1,10 @@
 package config
 
-import "github.com/aquarat/agent-quartermaster/internal/release"
+import (
+	"time"
+
+	"github.com/aquarat/agent-quartermaster/internal/release"
+)
 
 type Updates struct {
 	Repo      string         `toml:"repo"`
@@ -9,6 +13,19 @@ type Updates struct {
 	SpoolDir  string         `toml:"spool_dir"`
 	Forgejo   release.Source `toml:"forgejo"`
 	GitHub    release.Source `toml:"github"`
+	// CheckMinutes is how often the broker looks for a new release (default 5, 1–1440).
+	// A check is a git fetch from the forge; the release APIs are asked only when main
+	// carries a newer VERSION.
+	CheckMinutes int `toml:"check_minutes"`
+}
+
+// CheckInterval is the time between update checks.
+func (u Updates) CheckInterval() time.Duration {
+	m := u.CheckMinutes
+	if m <= 0 {
+		m = 5
+	}
+	return time.Duration(min(max(m, 1), 1440)) * time.Minute
 }
 
 func (u Updates) Cache() string {
