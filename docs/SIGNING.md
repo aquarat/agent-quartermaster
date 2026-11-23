@@ -43,8 +43,8 @@ aqmas sign client-a/releases/firmware-key --why "CI digest" --digest sha256:9f86
 
 ## For the owner
 
-**Admin → Credential sets → New signer.** Choose the organisation, service,
-a name and a scheme, then either
+**Vault → Add item → Signing key.** Choose the organisation and service
+(a new one is created on the way), a name and a scheme, then either
 
 * **Generate in aqmas**: the key is made on the bastion and never exists
   anywhere else; or
@@ -54,7 +54,9 @@ a name and a scheme, then either
 
 The passkey prompt shows the public key that will be created; for a pasted
 key, compare it with the public half you already have. Afterwards the page
-shows the public key (hex, PEM) and its fingerprint with copy buttons. Give
+shows the new key as a Vault item: the public key (hex, PEM) and its
+fingerprint with copy buttons, the hosts that may ask for signatures, its
+pending requests and live grants, and its recent history. Give
 those to whoever verifies. There is no reveal and no export for a signer: to
 move a key elsewhere, import the copy you kept, or make a new key.
 

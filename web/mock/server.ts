@@ -5,7 +5,7 @@
 //   bun mock/server.ts --port 9000 --fresh
 //   GET /mock/spawn         adds a new pending SSH request (dev convenience)
 //   GET /mock/login         MOCK ONLY: signs this browser in without a passkey (screenshots)
-//   GET /mock/setup?...     jumps Admin → Setup to a state (see mock/setup.ts)
+//   GET /mock/setup?...     jumps Settings → Setup to a state (see mock/setup.ts)
 //   GET /mock/vault?mode=buckets|migration-required&closed=1   sealed view (mock/vault.ts, mock/buckets.ts)
 //
 // Fake WebAuthn: no signature checks. It does check the assertion's JSON shape (the fields
@@ -182,7 +182,7 @@ export interface MockOptions {
   log?: boolean;
   /** Start with the sealed, organisation-scoped Credential sets view on (mock/vault.ts). */
   vault?: boolean;
-  /** Admin → Setup: how long each step of the fake runner takes (default 1500 ms). */
+  /** Settings → Setup: how long each step of the fake runner takes (default 1500 ms). */
   setupStepMs?: number;
   /** Seed a pending inspect and root bastion request and a queued task (mock/bastion.ts). */
   bastion?: boolean;
@@ -231,7 +231,7 @@ export class MockStore {
   recent: AuditEntry[] = [];
   /** Challenge ids applied, in order (tests read this). */
   applied: Array<{ object: string; action: string; canonical: Record<string, unknown> }> = [];
-  /** Admin → Setup (mock/setup.ts); set by startMock. */
+  /** Settings → Setup (mock/setup.ts); set by startMock. */
   setup!: MockSetup;
   /** Bastion access (mock/bastion.ts); set by startMock. */
   bastion!: MockBastion;
@@ -953,8 +953,8 @@ export function startMock(opts: MockOptions = {}) {
     const p = url.pathname;
     const isPost = req.method === "POST";
     let m: RegExpMatchArray | null;
-    if(p==='/api/ui/hosts' && !isPost){needSession();return json([]);}
-    // Admin → Setup, its cutover review, seal import and upgrade approval (mock/setup.ts).
+    if(p==='/api/ui/hosts' && !isPost){needSession();return json(store.vault.enabled?store.vault.hostList():[]);}
+    // Settings → Setup, its cutover review, seal import and upgrade approval (mock/setup.ts).
     if (/^\/api\/ui\/(setup|migration|migrations|updates|seal)(\/|$)/.test(p)) {
       needSession();
       const out = await store.setup.handle(req, url, body, session);

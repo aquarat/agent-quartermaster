@@ -109,7 +109,7 @@ describe("App in a DOM", () => {
   });
 
   test("passkeys: listed with authenticator, sync state and this-device; hostile nicknames stay text", async () => {
-    expect(root.querySelector('#sec-passkeys')).toBeNull();win.location.hash='#/admin';win.dispatchEvent(new win.Event('hashchange'));
+    expect(root.querySelector('#sec-passkeys')).toBeNull();win.location.hash='#/security';win.dispatchEvent(new win.Event('hashchange'));
     const evil = '<img src=x onerror="alert(3)">\u202Ekey';
     m.store.passkeys[1]!.info.nickname = evil;
     m.store.audit("owner", "passkey_rename", "passkey:" + m.store.passkeys[1]!.info.id, `to=${JSON.stringify(evil)}`);
@@ -141,7 +141,7 @@ describe("App in a DOM", () => {
   });
 
   test("activity: day groups, kinds as text + icon, filters, untrusted detail as text", async () => {
-    win.location.hash='#/';win.dispatchEvent(new win.Event('hashchange'));await until(()=>!!root.querySelector('#sec-recent'));
+    expect(root.querySelector('#sec-recent')).toBeNull();win.location.hash='#/activity';win.dispatchEvent(new win.Event('hashchange'));await until(()=>!!root.querySelector('#sec-recent'));
     const sec = root.querySelector<HTMLElement>("#sec-recent")!;
     await until(() => !!sec.querySelector(".ev-day"));
     const days = [...sec.querySelectorAll(".ev-day-h")].map((x) => x.textContent);
@@ -179,13 +179,18 @@ describe("App in a DOM", () => {
     btn("all").click();
   });
 
-  test("activity rows link to cards that are on the page", async () => {
+  test("activity rows link to their cards on Approvals", async () => {
     const sec = root.querySelector<HTMLElement>("#sec-recent")!;
     const jump = sec.querySelector<HTMLButtonElement>(".ev-jump");
     expect(jump).toBeTruthy();
     expect(jump!.getAttribute("aria-label")).toMatch(/^Show the .+ card$/);
     jump!.click();
-    expect(root.querySelectorAll(".focus").length).toBe(1);
+    // The card is on another tab: the address becomes the same #r=ID the CLI prints.
+    expect(win.location.hash).toMatch(/^#r=[A-Za-z0-9_-]+$/);
+    win.dispatchEvent(new win.Event("hashchange"));
+    await until(() => root.querySelectorAll(".focus").length === 1);
+    expect(root.querySelector(".focus")!.closest("#sec-pending, #sec-enroll, #sec-grants, #sec-standing")).toBeTruthy();
+    expect(root.querySelector('.tab[aria-current="page"]')!.textContent).toContain("Approvals");
   });
 
   test('Help uses live values and every displayed command has a copy button', async () => {

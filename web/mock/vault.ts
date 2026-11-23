@@ -88,6 +88,12 @@ export class MockVault {
   orgs: VaultOrg[] = [];
   sets: VaultSet[] = [];
   requests: SignRequest[] = [];
+  /** Application services (also ones that have no set yet). */
+  services: { id: string; org_id: string; slug: string; title: string }[] = [];
+  /** Enrolled hosts and the organisations each is admitted to (catalogue + /api/ui/hosts). */
+  hosts: { row_id: number; enrollment: string; name: string; fingerprint: string; class: string; address: string; revoked_at: string | null; orgs: Map<string, { active: boolean; generation: number }> }[] = [];
+  /** Per set: audit rows for the item view (newest first). */
+  private history = new Map<string, { at: string; actor: string; action: string; object: string; detail: string }[]>();
   private values = new Map<string, Map<string, string>>();
   private attempts = new Map<string, Attempt>();
 
@@ -132,6 +138,21 @@ export class MockVault {
         id, grant_id: status === "approved" ? "01MOCKGRANT" + id.slice(-6) : "", address, reason, items, ttl_seconds: ttl, max_signatures: max, deadline: Date.now() + 540_000, not_after: status === "approved" ? Date.now() + 1_260_000 : 0, status, used,
       });
     };
+    for (const x of this.sets) if (!this.services.some((v) => v.id === x.service_id)) this.services.push({ id: x.service_id, org_id: x.org_id, slug: x.service_slug, title: x.service_title });
+    const host = (name: string, cls: string, address: string, orgs: VaultOrg[]) =>
+      this.hosts.push({ row_id: this.hosts.length + 1, enrollment: id32("enrollment:" + name), name, fingerprint: "SHA256:" + b64url(sha256("mock host " + name)), class: cls, address, revoked_at: null, orgs: new Map(orgs.map((o) => [o.id, { active: true, generation: 1 }])) });
+    host("build-1", "agent", "192.0.2.14", [personal, client]);
+    host("web-1", "agent", "192.0.2.21", [personal]);
+    host("laptop", "owner-device", "198.51.100.7", [personal, client, club]);
+    const staging = this.sets[0]!, sp = "client-a/paas/staging";
+    const past = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
+    this.history.set(staging.set_id, [
+      { at: past(42), actor: "host:build-1", action: "env_collect_run", object: "grant:01MOCKGRANTENV0001", detail: `${sp} revision=7 enrollment=${id32("enrollment:build-1")}` },
+      { at: past(43), actor: "owner", action: "env_approve", object: "env:01MOCKENVREQ0001", detail: `passkey=1 ${sp}` },
+      { at: past(44), actor: "host:build-1", action: "env_request", object: "request:01MOCKENVREQ0001", detail: `${sp} mode=run` },
+      { at: past(3 * 1440), actor: "owner", action: "vault_reveal", object: "set:" + staging.set_id, detail: `passkey=1 nonce=mock ${sp} revision=7 names=DATABASE_URL` },
+      { at: past(5 * 1440), actor: "owner", action: "vault_commit", object: "set:" + staging.set_id, detail: `passkey=1 nonce=mock ${sp} revision=7 operation=merge changes=SMTP_PASSWORD:replace` },
+    ]);
     const manifest = Buffer.concat([Buffer.from("S1M1"), Buffer.alloc(12, 1), sha256("mock image"), Buffer.alloc(92, 7)]);
     request(manifestKey, "01MOCKSIGNREQUEST0000A7K2QD", "build-1", "192.0.2.14", "sign the 2026.11 release manifest", [{ name: "manifest.bin", size: manifest.length, sha256: hex(sha256(manifest)), message: manifest.toString("base64") }], 0, 1);
     request(imageKey, "01MOCKSIGNREQUEST0000B3X9TM", "build-1", "192.0.2.14", "nightly image builds", [
@@ -145,15 +166,66 @@ export class MockVault {
     return {
       owner_id: id32("owner"),
       organisations: this.orgs.map((o) => ({
-        id: o.id, slug: o.slug, title: o.title, revision: 1, hosts: [], auto_access: [], rules: [],
+        id: o.id, slug: o.slug, title: o.title, revision: 1,
         policy: { default_seconds: 3600, soft_cap_seconds: 86400, indefinite: true, standing_default_seconds: 3600, standing_soft_cap_seconds: 86400, standing_indefinite: true },
-        services: [...new Map(this.sets.filter((s) => s.org_id === o.id).map((s) => [s.service_id, s])).values()].map((v) => ({
-          id: v.service_id, slug: v.service_slug, title: v.service_title, revision: 1, provider: "application",
-          sets: this.sets.filter((s) => s.service_id === v.service_id).map((s) => ({ id: s.set_id, slug: s.set_slug, title: s.set_title, revision: s.revision, kind: s.kind, archived: false })),
+        rules: [],
+        services: this.services.filter((v) => v.org_id === o.id).map((v) => ({
+          id: v.id, slug: v.slug, title: v.title, revision: 1, provider: "application",
+          sets: this.sets.filter((s) => s.service_id === v.id).map((s) => ({ id: s.set_id, slug: s.set_slug, title: s.set_title, revision: s.revision, kind: s.kind, archived: false })),
         })),
+        hosts: this.hosts.filter((x) => !x.revoked_at).map((x) => ({ row_id: x.row_id, enrollment: x.enrollment, name: x.name, fingerprint: x.fingerprint, class: x.class, active: x.orgs.get(o.id)?.active ?? false, generation: x.orgs.get(o.id)?.generation ?? 0 })),
+        auto_access: [],
       })),
     };
   }
+  hostList() {
+    const day = 86_400_000;
+    return this.hosts.map((x, i) => ({ id: x.enrollment, name: x.name, address: x.address, class: x.class, enrolled_at: new Date(Date.now() - (20 + i) * day).toISOString(), not_before: new Date(Date.now() - (20 + i) * day).toISOString(), not_after: new Date(Date.now() + 70 * day).toISOString(), last_request_at: i < 2 ? new Date(Date.now() - (i + 1) * 2_520_000).toISOString() : null, revoked_at: x.revoked_at }));
+  }
+  private note(set: string, action: string, detail: string): void {
+    const rows = this.history.get(set) ?? [];
+    rows.unshift({ at: new Date().toISOString(), actor: "owner", action, object: "set:" + set, detail: "passkey=1 nonce=mock " + detail });
+    this.history.set(set, rows);
+    this.deps.audit(action, "set:" + set, detail);
+  }
+
+  /** One catalogue change (create an organisation, service or empty set; admit or remove a
+   * host): the plan the page proposed must be exactly what the current rows give. */
+  private change(object: string, action: string, id: string, planText: unknown, apply: boolean): void {
+    const fail = this.deps.fail, bad = () => fail(409, "conflict", "catalogue or admission changed; reload and review again");
+    if (typeof planText !== "string") return fail(400, "bad_request", "invalid catalogue proposal");
+    const c = JSON.parse(planText) as { organisation: { id: string; slug: string; title: string; revision: number }; service?: { id: string; slug: string; title: string; revision: number }; set?: { id: string; slug: string; title: string; revision: number }; host?: { enrollment: string } };
+    const fresh = (n: { id: string; slug: string; title: string; revision: number } | undefined, taken: { id: string; slug: string }[]) => !!n && n.id === id && /^[0-9a-f]{32}$/.test(n.id) && /^[a-z0-9][a-z0-9-]{0,62}$/.test(n.slug) && /^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,63}$/.test(n.title) && !taken.some((t) => t.id === n.id || t.slug === n.slug);
+    const cat = this.catalogue();
+    const org = cat.organisations.find((o) => o.id === c.organisation?.id);
+    if (object === "organisation" && action === "create") {
+      if (!fresh(c.organisation, this.orgs)) bad();
+      if (apply) {
+        this.orgs.push({ id: c.organisation.id, slug: c.organisation.slug, title: c.organisation.title, allow_reveal: true });
+        this.buckets?.scopes.push({ scope: c.organisation.id, title: c.organisation.title, has_key: false });
+      }
+      return;
+    }
+    if (!org) return bad();
+    const service = org.services.find((v) => v.id === c.service?.id);
+    if (object === "service" && action === "create") {
+      if (!fresh(c.service, org.services)) bad();
+      if (apply) this.services.push({ id: c.service!.id, org_id: org.id, slug: c.service!.slug, title: c.service!.title });
+    } else if (object === "credential_set" && action === "create") {
+      if (!service || !fresh(c.set, service.sets.map((x) => ({ id: x.id, slug: x.slug })))) bad();
+      if (apply) {
+        this.sets.push({ org_id: org.id, org_slug: org.slug, org_title: org.title, service_id: service!.id, service_slug: service!.slug, service_title: service!.title, set_id: c.set!.id, set_slug: c.set!.slug, set_title: c.set!.title, kind: "env-set", revision: 0, names: [], allow_reveal: true, signatures: 0 });
+        this.values.set(c.set!.id, new Map());
+      }
+    } else if (object === "org_host" && (action === "admit" || action === "remove")) {
+      const hst = this.hosts.find((x) => x.enrollment === id && x.enrollment === c.host?.enrollment);
+      const cur = hst?.orgs.get(org.id) ?? { active: false, generation: 0 };
+      if (!hst || cur.active !== (action === "remove")) return bad();
+      if (apply) hst.orgs.set(org.id, { active: action === "admit", generation: cur.generation + 1 });
+    } else return fail(400, "bad_request", "unsupported catalogue change in the mock");
+    if (apply) this.deps.audit(`${object}_${action}`, `${object}:${id}`, "change=" + planText);
+  }
+
   private state() {
     return { schemes: SCHEMES, organisations: this.orgs, sets: this.sets.map((s) => ({ ...s, allow_reveal: this.orgs.find((o) => o.id === s.org_id)!.allow_reveal })), requests: this.requests.filter((r) => r.status === "pending" || r.status === "approved") };
   }
@@ -225,7 +297,9 @@ export class MockVault {
         return { meta: { ...this.target(s), names, recipient: c.recipient }, facts };
       }
       case "signer-create": {
-        const parent = this.sets.find((s) => s.service_id === c.service_id) ?? fail(404, "not_found", "not found");
+        const svc = this.services.find((v) => v.id === c.service_id) ?? fail(404, "not_found", "not found");
+        const po = this.orgs.find((o) => o.id === svc.org_id)!;
+        const parent = { org_id: po.id, org_slug: po.slug, org_title: po.title, service_id: svc.id, service_slug: svc.slug, service_title: svc.title };
         const scheme = SCHEMES.find((x) => x.id === c.scheme);
         if (!scheme || typeof c.id !== "string" || !/^[0-9a-f]{32}$/.test(c.id) || typeof c.set_slug !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(c.set_slug) || typeof c.set_title !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,63}$/.test(c.set_title)) return fail(400, "bad_request", "invalid signer set");
         if (this.sets.some((s) => s.set_id === c.id || (s.service_id === parent.service_id && s.set_slug === c.set_slug))) fail(409, "conflict", "a set with that name or ID exists; reload");
@@ -296,6 +370,27 @@ export class MockVault {
     const p = url.pathname, post = req.method === "POST", fail = this.deps.fail;
     if (p === "/api/ui/seal/env/state" && !post) return { drafts: [], releases: [] };
     if (p === "/api/ui/catalogue" && !post) return this.catalogue();
+    const cm = p.match(/^\/api\/ui\/catalogue\/([a-z_]+)\/([^/]+)\/(challenge|decide)$/);
+    if (cm && post) {
+      const [, object, id, verb] = cm as unknown as [string, string, string, string];
+      if (verb === "challenge") {
+        this.change(object, String(body.action), id, body.plan, false);
+        const canonical = { v: 2, action: body.action, object, id, plan: body.plan, nonce: b64url(randomBytes(32)), issued_at: nowISO() };
+        const text = JSON.stringify(canonical, Object.keys(canonical).sort());
+        const ch = this.deps.issue(text, canonical, session);
+        return { challenge_id: ch.id, canonical: text, public_key: this.deps.requestOptions(req, ch.challenge) };
+      }
+      const c = this.deps.redeem(body.challenge_id, body.assertion, session);
+      if (c.object !== object || c.id !== id) fail(403, "forbidden", "challenge is for a different object");
+      this.change(object, String(c.action), id, c.plan, true);
+      return { ok: true };
+    }
+    if (p === "/api/ui/seal/vault/history" && !post) {
+      const set = this.sets.find((x) => x.set_id === url.searchParams.get("set")) ?? fail(404, "not_found", "not found");
+      const entries = this.history.get(set.set_id) ?? [];
+      const at = (re: RegExp) => Date.parse(entries.find((e) => re.test(e.action))?.at ?? "") || 0;
+      return { entries: entries.slice(0, 20), last_changed_at: at(/^(vault_commit|vault_signer_create|env_commit)$/), last_used_at: at(/^(sign|env_collect_.*)$/) };
+    }
     if (!p.startsWith("/api/ui/seal/vault/")) return undefined;
     const verb = p.slice("/api/ui/seal/vault/".length);
     if (verb === "state" && !post) return this.state();
@@ -350,7 +445,7 @@ export class MockVault {
           this.values.set(s.set_id, values);
           s.revision++;
           s.names = [...values.keys()].sort();
-          this.deps.audit("vault_commit", "set:" + s.set_id, `${s.org_slug}/${s.service_slug}/${s.set_slug} revision=${s.revision} changes=${signed.changes}`);
+          this.note(s.set_id, "vault_commit", `${s.org_slug}/${s.service_slug}/${s.set_slug} revision=${s.revision} changes=${signed.changes}`);
           return { ok: true };
         }
         case "reveal": {
@@ -360,7 +455,7 @@ export class MockVault {
           const recipientPublicKey = await suite.kem.deserializePublicKey(ab(Buffer.from(signed.recipient as string, "base64url")));
           const sender = await suite.createSenderContext({ recipientPublicKey, info: ab(tuple("hpke-vault", Buffer.from(this.installation, "base64url"), utf8("reveal"))) });
           const ct = await sender.seal(ab(plain), ab(tuple("hpke-vault-aad", sha256(c.text as string), Buffer.from(this.epoch, "base64url"), utf8(s.set_id))));
-          this.deps.audit("vault_reveal", "set:" + s.set_id, `${s.org_slug}/${s.service_slug}/${s.set_slug} revision=${s.revision} names=${names.join(",")}`);
+          this.note(s.set_id, "vault_reveal", `${s.org_slug}/${s.service_slug}/${s.set_slug} revision=${s.revision} names=${names.join(",")}`);
           return { enc: b64url(new Uint8Array(sender.enc)), ciphertext: b64url(new Uint8Array(ct)) };
         }
         case "signer-create": {
@@ -368,7 +463,7 @@ export class MockVault {
           const pub = Buffer.from(m.public_key!, "base64url");
           const s: VaultSet = { org_id: m.org_id!, org_slug: m.org_slug!, org_title: m.org_title!, service_id: m.service_id!, service_slug: m.service_slug!, service_title: m.service_title!, set_id: m.set_id!, set_slug: m.set_slug!, set_title: m.set_title!, kind: "signer", revision: 0, names: [], allow_reveal: true, scheme: m.scheme, origin: m.source === "import" ? "imported" : "generated", created_at: Date.now(), signatures: 0, public_key: m.public_key, public_hex: hex(pub), public_pem: spki(pub), fingerprint: m.fingerprint };
           this.sets.push(s);
-          this.deps.audit("vault_signer_create", "set:" + s.set_id, `${s.org_slug}/${s.service_slug}/${s.set_slug} scheme=${s.scheme} origin=${s.origin} fingerprint=${s.fingerprint}`);
+          this.note(s.set_id, "vault_signer_create", `${s.org_slug}/${s.service_slug}/${s.set_slug} scheme=${s.scheme} origin=${s.origin} fingerprint=${s.fingerprint}`);
           return { set_id: s.set_id, path: `${s.org_slug}/${s.service_slug}/${s.set_slug}`, scheme: s.scheme, public_key: s.public_key, public_hex: s.public_hex, public_pem: s.public_pem, fingerprint: s.fingerprint };
         }
         default: {

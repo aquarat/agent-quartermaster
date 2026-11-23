@@ -5,12 +5,15 @@ passkey-approved access (SSH certificates, Cloudflare API grants, env credential
 signatures from keys that never leave the broker; GitHub, Forgejo and HTTP APIs later) instead of holding long-lived keys. The server (`aqmasd`) runs on a dedicated
 bastion host; hosts enroll with the `aqmas` CLI.
 
-Use the approval queue for daily work, the gear icon for passkeys and enrolled hosts,
-and **Help** for enrollment and command examples using the running server’s URL and CA pin.
+The approval page has seven tabs: **Approvals** for daily work, **Vault** for the credentials
+(a searchable list of env sets, signing keys and what the broker holds; Add item; Reveal after a
+tap), **Hosts**, **Activity**, **Security** (passkeys, open buckets, recovery key), **Settings**
+(Setup, upgrades, policies) and **Help** for enrollment and command examples using the running
+server’s URL and CA pin. The review behind this layout is [docs/UI-REVIEW.md](docs/UI-REVIEW.md).
 
 - Design and milestone 1 scope: [docs/DESIGN.md](docs/DESIGN.md)
 - API contract: [docs/API.md](docs/API.md), shared types in `internal/api`
-- Credential sets from the approval page (write-only form, reveal) and signing inside aqmas:
+- Credential sets from the Vault tab (write-only form, reveal) and signing inside aqmas:
   [docs/SIGNING.md](docs/SIGNING.md). Signing keys should not leave aqmas where a signer
   scheme exists: agents call `aqmas sign ORG/SERVICE/KEY --why "..." FILE`; `aqmas run`
   remains for the cases where that is not possible.

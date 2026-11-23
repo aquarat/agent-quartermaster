@@ -1,4 +1,4 @@
-// Mock of Admin → Setup (docs/SETUP.md) for `bun run mock` and the tests: the setup view, the
+// Mock of Settings → Setup (docs/SETUP.md) for `bun run mock` and the tests: the setup view, the
 // signed run of each task with a fake runner (running → waiting → done, the broker "down" in
 // between), cancel, the cutover review, the staged store (seal import, or the move of a
 // format-1 store to per-credential buckets) with its passkey taps and the recovery drill, and

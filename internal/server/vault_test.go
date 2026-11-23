@@ -4,6 +4,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -354,6 +355,39 @@ func TestVaultFormAndReveal(t *testing.T) {
 	if !v.audited("vault_reveal", "client-a/paas/staging revision=2 names=APP_KEY,APP_TOKEN") {
 		t.Fatal("reveal not audited with its key names")
 	}
+	// The item view's history: this set's rows only, newest first, no values; a row about
+	// another path, or one a host wrote with this path inside a longer one, stays out.
+	requireNoError(t, v.s.store.Tx(context.Background(), func(q *store.Q) error {
+		for _, d := range []string{"client-a/paas/staging2 mode=run", "other/paas/staging mode=run"} {
+			if err := q.Audit(context.Background(), v.s.now(), "host:build-1", "env_request", "request:01X", d); err != nil {
+				return err
+			}
+		}
+		// The owner's decisions: only the ones whose signed metadata names this set, or
+		// whose detail names exactly this path; a path this one is the tail of stays out.
+		for _, d := range []string{
+			`passkey=1 canonical={"metadata":"{\"path\":\"xclient-a/paas/staging\",\"set\":\"0123456789abcdef0123456789abcdef\"}"}`,
+			`passkey=1 canonical={"metadata":"{\"path\":\"client-a/paas/staging\",\"set\":\"` + v.set + `\"}"}`,
+		} {
+			if err := q.Audit(context.Background(), v.s.now(), "owner", "env_approve", "env:01Z", d); err != nil {
+				return err
+			}
+		}
+		if err := q.Audit(context.Background(), v.s.now(), "owner", "vault_sign_approve", "request:01S", "passkey=1 nonce=n xclient-a/paas/staging host=build-1 ttl=0"); err != nil {
+			return err
+		}
+		return q.Audit(context.Background(), v.s.now(), "host:build-1", "env_collect_run", "grant:01Y", "client-a/paas/staging revision=2 enrollment=e")
+	}))
+	var hist struct {
+		Entries     []api.AuditEntry `json:"entries"`
+		LastChanged int64            `json:"last_changed_at"`
+		LastUsed    int64            `json:"last_used_at"`
+	}
+	mustStatus(t, "history", v.web("GET", "/api/ui/seal/vault/history?set="+v.set, nil, &hist), 200)
+	if len(hist.Entries) != 6 || hist.Entries[0].Action != "env_collect_run" || hist.Entries[1].Action != "env_approve" || !strings.Contains(hist.Entries[1].Detail, v.set) || hist.Entries[2].Action != "vault_reveal" || hist.Entries[5].Action != "vault_commit" || hist.LastChanged == 0 || hist.LastUsed == 0 {
+		t.Fatalf("history: %+v", hist)
+	}
+	mustStatus(t, "history of an unknown set", v.web("GET", "/api/ui/seal/vault/history?set=nope", nil, nil), 404)
 	// A .env import replaces the whole set.
 	v.commit(envset.Edit{Op: "import", Entries: []envset.Entry{{Name: "APP_TOKEN", Value: sentinel}, {Name: "APP_KEY", Value: vaultPEM}}}, []string{"APP_KEY", "APP_TOKEN"})
 	var state struct {

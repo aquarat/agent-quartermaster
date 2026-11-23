@@ -1,7 +1,7 @@
 // Access to the bastion itself, in happy-dom against the mock: the red root card and its
 // confirmation come from the signed text, the close choice is signed, bastion cards are never
 // batch-selectable, a queued task is approved through the setup flow, the banner, and
-// Admin → Bastion access.
+// Settings → Bastion access.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { createApi } from "../src/api";
@@ -216,21 +216,29 @@ describe("bastion access in a DOM", () => {
     expect(c.querySelector(".setup-warning")!.textContent).toContain("nothing open");
   });
 
-  test("Admin → Bastion access: status, sessions, and the allowlist signs the complete sorted list", async () => {
+  test("Settings → Bastion access: status, sessions, and the allowlist signs the complete sorted list", async () => {
     await until(() => m.store.setup.current === null, 8000);
-    win.location.hash = "#/admin";
+    win.location.hash = "#/settings";
     win.dispatchEvent(new win.Event("hashchange"));
-    await until(() => !!root.querySelector('#sec-bastion [data-task="bastion-allow"] .bastion-hosts'), 8000);
-    const sec = root.querySelector<HTMLElement>("#sec-bastion")!;
+    await until(() => (root.querySelectorAll("#sec-bastion .bastion-session").length ?? 0) === 3, 8000);
+    let sec = root.querySelector<HTMLElement>("#sec-bastion")!;
     expect(sec.querySelector(".bastion-status")!.textContent).toContain("Installed");
+    expect(sec.querySelector(".bastion-status")!.parentElement!.textContent).toContain("May ask for root: dev-1");
+    expect(sec.querySelector<HTMLAnchorElement>(".actions a")!.getAttribute("href")).toBe("#/setup");
+    expect(sec.querySelector("[data-task]")).toBeNull();
     expect(sec.textContent).toContain("emergency key is never touched");
     const rows = [...sec.querySelectorAll<HTMLElement>(".bastion-session")];
     expect(rows.length).toBe(3);
     expect(rows.some((r) => r.classList.contains("root") && r.textContent!.includes("NOT DELIVERED"))).toBe(true);
     expect(rows.some((r) => r.textContent!.includes("left open"))).toBe(true);
-    // The grouped tasks live here, not in the Setup summary line.
-    expect([...sec.querySelectorAll<HTMLElement>("[data-task]")].map((x) => x.dataset["task"])).toEqual(["bastion-access", "bastion-access-remove", "bastion-allow", "os-update", "reboot", "restart-cloudflared", "restart-broker", "disk-usage", "journal-vacuum"]);
     expect(root.querySelector("#sec-setup")!.textContent).not.toContain("bastion");
+    // The tasks are on Settings → Setup, after the Setup queue.
+    win.location.hash = "#/setup";
+    win.dispatchEvent(new win.Event("hashchange"));
+    await until(() => !!root.querySelector('main .bastion-panel [data-task="bastion-allow"] .bastion-hosts'), 8000);
+    sec = root.querySelector<HTMLElement>("main .bastion-panel")!;
+    expect(root.querySelector('#setup-root [data-task="os-update"]')).toBeNull();
+    expect([...sec.querySelectorAll<HTMLElement>("[data-task]")].map((x) => x.dataset["task"])).toEqual(["bastion-access", "bastion-access-remove", "bastion-allow", "os-update", "reboot", "restart-cloudflared", "restart-broker", "disk-usage", "journal-vacuum"]);
     expect(sec.querySelector<HTMLInputElement>('[data-task="os-update"] input[type="checkbox"]')!.checked).toBe(false);
     expect(sec.querySelector<HTMLInputElement>('[data-task="journal-vacuum"] input.text')!.value).toBe("14");
 
@@ -250,6 +258,9 @@ describe("bastion access in a DOM", () => {
   });
 
   test("revoking an active session goes through the ordinary grant revoke", async () => {
+    win.location.hash = "#/settings";
+    win.dispatchEvent(new win.Event("hashchange"));
+    await until(() => !!root.querySelector("#sec-bastion .bastion-session.active"), 8000);
     const sec = root.querySelector<HTMLElement>("#sec-bastion")!;
     const row = [...sec.querySelectorAll<HTMLElement>(".bastion-session.active")][0]!;
     button(row, "Revoke…").click();

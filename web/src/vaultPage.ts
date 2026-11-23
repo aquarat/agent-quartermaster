@@ -1,10 +1,9 @@
-// Admin → Credential sets: the write-only form, reveal, signer keys and signing approvals
+// Vault: the write-only form, reveal, signer keys and signing approvals
 // (docs/API.md "Vault", docs/SIGNING.md). All logic and every canonical check is in vault.ts;
 // this file only draws. Text from the server or a file goes in as text nodes through
 // visibleText; values the owner types or reveals live in form controls and <pre> text nodes
 // and are dropped on hide, save, navigation and pagehide.
 import { type Api } from "./api";
-import { type Catalogue, planString } from "./catalogue";
 import { type Child, append, h, replace } from "./dom";
 import type { ActionChoice, ActionTarget } from "./flows";
 import { countdown, duration, visibleText as vt } from "./format";
@@ -34,8 +33,12 @@ import {
 import type { Authenticator } from "./webauthn";
 
 const REVEAL_SECONDS = 60;
-const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
-const TITLE_RE = /^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,63}$/;
+export const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+export const TITLE_RE = /^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,63}$/;
+/** A slug suggestion from a display name ("Staging env" → "staging-env"). */
+export function slugify(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 63);
+}
 
 export interface VaultHost {
   api: Api;
@@ -46,13 +49,13 @@ export interface VaultHost {
   propose?(target: ActionTarget, choice: ActionChoice): void;
 }
 
-const pathOf = (s: { org_slug: string; service_slug: string; set_slug: string }) => `${s.org_slug}/${s.service_slug}/${s.set_slug}`;
+export const pathOf = (s: { org_slug: string; service_slug: string; set_slug: string }) => `${s.org_slug}/${s.service_slug}/${s.set_slug}`;
 const message = (e: unknown) => vt(e instanceof Error ? e.message : String(e));
 
-function btn(label: string, cls: string, click: (ev: MouseEvent) => void): HTMLButtonElement {
+export function btn(label: string, cls: string, click: (ev: MouseEvent) => void): HTMLButtonElement {
   return h("button", { class: "btn " + cls, type: "button", on: { click } }, label);
 }
-function copyButton(text: () => string, label = "Copy"): HTMLButtonElement {
+export function copyButton(text: () => string, label = "Copy"): HTMLButtonElement {
   const b = btn(label, "small", async () => {
     try {
       await navigator.clipboard.writeText(text());
@@ -92,7 +95,7 @@ function freeze(root: HTMLElement, except: HTMLElement): () => void {
 
 /** `before` must describe the captured choice only (never read live inputs): it runs after an
  * asynchronous round trip. `frozen` is the form the choice came from. */
-function ceremony<T>(slot: HTMLElement, auth: Authenticator, confirmLabel: string, cls: string, prepare: () => Promise<{ detail: string; opens?: string[]; tap(a: Authenticator): Promise<T> }>, before: (detail: string) => Child[], done: (out: T) => void, cancelled?: () => void, frozen?: HTMLElement): void {
+export function ceremony<T>(slot: HTMLElement, auth: Authenticator, confirmLabel: string, cls: string, prepare: () => Promise<{ detail: string; opens?: string[]; tap(a: Authenticator): Promise<T> }>, before: (detail: string) => Child[], done: (out: T) => void, cancelled?: () => void, frozen?: HTMLElement): void {
   const error = h("p", { class: "error", role: "alert" });
   const thaw = frozen ? freeze(frozen, slot) : () => {};
   const stop = cancelled;
@@ -295,115 +298,36 @@ export function signCards(host: VaultHost, seal: SealView, state: VaultState): H
   return [...state.requests].sort((a, b) => order(a) - order(b) || (a.id < b.id ? -1 : 1)).map((r) => signCard(host, seal, state, r));
 }
 
-// ---- the Admin section ----
+// ---- the forms the Vault tab is built from (vaultView.ts draws the layout) ----
 
-interface Tree {
-  id: string;
-  slug: string;
-  title: string;
-  revision?: number;
-  services: { id: string; slug: string; title: string; revision?: number }[];
+export interface Place {
+  org: { id: string; slug: string; title: string };
+  service: { id: string; slug: string; title: string };
 }
 
-export class VaultPage {
-  readonly el = h("div", { class: "vault" });
+/** The write-only editor, the signer card, the new-signer form and the reveal policy line.
+ * Each returns a detached element; the Vault tab decides where it goes. */
+export class VaultForms {
   private state?: VaultState;
   private seal?: SealView;
-  private catalogue?: Catalogue | null;
-  private sel = { org: "", service: "", set: "" };
-  private keys = { requests: "", pick: "", body: "" };
-  private requestsBox = h("div", { class: "list vault-requests" });
-  private pickBox = h("article", { class: "card vault-pick" });
-  private bodyBox = h("div", { class: "vault-body" });
   /** Drops revealed values, typed values and pasted keys (hide, save, leaving the page). */
   private forget: (() => void)[] = [];
   /** The signer made a moment ago in this tab (its card says so). */
-  private created = "";
+  created = "";
 
-  constructor(private host: VaultHost) {
-    this.el.append(this.requestsBox, this.pickBox, this.bodyBox);
-  }
+  constructor(private host: VaultHost) {}
 
   clearSecrets(): void {
     for (const f of this.forget.splice(0)) f();
   }
 
-  update(state: VaultState, seal: SealView, catalogue: Catalogue | null | undefined): void {
+  bind(state: VaultState, seal: SealView): void {
     this.state = state;
     this.seal = seal;
-    this.catalogue = catalogue;
-    const tree = this.tree();
-    const org = tree.find((o) => o.id === this.sel.org) ?? tree[0];
-    const service = org?.services.find((s) => s.id === this.sel.service) ?? org?.services[0];
-    const sets = state.sets.filter((s) => s.service_id === service?.id);
-    const set = sets.find((s) => s.set_id === this.sel.set) ?? sets[0];
-    this.sel = { org: org?.id ?? "", service: service?.id ?? "", set: set?.set_id ?? "" };
-
-    const rk = JSON.stringify([state.requests, seal.epoch]);
-    if (rk !== this.keys.requests && !this.requestsBox.querySelector(".vault-confirm")) {
-      this.keys.requests = rk;
-      replace(this.requestsBox, state.requests.length ? [h("h3", null, "Signing requests and grants"), signCards(this.host, seal, state)] : null);
-    }
-    const pk = JSON.stringify([tree, this.sel, sets.map((s) => [s.set_id, s.kind]), state.organisations, !!catalogue]);
-    if (pk !== this.keys.pick) {
-      this.keys.pick = pk;
-      this.drawPick(tree, sets);
-    }
-    const bk = JSON.stringify([set, service, state.organisations.find((o) => o.id === org?.id), seal.epoch]);
-    if (bk !== this.keys.body) {
-      this.keys.body = bk;
-      this.clearSecrets();
-      replace(this.bodyBox, !service ? null : [set ? (set.kind === "signer" ? this.signerView(set) : this.editor(set)) : h("p", { class: "empty" }, "This service has no credential sets yet."), this.newSigner(org!, service)]);
-    }
   }
 
-  private redraw(): void {
-    if (this.state && this.seal) this.update(this.state, this.seal, this.catalogue);
-  }
-
-  /** Organisations and application services: from the catalogue when Admin has it (it also
-   * lists services that have no sets yet), else from the sets themselves. */
-  private tree(): Tree[] {
-    const state = this.state!;
-    if (this.catalogue)
-      return this.catalogue.organisations.map((o) => ({ id: o.id, slug: o.slug, title: o.title, revision: o.revision, services: o.services.filter((s) => s.provider === "application").map((s) => ({ id: s.id, slug: s.slug, title: s.title, revision: s.revision })) }));
-    return state.organisations.map((o) => ({
-      id: o.id,
-      slug: o.slug,
-      title: o.title,
-      services: [...new Map(state.sets.filter((s) => s.org_id === o.id).map((s) => [s.service_id, { id: s.service_id, slug: s.service_slug, title: s.service_title }])).values()],
-    }));
-  }
-
-  private drawPick(tree: Tree[], sets: VaultSet[]): void {
-    const state = this.state!;
-    const org = tree.find((o) => o.id === this.sel.org);
-    const service = org?.services.find((s) => s.id === this.sel.service);
-    const select = (id: string, label: string, options: { id: string; text: string }[], value: string, pick: (v: string) => void) => {
-      const el = h("select", { id, class: "text" }, options.length ? options.map((o) => h("option", { value: o.id }, vt(o.text))) : h("option", { value: "" }, "none yet"));
-      el.value = value;
-      el.disabled = options.length === 0;
-      el.addEventListener("change", () => pick(el.value));
-      return h("div", { class: "field" }, h("label", { for: id }, label), el);
-    };
+  policyLine(org: VaultOrg): HTMLElement {
     const slot = h("div", { class: "vault-slot" });
-    const policyOrg = state.organisations.find((o) => o.id === org?.id);
-    replace(
-      this.pickBox,
-      h(
-        "div",
-        { class: "vault-selects" },
-        select("vault-org", "Organisation", tree.map((o) => ({ id: o.id, text: `${o.title} (${o.slug})` })), this.sel.org, (v) => ((this.sel = { org: v, service: "", set: "" }), this.redraw())),
-        select("vault-service", "Service", (org?.services ?? []).map((s) => ({ id: s.id, text: `${s.title} (${s.slug})` })), this.sel.service, (v) => ((this.sel = { ...this.sel, service: v, set: "" }), this.redraw())),
-        select("vault-set", "Credential set", sets.map((s) => ({ id: s.set_id, text: `${s.set_title} (${s.set_slug}) · ${s.kind === "signer" ? "signing key" : `${s.names.length} keys`}` })), this.sel.set, (v) => ((this.sel = { ...this.sel, set: v }), this.redraw())),
-      ),
-      policyOrg ? this.policyLine(policyOrg, slot) : null,
-      slot,
-      this.host.propose && this.catalogue ? this.createForms(org, service) : null,
-    );
-  }
-
-  private policyLine(org: VaultOrg, slot: HTMLElement): HTMLElement {
     const next = !org.allow_reveal;
     const b = btn(next ? "Allow reveal…" : "Turn reveal off…", "small", () =>
       ceremony(
@@ -412,59 +336,16 @@ export class VaultPage {
         next ? "Allow reveal with passkey" : "Turn reveal off with passkey",
         next ? "approve" : "deny",
         () => vaultPolicy(this.host.api, this.seal!, org, next, location.hostname),
-        () => [h("p", null, next ? "Values of " : "Values of ", h("bdi", null, vt(org.title)), next ? " can be shown on this page again, each time after a passkey tap." : " can no longer be shown on this page. Delivery to hosts (aqmas run) is unchanged.")],
+        () => [h("p", null, "Values of ", h("bdi", null, vt(org.title)), next ? " can be shown in the Vault again, each time after a passkey tap." : " can no longer be shown in the Vault. Delivery to hosts (aqmas run) is unchanged.")],
         () => this.host.changed(),
       ),
     );
-    b.disabled = false;
-    return h("p", { class: "vault-policy" }, h("span", null, "Reveal on this page for ", h("bdi", null, vt(org.title)), ": ", h("strong", null, org.allow_reveal ? "allowed" : "off"), ". "), b);
-  }
-
-  /** Create what is missing without leaving the page (the existing catalogue approval). */
-  private createForms(org: Tree | undefined, service: Tree["services"][number] | undefined): HTMLElement {
-    const cat = this.catalogue!;
-    const form = (label: string, kind: "organisation" | "service" | "credential_set") => {
-      const slug = h("input", { type: "text", class: "text", maxlength: "63", placeholder: "slug", autocomplete: "off", spellcheck: "false" });
-      const title = h("input", { type: "text", class: "text", maxlength: "64", placeholder: "Display name", autocomplete: "off" });
-      const error = h("p", { class: "error", role: "alert" });
-      return h(
-        "details",
-        { class: "vault-create" },
-        h("summary", null, label),
-        h("div", { class: "vault-create-row" }, slug, title, btn("Review…", "small", () => {
-          if (!SLUG_RE.test(slug.value) || !TITLE_RE.test(title.value)) {
-            error.textContent = "Slug: lower-case letters, digits and dashes. Name: letters, digits, spaces, dot, dash, underscore.";
-            return;
-          }
-          error.textContent = "";
-          const id = newSetId();
-          const n = { id, slug: slug.value, title: title.value, revision: 0 };
-          const node = (x: { id: string; slug: string; title: string; revision?: number }) => ({ id: x.id, slug: x.slug, title: x.title, revision: x.revision ?? 0 });
-          const policy = { default_seconds: 3600, soft_cap_seconds: 86400, indefinite: true, standing_default_seconds: 3600, standing_soft_cap_seconds: 86400, standing_indefinite: true };
-          const plan =
-            kind === "organisation"
-              ? { organisation: n, new_policy: policy, result_revision: 1 }
-              : kind === "service"
-                ? { organisation: node(org!), service: n, kind: "application", result_revision: 1 }
-                : { organisation: node(org!), service: node(service!), set: n, kind: "env-set", result_revision: 0 };
-          this.host.propose!({ object: kind, id, facts: { plan: planString({ owner_id: cat.owner_id, ...plan }) } }, { action: "create" });
-        })),
-        error,
-      );
-    };
-    return h(
-      "div",
-      { class: "vault-creates" },
-      h("span", { class: "muted" }, "Missing something? "),
-      form("New organisation", "organisation"),
-      org ? form(`New service in ${vt(org.title)}`, "service") : null,
-      org && service ? form(`New empty set in ${vt(service.title)}`, "credential_set") : null,
-    );
+    return h("div", { class: "vault-policy-box" }, h("p", { class: "vault-policy" }, h("span", null, "Reveal in the Vault for ", h("bdi", null, vt(org.title)), ": ", h("strong", null, org.allow_reveal ? "allowed" : "off"), ". "), b), slot);
   }
 
   // ---- env set: write-only form and reveal ----
 
-  private editor(set: VaultSet): HTMLElement {
+  editor(set: VaultSet): HTMLElement {
     const state = this.state!;
     const card = h("article", { class: "card vault-editor" });
     const slot = h("div", { class: "vault-slot" });
@@ -732,7 +613,7 @@ export class VaultPage {
     );
   }
 
-  private signerView(set: VaultSet): HTMLElement {
+  signerView(set: VaultSet): HTMLElement {
     const scheme = schemeOf(this.state!, set.scheme ?? "");
     const cmd = `aqmas sign ${pathOf(set)} --why "…" ${scheme?.input === "message" ? "manifest.bin" : "FILE..."}`;
     return h(
@@ -748,7 +629,8 @@ export class VaultPage {
     );
   }
 
-  private newSigner(org: Tree, service: Tree["services"][number]): HTMLElement {
+  /** The new-signing-key form for one service. `created` gets the new set's id. */
+  newSigner({ org, service }: Place, created?: (setId: string) => void, frozen?: HTMLElement): HTMLElement {
     const state = this.state!;
     const slug = h("input", { type: "text", class: "text", id: "ns-slug", maxlength: "63", placeholder: "release-key", autocomplete: "off", spellcheck: "false" });
     const title = h("input", { type: "text", class: "text", id: "ns-title", maxlength: "64", placeholder: "Release key", autocomplete: "off" });
@@ -768,6 +650,7 @@ export class VaultPage {
     const pasteField = h("div", { class: "field", hidden: true }, h("label", { for: "ns-key" }, "Private key (pasted once)"), pasted, h("p", { class: "hint muted" }, "Encrypted in this tab for the sealed store, then cleared from this field. aqmas shows you the matching public key before you confirm."));
     for (const el of [gen, imp]) el.addEventListener("change", () => (pasteField.hidden = !imp.checked));
     const slot = h("div", { class: "vault-slot" });
+    const root = h("div", { class: "card vault-new-signer" });
     const error = h("p", { class: "error", role: "alert" });
     this.forget.push(() => (pasted.value = ""));
     const parent = { org_id: org.id, org_slug: org.slug, org_title: org.title, service_id: service.id, service_slug: service.slug, service_title: service.title };
@@ -800,25 +683,31 @@ export class VaultPage {
         ],
         (out) => {
           slug.value = title.value = "";
-          this.sel = { ...this.sel, set: out.set_id };
-          // The new key becomes the selected set; its card carries the confirmation.
+          // The new key becomes the selected item; its card carries the confirmation.
           this.created = out.set_id;
+          created?.(out.set_id);
           this.host.changed();
         },
+        undefined,
+        // While the key waits for its tap, neither this form nor the one around it can move.
+        frozen ?? root,
       );
     });
-    return h(
-      "details",
-      { class: "card vault-new-signer" },
-      h("summary", null, "New signing key in ", h("bdi", null, vt(service.title))),
+    title.addEventListener("input", () => {
+      if (!slug.dataset["typed"]) slug.value = slugify(title.value);
+    });
+    slug.addEventListener("input", () => (slug.dataset["typed"] = slug.value ? "1" : ""));
+    append(root, [
+      h("h3", null, "New signing key in ", h("bdi", null, vt(org.title)), " › ", h("bdi", null, vt(service.title))),
       h("p", { class: "hint muted" }, "A signing key lives in the sealed store and is never delivered: hosts send digests and get signatures back, each one approved or covered by a time-boxed grant, each one logged."),
-      h("div", { class: "vault-selects" }, h("div", { class: "field" }, h("label", { for: "ns-slug" }, "Slug"), slug), h("div", { class: "field" }, h("label", { for: "ns-title" }, "Display name"), title), h("div", { class: "field" }, h("label", { for: "ns-scheme" }, "Scheme"), scheme)),
+      h("div", { class: "vault-selects" }, h("div", { class: "field" }, h("label", { for: "ns-title" }, "Name"), title), h("div", { class: "field" }, h("label", { for: "ns-slug" }, "Slug (in the path agents use)"), slug), h("div", { class: "field" }, h("label", { for: "ns-scheme" }, "Scheme"), scheme)),
       about,
       h("div", { class: "vault-source" }, h("label", { class: "check", for: "ns-generate" }, gen, " Generate inside aqmas"), h("label", { class: "check", for: "ns-import" }, imp, " Import an existing private key")),
       pasteField,
       error,
       h("div", { class: "actions" }, go),
       slot,
-    );
+    ]);
+    return root;
   }
 }

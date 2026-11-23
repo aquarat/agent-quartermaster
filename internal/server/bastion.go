@@ -200,7 +200,7 @@ func (s *Server) handleBastionCreate(w http.ResponseWriter, r *http.Request, h *
 			// Refused before anything is queued or pushed: a host the owner did not allow
 			// cannot even put a root card in front of the owner.
 			if !s.bastionAllowed(h.EnrollmentID, req.PeerAddress) {
-				return errForbidden("this host (at this address) is not allowed to ask for root on the bastion; the owner sets that under Admin → Bastion access")
+				return errForbidden("this host (at this address) is not allowed to ask for root on the bastion; the owner sets that under Settings → Bastion access")
 			}
 		}
 		if err := s.pendingRoom(ctx, q, h.ID, now); err != nil {

@@ -104,3 +104,30 @@ export function chevronIcon(): SVGSVGElement {
 export function warningIcon(): SVGSVGElement {
   return draw([{ d: "M12 3 2 21h20L12 3z" }, { d: "M12 10v5" }, { d: "M12 18v.5" }], "icon icon-warning");
 }
+
+const NAV_GLYPHS: Record<string, Shape[]> = {
+  approvals: [{ r: [4, 4, 16, 16, 3] }, { d: "M8.5 12.5l2.5 2.5 4.5-5" }],
+  vault: [{ r: [3, 4, 18, 15, 2] }, { c: [12, 11.5, 3] }, { d: "M12 8.5v-1M7 19v2M17 19v2" }],
+  hosts: [{ r: [3, 4, 18, 6, 1.5] }, { r: [3, 14, 18, 6, 1.5] }, { d: "M7 7h.01M7 17h.01" }],
+  activity: [{ d: "M3 12h4l3-7 4 14 3-7h4" }],
+  security: [{ d: "M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z" }, { d: "M9 12l2 2 4-4" }],
+  settings: [{ d: "M4 7h10M18 7h2M4 17h2M10 17h10" }, { c: [16, 7, 2] }, { c: [8, 17, 2] }],
+  help: [{ c: [12, 12, 9] }, { d: "M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.4-1 1-1 1.7" }, { d: "M12 17v.01" }],
+  search: [{ c: [11, 11, 6.5] }, { d: "M16 16l4.5 4.5" }],
+};
+export function navIcon(name: string): SVGSVGElement {
+  return draw(own(NAV_GLYPHS, name) ?? NAV_GLYPHS["help"]!, "glyph nav-glyph");
+}
+
+/** Vault item types: each also has its words next to it. */
+const ITEM_GLYPHS: Record<string, Shape[]> = {
+  "env-set": [{ r: [4, 3, 16, 18, 2] }, { d: "M8 8h8M8 12h8M8 16h5" }],
+  signer: [{ d: "M4 20h4L19 9l-4-4L4 16z" }, { d: "M13.5 6.5l4 4" }, { d: "M12 20h8" }],
+  cloudflare: PASSKEY_GLYPHS["apple"]!,
+  "ssh-ca": [{ r: [3, 5, 18, 14, 2] }, { d: "M7 10l3 2-3 2M12 14h4" }],
+  "internal-ca": [{ c: [12, 9, 5] }, { d: "M9 13.5 8 21l4-2 4 2-1-7.5" }],
+  access: KEY,
+};
+export function itemIcon(type: string): SVGSVGElement {
+  return draw(own(ITEM_GLYPHS, type) ?? KEY, "glyph item-glyph");
+}

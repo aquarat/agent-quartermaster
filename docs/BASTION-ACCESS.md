@@ -16,11 +16,11 @@ rules below are deliberate and are not relaxed for convenience.
 
 ## For the owner: what you do
 
-1. **Once:** Admin → Bastion access → **Allow aqmas access to the bastion**. Fill in the name
+1. **Once:** Settings → Setup → **Allow aqmas access to the bastion**. Fill in the name
    agents will use, the address fleet hosts reach this machine on and your account's name;
    check the SSH CA fingerprint; tap with a pinned passkey. The broker restarts (everything
    open closes).
-2. **Once per host that may ask for root:** tick it under *Who may ask for root* and tap
+2. **Once per host that may ask for root:** in Settings → Setup, tick it under *Who may ask for root* and tap
    (**Set who may ask for root on the bastion**). Empty by default.
 3. **An agent wants to read logs:** it runs `aqmas ssh bastion --why "…" -- logs aqmasd`; you
    get an amber card; tap.
@@ -438,11 +438,13 @@ or was refused.
 ## 10. Web UI
 
 * The red card (§6) in the pending list; amber inspect card; a normal card for a queued task.
-* **Admin → Bastion access**: whether access is installed (and the two access tasks), who may
-  ask for root (a checklist of enrolled hosts with their addresses, applied with one tap),
+* **Settings → Bastion access**: whether access is installed, who may ask for root, and
   active and recent bastion sessions (level, host, until, buckets closed, alert delivered or
-  not, collected or not, revoke), and the routine tasks with their last result.
-* The global red banner while a root certificate is unexpired.
+  not, collected or not, revoke).
+* **Settings → Setup**, after the Setup queue: the access tasks (allow, who may ask for root as
+  a checklist of enrolled hosts with their addresses, remove) and the routine tasks with
+  their last result.
+* The global red banner directly under the header, on every page, while a root certificate is unexpired.
 * Help page section.
 
 `GET /api/ui/bastion` → `{enabled, name, address, port, admin_user, inspect_user, ssh_ca,

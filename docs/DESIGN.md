@@ -77,7 +77,7 @@ See [Access to the bastion itself](BASTION-ACCESS.md) for inspect and root sessi
   that host use it (it lives in the agent user's config dir: an agent already has root on its
   own host by design). A request is attributed to the host whose certificate authenticated it.
   Re-enrolling an existing name is a high-risk card; approving it revokes the old certificate.
-  Revoke a host from Admin with a signed confirmation bound to its immutable enrollment ID,
+  Revoke a host from the Hosts tab with a signed confirmation bound to its immutable enrollment ID,
   or with `aqmasd revoke-host NAME` on the bastion. Owner-device enrollment signs the class;
   existing and ordinary hosts remain agent-class. The owner defaults are a 24-hour maximum
   SSH TTL and 30-day standing window. Existing high-risk and per-target limits still apply.

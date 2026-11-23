@@ -55,15 +55,17 @@ export interface Api {
   envState?():Promise<import('./envsets').EnvState>;
   /** Credential sets page (docs/API.md "Vault"). */
   vaultState?(): Promise<import('./vault').VaultState>;
+  /** One set's recent audit rows and when it last changed and was last used (display only). */
+  vaultHistory?(set: string): Promise<import('./vault').SetHistory>;
   vaultPost?<T>(path: 'attempt' | 'challenge' | 'finish', body: unknown): Promise<T>;
   envPost?<T>(path:'ticket'|'challenge'|'finish',body:unknown):Promise<T>;
   sealStatus?(): Promise<import("./sealPanel").SealView>;
   /** POST /api/ui/seal/{path}: control, passkeys, recovery, stage, batch, windows, drill (docs/BUCKETS.md). */
   sealPost?<T>(path: SealPath, body: unknown): Promise<T>;
-  /** Admin → Setup (docs/SETUP.md); `path` is relative to /api/ui/setup. */
+  /** Settings → Setup (docs/SETUP.md); `path` is relative to /api/ui/setup. */
   setupGet?<T>(path: string): Promise<T>;
   setupPost?<T>(path: string, body: unknown): Promise<T>;
-  /** Admin → Bastion access (docs/BASTION-ACCESS.md §10). */
+  /** Settings → Bastion access (docs/BASTION-ACCESS.md §10). */
   bastion?(): Promise<import("./types").BastionView>;
   /** Drop a maintenance request an agent queued (unsigned: it only returns to "nothing queued"). */
   dismissSetupRequest?(id: string): Promise<unknown>;
@@ -135,6 +137,7 @@ export function createApi(opts: ApiOptions = {}): Api {
 
   return {
     vaultState: () => call('GET', '/api/ui/seal/vault/state'),
+    vaultHistory: (set) => call('GET', `/api/ui/seal/vault/history?set=${encodeURIComponent(set)}`),
     vaultPost: (path, body) => call('POST', `/api/ui/seal/vault/${path}`, body),
     envState:()=>call('GET','/api/ui/seal/env/state'),envPost:(path,body)=>call('POST',`/api/ui/seal/env/${path}`,body),
     sealStatus: () => call('GET','/api/ui/seal/status'),

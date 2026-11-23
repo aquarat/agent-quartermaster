@@ -30,7 +30,7 @@
 //   seal-activate | close-all | rekey SCOPE | repair-leaf   signed seal control actions
 //   reopen                        reopen every bucket that has paused users (prints the taps)
 //   buckets [--json] | open-buckets   bucket status; the open buckets as "kind:label ..."
-//   recovery-drill FILE           Admin → Recovery drill with the identity in FILE
+//   recovery-drill FILE           Security → Recovery key drill with the identity in FILE
 //   create-scope TITLE            create an organisation's scope key (signed-in passkey)
 //   capability ACTION NAME [CAP]  register|enable|test|disable a passkey's scope keys
 //   window SECONDS COUNT MARKER   open a personal approval window, approve COUNT SSH requests
@@ -113,7 +113,7 @@ async function findPending(id: string) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const rp = new URL(origin).hostname;
-/** A seal control action (Admin → Buckets, Setup activation) exactly as the page signs it. */
+/** A seal control action (Security → Buckets, Setup activation) exactly as the page signs it. */
 async function control(action: string, params: Record<string, unknown> = {}) {
   const c = await (await import(`${web}/src/sealPanel.ts`)).beginControl(api, await api.sealStatus(), action as never, params, rp);
   console.error(`owner: signing seal ${action}${action === "activate" ? "" : " " + c.detail}${c.lines.length ? " · " + c.lines.join(" ") : ""}`);
@@ -152,7 +152,7 @@ try {
         if(n>=150)throw Error('no signing request queued');await Bun.sleep(100)}break;}
     case 'batch': {const state=await api.state(),v=await api.sealStatus();const sel=args.map(id=>({item:state.pending.find((p:any)=>p.id===id),action:'approve',ttl_seconds:300}));const b=await (await import(`${web}/src/approvals.ts`)).batchReview(api,v,sel,new URL(origin).hostname);await b.tap(auth);break;}
     case 'seal-status': console.log((await api.sealStatus()).mode);break;
-    // ---- Admin → Setup (docs/SETUP.md), through the web UI's own setup module ----
+    // ---- Settings → Setup (docs/SETUP.md), through the web UI's own setup module ----
     case 'setup': console.log(JSON.stringify(await api.setupGet!('')));break;
     case 'setup-state': {const v:any=await api.setupGet!('');const t=v.tasks.find((t:any)=>t.id===args[0]);console.log(t.state+(t.blocked_by?': '+t.blocked_by:''));break;}
     case 'setup-wait': {
@@ -220,11 +220,11 @@ try {
     case 'open-kinds': { // the kinds of the open buckets, sorted, unique, space-separated
       const v=await api.sealStatus();console.log([...new Set((v.buckets??[]).filter((b:any)=>b.open).map((b:any)=>b.kind))].sort().join(' '));break;
     }
-    case 'recovery-drill': { // IDENTITY-FILE: Admin → Recovery drill; prints {ok,scopes,buckets}
+    case 'recovery-drill': { // IDENTITY-FILE: Security → Recovery key drill; prints {ok,scopes,buckets}
       const v=await api.sealStatus();const r=await (await import(`${web}/src/recoveryPanel.ts`)).beginRecovery(api,v,{mode:'drill'},readFileSync(args[0]!,'utf8'),rp);
       console.log(JSON.stringify(await r.finish(auth)));break;
     }
-    case 'create-scope': { // TITLE: Admin → Buckets "Create": the signed-in passkey creates an organisation's scope key
+    case 'create-scope': { // TITLE: Security → Buckets "Create": the signed-in passkey creates an organisation's scope key
       const v=await api.sealStatus();const sc=(v.scopes??[]).find((x:any)=>x.title===args[0]||x.scope===args[0]);if(!sc)throw Error('no scope '+args[0]);
       const me=(await api.state()).passkeys.find((k:any)=>k.current);
       // Enable (two taps), then the test tap that lets the broker write into the new scope.

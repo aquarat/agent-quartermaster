@@ -303,7 +303,7 @@ Positive interop vectors: the signed `migration:activate` followed by `request:a
 cases include rewriting `v` alone, stripping any signed binding, adding an unknown plan field,
 or changing an enrollment generation between review and apply. None is a v2 approval.
 
-### Organisation Admin and duration choices
+### Organisations (Vault, Hosts, Settings) and duration choices
 
 After activation, `GET /api/ui/catalogue` returns the owner's organisations, services,
 sets, effective policy rules, eligible enrollments (including current generation), and
@@ -401,7 +401,7 @@ proxy choice and does not make the grants it issues indefinite.
 `serve`, `passkey-enroll-code` (one-time code, 15 min, single use, for the first passkey),
 `print-ssh-ca` (for `TrustedUserCAKeys`), `print-client-ca` (internal CA PEM),
 `tls-fingerprint` (the `--ca-pin` value), `revoke-host NAME` (revoke a host's client
-certificate at once; also available on Admin), `version`.
+certificate at once; also available on the Hosts tab), `version`.
 
 
 `setup-facts` prints the schema version and the public passkey records as JSON for the
@@ -773,12 +773,12 @@ Session routes under `/api/ui/seal/passkeys/` (BUCKETS.md §7):
 
 Repeat from step 1 for further scopes, two per round. A stage is bound to the session,
 expires after five minutes (its opened scope keys are wiped then, by its own timer and by the
-15 s reconcile pass) and is lost on restart (at most 16 pending). Admin's **Create**
+15 s reconcile pass) and is lost on restart (at most 16 pending). **Create** (Security → Buckets, or Vault → Add item)
 for a new organisation's scope is `enable` of the signed-in passkey for that scope (two
 taps). Until some passkey's wrap of a new scope has opened once (`test`, three taps in all),
 creating its first bucket is refused (409 "test the new scope first").
 
-## Recovery (Admin, rare path)
+## Recovery (Security tab, rare path)
 
 1. `POST /api/ui/seal/recovery/key {}` → `{attempt_id, recipient}`: a fresh broker key (two
    minutes, single use). The page seals the pasted identity text to it: HPKE base mode,
@@ -872,13 +872,13 @@ P1363 ECDSA-SHA256 proof over the suite-1 tuple `window-confirm`, installation,
 window ID and proposal ID (UTF-8 base64url), canonical digest (raw bytes).
 `presence` every 10s renews only the 30s presence lease; only applied decisions
 advance idle. Close/reload drops secrets, logout ends that session's windows,
-and a signed authority change fences old windows in SQLite. Admin can close
+and a signed authority change fences old windows in SQLite. Security → Buckets can close
 from another live owner session. A forwarded HTTP request or issued grant is
 not recalled by closing a window. A window click is not a passkey signature.
 # Env sets: immutable revisions and collection
 
 The sealed runtime resolves `GET /v2/env/set?path=org/service/set` only for
-the authenticated host's current admission. Admin → Env credential sets
+the authenticated host's current admission. Vault (an env set's “More”)
 issues a one-use, five-minute upload ticket bound to session, enrolled
 owner-device, operation, immutable path IDs and base revision. Enter the
 ticket at the CLI prompt (`--ticket-fd N` for a protected input stream).
@@ -947,10 +947,21 @@ from the audit alone. No PRF/KEK or decrypted finish packet is persisted.
 
 # Vault: web form, reveal and signer sets
 
-Sealed, organisation-scoped installations only. The owner's **Credential sets**
-page talks to four session-only routes under `/api/ui/seal/vault/`; agents ask
+Sealed, organisation-scoped installations only. The owner's **Vault** tab
+talks to five session-only routes under `/api/ui/seal/vault/`; agents ask
 for signatures under `/v2/sign/`. [SIGNING.md](SIGNING.md) is the guide; this
 section is the wire contract.
+
+`GET /api/ui/seal/vault/history?set=SET_ID` (owner session, read-only) returns
+`{entries, last_changed_at, last_used_at}` for one application set: its newest
+20 audit rows (`{at, actor, action, object, detail}`, as in `/api/ui/state`
+`recent`) and, in Unix milliseconds, when it last changed (`vault_commit`,
+`vault_signer_create`, `env_commit`) and was last used (`env_collect_*`,
+`sign`); 0 when no such row is among the newest 200 about the set. The rows are
+the owner's actions on the set (`object` `set:ID`), what admitted hosts asked
+for and collected (their `detail` begins with the set's path) and the owner's
+decisions on those. It carries no value, changes nothing and nothing is decided
+from it; an unknown or archived set is 404.
 
 ## Transport encryption
 

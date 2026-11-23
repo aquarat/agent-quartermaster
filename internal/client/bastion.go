@@ -147,7 +147,7 @@ func (e *Env) bastionStart(ctx context.Context, o BastionOptions) (level, why st
 	if info, err = c.BastionInfo(ctx); err != nil {
 		var ae *APIError
 		if errors.As(err, &ae) && ae.HTTPStatus == 404 {
-			err = errors.New("access to the bastion is not installed on this aqmasd (the owner installs it under Admin → Bastion access)")
+			err = errors.New("access to the bastion is not installed on this aqmasd (the owner installs it under Settings → Bastion access)")
 		}
 		return
 	}
@@ -392,7 +392,7 @@ func (e *Env) BastionRoot(ctx context.Context, o BastionOptions, run RunSSH) (in
 		return 0, &UsageError{Msg: fmt.Sprintf("--ttl for a root session is between 1m and %ds", info.RootMaxSeconds)}
 	}
 	if !info.RootAllowed {
-		return 0, errors.New("this host (at this address) may not ask for root on the bastion; the owner sets who may under Admin → Bastion access")
+		return 0, errors.New("this host (at this address) may not ask for root on the bastion; the owner sets who may under Settings → Bastion access")
 	}
 	ttl := o.TTL
 	if ttl == 0 {
@@ -478,7 +478,7 @@ func (e *Env) BastionShow(ctx context.Context) error {
 	fmt.Fprintf(w, "bastion      %s (%s port %d)\n", info.Name, info.Address, info.Port)
 	fmt.Fprintf(w, "inspect      as %s, read-only commands, up to %s (default %s): aqmas ssh %s --why \"...\" -- logs aqmasd\n",
 		info.InspectUser, time.Duration(info.InspectMaxSeconds)*time.Second, time.Duration(info.InspectDefault)*time.Second, info.Name)
-	root := "NOT allowed from this host (the owner sets who may ask under Admin → Bastion access)"
+	root := "NOT allowed from this host (the owner sets who may ask under Settings → Bastion access)"
 	if info.RootAllowed {
 		root = fmt.Sprintf("allowed from this host, up to %s, red card every time: aqmas ssh %s --level root --why \"...\"", time.Duration(info.RootMaxSeconds)*time.Second, info.Name)
 	}

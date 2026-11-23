@@ -1,4 +1,4 @@
-// Admin → Setup (docs/SETUP.md), DOM-free: the wire types of GET /api/ui/setup, the task
+// Settings → Setup (docs/SETUP.md), DOM-free: the wire types of GET /api/ui/setup, the task
 // parameter encoding the runner accepts, sealing of pasted secrets, the recovery key made in
 // the browser, and the signed "run this task" flow.
 //
@@ -46,7 +46,7 @@ export interface SetupTask {
   rerunnable?: boolean;
   last?: SetupRun | null;
   /** Where the page shows the task: "" / absent = the Setup queue; "bastion" and "routine"
-   * = Admin → Bastion access (maint.Spec.Group). */
+   * = Settings → Bastion access (maint.Spec.Group). */
   group?: string;
   /** Shown in red above the approve button (a restart closes every bucket…). */
   warning?: string;

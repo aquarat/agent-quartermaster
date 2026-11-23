@@ -54,7 +54,7 @@ The holder watches grant status and a local monotonic deadline bounded by `not_a
 
 **TTL is a collection deadline, not an upstream expiry.** For `run`, the grant need not kill the child: descendants, logs, process inspection and open file descriptors can retain values. File cleanup is hygiene on a cooperative host. aqmas records who requested which revision, when, why and who authorised release; it cannot audit use at the provider. Prefer proxy grants or issued short-lived credentials. A rotation helper should list exposed revisions, recipient enrollments and outstanding grants, guide changing the value **at the provider**, then stage the replacement and retire the old value. Editing the broker alone does not rotate a database password.
 
-**As built (2026-11-22): the Credential sets page.** Admin → Credential sets is a write-only form: pick the organisation, service and set (create them there if missing), type or paste values, or drop a `.env` file and see which keys it adds, replaces and removes, then commit with one passkey tap. Values are encrypted in the browser to a one-time key of the broker and are multi-line capable. The CLI ticket flow below still works. **Reveal** decrypts chosen values in the browser after a fresh passkey tap of its own: never under an approval window or batch, refused while locked, audited by key name, and governed by a per-organisation **Allow reveal** switch (on by default, including for new organisations; turn it off where the owner should not read values back). Signer keys have no reveal. Wire contract: [API.md](API.md#vault-web-form-reveal-and-signer-sets).
+**As built (2026-11-22; Vault tab since 2026-11-23): the Vault.** The **Vault** tab lists every item (env sets, signing keys, the Cloudflare parent credential, the CAs, access rules) with filters by type and by organisation → service and a search over names, paths and key names; an item shows its fields, the hosts that may ask for it and its recent history. **Add item** takes a type, a place and a name and creates a missing organisation, its key and a missing service on the way, one approval each. An env set is a write-only form: type or paste values, or drop a `.env` file and see which keys it adds, replaces and removes, then commit with one passkey tap. Values are encrypted in the browser to a one-time key of the broker and are multi-line capable. The CLI ticket flow below still works. **Reveal** decrypts chosen values in the browser after a fresh passkey tap of its own: never under an approval window or batch, refused while locked, audited by key name, and governed by a per-organisation **Allow reveal** switch (on by default, including for new organisations; turn it off where the owner should not read values back). Signer keys have no reveal. Wire contract: [API.md](API.md#vault-web-form-reveal-and-signer-sets).
 
 **Keys that sign should not be delivered at all.** Where a signing scheme exists, put the key in a `signer` set and have agents call `aqmas sign` ([SIGNING.md](SIGNING.md)); `aqmas run` with the key in an env set remains for tools that cannot work that way.
 
@@ -124,7 +124,7 @@ service binding. Plans larger than 128 KiB (compact JSON) or 512 rows in any inv
 The preview changes neither the backup nor the running catalogue. Re-run it after configuration,
 enrollment or grant changes.
 
-**From the approval page:** **Admin → Setup → Switch to organisations** ([SETUP.md](SETUP.md))
+**From the approval page:** **Settings → Setup → Switch to organisations** ([SETUP.md](SETUP.md))
 performs the supervised activation below with one approval plus the activation signature:
 backup, fenced review mode, restart, and a restore of the backup if the broker is unhealthy
 afterwards.
@@ -140,7 +140,7 @@ runs no sweeper or update poller, and saves a private consistent `pre-organisati
 Copy that recovery point to independently encrypted backup storage and compare its SHA-256 to
 the logged digest. Do not change config, keys or host records during review.
 
-Sign in at the normal approval origin, open **Admin**, review the full personal plan and recovery
+Sign in at the normal approval origin, open **Settings → Setup**, review the full personal plan and recovery
 digest, then activate with a passkey. A changed host inventory, elapsed validity boundary, or
 changed recovery file invalidates the review: restart maintenance and review the new point.
 The backfill, retirement, activation marker, audit and version 6 commit together. Stop maintenance
@@ -156,7 +156,7 @@ cannot enforce a script name. The plan lists the affected templates. Use proxy m
 No minter is opened and no legacy child is deleted by an unverified parent. Issued children
 can continue to work until provider expiry; verify/revoke them with the original issuing parent.
 
-**After activation:** Use **Admin → Organisations** to create an organisation, list its
+**After activation:** Use **Settings → Organisations** to create an organisation, list its
 services and sets, edit grant/standing policy, and admit or remove a specific enrollment.
 An admission previews which accesses need no additional owner tap, or **none**. New
 organisations have no hosts. New application services and credential sets contain only
@@ -191,7 +191,7 @@ exceed one hour; `cf.read.private` can never exceed two hours. Neither can be
 indefinite. Indefinite access is expected to be rare: it is never the default
 and must not result from a policy-auto or standing match.
 
-1. **Durations are per-organisation policy, edited on the Admin page** (passkey-signed), for each
+1. **Durations are per-organisation policy, edited under Settings → Organisations and policies** (passkey-signed), for each
    organisation and optionally per service/set: a default, a **soft cap** and whether
    **indefinite** is offered. Starting values for a new organisation: default **1 hour**, soft cap
    **24 hours**, indefinite available but never preselected. Choosing a duration above the soft cap

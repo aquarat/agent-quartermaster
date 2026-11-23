@@ -1,4 +1,4 @@
-// Package maint is the maintenance runner behind Admin → Setup (docs/SETUP.md).
+// Package maint is the maintenance runner behind Settings → Setup (docs/SETUP.md).
 //
 // aqmasd (unprivileged) writes one owner-signed request to a spool. The runner (root, started
 // by a systemd path unit as `aqmasd maint-run`) treats the spool as hostile: it verifies the
@@ -42,7 +42,7 @@ const (
 	TaskJournalVacuum = "journal-vacuum"
 )
 
-// Groups place a task on the page: "" is the Setup queue, the others Admin → Bastion access.
+// Groups place a task on the page: "" is the Setup queue, the others Settings → Bastion access.
 const (
 	GroupBastion = "bastion"
 	GroupRoutine = "routine"

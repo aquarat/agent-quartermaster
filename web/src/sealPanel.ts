@@ -1,6 +1,6 @@
 // Seal format 2 (docs/BUCKETS.md §5–6): the status the broker reports, its control actions
 // (close all, reopen, rekey, renew the agent TLS leaf, activate a staged store) and
-// Admin → Buckets. There is no unlock: a bucket opens only for the tap that needs it and
+// Security → Buckets. There is no unlock: a bucket opens only for the tap that needs it and
 // stays open only as long as its holds say.
 
 import { type Api } from "./api";
@@ -109,17 +109,8 @@ export function openSummary(v: SealView): string {
   return n === 0 ? "nothing open" : n === 1 ? "1 bucket open" : `${n} buckets open`;
 }
 
-/** The header's indicator: how much is decrypted right now. Links to Admin → Buckets. */
-export function bucketIndicator(v: SealView): HTMLElement {
-  const n = openCount(v);
-  const a = h("a", { class: `badge buckets-open${n ? " open" : ""}`, title: "Admin → Buckets" }, openSummary(v));
-  a.href = "#/admin";
-  a.dataset["open"] = String(n);
-  return a;
-}
-
 export const REKEY_WARNING =
-  "Rekey replaces this scope's key and every bucket key in it, and re-encrypts every value. Do it after losing a passkey or a backup: removing a passkey does not revoke copies of its wraps in old backups. Your passkey's new key uses a fresh PRF input that the broker cannot check in advance, so it taps once more right afterwards to test it; if that fails, the recovery key (Admin → Recovery) is the way back in. Afterwards only this passkey can open the scope: enable your other passkeys again from it. Open buckets of the scope close and their users pause until you Reopen them. Old copies then expose only values as they were at the copy.";
+  "Rekey replaces this scope's key and every bucket key in it, and re-encrypts every value. Do it after losing a passkey or a backup: removing a passkey does not revoke copies of its wraps in old backups. Your passkey's new key uses a fresh PRF input that the broker cannot check in advance, so it taps once more right afterwards to test it; if that fails, the recovery key (Security → Recovery key) is the way back in. Afterwards only this passkey can open the scope: enable your other passkeys again from it. Open buckets of the scope close and their users pause until you Reopen them. Old copies then expose only values as they were at the copy.";
 
 export const CLOSE_ALL_TEXT = "Close all wipes every open bucket key and hold and ends every approval window, without a restart. Grants that need a bucket pause until you Reopen them.";
 
@@ -212,7 +203,7 @@ export async function beginControl(api: Api, v: SealView, action: ControlAction,
   };
 }
 
-// ---- Admin → Buckets ----
+// ---- Security → Buckets ----
 
 const KINDS: Record<string, string> = {
   "ssh-ca": "SSH user CA",
@@ -237,7 +228,7 @@ export interface BucketsHooks {
   testAfterRekey?(scope: string, review: HTMLElement): Promise<void>;
 }
 
-/** Admin → Buckets: every bucket, what holds it open, what waits for a Reopen, per-scope
+/** Security → Buckets: every bucket, what holds it open, what waits for a Reopen, per-scope
  * Rekey and Create, Close all. Each action is one signed tap shown before it is taken. */
 export function bucketsPanel(api: Api, auth: Authenticator, v: SealView, pks: PasskeyInfo[], refresh: () => void, tab?: TabWindow, hooks: BucketsHooks = {}): HTMLElement {
   const root = h("article", { class: "card buckets" });
@@ -330,7 +321,7 @@ export function bucketsPanel(api: Api, auth: Authenticator, v: SealView, pks: Pa
     } else if (info) {
       if (info.tested === false)
         head.append(
-          h("span", { class: "badge warn", title: "No passkey has opened this scope key yet: Admin → Passkeys → Test, or Admin → Recovery" }, mine.length ? "Untested after rekey" : "Not tested yet"),
+          h("span", { class: "badge warn", title: "No passkey has opened this scope key yet: Security → Passkeys → Test, or Security → Recovery key" }, mine.length ? "Untested after rekey" : "Not tested yet"),
         );
       const after = hooks.testAfterRekey ? () => hooks.testAfterRekey!(s, review) : undefined;
       head.append(
@@ -424,7 +415,7 @@ export function sealBanner(v: SealView): HTMLElement | null {
       { class: "card warn-card" },
       h("h2", null, "Move to per-credential buckets"),
       h("p", null, "This broker runs a newer version that keeps every credential in its own bucket. Until the store is moved, it signs in, queues requests and lets you deny and revoke, but issues nothing."),
-      h("div", { class: "actions" }, link("Open Admin → Setup", "#/setup")),
+      h("div", { class: "actions" }, link("Open Settings → Setup", "#/setup")),
     );
   if (v.mode === "activated") return h("article", { class: "card" }, h("p", { class: "spinner", role: "status" }, "Activated. The broker restarts in a moment; nothing is open until an approval needs it."));
   return null;

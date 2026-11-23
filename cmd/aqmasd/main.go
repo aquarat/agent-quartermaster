@@ -240,7 +240,7 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 	return fmt.Errorf("unknown command %q", cmd)
 }
 
-// maintenance is the root side of Admin → Setup. It takes no path or command from its
+// maintenance is the root side of Settings → Setup. It takes no path or command from its
 // arguments: production always uses the fixed layout and the root-protected configuration.
 // "--test-layout DIR HOOK" relocates everything for the interop suite and is refused for root.
 func maintenance(cmd string, args []string) error {

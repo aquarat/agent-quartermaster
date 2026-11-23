@@ -600,7 +600,7 @@ func (s *Server) rekey(ctx context.Context, sess string, c *store.Challenge, in 
 		}
 		// The new wrap is under the fresh salt's KEK (the second evaluation of
 		// this tap). The broker cannot check that KEK before it is used, so the
-		// wrap is untested until it next opens (Admin → Passkeys → Test).
+		// wrap is untested until it next opens (Security → Passkeys → Test).
 		sw.Salt = bytes.Clone(t.rekeySalt[:])
 		w, err := s.passkeyScope(sw).Wrap(keks[1], newScope, pubS)
 		if err != nil {

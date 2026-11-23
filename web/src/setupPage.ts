@@ -1,4 +1,4 @@
-// Admin → Setup (docs/SETUP.md): the task queue. Each task is a card with its fixed
+// Settings → Setup (docs/SETUP.md): the task queue. Each task is a card with its fixed
 // description, its state, the last run, and whatever the owner has to enter or tap. The
 // broker restarts during tasks, so this page polls by itself and treats an unreachable broker
 // as "restarting", never as an error page.
@@ -46,8 +46,11 @@ export interface SetupHooks {
   pollMs?: number;
   idleMs?: number;
   /** Which task groups this page shows (maint.Spec.Group). Default [""]: the Setup queue;
-   * Admin → Bastion access shows ["bastion", "routine"]. */
+   * Settings → Bastion access shows ["bastion", "routine"]. */
   groups?: string[];
+  /** false: a second task list on a page whose Setup queue already shows the runner's
+   * notices (not installed, unpinned passkey, refused request). */
+  notices?: boolean;
   /** Forms for tasks this class has none for (the bastion and routine tasks). `run` builds
    * the usual Run… → check → Confirm with passkey panel. Return undefined for "no form". */
   form?(t: SetupTask, v: SetupView, can: boolean, label: string, run: (label: string, collect: () => Collected) => HTMLElement): Child[] | undefined;
@@ -350,6 +353,7 @@ export class SetupPage {
 
   private noticeKey = "";
   private renderNotices(v: SetupView): void {
+    if (this.hooks.notices === false) return;
     const keys = v.passkeys!;
     const key = JSON.stringify([v.runner_installed, v.refused, keys]);
     if (key === this.noticeKey) return;
@@ -845,7 +849,7 @@ export class SetupPage {
     purge.checked = true;
     const oneWay = [
       h("p", { class: "warn" }, h("strong", null, "One-way. "), "There is no rollback: after you activate, this version of aqmas cannot go back to the single store key, and the backup taken before the move is the only way back (with the previous version)."),
-      h("p", { class: "muted" }, "Your other passkeys that could open the old store become approve-only until you enable them for buckets in Admin → Passkeys."),
+      h("p", { class: "muted" }, "Your other passkeys that could open the old store become approve-only until you enable them for buckets in Security → Passkeys."),
     ];
     return [
       ...oneWay,

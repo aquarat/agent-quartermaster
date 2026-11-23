@@ -1,6 +1,6 @@
 // Access to the bastion itself (docs/BASTION-ACCESS.md §6, §7, §10): the red root card, the
 // inspect card, the card of a maintenance task an agent queued, the banner while a root
-// certificate is valid, and Admin → Bastion access. Rendering only: what is signed is checked
+// certificate is valid, and Settings → Bastion access. Rendering only: what is signed is checked
 // in canonical.ts, flows.ts and setup.ts, and the confirmation is always drawn from the
 // signed text.
 
@@ -295,7 +295,7 @@ export function queuedTaskCard(api: Api, auth: Authenticator, p: PendingItem, k:
       done.then(
         () => {
           busy(false);
-          replace(box, h("p", { class: "ok", role: "status" }, "Approved. The maintenance runner carries it out; progress is under Admin → Bastion access."));
+          replace(box, h("p", { class: "ok", role: "status" }, "Approved. The maintenance runner carries it out; progress is under Settings → Setup."));
           k.changed();
         },
         (e) => {
@@ -342,7 +342,7 @@ export function queuedTaskCard(api: Api, auth: Authenticator, p: PendingItem, k:
   );
 }
 
-// ---- Admin → Bastion access ----
+// ---- Settings → Bastion access ----
 
 /** The complete, sorted allowlist the bastion-allow task signs, from the ticked hosts. */
 export function allowParams(hosts: readonly BastionHost[], ticked: ReadonlySet<string>): { hosts: Array<{ id: string; name: string; address: string }> } {
@@ -381,7 +381,7 @@ export interface BastionPanelHooks {
   idleMs?: number;
 }
 
-/** Admin → Bastion access: whether access is installed, who may ask for root, the sessions,
+/** Settings → Bastion access: whether access is installed, who may ask for root, the sessions,
  * and the access and routine tasks (the Setup page's own cards, with their forms from here). */
 export class BastionPanel {
   readonly el = h("div", { class: "bastion-panel" });
@@ -396,8 +396,15 @@ export class BastionPanel {
     private api: Api,
     auth: Authenticator,
     private hooks: BastionPanelHooks,
+    /** "overview": Settings → Bastion access (status, who may ask, sessions). "tasks":
+     * Settings → Setup (the access and routine tasks with their forms). */
+    mode: "overview" | "tasks" = "overview",
   ) {
-    replace(this.el, this.head, this.sessions, h("h3", { class: "bastion-h" }, "Access and routine tasks"), h("p", { class: "muted" }, "Each task is one approval by a passkey that is pinned for maintenance. A small root program on this machine checks the signature itself and does the work; none of them takes free text."), this.tasks);
+    const notices = mode !== "tasks";
+    const setupLink = h("a", { class: "btn approve" }, "Open Setup");
+    setupLink.href = "#/setup";
+    if (mode === "tasks") replace(this.el, h("h3", { class: "bastion-h" }, "The bastion itself: access and routine tasks"), h("p", { class: "muted" }, "Each task is one approval by a passkey that is pinned for maintenance; none of them takes free text. Sessions and who may ask for root are shown under Settings → Bastion access."), this.tasks);
+    else replace(this.el, this.head, this.sessions, h("p", { class: "muted" }, "Allowing or removing access, choosing who may ask for root, updates, restarts and the journal are tasks under Settings → Setup."), h("div", { class: "actions" }, setupLink));
     this.page = new SetupPage(this.tasks, api, auth, {
       openMigration: () => {},
       openUpdate: () => {},
@@ -406,6 +413,7 @@ export class BastionPanel {
       pollMs: hooks.pollMs,
       idleMs: hooks.idleMs,
       groups: ["bastion", "routine"],
+      notices,
       loaded: () => this.load(),
       formKey: (t) => this.formKey(t),
       form: (t, v, can, label, run) => this.form(t, v, can, label, run),
@@ -447,6 +455,7 @@ export class BastionPanel {
             )
           : h("div", { class: "bastion-status off" }, h("p", null, h("span", { class: "badge setup-state state-blocked" }, "Not installed"), " This machine's sshd accepts only your emergency key. Run “Allow aqmas access to the bastion” below to let aqmas issue certificates for it.")),
         v.enabled && !v.alert_channel ? h("p", { class: "warn" }, ROOT_NO_ALERT, " A root session would be approved without a push notification.") : null,
+        v.enabled ? h("p", null, "May ask for root: ", (v.hosts ?? []).some((x) => x.allowed) ? (v.hosts ?? []).filter((x) => x.allowed).map((x, i) => [i ? ", " : "", h("bdi", { class: "host-name" }, vt(x.name)), " (", h("bdi", null, vt(x.allowed_address ?? x.address)), ")"]) : h("strong", null, "nobody"), ".") : null,
         h("p", { class: "muted" }, "Your emergency key is never touched by any of this and stays the way in when aqmas is down."),
       );
     }

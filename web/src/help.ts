@@ -43,6 +43,28 @@ export function helpPage(c: HelpConfig) {
     "div",
     { class: "help" },
     card(
+      "Where things are",
+      h(
+        "dl",
+        { class: "facts help-map" },
+        ...[
+          ["Approvals", "Everything waiting for you (access requests, signature requests, env releases, hosts asking to join), then who holds access now and your auto-approvals. The number on the tab counts what waits, on every page."],
+          ["Vault", "Every credential the broker holds, as one searchable list: env sets, signing keys, the Cloudflare parent credential, the CAs and the access rules. Filter by type or organisation; open an item for its fields, who may ask for it and what happened to it. “Add item” creates a new one."],
+          ["Hosts", "Enrolled hosts, the organisations each may ask for (Admit, Remove) and Revoke."],
+          ["Activity", "The audit log, with filters."],
+          ["Security", "Whether your passkeys can open your credentials (and Enable for the ones that cannot), passkeys, the buckets open right now with Reopen, Rekey and Close all, approval windows, and the recovery key."],
+          ["Settings", "Setup and upgrades, and each organisation's policies."],
+        ].map(([k, v]) => [h("dt", null, k), h("dd", null, v)]),
+      ),
+      p("The pill at the top right says how many buckets are decrypted right now; it opens a panel with what is open, what waits and Close all. Search (the magnifier, / or Ctrl+K) finds vault items by name, path or key name, hosts, passkeys, pages and actions."),
+    ),
+    card(
+      "Add, change and look at a credential",
+      p("Vault → Add item. Choose Env set (values a command gets as environment variables) or Signing key, then the organisation and service it belongs to and its name. A new organisation or service is created on the way: each is one passkey approval, and a new organisation also gets its own encryption key (three taps). The slug becomes part of the path hosts ask for and cannot be changed later."),
+      p("Open an env set to add, replace or remove keys, or drop a .env file on it; “Review and save” shows exactly what changes before the tap. The form is write-only: stored values are never loaded into it. Reveal shows one value, or all of them, for 60 seconds after a passkey tap of its own, and each reveal is logged with the key names; Copy is next to a revealed value. An organisation can have Reveal turned off (the item's “More”)."),
+      p("There is no rename, move or delete of a whole item yet: remove its keys instead (an empty set delivers nothing), and ask before reusing a slug."),
+    ),
+    card(
       "Enroll a machine",
       base
         ? [
@@ -84,7 +106,7 @@ export function helpPage(c: HelpConfig) {
     card(
       "Prefer aqmas sign over fetching a key",
       p(
-        "Where a signing scheme exists, the key should not leave aqmas. Put it in a signing key set (Admin → Credential sets) and have the host ask for signatures: the CLI hashes the files locally, the approval card shows each file name, size and SHA-256, and aqmas returns the signatures. The private key is never delivered, revealed or exported.",
+        "Where a signing scheme exists, the key should not leave aqmas. Put it in a signing key set (Vault) and have the host ask for signatures: the CLI hashes the files locally, the approval card shows each file name, size and SHA-256, and aqmas returns the signatures. The private key is never delivered, revealed or exported.",
       ),
       command('aqmas sign personal/firmware/release-key --why "release 1.2.3" image.bin'),
       p("Writes image.bin.sig. Several files, stdin (-) and a bare digest work too; --ttl and --count ask for a time-boxed grant that later calls reuse without another tap."),
@@ -125,19 +147,19 @@ export function helpPage(c: HelpConfig) {
         "Buckets belong to a scope: the installation (the two CAs) or one organisation. Each scope has its own key, wrapped once for every passkey enabled for it and once for your offline recovery key. One passkey tap opens at most two scope keys, for the length of the tap: the broker unwraps exactly the buckets the card lists and wipes the scope key at once.",
       ),
       p(
-        "Before you tap, the card says what the tap opens and for how long, for example “Opens SSH user CA: for this action only” or “Opens personal Cloudflare proxy token: while the grant lasts”. The passkey signs that list together with the decision; a page that changes it is refused. A bucket stays open only while something holds it: one operation (instant), a Cloudflare grant, an env release until collected (10 minutes at most), a signing grant, a standing rule, auto-approval, or an approval window. Admin → Buckets shows every hold and the header says how many buckets are open, or “nothing open”.",
+        "Before you tap, the card says what the tap opens and for how long, for example “Opens SSH user CA: for this action only” or “Opens personal Cloudflare proxy token: while the grant lasts”. The passkey signs that list together with the decision; a page that changes it is refused. A bucket stays open only while something holds it: one operation (instant), a Cloudflare grant, an env release until collected (10 minutes at most), a signing grant, a standing rule, auto-approval, or an approval window. Security → Buckets shows every hold and the header says how many buckets are open, or “nothing open”.",
       ),
       p(
-        "After a restart nothing is open, and nothing needs to be until it is used. Grants that need a bucket pause; agents wait with “closed: waiting for the owner to reopen it” and keep their deadline. Admin → Buckets lists them with Reopen (one tap opens up to two scopes). A standing rule or auto-approval needs one tap per restart, then none until the rule ends.",
+        "After a restart nothing is open, and nothing needs to be until it is used. Grants that need a bucket pause; agents wait with “closed: waiting for the owner to reopen it” and keep their deadline. Security → Buckets lists them with Reopen (one tap opens up to two scopes). A standing rule or auto-approval needs one tap per restart, then none until the rule ends.",
       ),
       p(
-        "Close all (Admin → Buckets, one tap) wipes every open bucket key and hold and ends every approval window, without a restart. Use it when you step away or suspect something.",
+        "Close all (Security → Buckets, one tap) wipes every open bucket key and hold and ends every approval window, without a restart. Use it when you step away or suspect something.",
       ),
       p(
-        "Enabling a passkey: in Admin → Passkeys, Enable on the new passkey. The passkey you are signed in with taps first (that tap opens the scope keys), then the new one taps once per two scopes. Test checks a passkey can open its scopes. A passkey without the PRF extension signs in, denies, revokes and approves while buckets are already open, but cannot open a closed one; the card says which passkey can.",
+        "Enabling a passkey: Security opens with how many of your passkeys can open your credentials. “Enable the other N” walks through them one after the other; or use Enable on one passkey under Security → Passkeys. The passkey you are signed in with taps first (that tap opens the scope keys), then the new one taps once per two scopes. Test checks a passkey can open its scopes. A passkey without the PRF extension signs in, denies, revokes and approves while buckets are already open, but cannot open a closed one; the card says which passkey can.",
       ),
       p(
-        "Recovery: if no passkey can open a scope any more, Admin → Recovery key enrols a passkey from your offline recovery key, and the recovery drill proves the key works without writing anything. This pastes the recovery key into a web page, so prefer enabling from another passkey. If a passkey or a backup is lost or stolen, remove it and Rekey its scopes (Admin → Buckets): removing a passkey does not revoke copies of its wraps in old backups.",
+        "Recovery: if no passkey can open a scope any more, Security → Recovery key enrols a passkey from your offline recovery key, and the recovery drill proves the key works without writing anything. This pastes the recovery key into a web page, so prefer enabling from another passkey. If a passkey or a backup is lost or stolen, remove it and Rekey its scopes (Security → Buckets): removing a passkey does not revoke copies of its wraps in old backups.",
       ),
       p(
         "Honest limits: buckets protect snapshots (a stolen disk or backup, a memory dump, brief root). They do not protect against an attacker who stays on the machine with root: every bucket is exposed as it is used. A window keeps its bucket open for its whole length, and auto-approval keeps the Cloudflare proxy token open from the first approval after a restart until the next restart; what may be approved meanwhile is limited by policy, not by cryptography. A malicious approval page can still turn your tap into another action, as before, and learn the keys of the scopes that tap opens.",
@@ -155,7 +177,7 @@ export function helpPage(c: HelpConfig) {
     ),
     card(
       "Bastion access",
-      p("The bastion that runs aqmas can itself be reached in three controlled ways, once you have run “Allow aqmas access to the bastion” under Admin → Bastion access. Your emergency key is never touched and stays the way in when aqmas is down."),
+      p("The bastion that runs aqmas can itself be reached in three controlled ways, once you have run “Allow aqmas access to the bastion” under Settings → Bastion access. Your emergency key is never touched and stays the way in when aqmas is down."),
       h("h3", null, "Inspect (amber card)"),
       p("An account that can only run fixed log and status commands: no shell, no forwarding, no sudo. One tap, default 1 hour; the certificate is reused until it expires."),
       command("aqmas ssh bastion --why 'approvals page slow' -- logs aqmasd since=2h"),

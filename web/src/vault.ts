@@ -94,6 +94,12 @@ export interface VaultState {
   sets: VaultSet[];
   requests: SignRequest[];
 }
+/** GET /api/ui/seal/vault/history: the item view's "recent activity" (0 = not in the rows read). */
+export interface SetHistory {
+  entries: import("./types").AuditEntry[];
+  last_changed_at: number;
+  last_used_at: number;
+}
 export interface Entry {
   name: string;
   value: string;

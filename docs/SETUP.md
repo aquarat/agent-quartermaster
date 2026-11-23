@@ -1,6 +1,6 @@
 # Setup queue and the maintenance runner
 
-**Admin → Setup** runs the remaining setup steps and every later upgrade from the approval
+**Settings → Setup** runs the remaining setup steps and every later upgrade from the approval
 page. Each task is one passkey approval over a canonical description ([API.md](API.md)); a
 small root program on the bastion, the *maintenance runner*, verifies that approval itself and
 carries the task out. After the runner is installed there is nothing left to do in a terminal.
@@ -14,7 +14,7 @@ carries the task out. After the runner is installed there is nothing left to do 
 | **Sync maintenance passkeys** | Replaces the runner's pinned passkeys with the listed ones | Tap **Run** with an already pinned passkey | Run again. |
 | **Upgrade aqmas** | Rebuild in a sandbox, compare with both releases, install, restart ([UPDATES.md](UPDATES.md)) | Review the diff; tap **Approve** | The previous binary is restored if the new one is unhealthy. |
 
-**Admin → Bastion access** shows the tasks that concern the bastion machine itself
+Below the queue, **Settings → Setup** shows the tasks that concern the bastion machine itself
 ([BASTION-ACCESS.md](BASTION-ACCESS.md)); they run through the same runner with the same
 rules:
 

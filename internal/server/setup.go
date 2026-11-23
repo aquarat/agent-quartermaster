@@ -29,7 +29,7 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
 )
 
-// Admin → Setup (docs/SETUP.md). aqmasd never performs a setup task: it describes them,
+// Settings → Setup (docs/SETUP.md). aqmasd never performs a setup task: it describes them,
 // has the owner sign one, and hands the signed request to the root runner through the
 // spool. The runner verifies everything again and trusts nothing written here.
 

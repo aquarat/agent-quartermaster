@@ -66,7 +66,7 @@ type PendingBastion struct {
 	AlertChannel bool     `json:"alert_channel"` // root only
 }
 
-// BastionHost is one enrolled host on Admin → Bastion access.
+// BastionHost is one enrolled host on Settings → Bastion access.
 type BastionHost struct {
 	ID      string `json:"id"` // enrollment ID
 	Name    string `json:"name"`
