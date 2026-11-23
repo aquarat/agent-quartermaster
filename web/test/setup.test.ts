@@ -194,7 +194,7 @@ describe("signing a setup task", () => {
 
   test("sign in", async () => {
     await completeLogin(api, auth, await prepareLogin(api));
-    expect((await view()).tasks!.map((t) => t.id)).toEqual(["cutover", "seal", "buckets", "enable-updates", "sync-passkeys", "upgrade"]);
+    expect((await view()).tasks!.filter((t) => !t.group).map((t) => t.id)).toEqual(["cutover", "seal", "buckets", "enable-updates", "sync-passkeys", "upgrade"]);
   });
 
   test("refuses to sign when the server's text differs: params, task, secrets hash, an extra key, the challenge, the options", async () => {

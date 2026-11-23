@@ -7,7 +7,7 @@
 
 import { ApiError, type Api, type ObjectKind } from "./api";
 import { challengeCommitsTo, describe, mismatches, parseCanonical, type Canonical, type Description, type Expectation } from "./canonical";
-import type { BeginResponse, GrantSummary, PasskeyInfo, PendingItem, StandingApproval } from "./types";
+import type { BastionDecision, BeginResponse, GrantSummary, PasskeyInfo, PendingItem, StandingApproval } from "./types";
 import { prepareTap, type PreparedOpen, type Tap } from "./buckets";
 import {
   decodeCreationOptions,
@@ -109,6 +109,39 @@ function cfFacts(scope: string | undefined, scopeParams: string | undefined, mod
 }
 
 export function targetForPending(item: PendingItem): ActionTarget {
+  if (item.kind === "setup") {
+    // Not a canonical request: a queued task is approved through the setup task flow
+    // (prepareSetupTask + completeSetupTask with the request id) or dismissed.
+    throw new FlowError("A queued maintenance task is approved from its own card.");
+  }
+  if (item.kind === "bastion") {
+    const b = item.bastion;
+    // Missing facts become "" / false so they are still compared: the page never signs a
+    // bastion session whose level or authority it did not show.
+    return {
+      object: "request",
+      id: item.id,
+      facts: {
+        requesting_host: item.requesting_host,
+        kind: "bastion",
+        level: b?.level ?? "",
+        host_id: b?.host_id ?? "",
+        address: item.requesting_address ?? "",
+        target: b?.target ?? "",
+        target_address: b?.target_address ?? "",
+        target_port: b?.target_port ?? 0,
+        login_user: b?.login_user ?? "",
+        principal: b?.principal ?? "",
+        key_fingerprint: b?.key_fingerprint ?? "",
+        ssh_ca: b?.ssh_ca ?? "",
+        host_key: b?.host_key ?? "",
+        cert_profile: b?.cert_profile ?? "",
+        sealed: b?.sealed ?? false,
+        open_buckets: b?.open_buckets ?? [],
+        alert_channel: b?.alert_channel ?? false,
+      },
+    };
+  }
   if (item.kind === "enrollment") {
     return {
       object: "enrollment",
@@ -199,6 +232,14 @@ export interface ActionChoice {
   /** rename: the new nickname; add: an optional nickname for the new passkey. Sent
    * normalised (normalizeNickname); the canonical must carry exactly it as new_nickname. */
   nickname?: string;
+  /** Root bastion approval of a sealed store: close every open bucket before the certificate
+   * is issued. Required there (the owner's explicit choice is signed) and refused elsewhere. */
+  closeBuckets?: boolean;
+}
+
+/** True for the one decision that carries the close choice. */
+function needsCloseChoice(target: ActionTarget, choice: ActionChoice): boolean {
+  return target.object === "request" && target.facts.kind === "bastion" && target.facts.level === "root" && target.facts.sealed === true && choice.action === "approve";
 }
 
 export interface PreparedAction {
@@ -228,6 +269,18 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
   if (choice.action === "approve") {
     if (choice.ttl_seconds !== undefined) body.ttl_seconds = choice.ttl_seconds;
     if (choice.standing_hours) body.standing_hours = choice.standing_hours;
+  }
+  const bastion = target.object === "request" && target.facts.kind === "bastion";
+  if (needsCloseChoice(target, choice)) {
+    if (typeof choice.closeBuckets !== "boolean") throw new FlowError("Choose whether to close all open buckets first.");
+    body.close_buckets = choice.closeBuckets;
+  } else if (choice.closeBuckets !== undefined) {
+    throw new FlowError("Only a root session on the bastion (sealed store) takes the close-buckets choice.");
+  }
+  if (bastion) {
+    if (target.facts.level !== "inspect" && target.facts.level !== "root") throw new FlowError("Not signing: this page does not know this bastion level.");
+    if (choice.standing_hours || choice.standing_seconds || choice.indefinite || choice.standing_indefinite) throw new FlowError("A bastion session takes no standing or indefinite choice.");
+    if (choice.action === "approve" && !(Number(choice.ttl_seconds) > 0)) throw new FlowError("Choose how long the session may last.");
   }
   let newNickname: string | undefined;
   if (choice.action === "rename" || choice.action === "add") {
@@ -259,7 +312,10 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
     standing_seconds:choice.standing_seconds,
     indefinite:choice.indefinite??target.facts.indefinite,standing_indefinite:choice.standing_indefinite??target.facts.standing_indefinite,
     new_nickname: newNickname,
+    close_buckets: choice.closeBuckets ?? false,
   });
+  // Belt and braces: a bastion card and a bastion text always go together.
+  if ((canonical.kind === "bastion") !== bastion && target.object === "request") problems.push("kind: the server's action is not the kind of request the card showed");
   if (problems.length > 0) {
     throw new FlowError(`Not signing: the server's action differs from what you chose (${problems.join("; ")}).`);
   }
@@ -325,6 +381,23 @@ export async function authorizeAddPasskey(api: Api, auth: Authenticator, p: Prep
   if (p.target.object !== "passkey" || p.canonical.action !== "add") throw new FlowError("not a passkey add action");
   const cred = await auth.get(p.options);
   return toRegistration(await api.registerBegin({ challenge_id: p.challengeId, assertion: encodeAssertion(cred) }));
+}
+
+/** Approve or deny a pending bastion request in one go (tools and tests; the page shows the
+ * canonical text in between). `closeBuckets` is required for a root approval of a sealed
+ * store and must be left out otherwise. Resolves to the server's BastionDecision. */
+export async function decideBastion(
+  api: Api,
+  auth: Authenticator,
+  item: PendingItem,
+  choice: { action: "approve" | "deny"; ttl_seconds?: number; closeBuckets?: boolean },
+): Promise<BastionDecision> {
+  if (item.kind !== "bastion") throw new FlowError("not a bastion request");
+  const c: ActionChoice = { action: choice.action };
+  if (choice.action === "approve") c.ttl_seconds = choice.ttl_seconds ?? item.ttl_requested;
+  if (choice.closeBuckets !== undefined) c.closeBuckets = choice.closeBuckets;
+  const p = await prepareAction(api, targetForPending(item), c);
+  return (await completeAction(api, auth, p)) as BastionDecision;
 }
 
 // ---- errors in words ----

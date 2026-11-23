@@ -99,3 +99,8 @@ export function syncIcon(synced: boolean): SVGSVGElement {
 export function chevronIcon(): SVGSVGElement {
   return draw([{ d: "M9 6l6 6-6 6" }], "glyph chevron");
 }
+
+/** Warning triangle for the root-on-the-bastion card (always next to the words). */
+export function warningIcon(): SVGSVGElement {
+  return draw([{ d: "M12 3 2 21h20L12 3z" }, { d: "M12 10v5" }, { d: "M12 18v.5" }], "icon icon-warning");
+}

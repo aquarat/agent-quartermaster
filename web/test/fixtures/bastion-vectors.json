@@ -1,0 +1,71 @@
+{
+  "note": "Canonical text of bastion decisions (docs/BASTION-ACCESS.md §5). valid must parse in Go (canon.Parse) and TypeScript (parseCanonical); invalid must be refused by both.",
+  "valid": [
+    {
+      "level": "root",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":true,\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":true,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[\\\"SSH user CA\\\",\\\"personal/paas/staging-env\\\"]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":1800,\"v\":1}"
+    },
+    {
+      "level": "root",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":false,\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":false,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[\\\"SSH user CA\\\",\\\"personal/paas/staging-env\\\"]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":1800,\"v\":1}"
+    },
+    {
+      "level": "root",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":true,\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":false,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":false,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":1800,\"v\":1}"
+    },
+    {
+      "level": "root",
+      "text": "{\"action\":\"deny\",\"address\":\"192.0.2.21\",\"alert_channel\":false,\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":false,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":0,\"v\":1}"
+    },
+    {
+      "level": "inspect",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":false,\"cert_profile\":\"source-address;force-command\",\"close_buckets\":false,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"inspect\",\"login_user\":\"aqmas-inspect\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[]\",\"principal\":\"aqmas-inspect@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":3600,\"v\":1}"
+    },
+    {
+      "level": "inspect",
+      "text": "{\"action\":\"deny\",\"address\":\"192.0.2.21\",\"alert_channel\":false,\"cert_profile\":\"source-address;force-command\",\"close_buckets\":false,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"inspect\",\"login_user\":\"aqmas-inspect\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[]\",\"principal\":\"aqmas-inspect@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":0,\"v\":1}"
+    }
+  ],
+  "invalid": [
+    {
+      "why": "root above one hour",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":true,\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":true,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[\\\"SSH user CA\\\",\\\"personal/paas/staging-env\\\"]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":3601,\"v\":1}"
+    },
+    {
+      "why": "root with the inspect profile",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":true,\"cert_profile\":\"source-address;force-command\",\"close_buckets\":true,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[\\\"SSH user CA\\\",\\\"personal/paas/staging-env\\\"]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":1800,\"v\":1}"
+    },
+    {
+      "why": "inspect with an open list",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":false,\"cert_profile\":\"source-address;force-command\",\"close_buckets\":false,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"inspect\",\"login_user\":\"aqmas-inspect\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[\\\"SSH user CA\\\"]\",\"principal\":\"aqmas-inspect@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":3600,\"v\":1}"
+    },
+    {
+      "why": "inspect with the close choice",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":false,\"cert_profile\":\"source-address;force-command\",\"close_buckets\":true,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"inspect\",\"login_user\":\"aqmas-inspect\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[]\",\"principal\":\"aqmas-inspect@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":3600,\"v\":1}"
+    },
+    {
+      "why": "deny with the alert flag",
+      "text": "{\"action\":\"deny\",\"address\":\"192.0.2.21\",\"alert_channel\":true,\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":false,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":0,\"v\":1}"
+    },
+    {
+      "why": "unsorted open list",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":true,\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":true,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[\\\"b\\\",\\\"a\\\"]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":1800,\"v\":1}"
+    },
+    {
+      "why": "unsealed with the close choice",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":true,\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":true,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":false,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":1800,\"v\":1}"
+    },
+    {
+      "why": "principal of another user",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":true,\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":true,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[\\\"SSH user CA\\\",\\\"personal/paas/staging-env\\\"]\",\"principal\":\"root@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":1800,\"v\":1}"
+    },
+    {
+      "why": "standing field",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"alert_channel\":true,\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":true,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[\\\"SSH user CA\\\",\\\"personal/paas/staging-env\\\"]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"standing_hours\":1,\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":1800,\"v\":1}"
+    },
+    {
+      "why": "missing alert_channel",
+      "text": "{\"action\":\"approve\",\"address\":\"192.0.2.21\",\"cert_profile\":\"source-address;permit-pty\",\"close_buckets\":true,\"host_id\":\"01ENROLLMENT\",\"host_key\":\"SHA256:host\",\"id\":\"01REQ\",\"issued_at\":\"2026-11-23T10:00:00Z\",\"key_fingerprint\":\"SHA256:key\",\"kind\":\"bastion\",\"level\":\"root\",\"login_user\":\"alice\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"object\":\"request\",\"open_buckets\":\"[\\\"SSH user CA\\\",\\\"personal/paas/staging-env\\\"]\",\"principal\":\"alice@bastion\",\"requesting_host\":\"dev-1\",\"sealed\":true,\"ssh_ca\":\"SHA256:ca\",\"target\":\"bastion\",\"target_address\":\"192.0.2.10\",\"target_port\":22,\"ttl_seconds\":1800,\"v\":1}"
+    }
+  ]
+}

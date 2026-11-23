@@ -45,6 +45,16 @@ export interface SetupHooks {
   /** Poll interval while a task is in progress (default 2 s) and otherwise (default 5 s). */
   pollMs?: number;
   idleMs?: number;
+  /** Which task groups this page shows (maint.Spec.Group). Default [""]: the Setup queue;
+   * Admin → Bastion access shows ["bastion", "routine"]. */
+  groups?: string[];
+  /** Forms for tasks this class has none for (the bastion and routine tasks). `run` builds
+   * the usual Run… → check → Confirm with passkey panel. Return undefined for "no form". */
+  form?(t: SetupTask, v: SetupView, can: boolean, label: string, run: (label: string, collect: () => Collected) => HTMLElement): Child[] | undefined;
+  /** What that form depends on besides the task's state (re-rendered when it changes). */
+  formKey?(t: SetupTask, v: SetupView): unknown;
+  /** Called (and awaited) after every successful load of the setup view, before rendering. */
+  loaded?(v: SetupView): void | Promise<void>;
 }
 
 /** How often the page asks for the setup state: while a task is in progress, and otherwise. */
@@ -56,7 +66,7 @@ interface Migration {
   recovery_sha256: string;
 }
 
-interface Collected {
+export interface Collected {
   params: Record<string, unknown>;
   secrets?: Record<string, string>;
   /** Plain words for what is about to be signed. */
@@ -68,7 +78,7 @@ interface Collected {
 }
 
 /** A problem with what the owner entered (shown next to the Run button). */
-class Invalid extends Error {}
+export class Invalid extends Error {}
 
 const BADGES: Record<string, string> = {
   available: "Ready",
@@ -256,7 +266,8 @@ export class SetupPage {
       return;
     }
     if (this.stopped) return;
-    const tasks = v.tasks ?? [];
+    const groups = this.hooks.groups ?? [""];
+    const tasks = (v.tasks ?? []).filter((t) => groups.includes(t.group ?? ""));
     const quiet = <T>(p: Promise<T> | undefined): Promise<T | undefined> => (p ? p.catch(() => undefined) : Promise.resolve(undefined));
     const cutover = tasks.find((t) => t.id === "cutover");
     const wantPreview = v.mode === "serve" && !!cutover && (cutover.state === "available" || cutover.state === "failed");
@@ -289,6 +300,8 @@ export class SetupPage {
     this.failing = false;
     this.banner.textContent = "";
     this.banner.hidden = true;
+    await this.hooks.loaded?.(this.view);
+    if (this.stopped) return;
     this.render();
     const signature = JSON.stringify([v.mode, tasks.map((t) => t.state)]);
     if (this.signature && this.signature !== signature) this.hooks.changed?.();
@@ -406,6 +419,7 @@ export class SetupPage {
         h("ol", { class: "setup-steps" }, steps.map((s) => h("li", null, vt(s)))),
         h("p", { class: "muted" }, h("strong", null, "Can it be undone? "), vt(t.reversible)),
       ),
+      t.warning ? h("p", { class: "warn setup-warning" }, vt(t.warning)) : null,
       status,
       form,
       last,
@@ -526,7 +540,7 @@ export class SetupPage {
       case "upgrade":
         return [t.state, this.updates];
       default:
-        return [can, t.state];
+        return [can, t.state, this.hooks.formKey?.(t, v)];
     }
   }
 
@@ -548,8 +562,13 @@ export class SetupPage {
         return again(this.pinsForm(t, v, can, label));
       case "upgrade":
         return this.updates && ["available", "idle", "failed", "done"].includes(t.state) ? [updateCard(this.updates, (target) => this.hooks.openUpdate(target))] : [];
-      default:
-        // A task this page has no form for: it can still say so instead of guessing parameters.
+      default: {
+        const custom = this.hooks.form?.(t, v, can, label, (l, collect) => this.runPanel(t, l, collect));
+        if (custom) return custom;
+      }
+      // A task this page has no form for: it can still say so instead of guessing parameters.
+      // eslint-disable-next-line no-fallthrough
+      case "":
         return can ? [h("p", { class: "muted" }, "This page is older than the broker and cannot start this task. Reload it.")] : [];
     }
   }
@@ -1145,7 +1164,8 @@ export class SetupPage {
 /** One line for the Admin page: what Setup wants next. */
 export function setupSummary(v: SetupView | null | undefined): string {
   if (!v) return "Setup steps and upgrades.";
-  const tasks = v.tasks ?? [];
+  // Bastion access and routine maintenance have their own section.
+  const tasks = (v.tasks ?? []).filter((t) => !t.group);
   const busy = tasks.find((t) => t.state === "waiting") ?? tasks.find((t) => t.state === "running");
   if (busy) return busy.state === "waiting" ? `“${vt(busy.title)}” is waiting for you.` : `“${vt(busy.title)}” is running.`;
   if (!v.runner_installed) return "The maintenance runner is not installed yet.";

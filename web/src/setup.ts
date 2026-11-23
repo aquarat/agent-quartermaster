@@ -45,6 +45,11 @@ export interface SetupTask {
   blocked_by?: string;
   rerunnable?: boolean;
   last?: SetupRun | null;
+  /** Where the page shows the task: "" / absent = the Setup queue; "bastion" and "routine"
+   * = Admin → Bastion access (maint.Spec.Group). */
+  group?: string;
+  /** Shown in red above the approve button (a restart closes every bucket…). */
+  warning?: string;
 }
 
 export interface SetupPasskey {
@@ -241,6 +246,11 @@ class Fields {
     if (typeof v !== "boolean") throw new Error(`${this.task}: ${k} must be true or false`);
     return String(v);
   }
+  int(k: string, min: number, max: number): string {
+    const v = this.get(k);
+    if (typeof v !== "number" || !Number.isSafeInteger(v) || v < min || v > max) throw new Error(`${this.task}: ${k} must be a whole number from ${min} to ${max}`);
+    return String(v);
+  }
   list(k: string): unknown[] {
     const v = this.get(k);
     if (!Array.isArray(v)) throw new Error(`${this.task}: ${k} must be a list`);
@@ -291,11 +301,76 @@ export function canonicalParams(task: string, params: Record<string, unknown>): 
       out = `{"pins":[${pins.join(",")}]}`;
       break;
     }
+    // Access to the bastion itself and routine maintenance (docs/BASTION-ACCESS.md §5).
+    case "bastion-access":
+      out = `{"name":${f.str("name")},"address":${f.str("address")},"port":${f.int("port", 1, 65535)},"admin_user":${f.str("admin_user")},"ssh_ca":${f.str("ssh_ca")}}`;
+      break;
+    case "bastion-allow": {
+      const hosts = f.list("hosts").map((x) => {
+        if (x === null || typeof x !== "object" || Array.isArray(x)) throw new Error("bastion-allow: a host must be an object");
+        const host = x as Record<string, unknown>;
+        const extra = Object.keys(host).filter((k) => k !== "id" && k !== "name" && k !== "address");
+        if (extra.length) throw new Error(`bastion-allow: unknown host field ${extra.join(", ")}`);
+        for (const k of ["id", "name", "address"]) if (typeof host[k] !== "string") throw new Error(`bastion-allow: ${k} must be a string`);
+        return host as { id: string; name: string; address: string };
+      });
+      // The complete list, sorted by enrollment id (ASCII), without duplicates.
+      hosts.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      if (hosts.some((x, i) => i > 0 && hosts[i - 1]!.id === x.id)) throw new Error("bastion-allow: a host is listed twice");
+      out = `{"hosts":[${hosts.map((x) => `{"id":${goString(x.id)},"name":${goString(x.name)},"address":${goString(x.address)}}`).join(",")}]}`;
+      break;
+    }
+    case "os-update":
+      out = `{"kernel":${f.bool("kernel")}}`;
+      break;
+    case "journal-vacuum":
+      out = `{"keep_days":${f.int("keep_days", 1, 365)}}`;
+      break;
+    case "bastion-access-remove":
+    case "reboot":
+    case "restart-cloudflared":
+    case "restart-broker":
+    case "disk-usage":
+      out = "{}";
+      break;
     default:
       throw new Error(`unknown setup task ${JSON.stringify(task)}`);
   }
   f.done();
   return out;
+}
+
+/** The parameters of a queued maintenance request, from its canonical text: accepted only
+ * when it is exactly this page's own encoding of the task's schema (so what the card says is
+ * what an approval signs). Throws otherwise. */
+export function queuedParams(task: string, text: string): Record<string, unknown> {
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    v = null;
+  }
+  if (v === null || typeof v !== "object" || Array.isArray(v)) throw new Error("the task parameters are not a JSON object");
+  if (canonicalParams(task, v as Record<string, unknown>) !== text) throw new Error("the task parameters are not in their canonical form");
+  return v as Record<string, unknown>;
+}
+
+/** Plain words for the parameters of a bastion or routine task (one line each). */
+export function paramLines(task: string, p: Record<string, unknown>): string[] {
+  switch (task) {
+    case "bastion-access":
+      return [`Name agents use: ${String(p["name"])}`, `Address and port: ${String(p["address"])}, ${String(p["port"])}`, `Admin account (root level): ${String(p["admin_user"])}`, `SSH user CA: ${String(p["ssh_ca"])}`];
+    case "bastion-allow": {
+      const hosts = (p["hosts"] as Array<{ id: string; name: string; address: string }>) ?? [];
+      return hosts.length ? hosts.map((x) => `${x.name} from ${x.address} (enrollment ${x.id})`) : ["Nobody: no host may ask for root."];
+    }
+    case "os-update":
+      return [p["kernel"] === true ? "Including the kernel and boot chain." : "The kernel and boot chain are left alone."];
+    case "journal-vacuum":
+      return [`Keep the last ${String(p["keep_days"])} day${p["keep_days"] === 1 ? "" : "s"} of the journal; older entries are deleted.`];
+    default:
+      return [];
+  }
 }
 
 /** The secrets a task with these parameters must carry, sorted (maint.SecretNames). */
@@ -417,9 +492,11 @@ export async function prepareSetupTask(
 
 /** Passkey prompt + hand-over to the runner's spool. Call straight from the owner's tap: the
  * prompt starts before any other await. */
-export async function completeSetupTask(api: Api, auth: Authenticator, p: PreparedSetup): Promise<void> {
+export async function completeSetupTask(api: Api, auth: Authenticator, p: PreparedSetup, request?: string): Promise<void> {
   const cred = await auth.get(p.options);
-  await api.setupPost!(`/${encodeURIComponent(p.task)}/run`, { challenge_id: p.challengeId, assertion: encodeAssertion(cred), secrets: p.packet });
+  // `request`: the agent's queued maintenance request this run answers (the broker marks it
+  // approved only if it asked for exactly the signed task and parameters).
+  await api.setupPost!(`/${encodeURIComponent(p.task)}/run`, { challenge_id: p.challengeId, assertion: encodeAssertion(cred), secrets: p.packet, ...(request ? { request } : {}) });
 }
 
 /** Prepare and sign in one go (tools and tests; the page shows the canonical in between). */
@@ -431,10 +508,11 @@ export async function runSetupTask(
   params: Record<string, unknown>,
   secrets?: Record<string, string>,
   rpId?: string,
+  request?: string,
 ): Promise<void> {
   const has = secrets && Object.keys(secrets).length > 0 ? secrets : undefined;
   const p = rpId === undefined ? await prepareSetupTask(api, view, task, params, has) : await prepareSetupTask(api, view, task, params, has, rpId);
-  await completeSetupTask(api, auth, p);
+  await completeSetupTask(api, auth, p, request);
 }
 
 /** Seal the pasted recovery identity to the import process and have it run the drill. */

@@ -62,6 +62,7 @@ import { opensList } from './approvals';
 import {TabWindow,multiPanel,windowAdmin} from './approvals';
 import {envPanel,type EnvState} from './envsets';
 import { VaultPage, signCards, type VaultHost } from './vaultPage';
+import { BastionPanel, bastionCard, bastionChoice, bastionSummary, decisionLines, queuedTaskCard, rootConfirmBlock, syncRootBanner } from './bastion';
 import type { VaultState } from './vault';
 
 function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/setup' ? 'setup' : location.hash === '#/help' ? 'help' : 'queue'; }
@@ -104,6 +105,8 @@ export class App {
   private setupView?: SetupView | null;
   /** The Setup page polls and redraws by itself while it is open. */
   private setupPage?: SetupPage;
+  /** Admin → Bastion access: polls and redraws by itself while Admin is open. */
+  private bastionPanel?: BastionPanel;
   private catalogue?: Catalogue|null;
   private migration?:{id:string;plan:string;recovery_sha256:string}|null;
   private help?: HelpConfig;
@@ -282,6 +285,8 @@ export class App {
     this.tab.end();
     this.setupPage?.stop();
     this.setupPage = undefined;
+    this.bastionPanel?.stop();
+    this.bastionPanel = undefined;
     this.view = "signin";
     this.state = null;
     this.login = null;
@@ -398,6 +403,8 @@ export class App {
     this.loginStatus = this.signBtn = this.loginDetails = null;
     this.setupPage?.stop();
     this.setupPage = undefined;
+    this.bastionPanel?.stop();
+    this.bastionPanel = undefined;
     const filters = h(
       "div",
       { class: "filters", role: "group", "aria-label": "Show activity" },
@@ -418,7 +425,7 @@ export class App {
     replace(
       this.root,
       h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Request queue')), h("p", { class: "status", id: "status" }), h("span", { id: "buckets-indicator", class: "buckets-indicator", "aria-live": "polite" }),h('nav',{'aria-label':'Pages'},nav('Help','#/help','Help'),nav('⚙','#/admin','Admin'))),
-      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='setup' ? h('main',{class:'subpage'},h('p',{class:'crumb'},nav('‹ Admin','#/admin','Back to Admin')),h('h2',null,'Setup'),h('p',{class:'muted'},'Each step is one passkey approval. A small root program on this machine checks your signature itself and does the work.'),h('div',{id:'setup-root',class:'setup'})) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('setup','Setup and upgrades'),section('buckets','Buckets'),section('orgs','Organisations'),section('vault','Credential sets'),section('passkeys','Passkeys'),section('recovery','Recovery key'),section('hosts','Enrolled hosts')) : h(
+      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='setup' ? h('main',{class:'subpage'},h('p',{class:'crumb'},nav('‹ Admin','#/admin','Back to Admin')),h('h2',null,'Setup'),h('p',{class:'muted'},'Each step is one passkey approval. A small root program on this machine checks your signature itself and does the work.'),h('div',{id:'setup-root',class:'setup'})) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('setup','Setup and upgrades'),section('bastion','Bastion access'),section('buckets','Buckets'),section('orgs','Organisations'),section('vault','Credential sets'),section('passkeys','Passkeys'),section('recovery','Recovery key'),section('hosts','Enrolled hosts')) : h(
         "main",
         { class: "sections" },
         h("div", { class: "col col-queue" }, section("signing", "Signatures to approve"), section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
@@ -442,9 +449,25 @@ export class App {
       });
       this.setupPage.start();
     }
+    if(this.page==='admin'&&this.api.bastion&&this.api.setupGet){
+      this.bastionPanel=new BastionPanel(this.api,this.auth,{
+        openRevoke:t=>this.sheet.openRevoke(t),
+        signedOut:()=>this.signedOut('Your session ended. Sign in again.'),
+        changed:()=>this.changed(),
+      });
+      this.bastionPanel.start();
+    }
     this.renderSections();
     this.schedulePoll();
   }
+
+  /** Until when a root certificate for the bastion is valid (0 = none). */
+  rootUntil(): number {
+    const at = Date.parse(this.state?.bastion_root_until ?? "");
+    return Number.isFinite(at) && at > Date.now() ? at : 0;
+  }
+
+  private renderRootBanner(): void { syncRootBanner(this.root, this.rootUntil() ? this.state!.bastion_root_until : undefined); }
 
   /** The seal panel sits above every page, except that Setup shows the supervised import as
    * its own checklist. */
@@ -455,13 +478,14 @@ export class App {
   private renderSections(): void {
     const s = this.state;
     if (!s || this.view !== "main") return;
+    this.renderRootBanner();
     if(this.seal&&this.envState&&this.page!=='help'){if(!this.root.querySelector('#sec-env'))this.root.insertBefore(section('env','Env credential sets'),this.root.querySelector('main'));this.section('env',[this.envState,this.page,this.catalogue,this.seal.mode],()=>[envPanel(this.api,this.auth,this.seal!,this.envState!,this.page==='admin'?this.catalogue:null,()=>this.changed())]);}
     if(!this.sealOnTop()){this.root.querySelector('#sec-seal')?.remove();this.rendered.delete('seal');}
-    else{if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));const seal=this.seal!;const batch=serving(seal)&&this.page==='queue'&&(s.pending??[]).length>0;this.section('seal',[seal.mode,this.page,batch?s.pending:null,batch?seal.epoch:null,this.tab.id()],()=>[sealBanner(seal),batch&&multiPanel(this.api,this.auth,seal,this.tab,s.pending??[],()=>this.changed())],!sealBanner(seal)&&!batch);}
+    else{if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));const seal=this.seal!;const batch=serving(seal)&&this.page==='queue'&&(s.pending??[]).length>0;this.section('seal',[seal.mode,this.page,batch?s.pending:null,batch?seal.epoch:null,this.tab.id()],()=>[sealBanner(seal),batch&&multiPanel(this.api,this.auth,seal,this.tab,(s.pending??[]).filter(p=>p.kind!=='bastion'&&p.kind!=='setup'),()=>this.changed())],!sealBanner(seal)&&!batch);}
     this.renderIndicator();
     if(this.page!=='queue'){
       document.title=`${this.page==='admin'?'Admin':this.page==='setup'?'Setup':'Help'} · aqmas`;
-      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys,this.seal?.passkeys,this.seal?.scopes,this.seal?.mode],()=>this.passkeys(s),false,!!this.root.querySelector('#sec-passkeys .capabilities button.confirm'));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);}
+      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys,this.seal?.passkeys,this.seal?.scopes,this.seal?.mode],()=>this.passkeys(s),false,!!this.root.querySelector('#sec-passkeys .capabilities button.confirm'));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);this.section('bastion',!!this.bastionPanel,()=>this.bastionPanel?[this.bastionPanel.el]:[h('p',{class:'empty'},'This server has no bastion access.')]);this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);}
       else if(this.page==='help'&&this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
       if(this.page==='admin'){
         const seal=this.seal, live=serving(seal);
@@ -492,7 +516,8 @@ export class App {
           ? requests.map((p) => this.requestCard(p))
           : [h("p", { class: "empty" }, "Nothing is waiting. New requests show up here within a few seconds.")],
       false,
-      touching,
+      // A queued task being approved keeps its card until that is done.
+      touching || !!this.root.querySelector("#sec-pending .queued-run.busy"),
     );
     {
       const v = this.vaultState, reqs = v?.requests ?? [];
@@ -814,6 +839,8 @@ export class App {
 
   private requestCard(p: PendingItem): HTMLElement {
     if (p.kind === "cloudflare") return this.cfRequestCard(p);
+    if (p.kind === "bastion") return bastionCard(p, { approve: (x) => this.sheet.openApprove(x), deny: (x) => this.sheet.openDeny(x), agentSays, until, since, ref: refCode });
+    if (p.kind === "setup") return queuedTaskCard(this.api, this.auth, p, { agentSays, until, ref: refCode, changed: () => this.changed() });
     const ssh = p.ssh;
     const high = p.risk === "high";
     const odd = !isPlainName(p.requesting_host) || (ssh && (!isPlainName(ssh.login_user) || !isPlainName(ssh.target_host)));
@@ -1320,6 +1347,7 @@ class Sheet {
         enrollFacts(p),
       );
     }
+    if (p.kind === "bastion") return bastionSummary(p);
     if (p.kind === "cloudflare") {
       const cf = p.cloudflare;
       const v = cfView(cf?.scope, cf?.scope_params, cf?.mode);
@@ -1354,6 +1382,10 @@ class Sheet {
         h("p", null, "It gets a client certificate and can ask for access. Configured automatic scopes and matching standing approvals may grant access without another prompt."),
         h("div", { class: "actions" }, this.cancelButton(), go),
       );
+      return;
+    }
+    if (p.kind === "bastion") {
+      this.chooseBastion(seq, p, again);
       return;
     }
     const cf = p.kind === "cloudflare" ? p.cloudflare : undefined;
@@ -1395,6 +1427,30 @@ class Sheet {
       void this.prepare(seq, target, { action: "approve", ttl_seconds: Math.max(0,ttl), standing_hours: Math.max(0,standing),standing_seconds:selected==='default'?standard:0,indefinite:ttl===-1,standing_indefinite:standing===-1 }, again);
     });
     this.render(h("h2", { id: "sheet-title" }, cf?.scope === "cf.admin" ? "Approve break-glass access" : "Approve access"), this.summary(p), ttlSet, standSet, h("div", { class: "actions" }, this.cancelButton(), go));
+  }
+
+  /** A bastion session (bastion.ts): the card is read again before the challenge, so the
+   * open-bucket list checked against the signed text is the current one. */
+  private chooseBastion(seq: number, p: PendingItem, again: () => void): void {
+    const form = bastionChoice(p, () => {
+      const { ttl, close } = form.read();
+      this.working("Preparing confirmation");
+      this.app.api.request(p.id).then(
+        (fresh) => {
+          if (!this.current(seq)) return;
+          const target = targetForPending({ ...fresh, kind: "bastion" });
+          const choice: ActionChoice = { action: "approve", ttl_seconds: ttl };
+          if (target.facts.level === "root" && target.facts.sealed) choice.closeBuckets = close;
+          void this.prepare(seq, target, choice, again);
+        },
+        (e) => {
+          if (!this.current(seq)) return;
+          this.retry = again;
+          this.showError(e);
+        },
+      );
+    });
+    this.render(form.title, form.body, h("div", { class: "actions" }, this.cancelButton(), form.go));
   }
 
   openDeny(p: PendingItem): void {
@@ -1514,16 +1570,24 @@ class Sheet {
     const d = p.description;
     const negative = isNegative(p.choice.action);
     const removingCurrent = p.canonical.object === "passkey" && p.canonical.action === "remove" && this.app.isCurrentPasskey(p.target.id);
-    const confirm = h("button", { class: `btn confirm big ${negative ? "deny" : "approve"}`, type: "button", "data-autofocus": "" }, "Confirm with passkey");
+    // Root on the bastion: the red block, drawn from the signed text only.
+    const rootFacts = d.bastion && d.bastion.level === "root" && d.bastion.action === "approve" ? d.bastion : undefined;
+    const confirm = h("button", { class: `btn confirm big ${negative ? "deny" : "approve"}${rootFacts ? " root" : ""}`, type: "button", "data-autofocus": "" }, rootFacts ? "Approve root session with passkey" : "Confirm with passkey");
     confirm.addEventListener("click", () => this.confirm(seq, p, confirm));
     const loud = d.breakGlass && !negative;
+    // The close choice is part of what is signed: changing it asks for a fresh challenge.
+    const rootBlock = rootFacts ? rootConfirmBlock(rootFacts, (close) => { const retry = this.retry ?? undefined; void this.prepare(this.begin(p.target), p.target, { ...p.choice, closeBuckets: close }, retry); }) : null;
+    const warnings = rootFacts ? d.warnings.filter((w) => w.includes("unusual characters")) : d.warnings;
+    const rootActive = !!p.open && this.app.rootUntil() > 0;
     this.render(
-      h("h2", { id: "sheet-title" }, loud ? "Break-glass: check, then confirm" : "Check, then confirm"),
+      h("h2", { id: "sheet-title" }, rootFacts ? "Root on the bastion: check, then confirm" : loud ? "Break-glass: check, then confirm" : "Check, then confirm"),
+      rootBlock,
       d.risk ? h("p", { class: "card-top" }, h("span", { class: "kind" }, "Cloudflare"), riskBadge(d.risk)) : null,
-      h("p", { class: `headline ${negative ? "neg" : "pos"}${loud ? " loud" : ""}` }, renderParts(d.headlineParts)),
+      h("p", { class: `headline ${negative ? "neg" : "pos"}${loud || rootFacts ? " loud" : ""}` }, renderParts(d.headlineParts)),
       d.details?.length ? h("ul", { class: "cf-details" }, d.details.map((line) => h("li", null, renderParts(line)))) : null,
       d.standingParts ? h("p", { class: "warn" }, renderParts(d.standingParts)) : null,
-      d.warnings.map((w, i) => h("p", { class: loud && i === 0 ? "breakglass" : "warn" }, vt(w))),
+      warnings.map((w, i) => h("p", { class: loud && i === 0 ? "breakglass" : "warn" }, vt(w))),
+      rootActive ? h("p", { class: "breakglass", role: "note" }, "A root certificate for the bastion is valid right now: what this approval opens is readable by that session.") : null,
       p.canonical.plan ? h('dl',{class:'facts'},d.fields.map(([k,v])=>fact(vt(k),h('bdi',null,vt(v))))) : null,
       removingCurrent ? h("p", { class: "warn" }, "This is the passkey you signed in with: you will be signed out here.") : null,
       p.open ? opensList(p.open.lines) : null,
@@ -1635,6 +1699,8 @@ class Sheet {
           ? "Revoked, with any auto-approval that issued it or came with it. aqmas deletes the API token at Cloudflare now."
           : "Revoked, with any auto-approval that issued it or came with it. The aqmas proxy refuses it from the next call.",
       );
+    else if (c.object === "grant" && c.kind === "bastion")
+      lines.push("Marked revoked. A certificate that was not collected yet is no longer handed out; one that was already collected stays valid until it expires, and an open session stays open.");
     else if (c.object === "grant")
       lines.push("Marked revoked, with any auto-approval that issued it or came with it. aqmas on the host stops reusing it; the certificate itself stays valid until it expires (no revocation list yet).");
     else if (c.object === "request" && c.action === "approve" && c.kind === "cloudflare") {
@@ -1651,6 +1717,7 @@ class Sheet {
       );
       if (c.mode === "token") lines.push("The API token is handed to the host once, on its next poll.");
     }
+    else if (c.object === "request" && c.action === "approve" && c.kind === "bastion") lines.push(...decisionLines(c, r as Record<string, unknown>));
     else if (c.object === "standing") lines.push("Matching requests need your approval again.");
     else if (c.object === "passkey" && c.action === "remove") lines.push("It can no longer sign in or approve anything here. Delete it from its password manager or key too if you no longer need it.");
     else if (c.object === "enrollment" && c.action === "approve") lines.push(h("span", null, h("bdi", null, vt(c.requesting_host ?? "The host")), " can now ask for access."));
@@ -1672,7 +1739,7 @@ class Sheet {
     this.render(
       h("h2", { id: "sheet-title", class: c.action === "approve" || c.action === "rename" ? "ok" : "neg" }, words[c.action] ?? "Done"),
       h("p", { class: "headline" }, renderParts(p.description.headlineParts)),
-      lines.map((l) => h("p", null, l)),
+      lines.map((l) => (l instanceof HTMLElement && l.tagName === "P" ? l : h("p", null, l))),
       h("div", { class: "actions" }, done),
     );
   }

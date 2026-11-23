@@ -63,6 +63,10 @@ export interface Api {
   /** Admin → Setup (docs/SETUP.md); `path` is relative to /api/ui/setup. */
   setupGet?<T>(path: string): Promise<T>;
   setupPost?<T>(path: string, body: unknown): Promise<T>;
+  /** Admin → Bastion access (docs/BASTION-ACCESS.md §10). */
+  bastion?(): Promise<import("./types").BastionView>;
+  /** Drop a maintenance request an agent queued (unsigned: it only returns to "nothing queued"). */
+  dismissSetupRequest?(id: string): Promise<unknown>;
   catalogue?():Promise<import('./catalogue').Catalogue|null>;
   migration?():Promise<{id:string;plan:string;recovery_sha256:string}|null>;
   hosts(): Promise<HostInfo[]>;
@@ -137,6 +141,8 @@ export function createApi(opts: ApiOptions = {}): Api {
     sealPost: (path,body) => call('POST',`/api/ui/seal/${path}`,body),
     setupGet: (path) => call('GET',`/api/ui/setup${path}`),
     setupPost: (path,body) => call('POST',`/api/ui/setup${path}`,body),
+    bastion: () => call('GET','/api/ui/bastion'),
+    dismissSetupRequest: (id) => call('POST',`/api/ui/setup-requests/${seg(id)}/dismiss`,{}),
     hosts: () => call('GET','/api/ui/hosts'),
     updates: () => call('GET','/api/ui/updates'),
     migration: () => call('GET','/api/ui/migration'),

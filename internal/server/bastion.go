@@ -702,6 +702,7 @@ func (s *Server) bastionItem(ctx context.Context, rq *store.Request) (*api.Pendi
 	pb.Level, pb.HostKey = bastionLevel(b, rq.LoginUser), hostKeyFingerprint(b.HostKey)
 	if pb.Level == api.LevelRoot {
 		it.Risk, pb.CertProfile, pb.OpenBuckets = "high", profileRoot, s.openBuckets(ctx, q)
+		pb.AlertChannel = s.notify.Configured()
 	}
 	since := s.now().Add(-7 * 24 * time.Hour)
 	if it.SimilarRecent, err = q.CountSimilar(ctx, rq.HostID, rq.TargetHost, rq.LoginUser, since); err != nil {

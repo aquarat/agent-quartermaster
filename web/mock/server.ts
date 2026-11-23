@@ -19,6 +19,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { resolve, sep, extname } from "node:path";
 import type { AuditEntry, GrantSummary, PasskeyInfo, PendingCloudflare, PendingItem, StandingApproval } from "../src/types";
 import { MockSetup } from "./setup";
+import { MockBastion } from "./bastion";
 import { MockBuckets } from "./buckets";
 import { MockPasskeyFlows } from "./passkeys";
 
@@ -183,6 +184,8 @@ export interface MockOptions {
   vault?: boolean;
   /** Admin → Setup: how long each step of the fake runner takes (default 1500 ms). */
   setupStepMs?: number;
+  /** Seed a pending inspect and root bastion request and a queued task (mock/bastion.ts). */
+  bastion?: boolean;
 }
 
 /** A mock passkey: credential id (for allowCredentials) plus what the UI lists. */
@@ -230,6 +233,8 @@ export class MockStore {
   applied: Array<{ object: string; action: string; canonical: Record<string, unknown> }> = [];
   /** Admin → Setup (mock/setup.ts); set by startMock. */
   setup!: MockSetup;
+  /** Bastion access (mock/bastion.ts); set by startMock. */
+  bastion!: MockBastion;
   vault!: MockVault;
   buckets!: MockBuckets;
   passkeyFlows!: MockPasskeyFlows;
@@ -652,6 +657,14 @@ export function startMock(opts: MockOptions = {}) {
     opts.setupStepMs,
   );
 
+  store.bastion = new MockBastion(store);
+  store.setup.bastion = store.bastion;
+  if (opts.bastion) {
+    store.bastion.spawn("root");
+    store.bastion.spawn("inspect");
+    store.bastion.spawnQueued();
+  }
+
   store.vault = new MockVault({
     issue: (text, canonical, session) => {
       const { id, rec } = issue("action", { canonical, canonicalText: text, sessionBound: session }, createHash("sha256").update(text, "utf8").digest());
@@ -727,6 +740,9 @@ export function startMock(opts: MockOptions = {}) {
       const p = store.pending.find((x) => x.id === id && (object === "enrollment") === (x.kind === "enrollment"));
       if (!p) throw new HttpError(404, "not_found", `no pending ${object} ${id}`);
       if (action !== "approve" && action !== "deny") throw new HttpError(400, "bad_request", "action must be approve or deny");
+      if (p.kind === "setup") throw new HttpError(400, "bad_request", "a queued task is approved through the setup flow");
+      if (p.kind === "bastion") return store.bastion.canonical(base, p, action, body, (st, code, m) => { throw new HttpError(st, code, m); });
+      if (body.close_buckets !== undefined) throw new HttpError(400, "bad_request", "close_buckets belongs to a root session on the bastion");
       if (object === "enrollment") {
         return {
           ...base,
@@ -814,6 +830,7 @@ export function startMock(opts: MockOptions = {}) {
       const p = store.pending.find((x) => x.id === id);
       if (!p) throw new HttpError(409, "conflict", "already decided or expired");
       store.pending = store.pending.filter((x) => x.id !== id);
+      if (p.kind === "bastion") return store.bastion.apply(c, p);
       // Audit rows as aqmasd writes them (internal/server/actions.go).
       const signed = `signed by passkey 1 nonce=${String(c.nonce).slice(0, 8)}`;
       if (c.object === "enrollment") {
@@ -943,6 +960,11 @@ export function startMock(opts: MockOptions = {}) {
       const out = await store.setup.handle(req, url, body, session);
       if (out !== undefined) return json(out);
     }
+    if (/^\/api\/ui\/(bastion$|setup-requests\/)/.test(p)) {
+      needSession();
+      const out = store.bastion.handle(p, isPost, (st, code, msg) => { throw new HttpError(st, code, msg); });
+      if (out !== undefined) return json(out);
+    }
     if (/^\/api\/ui\/seal\/(passkeys|recovery)\//.test(p)) {
       needSession();
       const out = await store.passkeyFlows.handle(req, url, body, session);
@@ -974,13 +996,15 @@ export function startMock(opts: MockOptions = {}) {
       if (store.vault.enabled) Object.assign(state, { seal_enabled: true, catalogue_enabled: true });
       if (withGrants) state.grants = store.grants;
       if (withPasskeys) state.passkeys = store.passkeyInfos(session);
+      const rootUntil = store.bastion.rootUntil();
+      if (rootUntil) state.bastion_root_until = rootUntil;
       return json(state);
     }
     if ((m = p.match(/^\/api\/ui\/requests\/([^/]+)$/)) && !isPost) {
       needSession();
       const item = store.pending.find((x) => x.id === decodeURIComponent(m![1]!));
       if (!item) throw new HttpError(404, "not_found", "no such pending request");
-      return json(item);
+      return json(store.bastion.refresh(item));
     }
     if (p === "/api/ui/login/begin" && isPost) {
       if (store.passkeys.length === 0) throw new HttpError(409, "conflict", "no passkey registered yet: use the enroll code");
@@ -1199,6 +1223,7 @@ if (import.meta.main) {
     fresh: args.includes("--fresh"),
     enrollCode: args.includes("--code") ? args[args.indexOf("--code") + 1] : undefined,
     log: !args.includes("--quiet"),
+    bastion: !args.includes("--no-bastion"),
   });
   const url = m.url.replace("127.0.0.1", "localhost");
   console.log(`aqmas mock on ${url}  (open http://localhost:${m.server.port}: WebAuthn needs "localhost", not an IP)`);

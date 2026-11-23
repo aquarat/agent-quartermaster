@@ -15,6 +15,7 @@ import { createECDH, createHash, randomBytes } from "node:crypto";
 import { Aes128Gcm, CipherSuite, DhkemP256HkdfSha256, HkdfSha256 } from "@hpke/core";
 import { bech32Decode, recipientOf } from "./age";
 import { MockBuckets } from "./buckets";
+import { BASTION_SPECS, bastionParams, type MockBastion } from "./bastion";
 import { stagePlan, type StageStep } from "../src/setup";
 import type { StageView } from "../src/sealPanel";
 
@@ -114,6 +115,9 @@ const SPECS = [
   },
 ] as const;
 
+/** With the bastion and routine tasks (mock/bastion.ts). */
+const ALL_SPECS: ReadonlyArray<{ id: string; steps: readonly string[]; group?: string }> = [...SPECS, ...BASTION_SPECS];
+
 const RE = {
   recipient: /^age1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$/,
   repo: /^ssh:\/\/[a-z_][a-z0-9_-]{0,31}@([a-z0-9][a-z0-9.-]{0,252})(:[0-9]{1,5})?\/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}\.git$/,
@@ -188,6 +192,8 @@ export interface MockHost {
 }
 
 export class MockSetup {
+  /** Bastion access (mock/bastion.ts); set by startMock. */
+  bastion?: MockBastion;
   mode: "serve" | "cutover" | "seal-setup" = "serve";
   installed = true;
   scoped = false;
@@ -346,7 +352,17 @@ export class MockSetup {
   }
 
   private start(task: string, params: Record<string, unknown>): void {
-    const steps: readonly string[] = SPECS.find((s) => s.id === task)!.steps;
+    const steps: readonly string[] = ALL_SPECS.find((s) => s.id === task)!.steps;
+    if (ALL_SPECS.find((s) => s.id === task)!.group) {
+      // A bastion or routine task: one step per tick, then the fake result.
+      this.begin(task, steps[0]!);
+      steps.slice(1).forEach((text, i) => this.later(i + 1, () => this.step(text)));
+      this.later(steps.length, () => {
+        const out = this.bastion?.ran(task, params) ?? { message: "Done." };
+        this.finish("done", out.message, out.result);
+      });
+      return;
+    }
     const at = (i: number) => steps[i]!;
     const stamp = nowISO().replace(/[-:]/g, "");
     switch (task) {
@@ -442,7 +458,7 @@ export class MockSetup {
     const keys = this.host.passkeys();
     const passkeys = keys.map((k) => ({ id: k.hex, credential: k.id, key_sha256: sha256hex("cose:" + k.id), name: k.name, pinned: pins.includes(k.id), current: k.hex === cur }));
     const unpinned = passkeys.filter((p) => !p.pinned).length;
-    const tasks = SPECS.map((spec) => {
+    const tasks = ALL_SPECS.map((spec) => {
       const t: Record<string, unknown> & { state: string } = { ...spec, state: "available" };
       let last: MockRun | undefined = this.last[spec.id];
       let blocked = "";
@@ -471,6 +487,17 @@ export class MockSetup {
           if (!this.updatesReady) [t.state, blocked] = ["blocked", "Enable self-update first."];
           else if (!this.candidate) t.state = "idle";
           break;
+        case "bastion-access":
+          rerunnable = true;
+          if (this.bastion?.enabled) t.state = "done";
+          break;
+        case "bastion-access-remove":
+        case "bastion-allow":
+          rerunnable = true;
+          if (!this.bastion?.enabled) [t.state, blocked, rerunnable] = ["blocked", "Access to the bastion is not installed.", false];
+          break;
+        default:
+          if (spec.group) rerunnable = true;
       }
       if (t.state === "available" && last?.state === "failed") t.state = "failed";
       if (t.state === "available" || t.state === "failed" || (t.state === "done" && rerunnable)) {
@@ -576,6 +603,8 @@ export class MockSetup {
         return { text: `{"pins":[${pins.map((p) => `{"id":${q(p.id)},"key_sha256":${q(p.key_sha256)}}`).join(",")}]}`, value: { pins }, secrets: [] };
       }
     }
+    const own = bastionParams(task, raw, (m) => this.host.fail(400, "bad_request", m));
+    if (own) return { ...own, secrets: [] };
     return this.host.fail(404, "not_found", "no such task");
   }
 
@@ -660,6 +689,7 @@ export class MockSetup {
           return { ok: true };
         }
       }
+      this.bastion?.answer(body.request, task, String(c.params), fail);
       this.received.push({ task, params: String(c.params), secrets });
       this.host.audit("setup_run", "setup:" + task, String(c.params));
       this.start(task, value);

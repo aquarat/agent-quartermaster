@@ -72,7 +72,15 @@ const CF_KEYS: Record<string, string[]> = {
   standing: [...COMMON_KEYS, "requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"],
   grant: [...COMMON_KEYS, "requesting_host", "kind", "scope", "scope_params", "mode", "ttl_seconds", "standing_hours"],
 };
-const STRING_KEYS = ["requesting_host", "kind", "target", "login_user", "key_fingerprint", "nickname", "new_nickname", "scope", "scope_params", "mode", "ip_condition", "nonce", "issued_at"] as const;
+// kind "bastion" (docs/BASTION-ACCESS.md §5): a session on the bastion itself. Its request
+// carries the level, the buckets open when the card was built and the close choice, and has
+// no standing field. A grant of this kind is revoked with the ordinary grant key set.
+const BASTION_KEYS = [...COMMON_KEYS, "kind", "level", "requesting_host", "host_id", "address", "target", "target_address", "target_port", "login_user", "principal",
+  "key_fingerprint", "ssh_ca", "host_key", "cert_profile", "ttl_seconds", "sealed", "open_buckets", "close_buckets", "alert_channel"];
+/** A root session certificate lasts at most this long (canon.BastionRootMaxSeconds). */
+export const BASTION_ROOT_MAX_SECONDS = 3600;
+const BASTION_PROFILES: Record<string, string> = { inspect: "source-address;force-command", root: "source-address;permit-pty" };
+const STRING_KEYS = ["requesting_host", "kind", "target", "login_user", "key_fingerprint", "nickname", "new_nickname", "scope", "scope_params", "mode", "ip_condition", "nonce", "issued_at", "level", "host_id", "ssh_ca", "host_key", "cert_profile", "open_buckets"] as const;
 const ALLOWED_ACTIONS: Record<string, string[]> = {
   migration:['activate'],
   update:['approve'],
@@ -114,6 +122,54 @@ function goEscape(s: string): string {
     .replace(/\u2029/g, "\\u2029");
 }
 
+const utf8Bytes = new TextEncoder();
+function bytewise(a: string, b: string): number {
+  const x = utf8Bytes.encode(a), y = utf8Bytes.encode(b);
+  for (let i = 0; i < x.length && i < y.length; i++) if (x[i] !== y[i]) return x[i]! - y[i]!;
+  return x.length - y.length;
+}
+
+/** open_buckets as the broker encodes it (canon.OpenList): sorted bytewise, distinct, a JSON
+ * array without whitespace or HTML escaping. */
+export function openList(labels: readonly string[]): string {
+  const l = [...new Set(labels)].sort(bytewise);
+  return `[${l.map((s) => JSON.stringify(s).replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029")).join(",")}]`;
+}
+
+/** Decode open_buckets; only the exact encoding of openList is accepted. */
+export function parseOpenList(text: unknown): string[] {
+  let v: unknown;
+  try {
+    v = typeof text === "string" && text.length <= 8192 ? JSON.parse(text) : null;
+  } catch {
+    v = null;
+  }
+  if (!Array.isArray(v) || v.some((x) => typeof x !== "string") || openList(v as string[]) !== text) throw new CanonicalError("invalid open_buckets");
+  return v as string[];
+}
+
+/** Kind "bastion": text that contradicts itself is refused, so a card cannot be signed that
+ * says one thing and applies another (mirrors canon.validateBastion). */
+function checkBastion(c: Canonical): void {
+  if (c.v !== 1) throw new CanonicalError("a bastion session requires canonical v1");
+  if (c.level !== "inspect" && c.level !== "root") throw new CanonicalError("unknown bastion level");
+  for (const k of ["host_id", "address", "target", "target_address", "login_user", "principal", "key_fingerprint", "ssh_ca", "host_key", "requesting_host"]) {
+    if (typeof c[k] !== "string" || c[k] === "") throw new CanonicalError(`incomplete bastion request (${k})`);
+  }
+  if (c.principal !== `${c.login_user}@${c.target}`) throw new CanonicalError("bastion principal does not match the login user and target");
+  if (c.cert_profile !== BASTION_PROFILES[c.level]) throw new CanonicalError("wrong certificate profile for this level");
+  for (const k of ["sealed", "close_buckets", "alert_channel"]) if (typeof c[k] !== "boolean") throw new CanonicalError(`canonical ${k} is not a boolean`);
+  const open = parseOpenList(c.open_buckets);
+  const approveRoot = c.level === "root" && c.action === "approve";
+  if ((!approveRoot && (open.length !== 0 || c.close_buckets || c.alert_channel)) || (!c.sealed && (open.length !== 0 || c.close_buckets))) {
+    throw new CanonicalError("open_buckets, close_buckets and alert_channel belong to a root approval");
+  }
+  const ttl = c.ttl_seconds;
+  if (typeof ttl !== "number" || !Number.isSafeInteger(ttl) || (c.action !== "approve" && ttl !== 0) || (c.action === "approve" && ttl <= 0) || (c.level === "root" && ttl > BASTION_ROOT_MAX_SECONDS)) {
+    throw new CanonicalError("invalid bastion duration");
+  }
+}
+
 /** Parse and validate canonical text. Throws CanonicalError. */
 export function parseCanonical(text: string): Canonical {
   let v: unknown;
@@ -138,7 +194,9 @@ export function parseCanonical(text: string): Canonical {
   // The key set depends on (object, kind): a Cloudflare request carries scope/params/mode
   // instead of target/user/key.
   const cf = c.kind === "cloudflare" && CF_KEYS[c.object] !== undefined;
-  let allowed = cf ? CF_KEYS[c.object]! : ALLOWED_KEYS[c.object]!;
+  const bastion = c.kind === "bastion";
+  if (bastion && c.object !== "request" && c.object !== "grant") throw new CanonicalError("a bastion session has no such object");
+  let allowed = cf ? CF_KEYS[c.object]! : bastion && c.object === "request" ? BASTION_KEYS : ALLOWED_KEYS[c.object]!;
   if(c.object==='migration'){if(typeof c.recovery_sha256!=='string' || !/^[0-9a-f]{64}$/.test(c.recovery_sha256) || typeof c.plan!=='string')throw new CanonicalError('invalid migration');planRows(c.plan,c.id);}
   else if(Object.hasOwn(catalogueVerbs,c.object)){if(c.v!==2||typeof c.plan!=='string')throw new CanonicalError('invalid catalogue change');catalogueRows(c.plan,c.object);}
   else if(c.v===2){if(!['request','standing','grant'].includes(c.object)|| !['ssh','cloudflare'].includes(c.kind??''))throw new CanonicalError('unsupported scoped action');allowed=[...new Set([...allowed,...bindingKeys(c.kind),...durationFlags,'standing_seconds'])];validateBinding(c);}
@@ -169,6 +227,8 @@ export function parseCanonical(text: string): Canonical {
     }
   }
   if (cf) checkCloudflare(c, allowed);
+  if (bastion && c.object === "request") checkBastion(c);
+  else for (const k of ["level", "host_id", "sealed", "open_buckets", "close_buckets", "alert_channel"]) if (c.v === 1 && Object.hasOwn(c, k)) throw new CanonicalError(`only a bastion session carries ${k}`);
   return c;
 }
 
@@ -275,6 +335,17 @@ export interface Expectation extends UpdateFields {
   nickname?: string;
   /** Passkey rename: the new nickname ("" for add and remove). */
   new_nickname?: string;
+  /** Kind "bastion": what the card showed (level, authority, the open buckets) and the
+   * owner's close choice. All are compared whenever the canonical or the card is a bastion one. */
+  level?: string;
+  host_id?: string;
+  ssh_ca?: string;
+  host_key?: string;
+  cert_profile?: string;
+  sealed?: boolean;
+  open_buckets?: readonly string[];
+  close_buckets?: boolean;
+  alert_channel?: boolean;
 }
 
 /** List of human-readable mismatches between canonical and the expectation (empty = ok). */
@@ -306,6 +377,19 @@ export function mismatches(c: Canonical, e: Expectation): string[] {
   cmp("scope_params", c.scope_params, e.scope_params);
   cmp("mode", c.mode, e.mode);
   cmp("ip_condition", c.ip_condition, e.ip_condition);
+  if ((c.kind === "bastion" || e.kind === "bastion") && (c.object === "request" || e.object === "request")) {
+    // Nothing here is optional: a card that did not show a fact cannot approve it.
+    const root = e.level === "root" && e.action === "approve";
+    cmp("kind", c.kind, "bastion");
+    cmp("level", c.level, e.level ?? "");
+    for (const k of ["host_id", "ssh_ca", "host_key", "cert_profile"] as const) cmp(k, c[k], e[k] ?? "");
+    cmp("sealed", c.sealed, e.sealed ?? false);
+    cmp("open_buckets", c.open_buckets, openList(root && e.sealed ? (e.open_buckets ?? []) : []));
+    cmp("close_buckets", c.close_buckets, root && e.sealed ? (e.close_buckets ?? false) : false);
+    cmp("alert_channel", c.alert_channel, root ? (e.alert_channel ?? false) : false);
+    if (e.action !== "approve") cmp("ttl_seconds", c.ttl_seconds, 0);
+    else if (e.ttl_seconds === undefined) out.push("ttl_seconds: no duration was chosen");
+  }
   if (e.object === "enrollment") cmp("replaces", c.replaces ?? false, e.replaces ?? false);
   if (e.object === "passkey") {
     // Every passkey action carries both nicknames; add and remove must not rename anything.
@@ -345,6 +429,69 @@ export interface Description {
   risk?: CFRisk;
   /** cf.admin: show the confirmation as break-glass. */
   breakGlass?: boolean;
+  /** Kind "bastion": the signed facts the card is drawn from. */
+  bastion?: BastionFacts;
+}
+
+/** A bastion decision, from the signed text only. */
+export interface BastionFacts {
+  level: "inspect" | "root";
+  action: string;
+  host: string;
+  target: string;
+  user: string;
+  address: string;
+  ttl: number;
+  sealed: boolean;
+  /** The buckets the signed text lists as open (root approval). */
+  open: string[];
+  close: boolean;
+  alert: boolean;
+}
+
+/** The fixed words of the red card (docs/BASTION-ACCESS.md §6). */
+export const ROOT_TITLE = "ROOT ON THE BASTION";
+export const ROOT_CONSEQUENCES =
+  "This is not an ordinary grant. Root on the bastion can read every bucket that is open while the session lasts, mint certificates for the whole fleet and replace aqmasd itself. Approving this is approving everything until the session ends.";
+export const ROOT_UNSEALED = "The store is not sealed: root on the bastion can read every credential outright. There are no buckets to close.";
+export const ROOT_CLOSE_LABEL = "Close all open buckets before the certificate is issued (also ends approval windows)";
+export const ROOT_NO_ALERT = "No alert channel is configured: nobody will be alerted.";
+export const ROOT_ALERT = "You will be alerted when it is issued.";
+export const INSPECT_NOTE = "The read-only inspect account: it can only run a fixed set of log and status commands. No shell, no forwarding, no sudo.";
+
+function describeBastion(c: Canonical): Description {
+  const b: BastionFacts = {
+    level: c.level as "inspect" | "root", action: c.action, host: c.requesting_host ?? "?", target: c.target ?? "?", user: c.login_user ?? "?", address: c.address ?? "?",
+    ttl: c.ttl_seconds ?? 0, sealed: c.sealed === true, open: parseOpenList(c.open_buckets), close: c.close_buckets === true, alert: c.alert_channel === true,
+  };
+  const root = b.level === "root";
+  const warnings: string[] = [];
+  let headline: Part[];
+  if (c.action === "approve") {
+    headline = root
+      ? t`${ROOT_TITLE}: let ${b.host} log in to ${b.target} as ${b.user} (your admin account, sudo) for ${duration(b.ttl)}.`
+      : t`Approve read-only inspect access to the bastion ${b.target} as ${b.user} for ${duration(b.ttl)}, requested by ${b.host}.`;
+    if (root) {
+      warnings.push(ROOT_CONSEQUENCES);
+      if (!b.sealed) warnings.push(ROOT_UNSEALED);
+      else if (b.open.length === 0) warnings.push("No bucket is open.");
+      else warnings.push(`Open right now: ${b.open.join(" · ")}. ${b.close ? "They are closed before the certificate is issued." : "They STAY OPEN: the root session can read them."}`);
+      warnings.push(b.alert ? ROOT_ALERT : ROOT_NO_ALERT);
+    } else warnings.push(INSPECT_NOTE);
+  } else {
+    headline = root ? t`Deny root on the bastion ${b.target} as ${b.user}, requested by ${b.host}.` : t`Deny inspect access to the bastion ${b.target}, requested by ${b.host}.`;
+  }
+  for (const [k, label] of [["requesting_host", "requesting host"], ["target", "bastion"], ["login_user", "login user"]] as const) {
+    if (!isPlainName(c[k])) warnings.push(`The ${label} name contains unusual characters: check it letter by letter.`);
+  }
+  return {
+    headline: partsText(headline),
+    headlineParts: headline,
+    warnings,
+    details: [t`Address: ${c.target_address!}, port ${String(c.target_port)}.`, t`Certificate principal ${c.principal!}, usable from ${c.address!} only (${String(c.cert_profile)}).`],
+    fields: fieldList(c),
+    bastion: b,
+  };
 }
 
 const FIELD_LABELS: Record<string, string> = {
@@ -365,6 +512,15 @@ const FIELD_LABELS: Record<string, string> = {
   nickname: "Passkey",
   new_nickname: "New name",
   key_fingerprint: "Key",
+  level: "Bastion level",
+  host_id: "Requester's enrollment",
+  ssh_ca: "Signing CA",
+  host_key: "Bastion host key",
+  cert_profile: "Certificate profile",
+  sealed: "Store sealed",
+  open_buckets: "Buckets open",
+  close_buckets: "Close them first",
+  alert_channel: "Alert channel",
   params: "Task parameters",
   secrets_sha256: "Sealed secrets (SHA-256)",
   id: "ID",
@@ -377,7 +533,8 @@ const FIELD_ORDER = Object.keys(FIELD_LABELS);
 function fieldValue(k: string, v: unknown): string {
   if (k === "ttl_seconds" && typeof v === "number") return v > 0 ? duration(v) : "n/a";
   if (k === "standing_hours" && typeof v === "number") return v > 0 ? `for ${hours(v)}` : "no";
-  if (k === "replaces" && typeof v === "boolean") return v ? "yes" : "no";
+  if ((k === "replaces" || k === "sealed" || k === "close_buckets" || k === "alert_channel") && typeof v === "boolean") return v ? "yes" : "no";
+  if (k === "open_buckets" && v === "[]") return "none";
   if (k === "scope_params" && v === "") return "none";
   if (k === "ip_condition" && v === "") return "n/a (proxy)";
   if ((k === "nickname" || k === "new_nickname") && v === "") return "(none)";
@@ -418,6 +575,7 @@ export function describe(c: Canonical): Description {
   if(c.object==='migration'){const headline='personal: activate organisation admissions and retire previous authority.';return {headline,headlineParts:[headline],warnings:['Pending requests expire; standing approvals and broker grants end. Issued SSH certificates and unverified children can still work until their original expiry.'],fields:[['Recovery SHA-256',String(c.recovery_sha256)],...planRows(String(c.plan),c.id)]};}
   if(c.v===2){const d=describe({...c,v:1});const path=[c.org_title,c.service_title,c.set_title].map(String).join(' › ');d.headline=`${path}: ${d.headline}`;d.headlineParts=[{value:path},': ',...d.headlineParts];if(c.indefinite||c.standing_indefinite)d.warnings.push(`INDEFINITE ${c.indefinite?'grant':'standing approval'} — active until revoked.`);if(Number(c.standing_seconds)>0)d.warnings.push(`Also auto-approve matching requests for ${duration(Number(c.standing_seconds))}.`);if(c.beyond_soft_cap||c.standing_beyond_soft_cap)d.warnings.push('Beyond soft cap: check the duration before approving.');d.fields=fieldList(c);return d;}
   if (c.kind === "cloudflare" && CF_KEYS[c.object]) return describeCloudflare(c);
+  if (c.kind === "bastion" && c.object === "request") return describeBastion(c);
   const kind = kindLabel(c.kind ?? "ssh");
   const host = c.requesting_host ?? "?";
   let headline: Part[];
@@ -457,6 +615,7 @@ export function describe(c: Canonical): Description {
       break;
     case "grant:revoke":
       headline = t`Revoke ${host}'s ${kind} access as ${who(c)}.`;
+      if (c.kind === "bastion") warnings.push("This marks the session revoked and stops a certificate that was not collected yet. A certificate that was already collected cannot be recalled, and a session that is open stays open.");
       break;
     case "passkey:add":
       headline = c.new_nickname ? t`Allow adding a new passkey named ${c.new_nickname} to aqmas.` : ["Allow adding a new passkey to aqmas (named after its authenticator)."];

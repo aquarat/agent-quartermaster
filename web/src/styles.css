@@ -1746,3 +1746,122 @@ p.open-lines { padding-left: 0.75rem; background: none; color: var(--muted); }
 .bucket-list { list-style: none; margin: 0.25rem 0; padding: 0; }
 .bucket { padding: 0.35rem 0; }
 .bucket .holds, .bucket .paused { margin: 0.15rem 0 0.15rem 1.25rem; padding: 0; font-size: 0.92em; }
+
+/* ---- Access to the bastion itself (docs/BASTION-ACCESS.md §6) ----
+   Root on the bastion is the loudest thing this UI can show: a filled red band with an icon
+   and the words, a red border and a tinted body. Never colour alone. */
+.root-band {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-ctl);
+  background: var(--admin);
+  color: var(--admin-ink);
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  background-image: repeating-linear-gradient(-45deg, rgb(0 0 0 / 0.12) 0 8px, transparent 8px 16px);
+  overflow-wrap: anywhere;
+}
+.root-band .icon {
+  flex: none;
+}
+.card.bastion-root,
+.row.bastion-session.root.active,
+.root-block,
+.summary.root-summary {
+  border: 3px solid var(--admin);
+  background: linear-gradient(var(--admin-bg), var(--admin-bg)) padding-box;
+}
+.root-block,
+.summary.root-summary {
+  border-radius: var(--radius-card);
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+.card.bastion-root .risk,
+.bad {
+  color: var(--admin);
+}
+.root-ask {
+  font-size: 1.0625rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.root-consequences {
+  font-weight: 600;
+}
+.root-open {
+  border-left: 4px solid var(--admin);
+  padding: 4px 0 4px 10px;
+}
+.root-open-list {
+  margin: 4px 0 0;
+  padding-left: 1.2em;
+  overflow-wrap: anywhere;
+}
+.root-alert.none {
+  color: var(--admin);
+}
+.root-close {
+  font-weight: 700;
+}
+.btn.approve.root,
+.btn.confirm.root {
+  background: var(--admin);
+  border-color: var(--admin);
+  color: var(--admin-ink);
+}
+.root-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0;
+  padding: 10px max(16px, env(safe-area-inset-right)) 10px max(16px, env(safe-area-inset-left));
+  background: var(--admin);
+  color: var(--admin-ink);
+  overflow-wrap: anywhere;
+}
+.root-banner p {
+  margin: 0;
+  min-width: 0;
+}
+.root-banner .icon {
+  flex: none;
+}
+.bastion-head .root-banner {
+  border-radius: var(--radius-ctl);
+}
+.card.bastion-inspect {
+  border: 2px solid var(--high);
+}
+.queued-params {
+  margin: 0;
+  padding-left: 1.2em;
+  overflow-wrap: anywhere;
+}
+.setup-warning {
+  color: var(--admin);
+  background: var(--admin-bg);
+}
+.bastion-panel,
+.bastion-head,
+.bastion-sessions {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.bastion-h {
+  margin: 8px 0 0;
+  font-size: 1rem;
+}
+.bastion-hosts {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}

@@ -102,7 +102,7 @@ var Specs = []Spec{
 		Reversible: "The previous binary is restored automatically if the new one is unhealthy. Database migrations are not reversed."},
 	{ID: TaskBastionAccess, Group: GroupBastion, Title: "Allow aqmas access to the bastion",
 		Summary: "Makes this machine's own sshd accept aqmas certificates for two accounts: a read-only inspect account that can only run fixed log and status commands, and your admin account (root, behind a red card, from hosts you allow). Your emergency keys are not touched and stay the way in when aqmas is down.",
-		Steps: []string{"Check the admin account and the SSH CA against what you signed", "Create the locked-down inspect account", "Install the CA, the two principals files and the forced-command block; validate and reload sshd",
+		Steps: []string{"Check the admin account and the SSH CA against what you signed", "Create the confined inspect account", "Install the CA, the two principals files and the forced-command block; validate and reload sshd",
 			"Record this machine as a destination in the configuration", "Restart the broker and check it is healthy"},
 		Reversible: "Yes: “Remove aqmas access to the bastion”. If a check fails, the previous sshd files and configuration are restored.",
 		Warning:    "Restarts the broker: every open bucket closes and every approval window ends."},

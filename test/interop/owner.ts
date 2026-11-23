@@ -330,12 +330,39 @@ try {
         choice.ttl_seconds = ttl==='indefinite'?0:Number(ttl ?? it.ttl_max);choice.indefinite=ttl==='indefinite';
         if (standing==='indefinite')choice.standing_indefinite=true;else if(standing)choice.standing_hours=Number(standing);
       }
+      if (it.kind === "bastion") {
+        // The page offers no standing choice for the bastion; asking the server anyway must fail.
+        const c: Record<string, unknown> = { action: cmd };
+        if (cmd === "approve") c.ttl_seconds = choice.ttl_seconds;
+        if (standing) c.standing_hours = Number(standing);
+        const p = await flows.prepareAction(api, flows.targetForPending(await api.request(id!)), c);
+        console.error("owner: signing " + p.canonicalText);
+        console.log(JSON.stringify(await flows.completeAction(api, auth, p)));
+        break;
+      }
       const p = await flows.prepareAction(api, flows.targetForPending(it), choice);
       console.error("owner: signing " + p.canonicalText);
       const out = await flows.completeAction(api, auth, p);
       console.log(JSON.stringify(out));
       break;
     }
+    case "approve-root": { // ID TTL close|keep: the red card, with the signed choice about open buckets
+      const [id, ttl, close] = args;
+      const it = await api.request(id!);
+      const p = await flows.prepareAction(api, flows.targetForPending(it), { action: "approve", ttl_seconds: Number(ttl), ...(it.bastion?.sealed ? { closeBuckets: close === "close" } : {}) });
+      console.error("owner: signing " + p.canonicalText);
+      console.log(JSON.stringify(await flows.completeAction(api, auth, p)));
+      break;
+    }
+    case "approve-task": { // ID: a maintenance task an agent queued, approved through the Setup flow
+      const it = await findPending(args[0]!);
+      const setup = await import(`${web}/src/setup.ts`);
+      await setup.runSetupTask(api, auth, await api.setupGet!(""), it.setup.task, setup.queuedParams(it.setup.task, it.setup.params), undefined, rp, it.id);
+      break;
+    }
+    case "bastion":
+      console.log(JSON.stringify(await api.bastion()));
+      break;
     case "revoke-grant": {
       const s = await api.state();
       const g = (s.grants ?? []).find((x: { id: string }) => x.id === args[0]);

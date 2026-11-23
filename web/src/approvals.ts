@@ -413,6 +413,8 @@ export function multiPanel(
     if (
       !item.scoped_facts ||
       item.kind === "enrollment" ||
+      item.kind === "bastion" || // a bastion session always needs its own tap
+      item.kind === "setup" ||
       item.ssh?.login_user === "root" ||
       item.risk === "high" ||
       item.ttl_requested! <= 0

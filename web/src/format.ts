@@ -46,6 +46,8 @@ export function kindLabel(kind: string): string {
   if (kind === "ssh") return "SSH";
   if (kind === "enrollment") return "New host";
   if (kind === "cloudflare") return "Cloudflare";
+  if (kind === "bastion") return "Bastion";
+  if (kind === "setup") return "Maintenance";
   return kind;
 }
 

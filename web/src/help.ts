@@ -153,5 +153,21 @@ export function helpPage(c: HelpConfig) {
       ),
       p("If aqmasd is down, use your emergency access."),
     ),
+    card(
+      "Bastion access",
+      p("The bastion that runs aqmas can itself be reached in three controlled ways, once you have run “Allow aqmas access to the bastion” under Admin → Bastion access. Your emergency key is never touched and stays the way in when aqmas is down."),
+      h("h3", null, "Inspect (amber card)"),
+      p("An account that can only run fixed log and status commands: no shell, no forwarding, no sudo. One tap, default 1 hour; the certificate is reused until it expires."),
+      command("aqmas ssh bastion --why 'approvals page slow' -- logs aqmasd since=2h"),
+      h("h3", null, "Root (red card)"),
+      p("Your admin account, with sudo. Root on the bastion can read every bucket that is open while the session lasts, mint certificates for the whole fleet and replace aqmasd: approving it is approving everything until the session ends. It always needs its own tap, lasts at most 1 hour, is only offered to hosts on the list root keeps (“Who may ask for root”), and the card lists the buckets open right now with “Close all open buckets first” ticked. While a root certificate is valid a red banner shows on every page."),
+      command("aqmas ssh bastion --level root --why 'replace the tunnel credentials'"),
+      h("h3", null, "Routine tasks (normal card, pinned passkey)"),
+      p("Nobody logs in: the root maintenance runner runs a fixed task. An agent can queue one; nothing runs until you approve it."),
+      command("aqmas bastion task os-update --why 'monthly updates'"),
+      command("aqmas bastion task journal-vacuum --keep-days 14 --why 'disk at 90%'"),
+      command("aqmas bastion task reboot --why 'kernel update pending'"),
+      p("Also: restart-cloudflared, restart-broker, disk-usage. “aqmas bastion” alone shows what this host may ask for. A reboot or broker restart comes back with nothing open."),
+    ),
   );
 }

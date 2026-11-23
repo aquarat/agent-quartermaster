@@ -46,6 +46,89 @@ export interface PendingCloudflare {
   notes?: string[];
 }
 
+/** Bastion detail for kind "bastion" (api.PendingBastion, docs/BASTION-ACCESS.md). */
+export interface PendingBastion {
+  level: string; // "inspect" | "root" ("unknown" when access is no longer installed)
+  target: string;
+  target_address: string;
+  target_port: number;
+  login_user: string;
+  principal: string;
+  key_fingerprint: string;
+  host_id: string;
+  ssh_ca: string;
+  host_key: string;
+  cert_profile: string;
+  sealed: boolean;
+  /** Labels of the buckets open right now, sorted (root only). */
+  open_buckets: string[] | null;
+  alert_channel?: boolean;
+}
+
+/** A maintenance task queued by an agent, kind "setup" (api.PendingSetup). */
+export interface PendingSetup {
+  task: string;
+  title: string;
+  summary: string;
+  steps: string[] | null;
+  reversible: string;
+  warning?: string;
+  /** The task's canonical parameter text: exactly what an approval signs. */
+  params: string;
+  blocked?: string;
+}
+
+/** Response of a decide on a bastion request (api.BastionDecision). */
+export interface BastionDecision {
+  id: string;
+  kind: string;
+  status: string;
+  level: string;
+  closed_count: number;
+  alert: string; // root: sent | failed | off
+}
+
+export interface BastionHost {
+  id: string; // enrollment id
+  name: string;
+  class?: string;
+  address: string;
+  allowed: boolean;
+  allowed_address?: string;
+  gone?: boolean;
+}
+
+export interface BastionSession {
+  grant_id: string;
+  level: string;
+  requesting_host: string;
+  login_user: string;
+  not_before: string;
+  not_after: string;
+  status: string; // active | expired | revoked
+  close_buckets: boolean;
+  closed_count: number;
+  alert: string; // "" | sent | failed | off
+  delivered_at?: string;
+}
+
+/** GET /api/ui/bastion (api.BastionView). */
+export interface BastionView {
+  enabled: boolean;
+  name?: string;
+  address?: string;
+  port?: number;
+  admin_user?: string;
+  inspect_user: string;
+  ssh_ca: string;
+  sealed: boolean;
+  alert_channel: boolean;
+  hosts: BastionHost[] | null;
+  sessions: BastionSession[] | null;
+  root_until?: string;
+  tasks: string[] | null;
+}
+
 export interface PendingItem {
   scoped_facts?: Record<string,string|number>;
   max_standing_hours?: number;
@@ -60,6 +143,8 @@ export interface PendingItem {
   ssh?: PendingSSH;
   enrollment?: PendingEnrollment;
   cloudflare?: PendingCloudflare;
+  bastion?: PendingBastion;
+  setup?: PendingSetup;
   ttl_requested: number;
   ttl_max: number;
   risk: string; // "normal" | "high" (Cloudflare: low/medium -> normal, high/admin -> high)
@@ -160,6 +245,8 @@ export interface UIState {
   recent: AuditEntry[] | null;
   grants?: GrantSummary[] | null; // active grants (api.UIState.grants)
   passkeys?: PasskeyInfo[] | null; // api.UIState.passkeys (absent on an older server)
+  /** Set while a root certificate for the bastion is unexpired and unrevoked. */
+  bastion_root_until?: string;
 }
 
 export type Action = "approve" | "deny" | "revoke" | "add" | "rename" | "remove" | 'activate' | 'create' | 'replace' | 'admit';
@@ -172,6 +259,8 @@ export interface ChallengeRequest {
   standing_hours?: number;
   /** Passkey rename: the new nickname. */
   nickname?: string;
+  /** Root bastion approval of a sealed store: close every open bucket first. */
+  close_buckets?: boolean;
 }
 
 /** Response of register/finish (api.RegisterResult). */

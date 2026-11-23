@@ -6,7 +6,7 @@
 #
 #   cutover (cancel, then activate) → seal into per-credential buckets (wrong recovery key and
 #   cancel, then browser-made key, staging taps, on-box drill, activation, nothing open after) → enable self-update (mismatching release
-#   refused, then seeded) → sync maintenance passkeys
+#   refused, then seeded) → sync maintenance passkeys → access to the bastion itself (bastion.sh)
 #
 # with an SSH grant issued and used after each step. A loop stands in for aqmas-maint.path;
 # a hook script stands in for systemd. Nothing outside the temp dir is touched.
@@ -104,6 +104,7 @@ start) running && exit 1
   setsid "$AQMASD" -config "$L/etc/config.toml" "\$2" >>"$T/aqmasd-\$2.log" 2>&1 </dev/null &
   echo \$! >\$pidfile ;;
 active) running ;;
+sys) shift; [[ -x $T/sys ]] && exec "$T/sys" "\$@"; exit 0 ;;  # the bastion tasks' system tools (bastion.sh)
 *) exit 2 ;;
 esac
 EOF
@@ -279,6 +280,10 @@ owner setup-run sync-passkeys
 owner setup-wait sync-passkeys done 30 >/dev/null
 [[ $(PINS) == 2/2 ]] || fail "pins after sync: $(PINS)"
 ok "maintenance passkeys synced by a signed list"
+
+# --- 5. access to the bastion itself: inspect, root, routine tasks (docs/BASTION-ACCESS.md) ---
+source "$ROOT/test/interop/bastion.sh"
+bastion_scenario
 
 # --- nothing pasted in the UI may be anywhere but where the runner stores it ---
 leaks=$(grep -rlE 'SENTINEL(lockalert|forgejoREAD|githubREAD)' "$T" --exclude-dir=alert --exclude=forgejo-read-token --exclude=github-read-token --exclude='config.before-*' --exclude='sign-*.err' 2>/dev/null || true)
