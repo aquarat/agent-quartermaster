@@ -33,6 +33,11 @@
 //   recovery-drill FILE           Security → Recovery key drill with the identity in FILE
 //   create-scope TITLE            create an organisation's scope key (signed-in passkey)
 //   capability ACTION NAME [CAP]  register|enable|test|disable a passkey's scope keys
+//                                 (OWNER_NO_PRF=1 register …: the new passkey has no PRF)
+//   remember NAME [LABEL]         Remember this browser for NAME, a passkey without PRF (docs/BUCKETS.md
+//                                 §13): the signed-in passkey approves, NAME enrols and tests
+//   forget NAME                   Forget this browser for NAME (signed by the signed-in passkey)
+//   browser-key                   print this "browser profile"'s key fingerprint ("" when it has none)
 //   window SECONDS COUNT MARKER   open a personal approval window, approve COUNT SSH requests
 //                                 under it, keep it open while MARKER exists, then close it
 //
@@ -65,6 +70,10 @@ interface Saved {
   ranId?: string;
   active?: string;
   cookie?: string;
+  /** This helper's "browser profile" key (docs/BUCKETS.md §13). A browser keeps it in IndexedDB
+   * as a non-extractable CryptoKey, which no file can hold: TEST ONLY, the state file keeps a
+   * JWK and every run imports it non-extractable, so the page code sees what a browser gives it. */
+  browser?: { privateJwk: JsonWebKey; publicJwk: JsonWebKey };
 }
 const saved: Saved = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : {};
 const keys: Record<string, SavedAuthenticator> = saved.keys ?? {};
@@ -72,6 +81,7 @@ let active = saved.active ?? "";
 let ranId = saved.ranId ?? "";
 const requestId = async (canonical: string) => Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical))).toString("hex").slice(0, 16);
 let cookie = saved.cookie ?? "";
+let profileKey = saved.browser;
 
 // The session cookie is Secure; this helper talks plain HTTP to 127.0.0.1 exactly like
 // cloudflared does, so the jar is kept by hand.
@@ -94,7 +104,7 @@ async function persist() {
   } catch {
     // no credential yet
   }
-  writeFileSync(stateFile, JSON.stringify({ keys, active, cookie, ranId } satisfies Saved), { mode: 0o600 });
+  writeFileSync(stateFile, JSON.stringify({ keys, active, cookie, ranId, ...(profileKey ? { browser: profileKey } : {}) } satisfies Saved), { mode: 0o600 });
 }
 
 async function findPasskey(name: string) {
@@ -111,6 +121,34 @@ async function findPending(id: string) {
   return it;
 }
 
+// Remembered browsers: every tap of this helper can take the page's own browser-key path
+// (web/src/buckets.ts browserPath), exactly as the app wires it at start.
+const browserKey = await import(`${web}/src/browserKey.ts`);
+const ECDH = { name: "ECDH", namedCurve: "P-256" };
+const browserKeys = new browserKey.BrowserKeys(
+  {
+    async load() {
+      if (!profileKey) return undefined;
+      return { privateKey: await crypto.subtle.importKey("jwk", profileKey.privateJwk, ECDH, false, ["deriveBits"]), publicKey: await crypto.subtle.importKey("jwk", profileKey.publicJwk, ECDH, true, []) };
+    },
+    async save() {
+      throw new Error("the helper's profile key is made by newProfileKey()");
+    },
+    async clear() {
+      profileKey = undefined;
+    },
+  },
+  async () => true,
+);
+async function newProfileKey() {
+  const pair = (await crypto.subtle.generateKey(ECDH, true, ["deriveBits"])) as CryptoKeyPair;
+  profileKey = { privateJwk: await crypto.subtle.exportKey("jwk", pair.privateKey), publicJwk: await crypto.subtle.exportKey("jwk", pair.publicKey) };
+}
+{
+  const { browserPath } = await import(`${web}/src/buckets.ts`);
+  browserPath.keys = browserKeys;
+  browserPath.release = (body: unknown) => api.sealPost("browser/release", body);
+}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const rp = new URL(origin).hostname;
 /** A seal control action (Security → Buckets, Setup activation) exactly as the page signs it. */
@@ -236,14 +274,44 @@ try {
       const [action,name,capability]=args;const v=await api.sealStatus();
       const key=action==='register'?null:await findPasskey(name!);const pk=key?(v.passkeys??[]).find((p:any)=>p.id===key.id):null;
       const keyed=(v.scopes??[]).filter((s:any)=>s.has_key).map((s:any)=>s.scope);
-      const scopes=action==='register'?(capability==='approve-only'?[]:keyed):action==='enable'?pk.missing:pk.scopes.map((s:any)=>s.scope);
+      // A passkey that opens only from remembered browsers is tested with this profile's key.
+      const local=pk?.mode==='browser'&&action==='test'?await browserKeys.current():undefined;
+      const here=local?(pk.browsers??[]).find((b:any)=>b.id===local.id):undefined;
+      if(pk?.mode==='browser'&&action==='test'&&!here)throw Error('this helper\'s browser is not remembered for '+name);
+      const scopes=action==='register'?(capability==='approve-only'?[]:keyed):action==='enable'?pk.missing:(here??pk).scopes.map((s:any)=>s.scope);
       const caps=await import(`${web}/src/capabilities.ts`);
-      let step=await caps.startCapability(api,v,{action,nickname:name,credential_id:key?.raw_id??'',capability:capability??(action==='disable'?'approve-only':'unlock'),scopes},rp);
+      let step=await caps.startCapability(api,v,{action,nickname:name,credential_id:key?.raw_id??'',capability:capability??(action==='disable'?'approve-only':'unlock'),scopes,...(local?{browser_key:local.public}:{})},rp);
       // The signed-in passkey approves each round; the passkey being enabled (or tested) answers the rest.
-      let device:any=action==='register'?await softAuthenticator(origin):name===active?auth:await softAuthenticator(origin,keys[name!]);
+      let device:any=action==='register'?await softAuthenticator(origin,undefined,{prf:process.env.OWNER_NO_PRF!=='1'}):name===active?auth:await softAuthenticator(origin,keys[name!]);
       for(let n=0;step;n++){if(n>12)throw Error('capability flow does not converge');const mine=/signed-in passkey/.test(step.progress??'')||(action==='disable');
         console.error(`owner: ${step.title} · ${step.progress??''}`);step=(await step.tap(mine?auth:device)) as any;}
       if(device!==auth&&action!=='disable')keys[name!]=await device.save();
+      break;
+    }
+    case 'browser-key': console.log((await browserKeys.current())?.id??'');break;
+    case 'remember': { // NAME [LABEL]: the offer the page makes when NAME returns no PRF result, accepted
+      const [name,label]=args;const v=await api.sealStatus();const key=await findPasskey(name!);const pk=(v.passkeys??[]).find((p:any)=>p.id===key.id);
+      const caps=await import(`${web}/src/capabilities.ts`);
+      if(!profileKey)await newProfileKey();
+      const ctx={keys:browserKeys,local:await browserKeys.current()};
+      const keyed=(v.scopes??[]).filter((s:any)=>s.has_key).map((s:any)=>s.scope);const done=caps.browserTested(pk,ctx.local);
+      const offer=caps.rememberOffer(api,v,{nickname:name!,credential_id:key.raw_id,scopes:keyed.filter((s:string)=>!done.includes(s))},rp,ctx,'interop',{skip:done});
+      console.error(`owner: ${offer.title}`);
+      let step:any=await offer.offer!.accept(label??'Interop browser');
+      const device:any=name===active?auth:await softAuthenticator(origin,keys[name!]);
+      for(let n=0;step;n++){if(n>12)throw Error('remember does not converge');const mine=/signed-in passkey/.test(step.progress??'');
+        console.error(`owner: ${step.title} · ${step.progress??''} · signing ${step.detail}`);step=await step.tap(mine?auth:device);}
+      if(device!==auth)keys[name!]=await device.save();
+      break;
+    }
+    case 'forget': { // NAME: Forget this helper's browser for NAME
+      const v=await api.sealStatus();const key=await findPasskey(args[0]!);const pk=(v.passkeys??[]).find((p:any)=>p.id===key.id);
+      const local=await browserKeys.current();const here=local?(pk.browsers??[]).find((b:any)=>b.id===local.id):undefined;
+      if(!here)throw Error('this helper\'s browser is not remembered for '+args[0]);
+      const step=await (await import(`${web}/src/capabilities.ts`)).startCapability(api,v,{action:'forget',capability:'unlock',nickname:args[0],credential_id:key.raw_id,scopes:[],browser_key:here.key},rp);
+      console.error(`owner: ${step.title} · signing ${step.detail}`);await step.tap(auth);
+      // As the page: the profile's key goes when no other passkey is remembered for it.
+      if(!((await api.sealStatus()).passkeys??[]).some((p:any)=>(p.browsers??[]).some((b:any)=>b.id===local!.id)))await browserKeys.forget();
       break;
     }
     case 'window': { // SECONDS COUNT MARKER: open a personal approval window, approve COUNT SSH requests under it, close it

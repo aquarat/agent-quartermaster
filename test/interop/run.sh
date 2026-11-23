@@ -323,6 +323,8 @@ RPID=$!; RID=$(owner wait ssh interop-host 20); owner approve "$RID" 300 >/dev/n
 wait "$RPID"; grep -qx ok "$T/closed2.out" || fail 'single-card SSH approval'
 nothing_open 'single approval (instant hold)'
 ok 'approvals open the SSH CA for the instant only (batch and single card)'
+source "$ROOT/test/interop/browserkey.sh"
+browser_key_scenario
 source "$ROOT/test/interop/vault.sh"
 source "$ROOT/test/interop/envsets.sh"
 env_scenario
