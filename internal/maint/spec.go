@@ -11,12 +11,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"slices"
 	"strings"
 
 	"github.com/aquarat/agent-quartermaster/internal/release"
+	"github.com/aquarat/agent-quartermaster/internal/server/config"
 )
 
 // Task identifiers: the complete allowlist. "upgrade" is carried by the older "update"
@@ -28,7 +30,28 @@ const (
 	TaskUpdates = "enable-updates"
 	TaskPins    = "sync-passkeys"
 	TaskUpgrade = "upgrade"
+	// Access to the bastion itself and routine maintenance (docs/BASTION-ACCESS.md §3, §7).
+	TaskBastionAccess = "bastion-access"
+	TaskBastionRemove = "bastion-access-remove"
+	TaskBastionAllow  = "bastion-allow"
+	TaskOSUpdate      = "os-update"
+	TaskReboot        = "reboot"
+	TaskRestartTunnel = "restart-cloudflared"
+	TaskRestartBroker = "restart-broker"
+	TaskDiskUsage     = "disk-usage"
+	TaskJournalVacuum = "journal-vacuum"
 )
+
+// Groups place a task on the page: "" is the Setup queue, the others Admin → Bastion access.
+const (
+	GroupBastion = "bastion"
+	GroupRoutine = "routine"
+)
+
+// AgentTasks are the only tasks an enrolled host may queue for the owner's approval
+// (POST /v1/setup-requests). Nothing here installs trust, changes who may approve, or
+// changes what the bastion runs beyond the distribution's own package updates.
+var AgentTasks = []string{TaskOSUpdate, TaskReboot, TaskRestartTunnel, TaskRestartBroker, TaskDiskUsage, TaskJournalVacuum}
 
 // Spec is the fixed, owner-facing description of a task. Nothing here comes from a request.
 type Spec struct {
@@ -39,6 +62,10 @@ type Spec struct {
 	Reversible string   `json:"reversible"`
 	// Secrets are the only names a sealed packet for this task may carry.
 	Secrets []string `json:"secrets,omitempty"`
+	// Group is where the page shows the task ("" = the Setup queue).
+	Group string `json:"group,omitempty"`
+	// Warning is shown in red above the approve button (a restart closes every bucket…).
+	Warning string `json:"warning,omitempty"`
 }
 
 // Specs lists the tasks in the order the Setup page shows them.
@@ -73,6 +100,49 @@ var Specs = []Spec{
 		Summary:    "Rebuilds the approved release from source in a sandbox, checks all four binaries against both published releases, installs the broker and restarts it.",
 		Steps:      []string{"Verify the approval and both releases", "Fetch, build and test in a sandbox without network", "Install, restart and check health"},
 		Reversible: "The previous binary is restored automatically if the new one is unhealthy. Database migrations are not reversed."},
+	{ID: TaskBastionAccess, Group: GroupBastion, Title: "Allow aqmas access to the bastion",
+		Summary: "Makes this machine's own sshd accept aqmas certificates for two accounts: a read-only inspect account that can only run fixed log and status commands, and your admin account (root, behind a red card, from hosts you allow). Your emergency keys are not touched and stay the way in when aqmas is down.",
+		Steps: []string{"Check the admin account and the SSH CA against what you signed", "Create the locked-down inspect account", "Install the CA, the two principals files and the forced-command block; validate and reload sshd",
+			"Record this machine as a destination in the configuration", "Restart the broker and check it is healthy"},
+		Reversible: "Yes: “Remove aqmas access to the bastion”. If a check fails, the previous sshd files and configuration are restored.",
+		Warning:    "Restarts the broker: every open bucket closes and every approval window ends."},
+	{ID: TaskBastionRemove, Group: GroupBastion, Title: "Remove aqmas access to the bastion",
+		Summary: "Stops this machine's sshd from accepting aqmas certificates and deletes the inspect account. Afterwards only your emergency key gets in.",
+		Steps: []string{"Remove this machine as a destination from the configuration and restart the broker", "Remove the CA, principals files and forced-command block; validate and reload sshd",
+			"End the inspect account's sessions and delete the account"},
+		Reversible: "Yes: allow access again. A root session that is already open is an ordinary login of your admin account and is not ended.",
+		Warning:    "Restarts the broker: every open bucket closes and every approval window ends."},
+	{ID: TaskBastionAllow, Group: GroupBastion, Title: "Set who may ask for root on the bastion",
+		Summary:    "Replaces the list of enrolled hosts that may ask for a root session with the hosts listed here. The list is kept by root, not by the broker, and this machine's sshd accepts a root certificate only from the listed addresses.",
+		Steps:      []string{"Write the root-owned list", "Rewrite the admin account's principals file with the listed addresses"},
+		Reversible: "Run it again with another list. An empty list means nobody can ask for root."},
+	{ID: TaskOSUpdate, Group: GroupRoutine, Title: "Update system packages",
+		Summary:    "Installs the distribution's pending package updates (dnf upgrade) and reports what changed. The kernel and the boot chain are left alone unless you allow them.",
+		Steps:      []string{"Record the installed packages and the boot files", "Run dnf upgrade outside the runner's sandbox", "Compare before and after; fail if the kernel, boot chain or boot files changed without your permission", "Check sshd still confines the inspect account"},
+		Reversible: "No. Undo by hand on the machine (dnf history undo)."},
+	{ID: TaskReboot, Group: GroupRoutine, Title: "Reboot the bastion",
+		Summary:    "Restarts the whole machine.",
+		Steps:      []string{"Record the request", "Reboot"},
+		Reversible: "No.",
+		Warning:    "The bastion comes back with nothing open: every bucket closed, every approval window ended, standing rules paused until the next approval. Approvals are unavailable for a minute or two."},
+	{ID: TaskRestartTunnel, Group: GroupRoutine, Title: "Restart cloudflared",
+		Summary:    "Restarts the tunnel connector that publishes this page.",
+		Steps:      []string{"Restart the tunnel service", "Check it is running"},
+		Reversible: "Nothing to undo.",
+		Warning:    "This page is unreachable for a few seconds."},
+	{ID: TaskRestartBroker, Group: GroupRoutine, Title: "Restart aqmasd",
+		Summary:    "Stops and starts the broker.",
+		Steps:      []string{"Stop the broker and wait for it to exit", "Start it and check it is healthy"},
+		Reversible: "Nothing to undo.",
+		Warning:    "The broker comes back with nothing open: every bucket closed, every approval window ended."},
+	{ID: TaskDiskUsage, Group: GroupRoutine, Title: "Show disk and journal usage",
+		Summary:    "Reports free space on the system and data file systems and the size of the journal. Changes nothing.",
+		Steps:      []string{"Measure"},
+		Reversible: "Read-only."},
+	{ID: TaskJournalVacuum, Group: GroupRoutine, Title: "Rotate and trim the journal",
+		Summary:    "Rotates the system journal and deletes entries older than the number of days you choose.",
+		Steps:      []string{"Rotate the journal", "Delete entries older than the chosen age", "Report the space freed"},
+		Reversible: "No: deleted log entries are gone."},
 }
 
 // Lookup finds a compiled-in task.
@@ -121,6 +191,121 @@ type Pin struct {
 // PinsParams is the complete new pin list.
 type PinsParams struct {
 	Pins []Pin `json:"pins"`
+}
+
+// BastionAccessParams describes this machine as a destination. SSHCA is the fingerprint of
+// the SSH user CA the owner read on the card: the runner trusts no other key.
+type BastionAccessParams struct {
+	Name      string `json:"name"`
+	Address   string `json:"address"`
+	Port      int    `json:"port"`
+	AdminUser string `json:"admin_user"`
+	SSHCA     string `json:"ssh_ca"`
+}
+
+// AllowedHost is one enrolled host that may ask for root on the bastion: its enrollment ID,
+// its name (for people) and the one address its requests and logins must come from.
+type AllowedHost struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Address string `json:"address"`
+}
+
+// BastionAllowParams is the complete new allowlist, sorted by enrollment ID.
+type BastionAllowParams struct {
+	Hosts []AllowedHost `json:"hosts"`
+}
+
+var enrollmentRE = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
+
+func (p BastionAllowParams) validate() error {
+	if p.Hosts == nil || len(p.Hosts) > 32 {
+		return errors.New("hosts must be a list of at most 32 entries (empty to allow nobody)")
+	}
+	for i, h := range p.Hosts {
+		ip, err := netip.ParseAddr(h.Address)
+		if !enrollmentRE.MatchString(h.ID) || !config.ValidName(h.Name) || err != nil || ip.String() != h.Address || ip.Zone() != "" || ip.IsUnspecified() || ip.IsMulticast() {
+			return errors.New("each host needs its enrollment id, name and a literal IP address")
+		}
+		if i > 0 && p.Hosts[i-1].ID >= h.ID {
+			return errors.New("hosts must be sorted by enrollment id, without duplicates")
+		}
+	}
+	return nil
+}
+
+// AgentAllowed says whether an enrolled host may queue this task with these parameters.
+// Beyond the task list: no kernel or boot-chain updates, and no journal trim that would
+// delete the last week (the record of a recent session on the bastion).
+func AgentAllowed(task string, params any) error {
+	if !slices.Contains(AgentTasks, task) {
+		return errors.New("this task can only be started by the owner on the approval page")
+	}
+	switch p := params.(type) {
+	case OSUpdateParams:
+		if p.Kernel {
+			return errors.New("only the owner can start an update that includes the kernel and boot chain")
+		}
+	case JournalVacuumParams:
+		if p.KeepDays < 7 {
+			return errors.New("a queued journal trim keeps at least 7 days")
+		}
+	}
+	return nil
+}
+
+// OSUpdateParams: Kernel allows kernel packages and the default boot entry to change.
+type OSUpdateParams struct {
+	Kernel bool `json:"kernel"`
+}
+
+// JournalVacuumParams: entries older than KeepDays days are deleted.
+type JournalVacuumParams struct {
+	KeepDays int `json:"keep_days"`
+}
+
+// Parameterless tasks. Distinct types, so the runner dispatches on the type alone.
+type (
+	BastionRemoveParams struct{}
+	RebootParams        struct{}
+	RestartTunnelParams struct{}
+	RestartBrokerParams struct{}
+	DiskUsageParams     struct{}
+)
+
+func (BastionRemoveParams) validate() error { return nil }
+func (RebootParams) validate() error        { return nil }
+func (RestartTunnelParams) validate() error { return nil }
+func (RestartBrokerParams) validate() error { return nil }
+func (DiskUsageParams) validate() error     { return nil }
+func (OSUpdateParams) validate() error      { return nil }
+
+func (p JournalVacuumParams) validate() error {
+	if p.KeepDays < 1 || p.KeepDays > 365 {
+		return errors.New("keep_days must be between 1 and 365")
+	}
+	return nil
+}
+
+var caFingerprintRE = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]{43}$`)
+
+func (p BastionAccessParams) validate() error {
+	// The same rules the configuration applies, so a signed request can never produce a
+	// configuration the broker refuses to start with.
+	ip, err := netip.ParseAddr(p.Address)
+	if !config.ValidName(p.Name) || err != nil || ip.String() != p.Address || ip.Zone() != "" || ip.IsUnspecified() || ip.IsMulticast() {
+		return errors.New("name must be a plain host name and address a literal IP address")
+	}
+	if p.Port < 1 || p.Port > 65535 {
+		return errors.New("port out of range")
+	}
+	if !config.ValidUser(p.AdminUser) || config.ReservedBastionUser(p.AdminUser) {
+		return errors.New("admin_user must be your own account: not root and not one of aqmas's accounts")
+	}
+	if !caFingerprintRE.MatchString(p.SSHCA) {
+		return errors.New("ssh_ca must be the SHA256 fingerprint of the SSH user CA")
+	}
+	return nil
 }
 
 var (
@@ -227,8 +412,80 @@ func blank(task string) (any, error) {
 		return UpdatesParams{}, nil
 	case TaskPins:
 		return PinsParams{}, nil
+	case TaskBastionAccess:
+		return BastionAccessParams{}, nil
+	case TaskBastionRemove:
+		return BastionRemoveParams{}, nil
+	case TaskBastionAllow:
+		return BastionAllowParams{}, nil
+	case TaskOSUpdate:
+		return OSUpdateParams{}, nil
+	case TaskReboot:
+		return RebootParams{}, nil
+	case TaskRestartTunnel:
+		return RestartTunnelParams{}, nil
+	case TaskRestartBroker:
+		return RestartBrokerParams{}, nil
+	case TaskDiskUsage:
+		return DiskUsageParams{}, nil
+	case TaskJournalVacuum:
+		return JournalVacuumParams{}, nil
 	}
 	return nil, errors.New("unknown setup task")
+}
+
+// Decode reads a task's parameters from JSON in any key order (what a browser or the CLI
+// sends) into the task's typed schema: unknown keys and trailing data are refused. Only the
+// tasks added with bastion access use it; Canonical then validates the values.
+func Decode(task string, raw []byte) (any, error) {
+	if len(raw) == 0 {
+		raw = []byte("{}")
+	}
+	strict := func(dst any) error {
+		d := json.NewDecoder(bytes.NewReader(raw))
+		d.DisallowUnknownFields()
+		if e := d.Decode(dst); e != nil || d.More() {
+			return errors.New("invalid task parameters")
+		}
+		return nil
+	}
+	var v any
+	var err error
+	switch task {
+	case TaskBastionAccess:
+		var p BastionAccessParams
+		err, v = strict(&p), p
+	case TaskBastionRemove:
+		var p BastionRemoveParams
+		err, v = strict(&p), p
+	case TaskBastionAllow:
+		var p BastionAllowParams
+		err, v = strict(&p), p
+	case TaskOSUpdate:
+		var p OSUpdateParams
+		err, v = strict(&p), p
+	case TaskReboot:
+		var p RebootParams
+		err, v = strict(&p), p
+	case TaskRestartTunnel:
+		var p RestartTunnelParams
+		err, v = strict(&p), p
+	case TaskRestartBroker:
+		var p RestartBrokerParams
+		err, v = strict(&p), p
+	case TaskDiskUsage:
+		var p DiskUsageParams
+		err, v = strict(&p), p
+	case TaskJournalVacuum:
+		var p JournalVacuumParams
+		err, v = strict(&p), p
+	default:
+		return nil, errors.New("unknown setup task")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 // Parse accepts only the canonical encoding of the named task's parameters: unknown keys,
@@ -267,7 +524,9 @@ func Parse(task, text string) (any, error) {
 		var p PinsParams
 		err, v = strict(&p), p
 	default:
-		return nil, errors.New("unknown setup task")
+		// Decode knows the bastion and routine tasks; the canonical round trip below is
+		// what refuses another key order, whitespace or an absent key.
+		v, err = Decode(task, []byte(text))
 	}
 	if err != nil {
 		return nil, err

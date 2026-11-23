@@ -218,6 +218,8 @@ type PendingItem struct {
 	SimilarRecent     int                `json:"similar_recent"`
 	Enrollment        *PendingEnrollment `json:"enrollment,omitempty"`
 	Cloudflare        *PendingCloudflare `json:"cloudflare,omitempty"` // kind "cloudflare" (milestone 2)
+	Bastion           *PendingBastion    `json:"bastion,omitempty"`    // kind "bastion" (bastion.go)
+	Setup             *PendingSetup      `json:"setup,omitempty"`      // kind "setup": a task queued by an agent
 	// Status is set by GET /api/ui/requests/{id} and /api/ui/enrollments/{id} (the item may
 	// have been decided since); UIState.pending items are always pending and omit it.
 	Status string `json:"status,omitempty"`
@@ -262,6 +264,9 @@ type UIState struct {
 	Grants           []GrantSummary     `json:"grants"` // active grants, newest first, with requesting_host
 	Recent           []AuditEntry       `json:"recent"`
 	Passkeys         []PasskeyInfo      `json:"passkeys"` // the owner's passkeys, oldest first
+	// BastionRootUntil is set while a root certificate for the bastion is unexpired and
+	// unrevoked (the UI shows a banner on every page).
+	BastionRootUntil *time.Time `json:"bastion_root_until,omitempty"`
 }
 
 // Passkey icon keys (PasskeyInfo.Icon); the web UI draws one glyph per key.
@@ -383,6 +388,9 @@ type ChallengeRequest struct {
 	TTLSeconds         int    `json:"ttl_seconds,omitempty"`
 	StandingHours      int    `json:"standing_hours,omitempty"`
 	Nickname           string `json:"nickname,omitempty"` // passkey rename: the new nickname
+	// CloseBuckets is the owner's choice on a root bastion card in a sealed store: close
+	// every open bucket before the certificate is issued. Required there, refused elsewhere.
+	CloseBuckets *bool `json:"close_buckets,omitempty"`
 }
 
 // ChallengeResponse carries the WebAuthn PublicKeyCredentialRequestOptions as raw JSON so the

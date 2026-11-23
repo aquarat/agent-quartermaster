@@ -83,6 +83,16 @@ var objectKeys = map[string][]string{
 // KindCloudflare is the request kind whose objects carry the Cloudflare key sets.
 const KindCloudflare = "cloudflare"
 
+// KindBastion is a session on the bastion itself (docs/BASTION-ACCESS.md §5). Its request
+// carries the level, the open-bucket list the owner was shown and the close choice, and has no
+// standing field: a standing approval for the bastion cannot be expressed, let alone signed.
+const KindBastion = "bastion"
+
+var bastionKeys = map[string][]string{
+	ObjectRequest: {"kind", "level", "requesting_host", "host_id", "address", "target", "target_address", "target_port", "login_user", "principal",
+		"key_fingerprint", "ssh_ca", "host_key", "cert_profile", "ttl_seconds", "sealed", "open_buckets", "close_buckets", "alert_channel"},
+}
+
 // cloudflareKeys replace objectKeys for kind "cloudflare".
 var cloudflareKeys = map[string][]string{
 	ObjectRequest:  {"requesting_host", "kind", "scope", "scope_params", "mode", "ip_condition", "ttl_seconds", "standing_hours"},
@@ -95,6 +105,14 @@ func keysFor(object, kind string) ([]string, bool) {
 	if kind == KindCloudflare {
 		if k, ok := cloudflareKeys[object]; ok {
 			return k, true
+		}
+	}
+	if kind == KindBastion {
+		if k, ok := bastionKeys[object]; ok {
+			return k, true
+		}
+		if object != ObjectGrant {
+			return nil, false
 		}
 	}
 	k, ok := objectKeys[object]
@@ -150,6 +168,15 @@ type Action struct {
 	IPCondition string `json:"ip_condition"`
 	Nickname    string `json:"nickname"`     // passkey: its current nickname
 	NewNickname string `json:"new_nickname"` // passkey rename: the new nickname
+	// Kind "bastion": the level (inspect|root), whether the store is sealed, the labels of the
+	// buckets open when the card was built (a JSON array as a string) and the owner's choice
+	// to close every bucket before the certificate is issued.
+	Level        string `json:"level"`
+	Sealed       bool   `json:"sealed"`
+	OpenBuckets  string `json:"open_buckets"`
+	CloseBuckets bool   `json:"close_buckets"`
+	// AlertChannel: a push channel exists, so approving a root session alerts the owner.
+	AlertChannel bool `json:"alert_channel"`
 }
 
 // Signed is a parsed canonical text: the action plus the challenge metadata.
@@ -189,6 +216,11 @@ func (a Action) values() map[string]any {
 		"ip_condition":    a.IPCondition,
 		"nickname":        a.Nickname,
 		"new_nickname":    a.NewNickname,
+		"level":           a.Level,
+		"sealed":          a.Sealed,
+		"open_buckets":    a.OpenBuckets,
+		"close_buckets":   a.CloseBuckets,
+		"alert_channel":   a.AlertChannel,
 	}
 	bindingValues(a.ScopeBinding, m)
 	m["standing_seconds"] = a.StandingSeconds
@@ -224,6 +256,11 @@ func Build(a Action, nonce string, issuedAt time.Time) (string, error) {
 	}
 	if a.Action == "" || a.ID == "" {
 		return "", errors.New("canon: action and id are required")
+	}
+	if a.Kind == KindBastion && a.Object == ObjectRequest {
+		if err := validateBastion(a); err != nil {
+			return "", err
+		}
 	}
 	v := a.version()
 	keys, ok := actionKeys(v, a.Object, a.Kind)
@@ -323,4 +360,62 @@ func Parse(canonical string) (Signed, error) {
 		return Signed{}, errors.New("canon: text is not canonical")
 	}
 	return s, nil
+}
+
+// BastionRootMaxSeconds caps a root session; canonical text beyond it cannot be built.
+const BastionRootMaxSeconds = 3600
+
+// OpenList encodes bucket labels for open_buckets: sorted, distinct, as a JSON array.
+func OpenList(labels []string) string {
+	l := slices.Clone(labels)
+	slices.Sort(l)
+	l = slices.Compact(l)
+	if l == nil {
+		l = []string{}
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(l)
+	return string(bytes.TrimSuffix(buf.Bytes(), []byte("\n")))
+}
+
+// ParseOpenList decodes open_buckets; only the exact encoding of OpenList is accepted.
+func ParseOpenList(text string) ([]string, error) {
+	var l []string
+	if len(text) > 8<<10 || json.Unmarshal([]byte(text), &l) != nil || l == nil || OpenList(l) != text {
+		return nil, errors.New("canon: invalid open_buckets")
+	}
+	return l, nil
+}
+
+// validateBastion rejects any bastion request text whose fields contradict each other, so a
+// card cannot be signed that says one thing and applies another.
+func validateBastion(a Action) error {
+	if a.Level != "inspect" && a.Level != "root" {
+		return errors.New("canon: unknown bastion level")
+	}
+	if a.HostID == "" || a.Address == "" || a.Target == "" || a.TargetAddress == "" || a.TargetPort <= 0 || a.LoginUser == "" || a.Principal != a.LoginUser+"@"+a.Target ||
+		a.KeyFingerprint == "" || a.SSHCA == "" || a.HostKey == "" || a.RequestingHost == "" {
+		return errors.New("canon: incomplete bastion request")
+	}
+	want := "source-address;force-command"
+	if a.Level == "root" {
+		want = "source-address;permit-pty"
+	}
+	if a.CertProfile != want {
+		return errors.New("canon: wrong certificate profile for this level")
+	}
+	open, err := ParseOpenList(a.OpenBuckets)
+	if err != nil {
+		return err
+	}
+	approveRoot := a.Level == "root" && a.Action == ActionApprove
+	if !approveRoot && (len(open) != 0 || a.CloseBuckets || a.AlertChannel) || !a.Sealed && (len(open) != 0 || a.CloseBuckets) {
+		return errors.New("canon: open_buckets, close_buckets and alert_channel belong to a root approval")
+	}
+	if a.Action != ActionApprove && a.TTLSeconds != 0 || a.Action == ActionApprove && a.TTLSeconds <= 0 || a.Level == "root" && a.TTLSeconds > BastionRootMaxSeconds {
+		return errors.New("canon: invalid bastion duration")
+	}
+	return nil
 }

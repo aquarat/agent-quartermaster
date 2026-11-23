@@ -70,7 +70,9 @@ func (q *Q) InsertPersonalRequest(ctx context.Context, r *Request) error {
 }
 
 func (q *Q) PersonalStatus(ctx context.Context, id string, host int64, now time.Time) (*Request, error) {
-	query := `SELECT ` + reqCols + ` FROM requests WHERE id=? AND host_id=?`
+	// The generic agent paths (status, cancel) serve SSH and Cloudflare requests only; every
+	// other kind has endpoints of its own and is "not found" here, in every mode.
+	query := `SELECT ` + reqCols + ` FROM requests WHERE id=? AND host_id=? AND kind IN ('ssh','cloudflare')`
 	args := []any{id, host}
 	query, args = q.personalOnly(query, args, "id", host, now)
 	return scanRequest(q.q.QueryRowContext(ctx, query, args...))

@@ -19,10 +19,18 @@ func (s *Server) bindAction(ctx context.Context, q *store.Q, a canon.Action) (ca
 	switch a.Object {
 	case canon.ObjectRequest:
 		source = a.ID
+		// A bastion session is deliberately outside the catalogue: it has no binding to
+		// add. Decided on the stored kind, never on what the action claims.
+		if r, err := q.GetRequest(ctx, source); err == nil && r.Kind == api.KindBastion {
+			return a, nil
+		}
 	case canon.ObjectGrant:
 		g, err := q.GetGrant(ctx, a.ID)
 		if err != nil {
 			return a, err
+		}
+		if g.Kind == api.KindBastion {
+			return a, nil
 		}
 		source = g.RequestID
 		a.Indefinite = g.NotAfter.Equal(untilRevoked)

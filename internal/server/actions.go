@@ -121,6 +121,17 @@ func (s *Server) buildActionQ(ctx context.Context, q *store.Q, object, id string
 		if err != nil || h.RevokedAt != nil {
 			return a, errConflict("the requesting host's identity was revoked")
 		}
+		// Every kind is named: nothing falls through to the SSH branch below by default.
+		switch r.Kind {
+		case api.KindBastion:
+			return s.bastionAction(ctx, q, r, h, in)
+		case api.KindSSH, api.KindCloudflare:
+		default:
+			return a, errBad("unknown request kind")
+		}
+		if in.CloseBuckets != nil {
+			return a, errBad("close_buckets belongs to a root session on the bastion")
+		}
 		if r.Kind == api.KindCloudflare {
 			if q.Scoped() && in.Action == "approve" {
 				l, err := s.decisionLimits(ctx, q, r)
@@ -453,6 +464,20 @@ func (s *Server) applyQ(ctx context.Context, q *store.Q, sg canon.Signed, passke
 		if err != nil {
 			return mapNotFound(err)
 		}
+		// A bastion session has its own apply path; neither the stored kind nor the signed
+		// kind alone selects it, and nothing below ever sees one.
+		if r.Kind == api.KindBastion || a.Kind == api.KindBastion {
+			if attribution != "" {
+				return errConflict("a bastion session needs its own passkey tap")
+			}
+			if q.Scoped() {
+				sess, _ := ctx.Value(sessionBindingKey{}).(string)
+				if _, err := q.GlobalOwner(ctx, sess, passkeyID, now); err != nil {
+					return errForbidden("owner session required")
+				}
+			}
+			return s.applyBastion(ctx, q, r, a, detail, now)
+		}
 		// The stored request must still be the one that was signed.
 		if r.Kind == api.KindSSH && (r.PeerAddress != a.Address || r.Principal != a.Principal) {
 			return errConflict("SSH request changed")
@@ -465,6 +490,9 @@ func (s *Server) applyQ(ctx context.Context, q *store.Q, sg canon.Signed, passke
 		h, err := q.GetHost(ctx, r.HostID)
 		if err != nil || h.RevokedAt != nil {
 			return errConflict("the requesting host's identity was revoked")
+		}
+		if r.Kind != api.KindSSH && r.Kind != api.KindCloudflare {
+			return errConflict("unknown request kind")
 		}
 		if a.Action == canon.ActionDeny {
 			if err := q.DecideRequest(ctx, r.ID, api.StatusDenied, "denied by owner", now); err != nil {

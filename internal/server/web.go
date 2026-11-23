@@ -65,6 +65,7 @@ func (s *Server) WebHandler() http.Handler {
 		api.Handle("POST /api/ui/"+o.path+"/{id}/challenge", s.requireSession(s.challengeHandler(o.object)))
 		api.Handle("POST /api/ui/"+o.path+"/{id}/"+o.verb, s.requireSession(s.decideHandler(o.object)))
 	}
+	s.bastionWebRoutes(api)
 	api.Handle("POST /api/ui/passkeys/challenge", s.requireSession(s.challengeHandler(canon.ObjectPasskey)))
 	api.Handle("POST /api/ui/passkeys/{id}/challenge", s.requireSession(s.challengeHandler(canon.ObjectPasskey)))
 	api.Handle("POST /api/ui/passkeys/{id}/rename", s.requireSession(s.passkeyChangeHandler(canon.ActionRename)))
@@ -566,6 +567,18 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 		}
 		out.Pending = append(out.Pending, *it)
 	}
+	if s.bastionOn {
+		tasks, err := s.setupItems(ctx, sess)
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+		out.Pending = append(out.Pending, tasks...)
+		if out.BastionRootUntil, err = q.ActiveBastionRoot(ctx, now); err != nil {
+			s.writeErr(w, r, err)
+			return
+		}
+	}
 	ens, err := q.PendingEnrollments(ctx, now)
 	if err != nil {
 		s.writeErr(w, r, err)
@@ -650,6 +663,9 @@ func (s *Server) highRisk(rq *store.Request) bool {
 }
 
 func (s *Server) requestItem(ctx context.Context, rq *store.Request) (*api.PendingItem, error) {
+	if rq.Kind == api.KindBastion {
+		return s.bastionItem(ctx, rq)
+	}
 	a, err := s.bindAction(ctx, s.store.Q(), canon.Action{Object: "request", ID: rq.ID, Kind: rq.Kind})
 	if err != nil {
 		return nil, err
@@ -999,6 +1015,18 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 		settled = true
 		if s.seal != nil {
 			s.reconcileHolds(ctx) // revokes end holds; new standing rules get their own
+		}
+		if object == canon.ObjectRequest && sg.Kind == api.KindBastion {
+			// Root: the alert is attempted and its outcome recorded here, before the
+			// requester can collect the certificate.
+			out, err := s.afterBastionDecision(ctx, sg)
+			s.bcast.notify()
+			if err != nil {
+				s.writeErr(w, r, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
 		}
 		if object == canon.ObjectGrant {
 			s.afterGrantRevoke(ctx, id) // token grants: delete the child token upstream now

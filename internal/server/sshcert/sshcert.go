@@ -25,6 +25,10 @@ type Params struct {
 	ApprovedAt    time.Time
 	TTL           time.Duration
 	PublicKey     ssh.PublicKey
+	// Extensions replaces the default permit-pty + permit-port-forwarding when not nil (an
+	// empty map means no extension). Critical adds critical options besides source-address.
+	Extensions map[string]string
+	Critical   map[string]string
 }
 
 // ParseEd25519 parses an authorized_keys line and accepts only a plain ssh-ed25519 key
@@ -75,6 +79,17 @@ func Sign(ca ssh.Signer, p Params) (*ssh.Certificate, error) {
 		return nil, err
 	}
 	nb, na := Validity(p.ApprovedAt, p.TTL)
+	ext := map[string]string{"permit-pty": "", "permit-port-forwarding": ""}
+	if p.Extensions != nil {
+		ext = p.Extensions
+	}
+	critical := map[string]string{"source-address": src}
+	for k, v := range p.Critical {
+		if k == "source-address" || k == "" || v == "" {
+			return nil, errors.New("sshcert: invalid critical option")
+		}
+		critical[k] = v
+	}
 	cert := &ssh.Certificate{
 		Key:             p.PublicKey,
 		Serial:          p.Serial,
@@ -84,11 +99,8 @@ func Sign(ca ssh.Signer, p Params) (*ssh.Certificate, error) {
 		ValidAfter:      uint64(nb.Unix()),
 		ValidBefore:     uint64(na.Unix()),
 		Permissions: ssh.Permissions{
-			CriticalOptions: map[string]string{"source-address": src},
-			Extensions: map[string]string{
-				"permit-pty":             "",
-				"permit-port-forwarding": "",
-			},
+			CriticalOptions: critical,
+			Extensions:      ext,
 		},
 	}
 	if err := cert.SignCert(rand.Reader, ca); err != nil {

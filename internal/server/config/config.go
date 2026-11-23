@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -44,6 +45,53 @@ type Config struct {
 	// Cloudflare configures milestone 2 (docs/CLOUDFLARE.md section 6). Absent or
 	// enabled=false: kind "cloudflare" requests are refused and /cf/ is not served.
 	Cloudflare Cloudflare `toml:"cloudflare"`
+	// Bastion, when set, lets aqmasd issue certificates for this machine's own sshd
+	// (docs/BASTION-ACCESS.md). Written by the "bastion-access" Setup task, never by hand
+	// from a request. It is not part of the personal catalogue's configuration fingerprint.
+	Bastion Bastion `toml:"bastion"`
+}
+
+// InspectUser is the fixed name of the bastion's read-only account.
+const InspectUser = "aqmas-inspect"
+
+// Bastion levels.
+const (
+	LevelInspect = "inspect"
+	LevelRoot    = "root"
+)
+
+// BastionRootMaxSeconds caps a root session certificate. It is not configurable.
+const BastionRootMaxSeconds = 3600
+
+// Bastion describes this machine as a destination. The zero value disables bastion access.
+type Bastion struct {
+	Name      string `toml:"name"`       // what agents type; principals are <user>@<name>
+	Address   string `toml:"address"`    // where fleet hosts reach this machine's sshd
+	Port      int    `toml:"port"`       // default 22
+	AdminUser string `toml:"admin_user"` // the owner's account here (has sudo): level "root"
+	HostKey   string `toml:"host_key"`   // this machine's own SSH host key
+}
+
+// Enabled reports whether bastion access is configured.
+func (b Bastion) Enabled() bool { return b.Name != "" }
+
+// User returns the login user of a level ("" for an unknown level).
+func (b Bastion) User(level string) string {
+	switch level {
+	case LevelInspect:
+		return InspectUser
+	case LevelRoot:
+		return b.AdminUser
+	}
+	return ""
+}
+
+// Principal returns the certificate principal of a level.
+func (b Bastion) Principal(level string) string { return b.User(level) + "@" + b.Name }
+
+// ReservedBastionUser reports names that can never be the bastion's admin account.
+func ReservedBastionUser(u string) bool {
+	return u == "root" || u == InspectUser || u == "aqmas" || u == "aqmas-build"
 }
 
 // Seal is an operator pin. Its presence fences legacy serving even if the
@@ -302,6 +350,24 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	if b := &c.Bastion; *b != (Bastion{}) {
+		if b.Port == 0 {
+			b.Port = 22
+		}
+		ip, ipErr := netip.ParseAddr(b.Address)
+		if !ValidName(b.Name) || ipErr != nil || ip.String() != b.Address || ip.Zone() != "" || ip.IsUnspecified() || ip.IsMulticast() || b.Port < 1 || b.Port > 65535 || !ValidUser(b.AdminUser) || ReservedBastionUser(b.AdminUser) {
+			return fmt.Errorf("config: [bastion] needs name, an IP address, a port and an admin_user that is not a reserved account")
+		}
+		key, _, opts, rest, err := ssh.ParseAuthorizedKey([]byte(b.HostKey))
+		if err != nil || len(opts) != 0 || len(rest) != 0 || key.Type() != ssh.KeyAlgoED25519 {
+			return fmt.Errorf("config: [bastion] host_key must be one ssh-ed25519 public key")
+		}
+		for _, level := range []string{LevelInspect, LevelRoot} {
+			if other, dup := principals[b.Principal(level)]; dup {
+				return fmt.Errorf("config: target %q would issue the bastion principal %q", other, b.Principal(level))
+			}
+		}
+	}
 	// Shared addresses are allowed; every other spelling must identify a single target.
 	reserved := map[string]string{}
 	for _, tg := range c.Targets {
@@ -314,6 +380,12 @@ func (c *Config) Validate() error {
 			}
 		}
 		reserved[tg.Name] = tg.Name
+	}
+	if c.Bastion.Enabled() {
+		if reserved[c.Bastion.Name] != "" {
+			return fmt.Errorf("config: [bastion] name %q is also a target", c.Bastion.Name)
+		}
+		reserved[c.Bastion.Name] = c.Bastion.Name
 	}
 	for _, tg := range c.Targets {
 		for _, alias := range tg.Aliases {

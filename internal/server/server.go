@@ -78,19 +78,22 @@ type Server struct {
 	maintenance     bool
 	cutover         *cutoverReview // installed before opening the maintenance web listener
 	profileRevision string
-	updates         updateState
-	cfg             *config.Config
-	log             *slog.Logger
-	now             func() time.Time
-	store           *store.Store
-	pki             *pki.PKI
-	wa              *webauthn.WebAuthn
-	rpID            string
-	ownerID         []byte
-	notify          *notify.Notifier
-	access          *cfaccess.Verifier
-	bcast           broadcaster
-	cf              cfState // milestone 2; zero when cloudflare.enabled is false
+	// bastionOn: the bastion tables exist and the bastion endpoints serve (normal serving
+	// only: never during a cutover, a seal import, a migration or recovery).
+	bastionOn bool
+	updates   updateState
+	cfg       *config.Config
+	log       *slog.Logger
+	now       func() time.Time
+	store     *store.Store
+	pki       *pki.PKI
+	wa        *webauthn.WebAuthn
+	rpID      string
+	ownerID   []byte
+	notify    *notify.Notifier
+	access    *cfaccess.Verifier
+	bcast     broadcaster
+	cf        cfState // milestone 2; zero when cloudflare.enabled is false
 }
 
 // DBPath returns the database path for a data dir.
@@ -236,6 +239,13 @@ func New(o Options) (*Server, error) {
 	}
 	if o.SealSetup {
 		s.notify = &notify.Notifier{}
+	}
+	if !o.Maintenance && !o.SealSetup && !o.Recovery && mode != modeMigration {
+		if err := st.InitBastion(context.Background()); err != nil {
+			st.Close()
+			return nil, err
+		}
+		s.bastionOn = true
 	}
 	if cfg.Cloudflare.Enabled && !s.maintenance && !o.SealSetup && !o.Recovery {
 		if err := s.setupCloudflare(o); err != nil {

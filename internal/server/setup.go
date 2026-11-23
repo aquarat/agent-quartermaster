@@ -219,6 +219,18 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 			} else if !candidate {
 				t.State = "idle"
 			}
+		case maint.TaskBastionAccess:
+			t.Rerunnable = true
+			if s.cfg.Bastion.Enabled() {
+				t.State = "done"
+			}
+		case maint.TaskBastionRemove, maint.TaskBastionAllow:
+			t.Rerunnable = true
+			if !s.cfg.Bastion.Enabled() {
+				t.State, t.Blocked, t.Rerunnable = "blocked", "Access to the bastion is not installed.", false
+			}
+		case maint.TaskOSUpdate, maint.TaskReboot, maint.TaskRestartTunnel, maint.TaskRestartBroker, maint.TaskDiskUsage, maint.TaskJournalVacuum:
+			t.Rerunnable = true
 		}
 		if t.State == "available" && t.Last != nil && t.Last.State == "failed" {
 			t.State = "failed"
@@ -417,7 +429,13 @@ func (s *Server) setupParams(ctx context.Context, task string, raw json.RawMessa
 		}
 		v = p
 	default:
-		return "", nil, errNotFound()
+		// The bastion and routine tasks: typed, strict, validated by Canonical below.
+		if v, err = maint.Decode(task, raw); err != nil {
+			if _, known := maint.Lookup(task); !known {
+				return "", nil, errNotFound()
+			}
+			return "", nil, errBad(err.Error())
+		}
 	}
 	if err != nil {
 		return "", nil, err
@@ -504,6 +522,9 @@ type setupRunRequest struct {
 	ChallengeID string          `json:"challenge_id"`
 	Assertion   json.RawMessage `json:"assertion"`
 	Secrets     string          `json:"secrets"`
+	// Request names the agent's queued maintenance request this run answers ("" when the
+	// owner started the task from the page).
+	Request string `json:"request,omitempty"`
 }
 
 func (s *Server) setupRun(w http.ResponseWriter, r *http.Request, sess string) {
@@ -533,10 +554,18 @@ func (s *Server) setupRun(w http.ResponseWriter, r *http.Request, sess string) {
 		s.writeErr(w, r, err)
 		return
 	}
-	if err = s.spool(r, sess, pkID, "setup_run", "setup:"+task, maint.Request{Canonical: text, Assertion: in.Assertion, Secrets: in.Secrets}); err != nil {
+	var answered []func(*store.Q) error
+	if in.Request != "" {
+		digest := hex.EncodeToString(canon.Challenge(text))[:16]
+		answered = append(answered, func(q *store.Q) error {
+			return approveSetupRequest(ctx, q, in.Request, task, sg.Params, digest, s.now())
+		})
+	}
+	if err = s.spool(r, sess, pkID, "setup_run", "setup:"+task, maint.Request{Canonical: text, Assertion: in.Assertion, Secrets: in.Secrets}, answered...); err != nil {
 		s.writeErr(w, r, err)
 		return
 	}
+	s.bcast.notify()
 	title, _ := maint.Lookup(task)
 	s.notify.Send("aqmas: setup task approved", title.Title, s.cfg.PublicBaseURL)
 	writeJSON(w, 200, api.OK{OK: true})
@@ -563,7 +592,7 @@ func (s *Server) pinnedFor(ctx context.Context, pkID int64) error {
 
 // spool hands one signed request to the root runner. The audit row and the request appear
 // together or not at all; only the canonical text is audited (secrets stay sealed).
-func (s *Server) spool(r *http.Request, sess string, pkID int64, action, object string, req maint.Request) error {
+func (s *Server) spool(r *http.Request, sess string, pkID int64, action, object string, req maint.Request, also ...func(*store.Q) error) error {
 	ctx := r.Context()
 	if err := s.pinnedFor(ctx, pkID); err != nil {
 		return err
@@ -593,6 +622,11 @@ func (s *Server) spool(r *http.Request, sess string, pkID int64, action, object 
 		}
 		if err := q.Audit(ctx, s.now(), "owner", action, object, fmt.Sprintf("passkey=%d %s", pkID, req.Canonical)); err != nil {
 			return err
+		}
+		for _, fn := range also {
+			if err := fn(q); err != nil {
+				return err
+			}
 		}
 		if err := os.Link(f.Name(), target); err != nil {
 			return errConflict("another maintenance request is already queued")

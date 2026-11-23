@@ -4,6 +4,7 @@ package notify
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -49,14 +50,33 @@ func (n *Notifier) send(title, text, clickURL string) {
 	n.Publish(context.Background(), title, text, clickURL)
 }
 
+// ErrNoChannel is Deliver's answer when no topic is configured.
+var ErrNoChannel = errors.New("no notification channel is configured")
+
+// Configured reports whether a push channel exists.
+func (n *Notifier) Configured() bool { return n != nil && (n.TopicURL != "" || n.Dispatch != nil) }
+
+// Deliver publishes synchronously and reports whether the push service accepted the
+// message. It is for the alerts that must be attempted before something is handed out.
+func (n *Notifier) Deliver(parent context.Context, title, text, clickURL string) error {
+	if n == nil || n.TopicURL == "" {
+		return ErrNoChannel
+	}
+	return n.publish(parent, title, text, clickURL)
+}
+
 // Publish runs synchronously within the caller's lease.
 func (n *Notifier) Publish(parent context.Context, title, text, clickURL string) {
+	_ = n.publish(parent, title, text, clickURL)
+}
+
+func (n *Notifier) publish(parent context.Context, title, text, clickURL string) error {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.TopicURL, strings.NewReader(clean(text, 300)+"\n"+clickURL))
 	if err != nil {
 		n.logErr()
-		return
+		return errors.New("ntfy publish failed")
 	}
 	req.Header.Set("Title", clean(title, 120))
 	req.Header.Set("Click", clickURL)
@@ -71,14 +91,16 @@ func (n *Notifier) Publish(parent context.Context, title, text, clickURL string)
 	resp, err := client.Do(req)
 	if err != nil {
 		n.logErr()
-		return
+		return errors.New("ntfy publish failed")
 	}
 	resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		if n.Log != nil {
 			n.Log.Warn("ntfy publish failed", "status", resp.StatusCode)
 		}
+		return errors.New("ntfy publish refused")
 	}
+	return nil
 }
 
 func (n *Notifier) logErr() {

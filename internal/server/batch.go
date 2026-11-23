@@ -35,6 +35,9 @@ func (s *Server) ordinary(ctx context.Context, q *store.Q, sess string, pk int64
 	if err != nil {
 		return empty, err
 	}
+	if r.Kind != api.KindSSH && r.Kind != api.KindCloudflare || a.Kind != r.Kind {
+		return empty, errConflict("this decision requires an individual passkey tap")
+	}
 	if !ordinaryRisk(a, r, s.highRisk(r)) {
 		return empty, errConflict("this decision requires an individual passkey tap")
 	}

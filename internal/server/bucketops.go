@@ -544,6 +544,18 @@ func (s *Server) decisionNeeds(ctx context.Context, q *store.Q, a canon.Action) 
 	if err != nil {
 		return nil, mapNotFound(err)
 	}
+	switch r.Kind {
+	case api.KindBastion:
+		// The SSH CA for the instant of signing: no hold afterwards, no standing rule re-armed.
+		row, err := s.caRow(ctx, q, seal.RoleSSHCA)
+		if err != nil {
+			return nil, err
+		}
+		return []bucketNeed{s.need(row)}, nil
+	case api.KindSSH, api.KindCloudflare:
+	default:
+		return nil, errBad("unknown request kind")
+	}
 	now := s.now()
 	standingUntil := time.Time{}
 	switch {

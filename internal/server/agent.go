@@ -54,6 +54,7 @@ func (s *Server) AgentHandler() http.Handler {
 	mux.Handle("GET /v1/grants", s.requirePersonal(s.handleGrants))
 	mux.Handle("GET /v1/ssh-ca", s.requirePersonal(s.handleSSHCA))
 	mux.Handle("GET /v1/ssh-target", s.requirePersonal(s.handleResolveTarget))
+	s.bastionAgentRoutes(mux)
 	// Milestone 2 (404 when cloudflare.enabled is false).
 	mux.Handle("GET /v1/cf/catalogue", s.requirePersonal(s.handleCFCatalogue))
 	mux.Handle("GET /v1/cf/snapshots", s.requirePersonal(s.handleCFSnapshots))
@@ -328,6 +329,8 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		return
 	}
 	if in.Kind != api.KindCloudflare && (in.Kind != api.KindSSH || in.SSH == nil || in.Cloudflare != nil) {
+		// Kind "bastion" has its own endpoint and never enters this path, where standing
+		// rules and policy auto-approval live.
 		s.writeErr(w, r, errBad(`kind must be "ssh" with an ssh object, or "cloudflare" with a cloudflare object`))
 		return
 	}
@@ -547,6 +550,11 @@ func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request, h *
 // requestStatus builds the agent-facing status; the grant (with certificate) is included only
 // while the request is approved.
 func (s *Server) requestStatus(ctx context.Context, q *store.Q, req *store.Request) (*api.RequestStatus, error) {
+	// Only the two kinds this path was written for. A bastion request has its own status
+	// endpoint, which is the only place a bastion certificate is ever handed out.
+	if req.Kind != api.KindSSH && req.Kind != api.KindCloudflare {
+		return nil, errNotFound()
+	}
 	out := &api.RequestStatus{ID: req.ID, Kind: req.Kind, Status: req.Status, DecidedAt: req.DecidedAt, DecisionNote: req.DecisionNote}
 	if req.Status != api.StatusApproved {
 		return out, nil
@@ -555,6 +563,9 @@ func (s *Server) requestStatus(ctx context.Context, q *store.Q, req *store.Reque
 	g, err := q.GrantByRequest(ctx, req.ID)
 	if err != nil {
 		return nil, err
+	}
+	if g.Kind != req.Kind {
+		return nil, errNotFound()
 	}
 	if g.Kind == api.KindCloudflare {
 		out.Grant = s.cfGrantView(g)

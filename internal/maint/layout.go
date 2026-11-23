@@ -49,6 +49,7 @@ const (
 	keyName     = "maint-secrets.key"
 	sourcesName = "maint-sources.json"
 	unitName    = "aqmasd.service"
+	allowName   = "bastion-allow.json"
 )
 
 // Production returns the fixed layout of an installed bastion.
@@ -98,6 +99,20 @@ func (l Layout) readSources() *Sources {
 		return nil
 	}
 	return &s
+}
+
+// AllowPath is the root-owned bastion allowlist next to the configuration.
+func AllowPath(configDir string) string { return filepath.Join(configDir, allowName) }
+
+// ReadAllow loads the bastion allowlist. Anything but a valid list written by the
+// "bastion-allow" task reads as empty: nobody may ask for root.
+func ReadAllow(path string) []AllowedHost {
+	var p BastionAllowParams
+	b, err := os.ReadFile(path)
+	if err != nil || len(b) > 64<<10 || json.Unmarshal(b, &p) != nil || p.validate() != nil {
+		return nil
+	}
+	return p.Hosts
 }
 
 // StatusPath is where aqmasd reads the runner's public status.
