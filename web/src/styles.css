@@ -2489,8 +2489,8 @@ dialog.search-dialog::backdrop {
 
 .admissions {
   margin: 4px 0 8px;
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
 }
 .admission-list li {
   display: flex;
@@ -2501,7 +2501,7 @@ dialog.search-dialog::backdrop {
 .admission-list li > bdi {
   font-weight: 600;
   flex: 1;
-  min-width: 8rem;
+  min-width: 4rem;
 }
 .admission-list li.in .badge {
   background: var(--risk-low-bg);
