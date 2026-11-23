@@ -10,9 +10,17 @@ import (
 
 // Seal format 2 (docs/BUCKETS.md §11). Public keys, salts, wraps and records
 // only: no statement here takes a bucket key, a scope key or a KEK.
+//
+// browser_keys, browser_wraps and the view scope_openers (remembered browsers,
+// §13) were added after schema 9 shipped. BucketDDL runs at every boot with IF
+// NOT EXISTS, so an existing store gains them empty and nothing else changes;
+// the schema version stays 9.
 const BucketDDL = `CREATE TABLE IF NOT EXISTS bucket_scopes(scope TEXT PRIMARY KEY,public_key BLOB NOT NULL CHECK(length(public_key)=65),recovery BLOB NOT NULL,created INTEGER NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS scope_wraps(id INTEGER PRIMARY KEY,passkey INTEGER NOT NULL REFERENCES passkeys(id) ON DELETE CASCADE,scope TEXT NOT NULL REFERENCES bucket_scopes(scope) ON DELETE CASCADE,salt BLOB NOT NULL UNIQUE CHECK(length(salt)=32),wrap BLOB NOT NULL CHECK(length(wrap)=73),created INTEGER NOT NULL,tested_at INTEGER,UNIQUE(passkey,scope)) STRICT;
 CREATE TABLE IF NOT EXISTS buckets(id BLOB PRIMARY KEY CHECK(length(id)=32),scope TEXT NOT NULL REFERENCES bucket_scopes(scope),kind TEXT NOT NULL CHECK(kind IN ('ssh-ca','internal-ca','cf-proxy','env-set','signer')),ref TEXT NOT NULL,public_key BLOB NOT NULL CHECK(length(public_key)=65),wrap BLOB NOT NULL CHECK(length(wrap)=113),payload BLOB,created INTEGER NOT NULL,UNIQUE(kind,ref)) STRICT;
+CREATE TABLE IF NOT EXISTS browser_keys(id INTEGER PRIMARY KEY,passkey INTEGER NOT NULL REFERENCES passkeys(id) ON DELETE CASCADE,public_key BLOB NOT NULL CHECK(length(public_key)=65),label TEXT NOT NULL,created INTEGER NOT NULL,last_used INTEGER,UNIQUE(passkey,public_key)) STRICT;
+CREATE TABLE IF NOT EXISTS browser_wraps(id BLOB PRIMARY KEY CHECK(length(id)=32),browser_key INTEGER NOT NULL REFERENCES browser_keys(id) ON DELETE CASCADE,scope TEXT NOT NULL REFERENCES bucket_scopes(scope) ON DELETE CASCADE,wrap BLOB NOT NULL CHECK(length(wrap)=73),sealed_kek BLOB NOT NULL CHECK(length(sealed_kek)=113),created INTEGER NOT NULL,tested_at INTEGER,UNIQUE(browser_key,scope)) STRICT;
+CREATE VIEW IF NOT EXISTS scope_openers AS SELECT passkey,scope,tested_at FROM scope_wraps UNION ALL SELECT k.passkey,w.scope,w.tested_at FROM browser_wraps w JOIN browser_keys k ON k.id=w.browser_key;
 CREATE TABLE IF NOT EXISTS notice_channel(singleton INTEGER PRIMARY KEY CHECK(singleton=1),topic_url TEXT NOT NULL) STRICT;
 CREATE TRIGGER IF NOT EXISTS keep_one_scope_passkey BEFORE DELETE ON passkeys WHEN EXISTS(` + orphanedWhere + `) BEGIN SELECT RAISE(ABORT,'last passkey that can open buckets'); END;`
 
@@ -20,7 +28,8 @@ CREATE TRIGGER IF NOT EXISTS keep_one_scope_passkey BEFORE DELETE ON passkeys WH
 // other passkey has a tested one: removing it would leave only the recovery key.
 // The trigger and OrphanedScopes share it, so both are per scope and count only
 // tested wraps (docs/BUCKETS.md §7).
-const orphanedWhere = `SELECT w.scope FROM scope_wraps w WHERE w.passkey=OLD.id AND NOT EXISTS(SELECT 1 FROM scope_wraps x WHERE x.scope=w.scope AND x.passkey!=w.passkey AND x.tested_at IS NOT NULL)`
+// scope_openers lists both kinds of wrap (PRF and remembered browser).
+const orphanedWhere = `SELECT DISTINCT w.scope FROM scope_openers w WHERE w.passkey=OLD.id AND NOT EXISTS(SELECT 1 FROM scope_openers x WHERE x.scope=w.scope AND x.passkey!=w.passkey AND x.tested_at IS NOT NULL)`
 
 // BucketTriggers recreates the guard triggers of a format-2 store at boot, so
 // a store made by an earlier build of schema 9 gets the current guard.
@@ -179,10 +188,11 @@ func (q *Q) RekeyScopeWrap(ctx context.Context, o ScopeWrapRow) error {
 	return one(q.q.ExecContext(ctx, `UPDATE scope_wraps SET salt=?,wrap=?,created=?,tested_at=NULL WHERE passkey=? AND scope=?`, o.Salt, o.Wrap, ms(o.Created), o.Passkey, o.Scope))
 }
 
-// ScopeTested reports whether any passkey has a tested wrap of the scope.
+// ScopeTested reports whether any passkey has a tested wrap of the scope
+// (of either kind: PRF or remembered browser).
 func (q *Q) ScopeTested(ctx context.Context, scope string) (bool, error) {
 	var ok bool
-	err := q.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM scope_wraps WHERE scope=? AND tested_at IS NOT NULL)`, scope).Scan(&ok)
+	err := q.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM scope_openers WHERE scope=? AND tested_at IS NOT NULL)`, scope).Scan(&ok)
 	return ok, err
 }
 func (q *Q) MarkScopeWrapTested(ctx context.Context, id int64, now time.Time) error {
@@ -190,16 +200,176 @@ func (q *Q) MarkScopeWrapTested(ctx context.Context, id int64, now time.Time) er
 	return err
 }
 
-// DeleteScopeWraps removes passkey wraps of a scope except one passkey's (rekey).
+// DeleteScopeWraps removes PRF wraps of a scope except one passkey's (rekey).
 func (q *Q) DeleteScopeWraps(ctx context.Context, scope string, keep int64) error {
 	_, err := q.q.ExecContext(ctx, `DELETE FROM scope_wraps WHERE scope=? AND passkey!=?`, scope, keep)
 	return err
 }
 
+// ---- remembered browsers (§13) ----
+
+// BrowserKeyRow is the public half of one browser profile's key, registered
+// for exactly one passkey.
+type BrowserKeyRow struct {
+	ID       int64
+	Passkey  int64
+	RawID    []byte
+	Public   []byte
+	Label    string
+	Created  time.Time
+	LastUsed *time.Time
+}
+
+// BrowserWrapRow is one remembered browser's wrap of a scope key: the scope
+// scalar under a KEK (Wrap) and that KEK sealed to the browser key (SealedKEK).
+// Both are ciphertext the broker cannot open.
+type BrowserWrapRow struct {
+	ID        []byte // 32 random bytes, bound into both ciphertexts
+	Key       int64
+	Passkey   int64
+	RawID     []byte
+	Public    []byte
+	Scope     string
+	Wrap      []byte
+	SealedKEK []byte
+	Created   time.Time
+	Tested    *time.Time
+}
+
+func nullTime(v sql.NullInt64) *time.Time {
+	if !v.Valid {
+		return nil
+	}
+	t := fromMS(v.Int64)
+	return &t
+}
+
+const browserKeyCols = `k.id,k.passkey,p.credential_id,k.public_key,k.label,k.created,k.last_used FROM browser_keys k JOIN passkeys p ON p.id=k.passkey`
+
+func scanBrowserKey(sc interface{ Scan(...any) error }) (BrowserKeyRow, error) {
+	var o BrowserKeyRow
+	var created int64
+	var used sql.NullInt64
+	err := sc.Scan(&o.ID, &o.Passkey, &o.RawID, &o.Public, &o.Label, &created, &used)
+	o.Created, o.LastUsed = fromMS(created), nullTime(used)
+	return o, err
+}
+
+// BrowserKeys lists remembered browsers, optionally of one passkey (0: all).
+func (q *Q) BrowserKeys(ctx context.Context, passkey int64) ([]BrowserKeyRow, error) {
+	var out []BrowserKeyRow
+	err := q.rows(ctx, `SELECT `+browserKeyCols+` WHERE ?1=0 OR k.passkey=?1 ORDER BY k.passkey,k.created,k.id`, func(r *sql.Rows) error {
+		o, err := scanBrowserKey(r)
+		out = append(out, o)
+		return err
+	}, passkey)
+	return out, err
+}
+
+// BrowserKey is one passkey's remembered browser with this public key.
+func (q *Q) BrowserKey(ctx context.Context, passkey int64, public []byte) (BrowserKeyRow, error) {
+	o, err := scanBrowserKey(q.q.QueryRowContext(ctx, `SELECT `+browserKeyCols+` WHERE k.passkey=? AND k.public_key=?`, passkey, public))
+	return o, notFound(err)
+}
+
+// PutBrowserKey registers a browser key for a passkey, or returns the row it
+// already has (its label is kept).
+func (q *Q) PutBrowserKey(ctx context.Context, o BrowserKeyRow) (int64, error) {
+	if _, err := q.q.ExecContext(ctx, `INSERT INTO browser_keys(passkey,public_key,label,created) VALUES(?,?,?,?) ON CONFLICT(passkey,public_key) DO NOTHING`, o.Passkey, o.Public, o.Label, ms(o.Created)); err != nil {
+		return 0, err
+	}
+	var id int64
+	err := q.q.QueryRowContext(ctx, `SELECT id FROM browser_keys WHERE passkey=? AND public_key=?`, o.Passkey, o.Public).Scan(&id)
+	return id, err
+}
+
+// DeleteBrowserKey forgets a remembered browser; its wraps go with it (cascade).
+func (q *Q) DeleteBrowserKey(ctx context.Context, id int64) error {
+	return one(q.q.ExecContext(ctx, `DELETE FROM browser_keys WHERE id=?`, id))
+}
+
+// TouchBrowserKey records that a remembered browser opened something.
+func (q *Q) TouchBrowserKey(ctx context.Context, id int64, now time.Time) error {
+	_, err := q.q.ExecContext(ctx, `UPDATE browser_keys SET last_used=? WHERE id=?`, ms(now), id)
+	return err
+}
+
+const browserWrapCols = `w.id,w.browser_key,k.passkey,p.credential_id,k.public_key,w.scope,w.wrap,w.sealed_kek,w.created,w.tested_at FROM browser_wraps w JOIN browser_keys k ON k.id=w.browser_key JOIN passkeys p ON p.id=k.passkey`
+
+func scanBrowserWrap(sc interface{ Scan(...any) error }) (BrowserWrapRow, error) {
+	var o BrowserWrapRow
+	var created int64
+	var tested sql.NullInt64
+	err := sc.Scan(&o.ID, &o.Key, &o.Passkey, &o.RawID, &o.Public, &o.Scope, &o.Wrap, &o.SealedKEK, &created, &tested)
+	o.Created, o.Tested = fromMS(created), nullTime(tested)
+	return o, err
+}
+
+// BrowserWraps lists remembered-browser wraps, optionally of one browser key (0: all).
+func (q *Q) BrowserWraps(ctx context.Context, key int64) ([]BrowserWrapRow, error) {
+	var out []BrowserWrapRow
+	err := q.rows(ctx, `SELECT `+browserWrapCols+` WHERE ?1=0 OR w.browser_key=?1 ORDER BY k.passkey,w.browser_key,w.scope!='installation',w.scope`, func(r *sql.Rows) error {
+		o, err := scanBrowserWrap(r)
+		out = append(out, o)
+		return err
+	}, key)
+	return out, err
+}
+func (q *Q) BrowserWrap(ctx context.Context, key int64, scope string) (BrowserWrapRow, error) {
+	o, err := scanBrowserWrap(q.q.QueryRowContext(ctx, `SELECT `+browserWrapCols+` WHERE w.browser_key=? AND w.scope=?`, key, scope))
+	return o, notFound(err)
+}
+
+// PutBrowserWrap inserts a remembered browser's wrap of a scope key (untested),
+// or replaces an untested one. A tested wrap is kept and ErrTestedWrap returned.
+func (q *Q) PutBrowserWrap(ctx context.Context, o BrowserWrapRow) error {
+	res, err := q.q.ExecContext(ctx, `INSERT INTO browser_wraps(id,browser_key,scope,wrap,sealed_kek,created) VALUES(?,?,?,?,?,?) ON CONFLICT(browser_key,scope) DO UPDATE SET id=excluded.id,wrap=excluded.wrap,sealed_kek=excluded.sealed_kek,created=excluded.created,tested_at=NULL WHERE browser_wraps.tested_at IS NULL`, o.ID, o.Key, o.Scope, o.Wrap, o.SealedKEK, ms(o.Created))
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrTestedWrap
+	}
+	return nil
+}
+
+// RekeyBrowserWrap replaces the rekeying browser's wrap with its wrap of the
+// new scope key under a fresh KEK (untested until it opens once).
+func (q *Q) RekeyBrowserWrap(ctx context.Context, o BrowserWrapRow) error {
+	return one(q.q.ExecContext(ctx, `UPDATE browser_wraps SET id=?,wrap=?,sealed_kek=?,created=?,tested_at=NULL WHERE browser_key=? AND scope=?`, o.ID, o.Wrap, o.SealedKEK, ms(o.Created), o.Key, o.Scope))
+}
+func (q *Q) MarkBrowserWrapTested(ctx context.Context, id []byte, now time.Time) error {
+	_, err := q.q.ExecContext(ctx, `UPDATE browser_wraps SET tested_at=? WHERE id=? AND tested_at IS NULL`, ms(now), id)
+	return err
+}
+
+// DeleteBrowserWraps removes remembered-browser wraps of a scope except one
+// browser key's (rekey; 0 keeps none).
+func (q *Q) DeleteBrowserWraps(ctx context.Context, scope string, keep int64) error {
+	_, err := q.q.ExecContext(ctx, `DELETE FROM browser_wraps WHERE scope=? AND browser_key!=?`, scope, keep)
+	return err
+}
+
+// BrowserOrphanedScopes lists the scopes this remembered browser has a wrap of
+// while nothing else has a tested one (no PRF wrap, no other browser's wrap):
+// forgetting it would leave only the recovery key.
+func (q *Q) BrowserOrphanedScopes(ctx context.Context, key int64) ([]string, error) {
+	var out []string
+	err := q.rows(ctx, `SELECT w.scope FROM browser_wraps w WHERE w.browser_key=?1 AND NOT EXISTS(SELECT 1 FROM scope_wraps x WHERE x.scope=w.scope AND x.tested_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM browser_wraps y WHERE y.scope=w.scope AND y.browser_key!=w.browser_key AND y.tested_at IS NOT NULL) ORDER BY 1`, func(r *sql.Rows) error {
+		var s string
+		err := r.Scan(&s)
+		out = append(out, s)
+		return err
+	}, key)
+	return out, err
+}
+
 // ScopeCoverage counts, per passkey, the buckets in scopes it can open.
 func (q *Q) ScopeCoverage(ctx context.Context) (map[int64]int, error) {
 	out := map[int64]int{}
-	err := q.rows(ctx, `SELECT w.passkey,count(b.id) FROM scope_wraps w LEFT JOIN buckets b ON b.scope=w.scope GROUP BY w.passkey`, func(r *sql.Rows) error {
+	err := q.rows(ctx, `SELECT w.passkey,count(b.id) FROM (SELECT DISTINCT passkey,scope FROM scope_openers) w LEFT JOIN buckets b ON b.scope=w.scope GROUP BY w.passkey`, func(r *sql.Rows) error {
 		var p int64
 		var n int
 		err := r.Scan(&p, &n)

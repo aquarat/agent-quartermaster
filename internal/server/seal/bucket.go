@@ -12,6 +12,7 @@ import (
 	"crypto/hpke"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"strings"
@@ -204,6 +205,86 @@ func (o PasskeyScope) Unwrap(kek *Key, wrap, scopePublic []byte) (*Key, error) {
 		return nil, errBucket
 	}
 	return scalarFrom(b, scopePublic)
+}
+
+// ---- remembered browsers (docs/BUCKETS.md §13) ----
+
+// BrowserScope names one remembered browser's wrap of a scope key for one
+// passkey. The KEK is 32 random bytes made in that browser; the broker keeps
+// the scope scalar wrapped under it (Wrap) and the KEK itself sealed to the
+// browser key's public half (SealKEK). Without the browser's private key
+// neither stored value opens anything.
+type BrowserScope struct {
+	Installation ID
+	RPID         string
+	RawID        []byte
+	Scope        string
+	WrapID       ID     // random, new for every wrap (the role a PRF salt has)
+	Browser      []byte // the browser key's public half, uncompressed P-256
+}
+
+func (o BrowserScope) valid() bool {
+	return o.Installation != (ID{}) && len(o.RPID) > 0 && len(o.RPID) <= 253 && len(o.RawID) > 0 && len(o.RawID) <= 1023 && label(o.Scope) && o.WrapID != (ID{}) && ValidPublic(o.Browser)
+}
+
+// KEKInfo is the HPKE info of the sealed KEK: it binds the installation, the
+// passkey, the scope, the wrap and the browser key.
+func (o BrowserScope) KEKInfo() []byte {
+	return T2("browser-kek", o.Installation[:], []byte(o.RPID), o.RawID, []byte(o.Scope), o.WrapID[:], o.Browser)
+}
+func (o BrowserScope) aad(scopePublic []byte) []byte {
+	return T2("scope-wrap-browser", o.Installation[:], []byte(o.RPID), o.RawID, []byte(o.Scope), o.WrapID[:], o.Browser, scopePublic)
+}
+
+// Wrap seals the scope scalar under the browser's KEK (XChaCha20-Poly1305, fresh nonce).
+func (o BrowserScope) Wrap(kek, scope *Key, scopePublic []byte) ([]byte, error) {
+	if !o.valid() || scope == nil || !scope.Matches(scopePublic) {
+		return nil, errBucket
+	}
+	return kek.encrypt(scope.page[:32], o.aad(scopePublic))
+}
+
+// Unwrap opens the scope scalar and checks it against the scope's public key.
+func (o BrowserScope) Unwrap(kek *Key, wrap, scopePublic []byte) (*Key, error) {
+	if !o.valid() || len(wrap) != 73 || len(scopePublic) != 65 {
+		return nil, errBucket
+	}
+	b, err := kek.open(nil, wrap, o.aad(scopePublic))
+	if err != nil {
+		return nil, errBucket
+	}
+	return scalarFrom(b, scopePublic)
+}
+
+// SealKEK encrypts the KEK to the browser key (HPKE, 113 bytes). Only that
+// browser can open it; the broker stores it and hands it out inside a valid
+// tap by the wrap's own passkey.
+func (o BrowserScope) SealKEK(kek *Key) ([]byte, error) {
+	if !o.valid() || kek == nil || kek.page == nil {
+		return nil, errBucket
+	}
+	return sealTo(o.Browser, o.KEKInfo(), kek.page[:32])
+}
+
+// OpenKEK is the browser's half (web/src/browserKey.ts), for tests: the
+// broker never holds a browser key's private half.
+func (o BrowserScope) OpenKEK(browser *Key, sealed []byte) (*Key, error) {
+	if !o.valid() || len(sealed) != 65+32+16 || !browser.Matches(o.Browser) {
+		return nil, errBucket
+	}
+	b, err := browser.openFrom(o.KEKInfo(), sealed)
+	if err != nil {
+		return nil, errBucket
+	}
+	defer clear(b)
+	return importKey(b)
+}
+
+// BrowserKeyID is a browser key's fingerprint: hex of the first 16 bytes of
+// SHA-256(public half). It names the key in canonicals, the audit log and the UI.
+func BrowserKeyID(public []byte) string {
+	h := sha256.Sum256(public)
+	return hex.EncodeToString(h[:16])
 }
 
 // Scope is a scope key's public description.

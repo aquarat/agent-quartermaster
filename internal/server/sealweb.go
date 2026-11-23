@@ -22,6 +22,7 @@ func (s *Server) sealRoutes(m *http.ServeMux) {
 	s.envWebRoutes(m)
 	s.vaultRoutes(m)
 	s.recoveryRoutes(m)
+	s.browserRoutes(m)
 	m.Handle("GET /api/ui/seal/status", s.requireSession(s.sealStatus))
 	m.Handle("POST /api/ui/seal/drill", s.requireSession(s.sealDrill))
 	s.stageRoutes(m)
@@ -93,14 +94,19 @@ type coverageScope struct {
 	Tested bool   `json:"tested"`
 }
 type passkeyCoverage struct {
-	ID      string          `json:"id"`
-	Name    string          `json:"name"`
-	Current bool            `json:"current"`
-	PRF     bool            `json:"prf"`
-	Scopes  []coverageScope `json:"scopes"`
-	Opens   int             `json:"opens"`
-	Of      int             `json:"of"`
-	Missing []string        `json:"missing"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Current bool   `json:"current"`
+	PRF     bool   `json:"prf"`
+	// Mode says how the passkey opens buckets: "prf" (its own secret), "browser"
+	// (only from the remembered browsers listed, §13) or "" (it opens nothing).
+	// For "browser", Scopes is the union over its browsers.
+	Mode     string          `json:"mode"`
+	Browsers []browserView   `json:"browsers"`
+	Scopes   []coverageScope `json:"scopes"`
+	Opens    int             `json:"opens"`
+	Of       int             `json:"of"`
+	Missing  []string        `json:"missing"`
 }
 type sealView struct {
 	Mode           string            `json:"mode"`
@@ -242,6 +248,14 @@ func (s *Server) sealView(ctx context.Context, sess string) (sealView, error) {
 	if err != nil {
 		return v, err
 	}
+	bkeys, err := q.BrowserKeys(ctx, 0)
+	if err != nil {
+		return v, err
+	}
+	bwraps, err := q.BrowserWraps(ctx, 0)
+	if err != nil {
+		return v, err
+	}
 	for _, k := range keys {
 		c := passkeyCoverage{ID: k.id, Name: k.Name, Current: k.ID == row, Scopes: []coverageScope{}, Of: len(buckets), Missing: []string{}}
 		for _, w := range wraps {
@@ -251,6 +265,27 @@ func (s *Server) sealView(ctx context.Context, sess string) (sealView, error) {
 			}
 		}
 		c.PRF = len(c.Scopes) > 0
+		c.Browsers = browserViews(bkeys, bwraps, k.ID)
+		switch {
+		case c.PRF:
+			c.Mode = "prf"
+		case len(c.Browsers) > 0:
+			c.Mode = "browser"
+			for _, sc := range v.Scopes {
+				has, tested := false, false
+				for _, b := range c.Browsers {
+					for _, x := range b.Scopes {
+						if x.Scope == sc.Scope {
+							has, tested = true, tested || x.Tested
+						}
+					}
+				}
+				if has {
+					c.Scopes = append(c.Scopes, coverageScope{sc.Scope, tested})
+					c.Opens += count[sc.Scope]
+				}
+			}
+		}
 		for _, sc := range v.Scopes {
 			if !slices.ContainsFunc(c.Scopes, func(x coverageScope) bool { return x.Scope == sc.Scope }) {
 				c.Missing = append(c.Missing, sc.Scope)
@@ -554,7 +589,7 @@ func (s *Server) rekey(ctx context.Context, sess string, c *store.Challenge, in 
 		return nil, err
 	}
 	defer destroyKeys(keks)
-	olds, err := s.unwrapScopes(ctx, row, t.scopes, keks[:1])
+	olds, err := s.unwrapScopes(ctx, t, row, keks[:1])
 	if err != nil {
 		return nil, err
 	}
@@ -594,6 +629,40 @@ func (s *Server) rekey(ctx context.Context, sess string, c *store.Challenge, in 
 		if err = q.ReplaceScope(ctx, store.ScopeRow{Scope: scope, Public: pubS, Recovery: rec}); err != nil {
 			return err
 		}
+		if rel := t.released.Load(); rel != nil {
+			// A remembered browser rekeyed (§13): its new wrap is under the fresh
+			// KEK its page made for this tap (the packet's second key), sealed to
+			// the same browser key, with the descriptor's rekey salt as wrap ID.
+			// As for a PRF passkey, nothing else keeps a wrap: no wrap is made for
+			// a passkey or a browser that did not take part in this tap.
+			bw, err := q.BrowserWrap(ctx, rel.key, scope)
+			if err != nil {
+				return err
+			}
+			bw.ID = bytes.Clone(t.rekeySalt[:])
+			bs := s.browserScope(bw)
+			w, err := bs.Wrap(keks[1], newScope, pubS)
+			if err != nil {
+				return err
+			}
+			sealed, err := bs.SealKEK(keks[1])
+			if err != nil {
+				return err
+			}
+			if err = q.RekeyBrowserWrap(ctx, store.BrowserWrapRow{ID: bw.ID, Key: rel.key, Scope: scope, Wrap: w, SealedKEK: sealed, Created: s.now()}); err != nil {
+				return err
+			}
+			if err = q.DeleteBrowserWraps(ctx, scope, rel.key); err != nil {
+				return err
+			}
+			if err = q.DeleteScopeWraps(ctx, scope, 0); err != nil {
+				return err
+			}
+			if err = q.DropScopeDrafts(ctx, scope); err != nil {
+				return err
+			}
+			return q.Audit(ctx, s.now(), "owner", "seal_rekey", "scope:"+scope, fmt.Sprintf("passkey=%d browser=%s buckets=%d canonical=%s", row, seal.BrowserKeyID(bw.Public), len(rows), c.Canonical))
+		}
 		sw, err := q.ScopeWrap(ctx, row, scope)
 		if err != nil {
 			return err
@@ -610,6 +679,9 @@ func (s *Server) rekey(ctx context.Context, sess string, c *store.Challenge, in 
 			return err
 		}
 		if err = q.DeleteScopeWraps(ctx, scope, row); err != nil {
+			return err
+		}
+		if err = q.DeleteBrowserWraps(ctx, scope, 0); err != nil {
 			return err
 		}
 		if err = q.DropScopeDrafts(ctx, scope); err != nil {

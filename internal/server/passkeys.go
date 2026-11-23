@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -74,6 +75,19 @@ func (s *Server) verifyAssertion(ctx context.Context, challenge []byte, assertio
 	return s.verifySelected(ctx, challenge, assertion, nil, protocol.AuthenticationExtensions{})
 }
 func (s *Server) verifySelected(ctx context.Context, challenge []byte, assertion json.RawMessage, allowed [][]byte, ext protocol.AuthenticationExtensions) (int64, error) {
+	return s.verifyWith(ctx, challenge, assertion, allowed, ext, true)
+}
+
+// verifyOnly checks an assertion exactly as verifySelected does but records
+// nothing: no sign count, no last use, no verified-signer identity. The
+// release of a remembered browser's sealed KEKs uses it, because the same
+// assertion is verified again (and recorded) by the finish that follows; a
+// sign count stored here would make that second check look like a clone.
+func (s *Server) verifyOnly(ctx context.Context, challenge []byte, assertion json.RawMessage, allowed [][]byte, ext protocol.AuthenticationExtensions) (int64, error) {
+	return s.verifyWith(ctx, challenge, assertion, allowed, ext, false)
+}
+
+func (s *Server) verifyWith(ctx context.Context, challenge []byte, assertion json.RawMessage, allowed [][]byte, ext protocol.AuthenticationExtensions, record bool) (int64, error) {
 	if len(assertion) == 0 || string(assertion) == "null" {
 		return 0, errBad("assertion required")
 	}
@@ -111,6 +125,18 @@ func (s *Server) verifySelected(ctx context.Context, challenge []byte, assertion
 		s.log.Warn("passkey sign count did not increase; possible clone", "credential", base64.RawURLEncoding.EncodeToString(cred.ID))
 		_ = s.store.Q().Audit(ctx, s.now(), "system", "passkey_clone_warning", "passkey:"+passkeyID(cred.ID), "sign count regressed; assertion refused")
 		return 0, errForbidden("passkey sign count regressed")
+	}
+	if !record {
+		pks, err := s.store.Q().Passkeys(ctx)
+		if err != nil {
+			return 0, err
+		}
+		for _, p := range pks {
+			if bytes.Equal(p.CredentialID, cred.ID) {
+				return p.ID, nil
+			}
+		}
+		return 0, errForbidden("passkey no longer registered")
 	}
 	newJSON, err := json.Marshal(cred)
 	if err != nil {

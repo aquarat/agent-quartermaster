@@ -581,7 +581,7 @@ func (s *Server) stageCanonical(step, credential string, scopes []string, nonce,
 // first slot carries the format-1 KEK.
 func (s *Server) stageTap(sess, purpose, canonical string, cred webauthn.Credential, scopes []string, salts []seal.ID, legacy *legacyView, legacySalt seal.ID) (protocol.PublicKeyCredentialRequestOptions, *tapOpen, error) {
 	if legacy == nil {
-		return s.enrolTap(sess, purpose, canonical, cred, scopes, salts)
+		return s.enrolTap(sess, purpose, canonical, cred, scopes, salts, nil)
 	}
 	var opts protocol.PublicKeyCredentialRequestOptions
 	attempt, recipient, err := s.seal.opens.Begin(sess, purpose, "")

@@ -407,6 +407,18 @@ type ChallengeResponse struct {
 // §4.2): canonical JSON the page verifies, shows and binds into the challenge.
 type OpenOffer struct {
 	Descriptor string `json:"descriptor"`
+	// Browsers lists the (passkey, remembered browser) pairs that can open every
+	// scope of the descriptor (docs/BUCKETS.md §13). A hint for the page, which
+	// compares it with the key its own profile holds; it is not signed.
+	Browsers []BrowserOpener `json:"browsers,omitempty"`
+}
+
+// BrowserOpener is one passkey's remembered browser: the passkey's raw
+// credential ID (base64url), the browser key's fingerprint and its label.
+type BrowserOpener struct {
+	CredentialID string `json:"credential_id"`
+	KeyID        string `json:"key_id"`
+	Label        string `json:"label"`
 }
 
 // OpenPacket carries the passkey's key-encryption keys, HPKE-sealed by the page

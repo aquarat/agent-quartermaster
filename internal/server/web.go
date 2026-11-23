@@ -648,6 +648,16 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 						p.TestedAt = w.Tested
 					}
 				}
+				bwraps, err := q.BrowserWraps(ctx, 0)
+				if err != nil {
+					s.writeErr(w, r, err)
+					return
+				}
+				for _, bw := range bwraps {
+					if bw.Passkey == pks[i].ID && bw.Tested != nil && (p.TestedAt == nil || bw.Tested.After(*p.TestedAt)) {
+						p.TestedAt = bw.Tested
+					}
+				}
 			}
 		}
 		out.Passkeys = append(out.Passkeys, p)
@@ -920,6 +930,7 @@ func (s *Server) challengeHandler(object string) func(http.ResponseWriter, *http
 			return
 		}
 		if t != nil {
+			t.canonical = text
 			s.seal.taps.put(c.ID, t, now)
 		}
 		writeJSON(w, http.StatusOK, api.ChallengeResponse{ChallengeID: c.ID, Canonical: text, PublicKey: opts, Open: t.offer()})
