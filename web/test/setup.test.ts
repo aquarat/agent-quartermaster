@@ -2,6 +2,7 @@
 // recovery key made in the browser, and the pre-signing checks of a setup run.
 import { afterAll, describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { Aes128Gcm, CipherSuite, DhkemP256HkdfSha256, HkdfSha256 } from "@hpke/core";
 import { createApi, type Api } from "../src/api";
@@ -23,7 +24,12 @@ import {
 } from "../src/setup";
 import { bech32Decode, recipientOf } from "../mock/age";
 import { startMock } from "../mock/server";
-import { fakeAuth, jarFetch } from "./helpers";
+import { fakeAuth, jarFetch, prfAuth } from "./helpers";
+import { stagePlan, stageStep } from "../src/setup";
+import { prepareControl } from "../src/sealPanel";
+import { deriveKEK } from "../src/buckets";
+import { wrapKeyBytes } from "../src/seal";
+import type { StageView } from "../src/sealPanel";
 
 const te = new TextEncoder();
 const hex = (b: ArrayBuffer | Uint8Array) => Buffer.from(b as ArrayBuffer).toString("hex");
@@ -44,6 +50,14 @@ describe("canonicalParams: exactly Go's json.Marshal of the typed parameters", (
     expect(() => canonicalParams("seal", { recipient, purge_backups: "yes", lock_alert: false })).toThrow();
     expect(() => canonicalParams("seal", { recipient, purge_backups: true })).toThrow();
     expect(() => canonicalParams("seal", { recipient, purge_backups: true, lock_alert: false, identity: "x" })).toThrow();
+  });
+
+  test("buckets: exactly {\"purge_backups\":bool}", () => {
+    expect(canonicalParams("buckets", { purge_backups: true })).toBe('{"purge_backups":true}');
+    expect(canonicalParams("buckets", { purge_backups: false })).toBe('{"purge_backups":false}');
+    expect(() => canonicalParams("buckets", {})).toThrow();
+    expect(() => canonicalParams("buckets", { purge_backups: "yes" })).toThrow();
+    expect(() => canonicalParams("buckets", { purge_backups: true, rollback: true })).toThrow();
   });
 
   test("enable-updates: known_hosts sorted, flags last, no HTML escaping", () => {
@@ -180,7 +194,7 @@ describe("signing a setup task", () => {
 
   test("sign in", async () => {
     await completeLogin(api, auth, await prepareLogin(api));
-    expect((await view()).tasks!.map((t) => t.id)).toEqual(["cutover", "seal", "enable-updates", "sync-passkeys", "upgrade"]);
+    expect((await view()).tasks!.map((t) => t.id)).toEqual(["cutover", "seal", "buckets", "enable-updates", "sync-passkeys", "upgrade"]);
   });
 
   test("refuses to sign when the server's text differs: params, task, secrets hash, an extra key, the challenge, the options", async () => {
@@ -299,14 +313,15 @@ describe("signing a setup task", () => {
     s.recipient = mine.recipient;
     const seal = await api.sealStatus!();
     expect(seal.mode).toBe("setup");
-    expect(seal.drilled).toBe(false);
-    await expect(sendDrill(api, seal, other.identity)).rejects.toThrow(/not the recovery key/);
+    expect(seal.stage!.drilled).toBe(false);
+    const key = { drill_key: seal.stage!.drill_key, installation: seal.installation };
+    await expect(sendDrill(api, key, other.identity)).rejects.toThrow(/not the recovery key/);
     expect(s.drilled).toBe(false);
     const start = f.log.length;
-    await sendDrill(api, seal, `  ${mine.identity}\n`);
+    await sendDrill(api, key, `  ${mine.identity}\n`);
     const sent = f.log.slice(start);
     expect(s.drilled).toBe(true);
-    expect((await api.sealStatus!()).drilled).toBe(true);
+    expect((await api.sealStatus!()).stage!.drilled).toBe(true);
     expect(sent.length).toBe(1);
     expect(sent[0]!.url.endsWith("/api/ui/seal/drill")).toBe(true);
     expect(Object.keys(sent[0]!.body as object)).toEqual(["packet"]);
@@ -318,6 +333,7 @@ describe("signing a setup task", () => {
     const s = m.store.setup;
     s.jump(new URLSearchParams("mode=serve&scoped=1"));
     s.mode = "serve";
+    s.activated = false;
     const v = await view();
     const pins = v.passkeys!.map((k) => ({ id: k.credential, key_sha256: k.key_sha256 }));
     const before = auth.gets.length;
@@ -341,5 +357,163 @@ describe("host key fingerprint", () => {
     expect(await hostKeyFingerprint(`forge.example.com ssh-ed25519 ${blob}`)).toBe(want);
     expect(want).toMatch(/^SHA256:[A-Za-z0-9+/]{43}$/);
     await expect(hostKeyFingerprint("forge.example.com ssh-ed25519 not-base64!")).rejects.toThrow();
+  });
+});
+
+describe("the stage plan", () => {
+  const sc = (scope: string, wrapped = false, tested = false) => ({ scope, title: scope, buckets: 1, wrapped, tested });
+  const st = (over: Partial<StageView>): StageView => ({ source: "unsealed", scopes: [], drilled: false, drill_key: "", choices: [], ...over });
+  test("seal import: two scopes per create tap, then two per test tap", () => {
+    let p = stagePlan(st({ scopes: [sc("installation"), sc("a"), sc("b")] }));
+    expect(p).toMatchObject({ migrate: false, next: { step: "create", scopes: ["installation", "a"] }, tap: 1, taps: 4 });
+    p = stagePlan(st({ scopes: [sc("installation", true), sc("a", true), sc("b")] }));
+    expect(p).toMatchObject({ next: { step: "create", scopes: ["b"] }, tap: 2 });
+    p = stagePlan(st({ scopes: [sc("installation", true), sc("a", true), sc("b", true)] }));
+    expect(p).toMatchObject({ next: { step: "test", scopes: ["installation", "a"] }, tap: 3, created: true, tested: false });
+    p = stagePlan(st({ scopes: [sc("installation", true, true), sc("a", true, true), sc("b", true, true)] }));
+    expect(p).toMatchObject({ next: null, tested: true });
+  });
+  test("migration: the open-legacy tap carries exactly the installation scope first", () => {
+    let p = stagePlan(st({ source: "format-1", legacy_unlocked: false, scopes: [sc("a"), sc("installation"), sc("b")] }));
+    expect(p).toMatchObject({ migrate: true, next: { step: "open-legacy", scopes: ["installation"] }, tap: 1, taps: 4 });
+    p = stagePlan(st({ source: "format-1", legacy_unlocked: true, scopes: [sc("a"), sc("installation", true), sc("b")] }));
+    expect(p).toMatchObject({ next: { step: "create", scopes: ["a", "b"] }, tap: 2 });
+  });
+});
+
+describe("the staged store against the mock", () => {
+  const m = startMock({ port: 0, distDir: null, setupStepMs: 20 });
+  const f = jarFetch();
+  const api = createApi({ base: m.url, fetch: f });
+  const rp = "127.0.0.1";
+  // The seeded "iPhone" passkey (mock/server.ts seedCred(1)), with a PRF.
+  const pk = prfAuth(m.url, { rawId: new Uint8Array(createHash("sha256").update("seed-1").digest()) });
+  afterAll(() => m.stop());
+  const s = () => m.store.setup;
+  const status = () => api.sealStatus!();
+  const fromB64 = (x: string) => new Uint8Array(decode(x));
+
+  async function tapAll(before = 0): Promise<number> {
+    let taps = 0;
+    for (;;) {
+      const v = await status();
+      const plan = stagePlan(v.stage!);
+      if (!plan.next) return taps;
+      expect(plan.tap).toBe(before + taps + 1);
+      const choice = v.stage!.choices.find((c) => c.credential_id === pk.id)!;
+      const step = await stageStep(api, v, plan.next.step, choice, plan.next.scopes, rp);
+      expect(step.lines.length).toBe(1);
+      const gets = pk.gets.length;
+      const done = step.finish(pk);
+      expect(pk.gets.length).toBe(gets + 1); // the prompt started inside the call
+      await done;
+      taps++;
+    }
+  }
+
+  test("sign in", async () => {
+    await completeLogin(api, pk, await prepareLogin(api));
+  });
+
+  test("seal import: create and test taps, the drill, then Activate (a plain signature)", async () => {
+    const mine = await generateAgeIdentity();
+    s().jump(new URLSearchParams("scoped=1&mode=seal-setup&wrap=none&drilled=0"));
+    s().recipient = mine.recipient;
+    const v = await status();
+    expect(v.stage!.source).toBe("unsealed");
+    expect(stagePlan(v.stage!).taps).toBe(4);
+    const start = s().stageKeks.length;
+    expect(await tapAll()).toBe(4);
+    const got = s().stageKeks.slice(start);
+    expect(got.map((x) => x.step)).toEqual(["create", "create", "test", "test"]);
+    // A test tap reproduces exactly the KEKs the create taps made.
+    expect([...got[2]!.keks, ...got[3]!.keks]).toEqual([...got[0]!.keks, ...got[1]!.keks]);
+    expect(JSON.stringify(f.log.map((x) => x.body)).includes(Buffer.from(pk.handed[0]!).toString("base64url"))).toBe(false);
+    for (const h of pk.handed) expect(h.every((b) => b === 0)).toBe(true); // PRF outputs wiped
+    // No manifest until the recovery key is proven.
+    expect((await status()).stage!.manifest).toBeUndefined();
+    await sendDrill(api, { drill_key: (await status()).stage!.drill_key, installation: v.installation }, mine.identity);
+    const ready = await status();
+    expect(ready.stage!.manifest).toContain("recovery_recipient");
+    const b = await api.sealPost!<{ challenge_id: string; canonical: string; public_key: unknown }>("control/challenge", { action: "activate" });
+    const { tap } = await prepareControl(ready, "activate", b, rp);
+    expect(tap.open).toBeUndefined();
+    await api.sealPost!("control/finish", { challenge_id: b.challenge_id, ...(await tap.sign(pk)) });
+    expect((await status()).mode).toBe("activated");
+    for (let i = 0; i < 200 && !s().sealed; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(s().sealed).toBe(true);
+  });
+
+  test("migration: the open-legacy tap sends the format-1 KEK in slot 1 and the installation KEK in slot 2", async () => {
+    const mine = await generateAgeIdentity();
+    for (let i = 0; i < 200 && s().current; i++) await new Promise((r) => setTimeout(r, 10));
+    s().activated = false;
+    s().jump(new URLSearchParams("mode=bucket-migrate&wrap=none&drilled=0"));
+    s().recipient = mine.recipient;
+    const v = await status();
+    expect(v.stage!.source).toBe("format-1");
+    expect(v.stage!.legacy_unlocked).toBe(false);
+    const plan = stagePlan(v.stage!);
+    expect(plan.next).toEqual({ step: "open-legacy", scopes: ["installation"] });
+    const choice = v.stage!.choices.find((c) => c.credential_id === pk.id)!;
+    expect(choice.legacy).toBeTruthy();
+    const step = await stageStep(api, v, "open-legacy", choice, ["installation"], rp);
+    await step.finish(pk);
+    const got = s().stageKeks.at(-1)!;
+    expect(got.step).toBe("open-legacy");
+    expect(got.keks.length).toBe(2);
+    const L = choice.legacy!;
+    const cred = pk.rawId;
+    const legacyKEK = await wrapKeyBytes(new Uint8Array(await pk.evaluate(fromB64(L.prf_salt))), fromB64(L.installation), rp, cred, L.mk_version, fromB64(L.prf_salt));
+    expect(got.keks[0]).toBe(hex(legacyKEK));
+    const salt = fromB64(s().stageScopes.find((x) => x.scope === "installation")!.salt!);
+    const instKEK = await deriveKEK(await pk.evaluate(salt), fromB64(v.installation), rp, cred, "installation", salt);
+    expect(got.keks[1]).toBe(hex(instKEK));
+    expect((await status()).stage!.legacy_unlocked).toBe(true);
+    expect(await tapAll(1)).toBe(3);
+  });
+
+  test("refused before the tap: another step, other scopes, another descriptor; a passkey without PRF sends nothing", async () => {
+    s().activated = false;
+    s().jump(new URLSearchParams("scoped=1&mode=seal-setup&wrap=none"));
+    const v = await status();
+    const choice = v.stage!.choices.find((c) => c.credential_id === pk.id)!;
+    const alter = (edit: (r: { canonical: string; open: { descriptor: string } }) => void) =>
+      ({
+        sealPost: async (path: string, body: unknown) => {
+          const r = await api.sealPost!<{ canonical: string; open: { descriptor: string } }>(path as "stage/challenge", body);
+          edit(r);
+          return r;
+        },
+      }) as unknown as typeof api;
+    const plan = stagePlan(v.stage!);
+    const gets = pk.gets.length;
+    // The text names another step.
+    await expect(stageStep(alter((r) => (r.canonical = r.canonical.replace('"action":"create"', '"action":"test"'))), v, "create", choice, plan.next!.scopes, rp)).rejects.toThrow(/Not signing/);
+    // The descriptor names other scopes (and so the challenge no longer binds it either).
+    await expect(stageStep(alter((r) => (r.open.descriptor = r.open.descriptor.replace("org-personal", "org-client-a"))), v, "create", choice, plan.next!.scopes, rp)).rejects.toThrow(/Not signing/);
+    // Asking for the wrong step is refused by the broker.
+    await expect(stageStep(api, v, "test", choice, plan.next!.scopes, rp)).rejects.toThrow();
+    expect(pk.gets.length).toBe(gets);
+    // A passkey without PRF: nothing reaches stage/finish.
+    const plain = prfAuth(m.url, { prf: false, rawId: pk.rawId });
+    const step = await stageStep(api, v, "create", choice, plan.next!.scopes, rp);
+    const n = f.log.length;
+    await expect(step.finish(plain)).rejects.toThrow(/PRF/);
+    expect(f.log.slice(n).some((x) => x.url.endsWith("/stage/finish"))).toBe(false);
+  });
+
+  test("Move to per-credential buckets: the run signs exactly {purge_backups} and stages a format-1 store", async () => {
+    for (let i = 0; i < 200 && s().current; i++) await new Promise((r) => setTimeout(r, 10));
+    s().stop();
+    s().current = null;
+    s().jump(new URLSearchParams("mode=serve&scoped=1&sealed=1&format1=1"));
+    s().activated = false;
+    const v = await api.setupGet!<SetupView>("");
+    expect(v.tasks!.find((t) => t.id === "buckets")!.state).toBe("available");
+    await runSetupTask(api, pk, v, "buckets", { purge_backups: false }, undefined, rp);
+    expect(s().received.at(-1)).toEqual({ task: "buckets", params: '{"purge_backups":false}', secrets: {} });
+    for (let i = 0; i < 200 && s().mode !== "seal-setup"; i++) await new Promise((r) => setTimeout(r, 10));
+    expect((await status()).stage!.source).toBe("format-1");
   });
 });

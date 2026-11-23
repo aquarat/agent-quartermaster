@@ -6,6 +6,7 @@
 //   GET /mock/spawn         adds a new pending SSH request (dev convenience)
 //   GET /mock/login         MOCK ONLY: signs this browser in without a passkey (screenshots)
 //   GET /mock/setup?...     jumps Admin → Setup to a state (see mock/setup.ts)
+//   GET /mock/vault?mode=buckets|migration-required&closed=1   sealed view (mock/vault.ts, mock/buckets.ts)
 //
 // Fake WebAuthn: no signature checks. It does check the assertion's JSON shape (the fields
 // go-webauthn parses), that clientDataJSON's type and challenge match the issued challenge,
@@ -18,6 +19,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { resolve, sep, extname } from "node:path";
 import type { AuditEntry, GrantSummary, PasskeyInfo, PendingCloudflare, PendingItem, StandingApproval } from "../src/types";
 import { MockSetup } from "./setup";
+import { MockBuckets } from "./buckets";
+import { MockPasskeyFlows } from "./passkeys";
 
 const b64url = (b: Uint8Array | Buffer) => Buffer.from(b).toString("base64url");
 const fromB64url = (s: string) => {
@@ -228,6 +231,8 @@ export class MockStore {
   /** Admin → Setup (mock/setup.ts); set by startMock. */
   setup!: MockSetup;
   vault!: MockVault;
+  buckets!: MockBuckets;
+  passkeyFlows!: MockPasskeyFlows;
 
   constructor(enrollCode: string | null) {
     this.enrollCode = enrollCode;
@@ -276,7 +281,8 @@ export class MockStore {
 
   passkeyInfos(session: string | undefined): PasskeyInfo[] {
     const cur = session ? this.sessionPasskey.get(session) : undefined;
-    return this.passkeys.map((p) => ({ ...p.info, current: p.info.id === cur }));
+    // raw_id: the credential ID (sealed installations only, as aqmasd sends it).
+    return this.passkeys.map((p) => ({ ...p.info, current: p.info.id === cur, ...(this.buckets?.enabled ? { raw_id: p.id } : {}) }));
   }
 
   sweep(now = Date.now()) {
@@ -664,6 +670,33 @@ export function startMock(opts: MockOptions = {}) {
     audit: (action, object, detail) => store.audit("owner", action, object, detail),
   });
   store.vault.enabled = opts.vault === true;
+  store.buckets = new MockBuckets(
+    {
+      passkeys: () => store.passkeys.map((p) => ({ id: p.id, hex: p.info.id, name: p.info.nickname })),
+      sessionPasskey: (session) => (session ? store.sessionPasskey.get(session) : undefined),
+      issue: (text, canonical, session, challenge) => {
+        const { id, rec } = issue("action", { canonical, canonicalText: text, sessionBound: session }, challenge);
+        return { id, challenge: rec.challenge };
+      },
+      redeem: (challengeId, assertion, session) => {
+        const rec = take(challengeId, "action");
+        if (rec.sessionBound !== session) throw new HttpError(403, "forbidden", "challenge belongs to another session");
+        checkCredential(assertion, rec, "webauthn.get");
+        return rec.canonical!;
+      },
+      requestOptions: (req, challenge) => requestOptions(req, challenge, true) as { publicKey: Record<string, unknown> },
+      fail: (status, code, message) => {
+        throw new HttpError(status, code, message);
+      },
+      audit: (action, object, detail) => store.audit("owner", action, object, detail),
+    },
+    store.vault.installation,
+    store.vault.epoch,
+  );
+  store.vault.buckets = store.buckets;
+  store.buckets.seed(store.vault.orgs, store.vault.sets);
+  store.buckets.enabled = store.vault.enabled;
+  store.passkeyFlows = new MockPasskeyFlows({ buckets: store.buckets, store, fail: (status, code, message) => { throw new HttpError(status, code, message); } });
 
   function creationOptions(req: Request, challenge: string) {
     return {
@@ -910,6 +943,16 @@ export function startMock(opts: MockOptions = {}) {
       const out = await store.setup.handle(req, url, body, session);
       if (out !== undefined) return json(out);
     }
+    if (/^\/api\/ui\/seal\/(passkeys|recovery)\//.test(p)) {
+      needSession();
+      const out = await store.passkeyFlows.handle(req, url, body, session);
+      if (out !== undefined) return json(out);
+    }
+    if (/^\/api\/ui\/seal\/(status|control\/)/.test(p)) {
+      needSession();
+      const out = await store.buckets.handle(req, url, body, session);
+      if (out !== undefined) return json(out);
+    }
     if (/^\/api\/ui\/(seal|catalogue)(\/|$)/.test(p)) {
       needSession();
       const out = await store.vault.handle(req, url, body, session);
@@ -1037,13 +1080,29 @@ export function startMock(opts: MockOptions = {}) {
       const object = { requests: "request", enrollments: "enrollment", standing: "standing", grants: "grant" }[coll!]!;
       const id = decodeURIComponent(rawId!);
       const applyVerb = object === "request" || object === "enrollment" ? "decide" : "revoke";
+      const sealed = store.buckets.enabled && store.buckets.mode === "buckets";
       if (verb === "challenge") {
-        const canonical = canonicalFor(object, id, String(body.action), body);
+        const canonical: Record<string, unknown> = canonicalFor(object, id, String(body.action), body);
         const text = canonicalJSON(canonical);
+        if (sealed && body.action === "approve" && applyVerb === "decide") {
+          // Format 2: the tap that approves opens the bucket the action needs (docs/BUCKETS.md §4.1).
+          const p = store.pending.find((x) => x.id === id)!;
+          const ttl = Number(canonical.ttl_seconds ?? 0);
+          const until = (s: number) => new Date(Date.now() + s * 1000).toISOString().replace(/\.\d+Z$/, "Z");
+          const b = p.kind === "enrollment" ? store.buckets.find("internal-ca") : p.kind === "cloudflare" ? store.buckets.find("cf-proxy") : store.buckets.find("ssh-ca");
+          const hold = p.kind === "cloudflare" ? { hold: "grant", until: until(ttl || 3600) } : Number(canonical.standing_hours) > 0 ? { hold: "standing", until: until(Number(canonical.standing_hours) * 3600) } : { hold: "instant", until: "" };
+          if (b) return json(await store.buckets.bucketOffer(req, text, canonical, session, { buckets: [{ id: b.id, ...hold }] }));
+        }
         const { id: cid, rec } = issue("action", { canonical, canonicalText: text, sessionBound: session }, createHash("sha256").update(text, "utf8").digest());
         return json({ challenge_id: cid, canonical: text, public_key: requestOptions(req, rec.challenge, true) });
       }
       if (verb !== applyVerb) throw new HttpError(404, "not_found", "no such endpoint");
+      if (sealed) {
+        const f = await store.buckets.finish(body, session);
+        if (f.canonical.object !== object || f.canonical.id !== id) throw new HttpError(403, "forbidden", "challenge is for a different object");
+        return json(applyAction(f.canonical));
+      }
+      if (body.open !== undefined) throw new HttpError(400, "bad_request", "this action opens nothing");
       const rec = take(body.challenge_id, "action");
       if (rec.sessionBound !== session) throw new HttpError(403, "forbidden", "challenge belongs to another session");
       if (rec.canonical?.object !== object || rec.canonical?.id !== id) throw new HttpError(403, "forbidden", "challenge is for a different object");
@@ -1090,9 +1149,11 @@ export function startMock(opts: MockOptions = {}) {
           res = new Response(null, { status: 302, headers: { Location: "/", "Set-Cookie": `aqmas_session=${sid}; Path=/; HttpOnly; SameSite=Strict` } });
         } else if (url.pathname === "/mock/vault") {
           // MOCK ONLY: show the sealed, organisation-scoped Credential sets view.
-          store.vault.enabled = true;
-          store.vault.locked = url.searchParams.get("locked") === "1";
-          res = json({ vault: true, locked: store.vault.locked });
+          store.vault.enabled = store.buckets.enabled = true;
+          const mode = url.searchParams.get("mode");
+          store.buckets.mode = mode === "migration-required" ? "migration-required" : "buckets";
+          if (url.searchParams.get("closed") === "1") store.buckets.closeAll();
+          res = json({ vault: true, mode: store.buckets.mode });
         } else if (url.pathname === "/mock/setup") {
           res = json(store.setup.jump(url.searchParams));
         } else if (url.pathname.startsWith("/api/") && store.setup.downUntil > Date.now()) {

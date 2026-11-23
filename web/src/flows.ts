@@ -8,6 +8,7 @@
 import { ApiError, type Api, type ObjectKind } from "./api";
 import { challengeCommitsTo, describe, mismatches, parseCanonical, type Canonical, type Description, type Expectation } from "./canonical";
 import type { BeginResponse, GrantSummary, PasskeyInfo, PendingItem, StandingApproval } from "./types";
+import { prepareTap, type PreparedOpen, type Tap } from "./buckets";
 import {
   decodeCreationOptions,
   decodeRequestOptions,
@@ -208,6 +209,10 @@ export interface PreparedAction {
   canonical: Canonical;
   description: Description;
   options: PublicKeyCredentialRequestOptions;
+  /** Seal format 2: the buckets this tap opens and for how long (shown on the card). */
+  open?: PreparedOpen;
+  /** Signs, and seals the PRF-derived keys when the action opens buckets. */
+  tap?: Tap;
   /** When the server stops accepting this challenge (2 min per API.md, or the WebAuthn timeout). */
   validUntil: number;
 }
@@ -262,15 +267,28 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
   const pk = unwrapPublicKey(r.public_key);
   const challenge = pk["challenge"];
   if (typeof challenge !== "string") throw new FlowError("Not signing: the server sent no WebAuthn challenge.");
-  let commits = false;
-  try {
-    commits = await challengeCommitsTo(r.canonical, challenge);
-  } catch (e) {
-    throw new FlowError(`Not signing: ${(e as Error).message}.`);
+  let tap: Tap | undefined;
+  if (r.open !== undefined && r.open !== null) {
+    // Format 2: the challenge binds the action AND the buckets the tap opens (docs/BUCKETS.md §4.2).
+    if (choice.action !== "approve" || (target.object !== "request" && target.object !== "enrollment")) throw new FlowError("Not signing: only an approval can open a bucket.");
+    const rp = typeof location !== "undefined" && location.hostname ? location.hostname : String(pk["rpId"] ?? "");
+    try {
+      tap = await prepareTap(r, rp);
+    } catch (e) {
+      throw new FlowError(`Not signing: ${(e as Error).message}.`);
+    }
+  } else {
+    let commits = false;
+    try {
+      commits = await challengeCommitsTo(r.canonical, challenge);
+    } catch (e) {
+      throw new FlowError(`Not signing: ${(e as Error).message}.`);
+    }
+    if (!commits) throw new FlowError("Not signing: the passkey challenge does not match the action shown.");
+    if (pk["extensions"] !== undefined && pk["extensions"] !== null) throw new FlowError("Not signing: the request carries unexpected extensions.");
   }
-  if (!commits) throw new FlowError("Not signing: the passkey challenge does not match the action shown.");
 
-  const options = decodeRequestOptions(r.public_key);
+  const options = tap?.options ?? decodeRequestOptions(r.public_key);
   const timeout = typeof options.timeout === "number" && options.timeout > 0 ? Math.min(options.timeout, CHALLENGE_LIFETIME_MS) : CHALLENGE_LIFETIME_MS;
   options.timeout = timeout;
   return {
@@ -281,6 +299,7 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
     canonical,
     description: describe(canonical),
     options,
+    ...(tap ? { tap, open: tap.open } : {}),
     validUntil: now + timeout,
   };
 }
@@ -288,6 +307,12 @@ export async function prepareAction(api: Api, target: ActionTarget, choice: Acti
 /** Passkey prompt + apply. Call straight from the owner's tap on "Confirm with passkey". */
 export async function completeAction(api: Api, auth: Authenticator, p: PreparedAction): Promise<unknown> {
   if (p.target.object === "passkey" && p.choice.action === "add") throw new FlowError("Use authorizeAddPasskey to add a passkey.");
+  if (p.tap) {
+    // tap.sign starts the passkey prompt before its first await (Safari's user gesture). The
+    // KEK packet is sent only when this passkey returned PRF results.
+    const signed = await p.tap.sign(auth);
+    return api.apply(p.target.object, p.target.id, p.challengeId, signed.assertion, undefined, signed.open);
+  }
   const cred = await auth.get(p.options);
   // Passkey rename/remove: the endpoint is named after the SIGNED action (canonical), so a
   // page bug can't send a rename assertion to the remove endpoint (the server refuses it anyway).
@@ -295,7 +320,7 @@ export async function completeAction(api: Api, auth: Authenticator, p: PreparedA
   return api.apply(p.target.object, p.target.id, p.challengeId, encodeAssertion(cred), action);
 }
 
-/** Adding a passkey: sign the "passkey:add" action, which unlocks register/begin. */
+/** Adding a passkey: sign the "passkey:add" action, which opens register/begin. */
 export async function authorizeAddPasskey(api: Api, auth: Authenticator, p: PreparedAction): Promise<PreparedRegistration> {
   if (p.target.object !== "passkey" || p.canonical.action !== "add") throw new FlowError("not a passkey add action");
   const cred = await auth.get(p.options);

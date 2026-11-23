@@ -13,7 +13,7 @@ import { h, replace, type Child } from "./dom";
 import { explainError, nothingChanged, type ActionTarget } from "./flows";
 import { ago, countdown, visibleText as vt } from "./format";
 import { planRows } from "./migration";
-import { beginChoice, beginControl, type SealView } from "./sealPanel";
+import { beginControl, type SealView, type StageChoice } from "./sealPanel";
 import {
   ageRecipientProblem,
   completeSetupTask,
@@ -21,7 +21,11 @@ import {
   hostKeyFingerprint,
   prepareSetupTask,
   sendDrill,
+  stagePlan,
+  stageStep,
+  staging,
   type HostKeys,
+  type StageStep,
   type PreparedSetup,
   type SetupRun,
   type SetupTask,
@@ -260,7 +264,7 @@ export class SetupPage {
     const upgrade = tasks.find((t) => t.id === "upgrade");
     const [migration, seal, updates, preview] = await Promise.all([
       v.mode === "cutover" ? quiet(this.api.migration?.()) : undefined,
-      v.mode === "seal-setup" ? quiet(this.api.sealStatus?.()) : undefined,
+      staging(v.mode) ? quiet(this.api.sealStatus?.()) : undefined,
       upgrade && upgrade.state !== "blocked" ? quiet(this.api.updates()) : undefined,
       wantPreview && !this.preview
         ? this.api.setupGet!<{ id: string; plan: string }>("/cutover/preview").catch((e) => (e instanceof ApiError && e.status >= 400 && e.status < 500 ? { error: explain(e) } : undefined))
@@ -270,7 +274,7 @@ export class SetupPage {
     // A helper call that failed (the broker went away mid-poll) keeps what was shown before.
     if (v.mode !== "cutover") this.migration = null;
     else if (migration) this.migration = migration;
-    if (v.mode !== "seal-setup") this.seal = null;
+    if (!staging(v.mode)) this.seal = null;
     else if (seal) this.seal = seal;
     if (updates) this.updates = updates;
     if (preview) this.preview = preview;
@@ -513,7 +517,8 @@ export class SetupPage {
       case "cutover":
         return [can, t.state, v.mode, v.mode === "cutover" ? this.migration : null, can ? this.preview : null, v.current?.state];
       case "seal":
-        return [can, t.state, v.mode, v.mode === "seal-setup" ? this.seal : null, v.current?.state];
+      case "buckets":
+        return [can, t.state, v.mode, this.stagedHere(t, v) ? this.seal : null, v.current?.state];
       case "enable-updates":
         return [can, t.state, v.deploy_key, v.update_sources];
       case "sync-passkeys":
@@ -534,7 +539,9 @@ export class SetupPage {
       case "cutover":
         return v.mode === "cutover" ? this.cutoverReview(t, v) : can ? this.cutoverForm(t, label) : [];
       case "seal":
-        return v.mode === "seal-setup" ? this.sealChecklist(v) : can ? this.sealForm(t, label) : [];
+        return this.stagedHere(t, v) ? this.stageChecklist(v) : can ? this.sealForm(t, label) : [];
+      case "buckets":
+        return this.stagedHere(t, v) ? this.stageChecklist(v) : can ? this.bucketsForm(t, label) : [];
       case "enable-updates":
         return again(this.updatesForm(t, v, can, label));
       case "sync-passkeys":
@@ -757,8 +764,8 @@ export class SetupPage {
       const tok = token.value.trim();
       let secrets: Record<string, string> | undefined;
       if (url || tok) {
-        if (!TOPIC_RE.test(url)) throw new Invalid("The lock alert needs the ntfy topic address, like https://ntfy.example.com/topic (lower-case host, no user name or query).");
-        if (!TOKEN_RE.test(tok)) throw new Invalid("The lock alert needs the publish-only token for that topic.");
+        if (!TOPIC_RE.test(url)) throw new Invalid("The restart alert needs the ntfy topic address, like https://ntfy.example.com/topic (lower-case host, no user name or query).");
+        if (!TOKEN_RE.test(tok)) throw new Invalid("The restart alert needs the publish-only token for that topic.");
         secrets = { ntfy_topic_url: url, ntfy_token: tok };
       }
       const params = { recipient, purge_backups: purge.checked, lock_alert: !!secrets };
@@ -774,7 +781,7 @@ export class SetupPage {
             h("dd", null, h("span", { class: "mono" }, recipient)),
             h("dt", null, "Older backups"),
             h("dd", null, params.purge_backups ? "deleted after activation (they hold the plaintext keys)" : "kept (they still hold the plaintext keys)"),
-            h("dt", null, "Lock alert"),
+            h("dt", null, "Restart alert"),
             h("dd", null, secrets ? "set up; its address and token travel encrypted to the runner" : "not set up"),
           ),
           h("p", null, "Nothing is sealed for good until you activate in the next steps."),
@@ -790,15 +797,15 @@ export class SetupPage {
 
     return [
       h("h4", null, "1. Recovery key"),
-      h("p", { class: "muted" }, "If every unlock passkey is ever lost, this key is the only way to get the sealed store back."),
+      h("p", { class: "muted" }, "If every passkey that can open the store is ever lost, this key is the only way to get the sealed store back."),
       keyBox,
       h("h4", null, "2. Old backups"),
       check(purge, "Delete older on-box backups that still contain the plaintext keys (recommended)"),
       h(
         "details",
         { class: "setup-more" },
-        h("summary", null, "3. Lock alert (optional, can be skipped)"),
-        h("p", { class: "muted" }, "Sends you a notification whenever the broker is waiting locked, for example after a reboot. Use a dedicated ntfy topic."),
+        h("summary", null, "3. Restart alert (optional, can be skipped)"),
+        h("p", { class: "muted" }, "Sends you a notification whenever the broker restarts (for example after a reboot) and grants wait for you to reopen them. Use a dedicated ntfy topic."),
         field("ntfy topic address", topic),
         field("Publish-only token", token, "Sealed in this browser for the runner; the broker never sees it."),
       ),
@@ -806,23 +813,53 @@ export class SetupPage {
     ];
   }
 
-  /** seal-setup mode: wrap, test, prove the recovery key, activate. */
-  private sealChecklist(v: SetupView): Child[] {
+  /** Whether this card shows the staged store: the staging belongs to the task that runs. */
+  private stagedHere(t: SetupTask, v: SetupView): boolean {
+    if (!staging(v.mode)) return false;
+    const owner = v.current?.task ?? (v.mode === "bucket-migrate" ? "buckets" : "seal");
+    return owner === t.id;
+  }
+
+  /** "Move to per-credential buckets": one-way, so the card says so before Run. */
+  private bucketsForm(t: SetupTask, label: string): Child[] {
+    const purge = input("checkbox");
+    purge.checked = true;
+    const oneWay = [
+      h("p", { class: "warn" }, h("strong", null, "One-way. "), "There is no rollback: after you activate, this version of aqmas cannot go back to the single store key, and the backup taken before the move is the only way back (with the previous version)."),
+      h("p", { class: "muted" }, "Your other passkeys that could open the old store become approve-only until you enable them for buckets in Admin → Passkeys."),
+    ];
+    return [
+      ...oneWay,
+      check(purge, "Delete the pre-migration and older on-box backups after activation (recommended)"),
+      h("p", { class: "hint muted" }, "They still hold the old single-key store, which anyone with a copy and one tap from your old passkey salts could open."),
+      this.runPanel(t, label, () => ({
+        params: { purge_backups: purge.checked },
+        summary: [
+          h("p", { class: "headline pos" }, "Move to per-credential buckets: back up, stop the broker and stage every credential in its own bucket for your taps."),
+          ...oneWay,
+          h("dl", { class: "facts" }, h("dt", null, "Older backups"), h("dd", null, purge.checked ? "deleted after activation (they hold the old store)" : "kept (they still hold the old store)")),
+          h("p", null, "Nothing changes for good until you activate in the next steps; cancelling before then restores everything."),
+        ],
+      })),
+    ];
+  }
+
+  /** Mode setup (seal import or bucket migration): open the old store (migration), create
+   * and test this passkey's scope keys, prove the recovery key, activate. */
+  private stageChecklist(v: SetupView): Child[] {
     const s = this.seal;
     const cancel = v.current?.state === "waiting" ? this.cancelControl() : null;
-    if (!s) return [h("p", { class: "muted", role: "status" }, "Loading the import…"), cancel];
-    if (s.mode === "activated") return [h("p", { class: "spinner", role: "status" }, "Activated. The broker restarts locked in a moment; unlock it with your passkey when it is back.")];
-    if (s.mode !== "setup") return [];
-    const choices = s.choices ?? [];
-    const creating = choices.filter((c) => c.selection.registration_id?.endsWith("-create"));
-    const testing = choices.filter((c) => c.selection.registration_id?.endsWith("-test"));
-    const tested = !!s.manifest;
-    const created = tested || testing.length > 0;
-    const elsewhere = !tested && choices.length === 0;
-    const drilled = !!s.drilled;
+    if (!s) return [h("p", { class: "muted", role: "status" }, "Loading the staged store…"), cancel];
+    if (s.mode === "activated") return [h("p", { class: "spinner", role: "status" }, "Activated. The broker restarts in a moment with nothing open: each credential opens with the approval that needs it.")];
+    if (s.mode !== "setup" || !s.stage) return [];
+    const st = s.stage;
+    const plan = stagePlan(st);
+    const drilled = !!st.drilled;
+    const ready = !!st.manifest;
     const review = h("div", { class: "setup-run", role: "status" });
+    const titleOf = (scope: string) => st.scopes.find((x) => x.scope === scope)?.title || scope;
 
-    const ceremony = (label: string, title: string, begin: () => Promise<{ detail: string; finish: (auth: Authenticator) => Promise<void> }>, open = false) => {
+    const ceremony = (label: string, title: string, begin: () => Promise<{ detail: string; lines?: string[]; finish: (auth: Authenticator) => Promise<void> }>, open = false) => {
       const b = h("button", { type: "button", class: "btn approve" }, label);
       b.addEventListener("click", async () => {
         b.disabled = true;
@@ -832,12 +869,20 @@ export class SetupPage {
           sign.addEventListener("click", () => {
             sign.disabled = true;
             // finish() starts the passkey prompt synchronously, inside this tap.
-            c.finish(this.auth).then(
-              () => replace(review, h("p", { class: "spinner" }, "Done. Checking…")),
-              (e) => replace(review, h("p", { class: "error" }, vt(explain(e)))),
-            ).finally(() => void this.refresh());
+            c.finish(this.auth)
+              .then(
+                () => replace(review, h("p", { class: "spinner" }, "Done. Checking…")),
+                (e) => replace(review, h("p", { class: "error" }, vt(explain(e)))),
+              )
+              .finally(() => void this.refresh());
           });
-          replace(review, h("h4", null, title), h("details", { class: "signed", open }, h("summary", null, "Exactly what your passkey signs"), h("pre", { class: "cmd" }, vt(c.detail))), h("div", { class: "actions" }, sign));
+          replace(
+            review,
+            h("h4", null, title),
+            c.lines?.length ? h("ul", { class: "open-lines" }, c.lines.map((l) => h("li", null, vt(l)))) : null,
+            h("details", { class: "signed", open }, h("summary", null, "Exactly what your passkey signs"), h("pre", { class: "cmd" }, vt(c.detail))),
+            h("div", { class: "actions" }, sign),
+          );
           sign.focus();
         } catch (e) {
           replace(review, h("p", { class: "error" }, vt(explain(e))));
@@ -847,13 +892,27 @@ export class SetupPage {
       });
       return b;
     };
-    const wrap = (key: SealView["choices"][number], verb: string, title: string) =>
-      ceremony(`${verb} with ${vt(key.name)}…`, title, async () => {
-        const { p } = await beginChoice(this.api, key);
-        return { detail: p.canonical, finish: async (auth) => void (await this.api.sealPost!("unlock/finish", await p.finish(auth))) };
+    const tapFor = (step: StageStep, scopes: string[], verb: string, title: string) => (choice: StageChoice) =>
+      ceremony(`${verb} with ${vt(choice.name)}…`, title, async () => {
+        const p = await stageStep(this.api, s, step, choice, scopes, location.hostname);
+        return { detail: p.canonical, lines: p.lines, finish: (auth) => p.finish(auth) };
       });
     const step = (done: boolean, now: boolean, title: string, ...body: Child[]) =>
       h("li", { class: `setup-step${done ? " done" : now ? " now" : ""}`, "data-done": String(done) }, h("p", null, h("strong", null, title), " ", h("span", { class: `badge setup-state state-${done ? "done" : now ? "waiting" : "blocked"}` }, done ? "Done" : now ? "Your turn" : "Later")), done ? null : body);
+    const guide = (step: StageStep) => {
+      const n = plan.next;
+      if (!n || n.step !== step) return null;
+      return h("p", { class: "setup-tap" }, `Tap ${plan.tap} of ${plan.taps}: `, n.scopes.map(titleOf).join(" and "));
+    };
+    const choices = (step: StageStep) => {
+      const n = plan.next;
+      if (!n || n.step !== step) return null;
+      const list = step === "open-legacy" ? st.choices.filter((c) => !!c.legacy) : st.choices;
+      if (!list.length) return h("p", { class: "warn" }, "No passkey here can do this step. It may have been started in another browser session: continue there, or cancel and run the task again.");
+      const verb = step === "open-legacy" ? "Open" : step === "create" ? "Create" : "Test";
+      const title = step === "open-legacy" ? "Open the old store and create the first key" : step === "create" ? "Create this passkey's keys" : "Test this passkey's keys";
+      return h("div", { class: "actions" }, list.map(tapFor(step, n.scopes, verb, title)));
+    };
 
     const drillKey = input("password", "AGE-SECRET-KEY-1…");
     const drillOut = h("p", { class: "error", role: "alert" });
@@ -869,7 +928,7 @@ export class SetupPage {
       }
       drillGo.disabled = true;
       try {
-        await sendDrill(this.api, s, identity);
+        await sendDrill(this.api, { drill_key: st.drill_key, installation: s.installation }, identity);
       } catch (e) {
         drillOut.textContent = vt(explain(e));
       } finally {
@@ -878,27 +937,28 @@ export class SetupPage {
       void this.refresh();
     });
 
-    const activate = ceremony("Activate…", "Activate sealed installation", () => beginControl(this.api, s, "activate"), true);
-    activate.disabled = !(tested && drilled);
-
+    const activate = ceremony("Activate…", "Activate the bucket store", () => beginControl(this.api, s, "activate"), true);
+    activate.disabled = !ready;
+    const scopeList = h(
+      "ul",
+      { class: "setup-scopes" },
+      st.scopes.map((x) => h("li", { "data-scope": x.scope }, vt(x.title || x.scope), ` · ${x.buckets} bucket${x.buckets === 1 ? "" : "s"} · `, x.tested ? "tested" : x.wrapped ? "created, not tested" : "not created")),
+    );
+    const items: HTMLElement[] = [];
+    if (plan.migrate)
+      items.push(
+        step(plan.legacyDone, plan.next?.step === "open-legacy", "Open the old store", h("p", { class: "muted" }, "One tap with a passkey that opened the old store: it opens the old key once, moves every credential into its bucket in memory and creates your first scope key."), guide("open-legacy"), choices("open-legacy")),
+      );
+    items.push(
+      step(plan.created, plan.next?.step === "create", "Create your passkey's keys", h("p", { class: "muted" }, "Each tap creates this passkey's key for up to two scopes."), scopeList, guide("create"), choices("create")),
+      step(plan.tested, plan.next?.step === "test", "Test them", h("p", { class: "muted" }, "Each tap proves the same passkey opens up to two scope keys again."), guide("test"), choices("test")),
+      step(drilled, !drilled, "Prove the recovery key", field("Paste the recovery key you saved", drillKey, "It is encrypted in this browser for the broker, used once to open every staged scope key, and not kept."), h("div", { class: "actions" }, drillGo), drillOut),
+      step(false, ready, "Activate", h("p", { class: "muted" }, ready ? "Review the manifest and sign. After this the broker restarts with nothing open; each approval opens only the bucket it needs." : "Available once every scope key is created and tested and the recovery key is proven."), h("div", { class: "actions" }, activate)),
+    );
     return [
-      h("p", null, "Fleet access is paused while you finish these four steps. Nothing is sealed for good until the last one."),
-      elsewhere ? h("p", { class: "warn" }, "The unlock wrap was started in another browser session. Continue there, or cancel and run the task again from here.") : null,
-      h(
-        "ol",
-        { class: "setup-checklist" },
-        step(created, creating.length > 0, "Create the unlock wrap", h("p", { class: "muted" }, "One tap: your passkey makes the key that unlocks the store."), h("div", { class: "actions" }, creating.map((k) => wrap(k, "Create", "Create unlock wrap")))),
-        step(tested, testing.length > 0, "Test the wrap", h("p", { class: "muted" }, "One more tap proves the same passkey can open it again."), h("div", { class: "actions" }, testing.map((k) => wrap(k, "Test", "Test wrap independently")))),
-        step(
-          drilled,
-          !drilled,
-          "Prove the recovery key",
-          field("Paste the recovery key you saved", drillKey, "It is encrypted in this browser for the import, used once to open the staged copy, and not kept."),
-          h("div", { class: "actions" }, drillGo),
-          drillOut,
-        ),
-        step(false, tested && drilled, "Activate", h("p", { class: "muted" }, tested && drilled ? "Review the manifest and sign. After this the plaintext key files are deleted and the broker restarts locked." : "Available once the wrap is tested and the recovery key is proven."), h("div", { class: "actions" }, activate)),
-      ),
+      h("p", null, "Fleet access is paused while you finish these steps. Nothing changes for good until you activate."),
+      plan.migrate ? h("p", { class: "warn" }, "One-way: after you activate there is no rollback; the pre-migration backup is the only way back. Your other old passkeys become approve-only until enabled.") : null,
+      h("ol", { class: "setup-checklist" }, items),
       review,
       cancel,
     ];

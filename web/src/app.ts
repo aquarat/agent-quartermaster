@@ -55,8 +55,10 @@ import { SetupPage, setupSummary } from './setupPage';
 import type { SetupView } from './setup';
 import { helpPage, type HelpConfig } from './help';
 import {cataloguePage,type Catalogue} from './catalogue';
-import {sealPanel,type SealView} from './sealPanel';
-import {capabilityForm} from './capabilities';
+import { bucketIndicator, bucketsPanel, sealBanner, serving, type SealView } from './sealPanel';
+import { capabilityForm, createScope } from './capabilities';
+import { recoveryPanel } from './recoveryPanel';
+import { opensList } from './approvals';
 import {TabWindow,multiPanel,windowAdmin} from './approvals';
 import {envPanel,type EnvState} from './envsets';
 import { VaultPage, signCards, type VaultHost } from './vaultPage';
@@ -161,8 +163,8 @@ export class App {
     try {
       const s = await this.api.state();
       this.seal=s.seal_enabled?await this.api.sealStatus!():undefined;
-      this.envState=this.seal&&['unlocked','locked'].includes(this.seal.mode)?await this.api.envState!():undefined;
-      this.vaultState=this.seal&&s.catalogue_enabled&&this.api.vaultState&&['unlocked','locked'].includes(this.seal.mode)?await this.api.vaultState().catch((e)=>{if(e instanceof ApiError&&e.status===404)return undefined;throw e;}):undefined;
+      this.envState=serving(this.seal)?await this.api.envState!():undefined;
+      this.vaultState=serving(this.seal)&&s.catalogue_enabled&&this.api.vaultState?await this.api.vaultState().catch((e)=>{if(e instanceof ApiError&&e.status===404)return undefined;throw e;}):undefined;
       if(this.tab.id()&&!this.seal?.active_windows?.some(w=>w.id===this.tab.id()))this.tab.forget();
       this.migration=s.migration;
       if(requested==='admin') [this.hosts,this.setupView]=await Promise.all([this.api.hosts(),this.api.setupGet?this.api.setupGet<SetupView>('').catch(()=>null):null]);
@@ -415,8 +417,8 @@ export class App {
     );
     replace(
       this.root,
-      h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Request queue')), h("p", { class: "status", id: "status" }),h('nav',{'aria-label':'Pages'},nav('Help','#/help','Help'),nav('⚙','#/admin','Admin'))),
-      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='setup' ? h('main',{class:'subpage'},h('p',{class:'crumb'},nav('‹ Admin','#/admin','Back to Admin')),h('h2',null,'Setup'),h('p',{class:'muted'},'Each step is one passkey approval. A small root program on this machine checks your signature itself and does the work.'),h('div',{id:'setup-root',class:'setup'})) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('setup','Setup and upgrades'),section('orgs','Organisations'),section('vault','Credential sets'),section('passkeys','Passkeys'),section('hosts','Enrolled hosts')) : h(
+      h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Request queue')), h("p", { class: "status", id: "status" }), h("span", { id: "buckets-indicator", class: "buckets-indicator", "aria-live": "polite" }),h('nav',{'aria-label':'Pages'},nav('Help','#/help','Help'),nav('⚙','#/admin','Admin'))),
+      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='setup' ? h('main',{class:'subpage'},h('p',{class:'crumb'},nav('‹ Admin','#/admin','Back to Admin')),h('h2',null,'Setup'),h('p',{class:'muted'},'Each step is one passkey approval. A small root program on this machine checks your signature itself and does the work.'),h('div',{id:'setup-root',class:'setup'})) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('setup','Setup and upgrades'),section('buckets','Buckets'),section('orgs','Organisations'),section('vault','Credential sets'),section('passkeys','Passkeys'),section('recovery','Recovery key'),section('hosts','Enrolled hosts')) : h(
         "main",
         { class: "sections" },
         h("div", { class: "col col-queue" }, section("signing", "Signatures to approve"), section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
@@ -455,11 +457,17 @@ export class App {
     if (!s || this.view !== "main") return;
     if(this.seal&&this.envState&&this.page!=='help'){if(!this.root.querySelector('#sec-env'))this.root.insertBefore(section('env','Env credential sets'),this.root.querySelector('main'));this.section('env',[this.envState,this.page,this.catalogue,this.seal.mode],()=>[envPanel(this.api,this.auth,this.seal!,this.envState!,this.page==='admin'?this.catalogue:null,()=>this.changed())]);}
     if(!this.sealOnTop()){this.root.querySelector('#sec-seal')?.remove();this.rendered.delete('seal');}
-    else{if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));this.section('seal',[this.seal,this.page,this.page==='admin'?s.passkeys:null,this.page==='queue'?s.pending:null],()=>[sealPanel(this.api,this.auth,this.seal!,()=>this.changed(),this.tab),this.seal!.mode==='unlocked'&&(this.page==='admin'?windowAdmin(this.api,this.auth,this.seal!,this.tab,s.passkeys??[],()=>this.changed()):this.page==='queue'&&multiPanel(this.api,this.auth,this.seal!,this.tab,s.pending??[],()=>this.changed()))]);}
+    else{if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));const seal=this.seal!;const batch=serving(seal)&&this.page==='queue'&&(s.pending??[]).length>0;this.section('seal',[seal.mode,this.page,batch?s.pending:null,batch?seal.epoch:null,this.tab.id()],()=>[sealBanner(seal),batch&&multiPanel(this.api,this.auth,seal,this.tab,s.pending??[],()=>this.changed())],!sealBanner(seal)&&!batch);}
+    this.renderIndicator();
     if(this.page!=='queue'){
       document.title=`${this.page==='admin'?'Admin':this.page==='setup'?'Setup':'Help'} · aqmas`;
-      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);}
+      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys,this.seal?.passkeys,this.seal?.scopes,this.seal?.mode],()=>this.passkeys(s));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);}
       else if(this.page==='help'&&this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
+      if(this.page==='admin'){
+        const seal=this.seal, live=serving(seal);
+        this.section('buckets',[seal,s.passkeys,this.tab.id()],()=>live?[bucketsPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed(),this.tab,{createScope:(scope,review)=>createScope(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed())}),windowAdmin(this.api,this.auth,seal!,this.tab,s.passkeys??[],()=>this.changed())]:[h('p',{class:'empty'},seal?.mode==='migration-required'?'Available after the move to per-credential buckets (Setup).':'Available once the store is sealed (Setup).')],!seal);
+        this.section('recovery',[seal?.mode,seal?.installation,seal?.epoch,seal?.scopes,s.passkeys],()=>live?[recoveryPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed())]:[],!live);
+      }
       if(this.page==='admin')this.section('orgs',this.catalogue,()=>this.catalogue?[cataloguePage(this.catalogue,(t,c)=>this.sheet.openCatalogue(t,c))]:['Available after personal activation.']);
       if(this.page==='admin'){
         const v=this.vaultState;
@@ -487,7 +495,7 @@ export class App {
     {
       const v = this.vaultState, reqs = v?.requests ?? [];
       const busy = !!this.root.querySelector("#sec-signing .vault-confirm");
-      this.section("signing", [reqs, v?.unlocked, this.seal?.epoch], () => (v && this.seal ? signCards(this.vaultHost(), this.seal, v) : []), reqs.length === 0, touching || busy, reqs.filter((r) => r.status === "pending").length);
+      this.section("signing", [reqs, this.seal?.epoch], () => (v && this.seal ? signCards(this.vaultHost(), this.seal, v) : []), reqs.length === 0, touching || busy, reqs.filter((r) => r.status === "pending").length);
     }
     this.section("enroll", enrolls, () => enrolls.map((p) => this.enrollCard(p)), enrolls.length === 0, touching);
     this.section(
@@ -656,8 +664,30 @@ export class App {
     return [
       h("div", { class: "tiles" }, list.map((p) => this.passkeyTile(p, only))),
       only ? h("p", { class: "muted" }, "Add a second passkey (another password manager or a hardware key) so you can still get in if you lose this one.") : null,
-      h("div", { class: "pk-foot" }, this.seal ? this.seal.mode==='unlocked'?capabilityForm(this.api,this.auth,this.seal,list,()=>this.changed()):'Unlock to manage capabilities.' : add, signedIn),
+      h("div", { class: "pk-foot" }, this.seal ? serving(this.seal) ? capabilityForm(this.api, this.auth, this.seal, list, () => this.changed()) : "Passkeys are managed here again after the move to per-credential buckets (Setup)." : add, signedIn),
     ];
+  }
+
+  /** "Opens N of M buckets" / "Approve only" from the seal status (format 2). */
+  private bucketBadge(p: PasskeyInfo): HTMLElement | null {
+    const k = serving(this.seal) ? this.seal!.passkeys?.find((x) => x.id === p.id) : undefined;
+    if (!k) return null;
+    if (!k.prf || k.opens === 0) return h("span", { class: "badge", title: k.prf ? "Not enabled for any scope yet" : "This passkey has no PRF: it signs and approves, but cannot open a closed bucket" }, "Approve only");
+    return h("span", { class: "badge", title: k.missing.length ? "Not enabled for " + k.missing.map((m) => this.seal!.scopes?.find((x) => x.scope === m)?.title ?? m).join(", ") : "Enabled for every scope" }, `Opens ${k.opens} of ${k.of} buckets`);
+  }
+
+  /** The header's "N buckets open" / "nothing open". */
+  private renderIndicator(): void {
+    const el = this.root.querySelector<HTMLElement>("#buckets-indicator");
+    if (!el) return;
+    if (serving(this.seal)) replace(el, bucketIndicator(this.seal!));
+    else replace(el);
+  }
+
+  /** Raw credential IDs → nicknames (to say which passkey can open a bucket). */
+  passkeyNames(raw: string[]): string[] {
+    const list = this.state?.passkeys ?? [];
+    return raw.map((r) => list.find((p) => p.raw_id === r)?.nickname).filter((n): n is string => !!n);
   }
 
   private passkeyTile(p: PasskeyInfo, only: boolean): HTMLElement {
@@ -690,7 +720,7 @@ export class App {
           synced ? "Synced" : "Device-bound",
         ),
         p.current ? h("span", { class: "badge this", title: "You signed in with this passkey" }, "This device") : null,
-        p.raw_id ? h('span',{class:'badge'},p.unlock_tested_at?'Can unlock · tested '+absoluteTime(p.unlock_tested_at):'Approve only'):null,
+        this.bucketBadge(p),
       ),
       h(
         "dl",
@@ -1267,6 +1297,13 @@ class Sheet {
     }
   }
 
+  /** Which passkeys can open what this tap needs (§4.4: a passkey without PRF cannot). */
+  private whoCanOpen(raw: string[]): HTMLElement {
+    const names = this.app.passkeyNames(raw);
+    if (!raw.length) return h("p", { class: "warn" }, "No passkey can open these buckets: this works only while they are already open.");
+    return h("p", { class: "muted" }, names.length ? `A passkey that can open them: ${names.map((n) => vt(n)).join(", ")}. Another passkey only approves if they are already open.` : "Only some of your passkeys can open them.");
+  }
+
   private cancelButton(): HTMLButtonElement {
     return h("button", { class: "btn", type: "button", on: { click: () => this.close() } }, "Cancel");
   }
@@ -1487,6 +1524,8 @@ class Sheet {
       d.warnings.map((w, i) => h("p", { class: loud && i === 0 ? "breakglass" : "warn" }, vt(w))),
       p.canonical.plan ? h('dl',{class:'facts'},d.fields.map(([k,v])=>fact(vt(k),h('bdi',null,vt(v))))) : null,
       removingCurrent ? h("p", { class: "warn" }, "This is the passkey you signed in with: you will be signed out here.") : null,
+      p.open ? opensList(p.open.lines) : null,
+      p.open ? this.whoCanOpen(p.open.canOpen) : null,
       h(
         "details",
         { class: "signed" },

@@ -92,7 +92,7 @@ function freeze(root: HTMLElement, except: HTMLElement): () => void {
 
 /** `before` must describe the captured choice only (never read live inputs): it runs after an
  * asynchronous round trip. `frozen` is the form the choice came from. */
-function ceremony<T>(slot: HTMLElement, auth: Authenticator, confirmLabel: string, cls: string, prepare: () => Promise<{ detail: string; tap(a: Authenticator): Promise<T> }>, before: (detail: string) => Child[], done: (out: T) => void, cancelled?: () => void, frozen?: HTMLElement): void {
+function ceremony<T>(slot: HTMLElement, auth: Authenticator, confirmLabel: string, cls: string, prepare: () => Promise<{ detail: string; opens?: string[]; tap(a: Authenticator): Promise<T> }>, before: (detail: string) => Child[], done: (out: T) => void, cancelled?: () => void, frozen?: HTMLElement): void {
   const error = h("p", { class: "error", role: "alert" });
   const thaw = frozen ? freeze(frozen, slot) : () => {};
   const stop = cancelled;
@@ -122,6 +122,7 @@ function ceremony<T>(slot: HTMLElement, auth: Authenticator, confirmLabel: strin
           "div",
           { class: "vault-confirm" },
           ...before(p.detail),
+          p.opens?.length ? h("ul", { class: "open-lines" }, p.opens.map((l) => h("li", null, vt(l)))) : null,
           h("p", { class: "hint muted" }, "Checked: the text your passkey signs describes exactly this."),
           h("div", { class: "actions" }, btn("Cancel", "", () => (replace(slot), cancelled?.())), go),
           error,
@@ -283,8 +284,7 @@ function signCard(host: VaultHost, seal: SealView, state: VaultState, req: SignR
       card,
     );
   };
-  actions.append(btn("Deny…", "deny", () => decide("sign-deny")), btn(state.unlocked ? "Approve…" : "Unlock to approve", "approve", () => decide("sign-approve")));
-  (actions.lastChild as HTMLButtonElement).disabled = !state.unlocked;
+  actions.append(btn("Deny…", "deny", () => decide("sign-deny")), btn("Approve…", "approve", () => decide("sign-approve")));
   card.append(blunt, actions, slot);
   return card;
 }
@@ -339,17 +339,17 @@ export class VaultPage {
     const set = sets.find((s) => s.set_id === this.sel.set) ?? sets[0];
     this.sel = { org: org?.id ?? "", service: service?.id ?? "", set: set?.set_id ?? "" };
 
-    const rk = JSON.stringify([state.requests, state.unlocked, seal.epoch]);
+    const rk = JSON.stringify([state.requests, seal.epoch]);
     if (rk !== this.keys.requests && !this.requestsBox.querySelector(".vault-confirm")) {
       this.keys.requests = rk;
       replace(this.requestsBox, state.requests.length ? [h("h3", null, "Signing requests and grants"), signCards(this.host, seal, state)] : null);
     }
-    const pk = JSON.stringify([tree, this.sel, sets.map((s) => [s.set_id, s.kind]), state.organisations, state.unlocked, !!catalogue]);
+    const pk = JSON.stringify([tree, this.sel, sets.map((s) => [s.set_id, s.kind]), state.organisations, !!catalogue]);
     if (pk !== this.keys.pick) {
       this.keys.pick = pk;
       this.drawPick(tree, sets);
     }
-    const bk = JSON.stringify([set, service, state.unlocked, state.organisations.find((o) => o.id === org?.id), seal.epoch]);
+    const bk = JSON.stringify([set, service, state.organisations.find((o) => o.id === org?.id), seal.epoch]);
     if (bk !== this.keys.body) {
       this.keys.body = bk;
       this.clearSecrets();
@@ -416,7 +416,7 @@ export class VaultPage {
         () => this.host.changed(),
       ),
     );
-    b.disabled = next && !this.state!.unlocked;
+    b.disabled = false;
     return h("p", { class: "vault-policy" }, h("span", null, "Reveal on this page for ", h("bdi", null, vt(org.title)), ": ", h("strong", null, org.allow_reveal ? "allowed" : "off"), ". "), b);
   }
 
@@ -503,7 +503,7 @@ export class VaultPage {
           return h("li", { class: "chg-" + kind }, h("span", { class: "mono" }, vt(name)), " ", h("span", { class: "badge" }, kind === "add" ? "added" : kind === "replace" ? "replaced" : "removed"));
         }),
       );
-      save.disabled = !state.unlocked || changes.length === 0 || error.textContent !== "";
+      save.disabled = changes.length === 0 || error.textContent !== "";
       for (const li of existing.children) {
         const n = li.getAttribute("data-name")!;
         li.classList.toggle("gone", mode === "import" ? !e.entries.some((x) => x.name === n) : removed.has(n));
@@ -545,7 +545,7 @@ export class VaultPage {
     };
 
     // Existing keys: names only. Their values are never fetched to draw this list.
-    const canReveal = set.allow_reveal && state.unlocked;
+    const canReveal = set.allow_reveal;
     const hide = () => {
       for (const pre of revealBox.querySelectorAll("pre")) pre.textContent = "";
       replace(revealBox);
@@ -690,12 +690,11 @@ export class VaultPage {
     append(card, [
       scopeHeading(set.org_title, set.service_title, set.set_title),
       h("p", { class: "muted" }, h("span", { class: "mono" }, vt(pathOf(set))), " · revision ", String(set.revision), " · ", set.names.length === 1 ? "1 key" : `${set.names.length} keys`),
-      !state.unlocked ? h("p", { class: "warn" }, "The broker is locked: unlock it to save or reveal values. Key names stay visible.") : null,
       set.names.length
         ? [
             existing,
             set.allow_reveal
-              ? state.unlocked && set.names.length > 1
+              ? set.names.length > 1
                 ? h("div", { class: "actions start" }, btn("Reveal all…", "small", () => reveal([...set.names].sort())))
                 : null
               : h("p", { class: "hint muted" }, "Reveal is off for this organisation: values can be replaced here, not shown."),
@@ -772,7 +771,7 @@ export class VaultPage {
     const error = h("p", { class: "error", role: "alert" });
     this.forget.push(() => (pasted.value = ""));
     const parent = { org_id: org.id, org_slug: org.slug, org_title: org.title, service_id: service.id, service_slug: service.slug, service_title: service.title };
-    const go = btn(state.unlocked ? "Review…" : "Unlock to create a key", "approve", () => {
+    const go = btn("Review…", "approve", () => {
       if (!SLUG_RE.test(slug.value) || !TITLE_RE.test(title.value)) {
         error.textContent = "Slug: lower-case letters, digits and dashes. Name: letters, digits, spaces, dot, dash, underscore.";
         return;
@@ -808,7 +807,6 @@ export class VaultPage {
         },
       );
     });
-    go.disabled = !state.unlocked;
     return h(
       "details",
       { class: "card vault-new-signer" },

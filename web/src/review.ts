@@ -1,9 +1,11 @@
 import { decode, encode } from "./b64url";
-import { unwrapPublicKey, decodeRequestOptions } from "./webauthn";
+import { prepareTap, type Tap, type TapExpectation } from "./buckets";
 export interface Review {
   canonical: string;
   challenge_id: string;
   public_key: unknown;
+  /** Format 2: the buckets this tap opens (docs/BUCKETS.md §4.2). */
+  open?: { descriptor: string };
 }
 export function binary32(v: unknown) {
   return (
@@ -13,12 +15,7 @@ export function binary32(v: unknown) {
     encode(decode(v)) === v
   );
 }
-export async function checkReview(
-  b: Review,
-  expected: Record<string, unknown>,
-  rp: string,
-  selected?: string,
-) {
+function checkCanonical(b: Review, expected: Record<string, unknown>) {
   const c = JSON.parse(b.canonical);
   if (
     !binary32(c.nonce) ||
@@ -33,24 +30,30 @@ export async function checkReview(
       .replace(/\u2029/g, "\\u2029") !== b.canonical
   )
     throw Error("Canonical differs from the reviewed action");
-  const o = unwrapPublicKey(b.public_key);
-  if (
-    o.rpId !== rp ||
-    o.userVerification !== "required" ||
-    o.extensions !== undefined ||
-    !Array.isArray(o.allowCredentials) ||
-    !o.allowCredentials.length ||
-    o.allowCredentials.some((x) => x.type !== "public-key") ||
-    (selected &&
-      (o.allowCredentials.length !== 1 ||
-        o.allowCredentials[0].id !== selected)) ||
-    encode(
-      await crypto.subtle.digest(
-        "SHA-256",
-        new TextEncoder().encode(b.canonical),
-      ),
-    ) !== o.challenge
-  )
-    throw Error("Invalid review options");
-  return decodeRequestOptions(o);
+}
+/** A v3 review whose tap may open buckets: checks the canonical against what the card shows,
+ * then the options and (if present) the open descriptor bound into the challenge. Pass
+ * `installation`/`epoch` so a descriptor from another broker start is refused. */
+export async function checkTap(
+  b: Review,
+  expected: Record<string, unknown>,
+  rp: string,
+  want: TapExpectation = {},
+): Promise<Tap> {
+  checkCanonical(b, expected);
+  return prepareTap(b, rp, {
+    installation: typeof expected.installation === "string" ? expected.installation : undefined,
+    epoch: typeof expected.epoch === "string" ? expected.epoch : undefined,
+    ...want,
+  });
+}
+/** A v3 review whose tap opens nothing: challenge = SHA-256(canonical), no extensions. */
+export async function checkReview(
+  b: Review,
+  expected: Record<string, unknown>,
+  rp: string,
+  selected?: string,
+) {
+  checkCanonical(b, expected);
+  return (await prepareTap(b, rp, { selected, allowOpen: false })).options;
 }

@@ -36,6 +36,15 @@ export const OBJECT_PATHS = {
 } as const;
 export type ObjectKind = keyof typeof OBJECT_PATHS | "passkey";
 
+export type SealPath =
+  | `control/${"challenge" | "finish"}`
+  | `passkeys/${"challenge" | "authorize" | "create" | "evaluate" | "finish"}`
+  | `recovery/${"key" | "challenge" | "finish"}`
+  | `stage/${"challenge" | "finish"}`
+  | `batch/${"challenge" | "finish"}`
+  | "drill"
+  | `windows/${"policy/challenge" | "policy/finish" | "open/challenge" | "open/finish" | "prepare" | "confirm" | "presence" | "close"}`;
+
 export interface ApiOptions {
   /** Base URL; "" (same origin) in the browser. */
   base?: string;
@@ -48,8 +57,9 @@ export interface Api {
   vaultState?(): Promise<import('./vault').VaultState>;
   vaultPost?<T>(path: 'attempt' | 'challenge' | 'finish', body: unknown): Promise<T>;
   envPost?<T>(path:'ticket'|'challenge'|'finish',body:unknown):Promise<T>;
-  sealStatus?(): Promise<import('./sealPanel').SealView>;
-  sealPost?<T>(path: 'unlock/challenge'|'unlock/finish'|'control/challenge'|'control/finish'|`passkeys/${'challenge'|'authorize'|'create'|'evaluate'|'finish'}`|`batch/${'challenge'|'finish'}`|'drill'|`windows/${'policy/challenge'|'policy/finish'|'open/challenge'|'open/finish'|'prepare'|'confirm'|'presence'|'close'}`, body: unknown): Promise<T>;
+  sealStatus?(): Promise<import("./sealPanel").SealView>;
+  /** POST /api/ui/seal/{path}: control, passkeys, recovery, stage, batch, windows, drill (docs/BUCKETS.md). */
+  sealPost?<T>(path: SealPath, body: unknown): Promise<T>;
   /** Admin → Setup (docs/SETUP.md); `path` is relative to /api/ui/setup. */
   setupGet?<T>(path: string): Promise<T>;
   setupPost?<T>(path: string, body: unknown): Promise<T>;
@@ -63,7 +73,7 @@ export interface Api {
   challenge(object: ObjectKind, id: string, body: ChallengeRequest): Promise<ChallengeResponse>;
   /** Apply a signed action. Passkey rename/remove need `action` (it picks the endpoint; the
    * server also checks it against what was signed). */
-  apply(object: ObjectKind, id: string, challengeId: string, assertion: unknown, action?: string): Promise<unknown>;
+  apply(object: ObjectKind, id: string, challengeId: string, assertion: unknown, action?: string, open?: unknown): Promise<unknown>;
   loginBegin(): Promise<BeginResponse>;
   loginFinish(challengeId: string | undefined, assertion: unknown): Promise<unknown>;
   registerBegin(body: { enroll_code?: string; challenge_id?: string; assertion?: unknown }): Promise<BeginResponse>;
@@ -141,13 +151,14 @@ export function createApi(opts: ApiOptions = {}): Api {
       }
       return call<ChallengeResponse>("POST", `/api/ui/${objectPath(object).path}/${seg(id)}/challenge`, body);
     },
-    apply: (object, id, challengeId, assertion, action) => {
+    apply: (object, id, challengeId, assertion, action, open) => {
       if (object === "passkey") {
         if (action !== "rename" && action !== "remove") throw new Error("adding a passkey is applied by registerBegin");
         return call<unknown>("POST", `/api/ui/passkeys/${seg(id)}/${action}`, { challenge_id: challengeId, assertion });
       }
       const p = objectPath(object);
-      return call<unknown>("POST", `/api/ui/${p.path}/${seg(id)}/${p.apply}`, { challenge_id: challengeId, assertion });
+      // Format 2: the KEK packet of a bucket-opening tap travels next to the assertion.
+      return call<unknown>("POST", `/api/ui/${p.path}/${seg(id)}/${p.apply}`, open ? { challenge_id: challengeId, assertion, open } : { challenge_id: challengeId, assertion });
     },
     loginBegin: () => call<BeginResponse>("POST", "/api/ui/login/begin", {}),
     loginFinish: (challengeId, assertion) =>

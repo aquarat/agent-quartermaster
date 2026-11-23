@@ -81,7 +81,7 @@ import { afterAll, beforeAll } from "bun:test";
 import { createApi, type Api } from "../src/api";
 import { completeLogin, prepareLogin } from "../src/flows";
 import { startMock } from "../mock/server";
-import { fakeAuth, jarFetch } from "./helpers";
+import { fakeAuth, jarFetch, prfAuth } from "./helpers";
 import { hexPreview, itemMessage, newSetId, vaultCommit, vaultPolicy, vaultReveal, vaultSignDecision, vaultSignerCreate, type VaultState } from "../src/vault";
 import type { SealView } from "../src/sealPanel";
 
@@ -107,7 +107,10 @@ function tampering(api: Api, tamper: (canonical: Json, meta: Json, res: Json) =>
 describe("vault actions against the mock", () => {
   const m = startMock({ port: 0, distDir: null, vault: true });
   const api = createApi({ base: m.url, fetch: jarFetch() });
-  const auth = fakeAuth(m.url);
+  // A passkey with PRF that is enabled for every scope: its taps open the buckets they need.
+  const auth = prfAuth(m.url);
+  m.store.addPasskey("apple", "PRF test passkey", Date.now(), undefined, auth.id);
+  m.store.buckets.enableAll(auth.id);
   const rp = new URL(m.url).hostname;
   let seal: SealView;
   let state: VaultState;
@@ -296,15 +299,26 @@ describe("vault actions against the mock", () => {
     await (await vaultSignDecision(api, seal, setOf(timed), state.requests.find((r) => r.id === timed.id)!, "sign-revoke", 0, 0, rp)).tap(auth);
   });
 
-  test("locked: nothing leaves, turning reveal off still works", async () => {
-    await fetch(m.url + "/mock/vault?locked=1");
+  test("closed buckets: saving needs nothing open; a reveal opens the set's bucket only with PRF", async () => {
+    await fetch(m.url + "/mock/vault?closed=1");
     seal = await api.sealStatus!();
     await refresh();
-    expect(state.unlocked).toBe(false);
     const s = set("client-a/paas/staging");
-    await expect(vaultReveal(api, seal, s, ["APP_SECRET"], rp)).rejects.toThrow("unlock");
-    await expect(vaultCommit(api, seal, s, { operation: "merge", entries: [{ name: "APP_ID", value: "1" }], remove: [] }, rp)).rejects.toThrow("unlock");
-    await (await vaultPolicy(api, seal, state.organisations.find((o) => o.slug === "client-a")!, false, rp)).tap(auth);
-    await fetch(m.url + "/mock/vault?locked=0");
+    expect(seal.buckets!.find((b) => b.label === "client-a/paas/staging")!.open).toBe(false);
+    // A write is encrypted to the bucket's public key: no open, no PRF.
+    const commit = await vaultCommit(api, seal, s, { operation: "merge", entries: [{ name: "APP_ID", value: "1" }], remove: [] }, rp);
+    await commit.tap(fakeAuth(m.url));
+    await refresh();
+    // A passkey without PRF cannot open the closed bucket: the broker refuses, nothing leaves.
+    const noPrf = await vaultReveal(api, seal, set("client-a/paas/staging"), ["APP_ID"], rp);
+    expect(noPrf.opens).toEqual(["Opens client-a/paas/staging: for this action only"]);
+    await expect(noPrf.tap(fakeAuth(m.url))).rejects.toThrow("closed");
+    // The enabled passkey's tap carries the KEK packet; the bucket opens for this reveal only.
+    const before = m.store.buckets.packets.length;
+    expect((await (await vaultReveal(api, seal, set("client-a/paas/staging"), ["APP_ID"], rp)).tap(auth))[0]!.value).toBe("1");
+    expect(m.store.buckets.packets.length).toBe(before + 1);
+    expect((await api.sealStatus!()).buckets!.find((b) => b.label === "client-a/paas/staging")!.open).toBe(false);
+    // Policy changes open nothing.
+    await (await vaultPolicy(api, seal, state.organisations.find((o) => o.slug === "client-a")!, false, rp)).tap(fakeAuth(m.url));
   });
 });

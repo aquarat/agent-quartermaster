@@ -1,8 +1,9 @@
 import { type Api } from "./api";
 import { type SealView } from "./sealPanel";
 import { type Catalogue } from "./catalogue";
-import { type Authenticator, encodeAssertion } from "./webauthn";
-import { checkReview, type Review } from "./review";
+import { type Authenticator } from "./webauthn";
+import { checkTap, type Review } from "./review";
+import { opensList } from "./approvals";
 import { h, replace } from "./dom";
 import { visibleText } from "./format";
 interface Binding {
@@ -111,7 +112,8 @@ export async function envReview(
     action,
     ttl_seconds: ttl,
   });
-  const opts = await checkReview(
+  // Approving a release opens the set's bucket (format 2); the other actions open nothing.
+  const tap = await checkTap(
     b,
     {
       v: 3,
@@ -124,8 +126,10 @@ export async function envReview(
       ttl_seconds: ttl,
     },
     rp,
+    { allowOpen: action === "approve" },
   );
   return {
+    opens: tap.lines,
     detail:
       `${action} · ${item.title} · Ref ${item.id.slice(-6)}\n` +
       (draft
@@ -136,7 +140,7 @@ export async function envReview(
     tap: async (auth: Authenticator) =>
       api.envPost!("finish", {
         challenge_id: b.challenge_id,
-        assertion: encodeAssertion(await auth.get(opts)),
+        ...(await tap.sign(auth)),
       }),
   };
 }
@@ -253,6 +257,7 @@ export function envPanel(
           );
           replace(
             review,
+            action === "approve" ? opensList(p.opens) : null,
             h("pre", null, visibleText(p.detail)),
             button("Confirm " + action + " with passkey", async () => {
               await p.tap(auth);

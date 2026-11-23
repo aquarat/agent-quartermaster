@@ -5,7 +5,8 @@ import { Window } from "happy-dom";
 import { ApiError, createApi, type Api } from "../src/api";
 import type { SetupTask, SetupView } from "../src/setup";
 import { startMock } from "../mock/server";
-import { fakeAuth, jarFetch } from "./helpers";
+import { createHash } from "node:crypto";
+import { fakeAuth, jarFetch, prfAuth } from "./helpers";
 
 const win = new Window({ url: "http://localhost/" });
 const G = globalThis as Record<string, unknown>;
@@ -251,7 +252,8 @@ describe("Setup through the App and the mock", () => {
   const m = startMock({ port: 0, distDir: null, setupStepMs: 40 });
   const f = jarFetch();
   const api = createApi({ base: m.url, fetch: f });
-  const auth = fakeAuth(m.url);
+  // The seeded "iPhone" passkey (mock/server.ts seedCred(1)), with a PRF: the stage needs one.
+  const auth = prfAuth(m.url, { rawId: new Uint8Array(createHash("sha256").update("seed-1").digest()) });
   let root: HTMLElement;
   const card = (id: string) => root.querySelector<HTMLElement>(`[data-task="${id}"]`)!;
   const state = (id: string) => card(id)?.dataset["state"];
@@ -305,6 +307,7 @@ describe("Setup through the App and the mock", () => {
     expect([...root.querySelectorAll<HTMLElement>("[data-task]")].map((c) => [c.dataset["task"], c.dataset["state"]])).toEqual([
       ["cutover", "available"],
       ["seal", "blocked"],
+      ["buckets", "blocked"],
       ["enable-updates", "available"],
       ["sync-passkeys", "done"],
       ["upgrade", "blocked"],
@@ -381,7 +384,7 @@ describe("Setup through the App and the mock", () => {
     expect(purge.checked).toBe(true);
     savedBox.checked = true;
     // The optional lock alert.
-    const alert = [...c.querySelectorAll("details")].find((d) => d.querySelector("summary")!.textContent!.includes("Lock alert"))!;
+    const alert = [...c.querySelectorAll("details")].find((d) => d.querySelector("summary")!.textContent!.includes("Restart alert"))!;
     expect(alert.hasAttribute("open")).toBe(false);
     const [topic, tok] = [...alert.querySelectorAll<HTMLInputElement>("input")];
     expect(tok!.type).toBe("password");
@@ -409,26 +412,36 @@ describe("Setup through the App and the mock", () => {
     expect(m.store.setup.recipient).toBe(params.recipient);
   }, 30000);
 
-  test("seal-setup: a four-step checklist; Activate needs the tested wrap and the proven recovery key", async () => {
+  test("seal-setup: create and test taps (tap N of M), the drill, then Activate", async () => {
     await until(() => card("seal").querySelectorAll(".setup-checklist > li").length === 4, 8000);
     const steps = () => [...card("seal").querySelectorAll<HTMLElement>(".setup-checklist > li")];
-    expect(steps().map((s) => s.querySelector("strong")!.textContent)).toEqual(["Create the unlock wrap", "Test the wrap", "Prove the recovery key", "Activate"]);
+    expect(steps().map((s) => s.querySelector("strong")!.textContent)).toEqual(["Create your passkey's keys", "Test them", "Prove the recovery key", "Activate"]);
     expect(steps().map((s) => s.dataset["done"])).toEqual(["false", "false", "false", "false"]);
-    // The generic import panel is not shown twice on this page.
+    // The generic panel is not shown twice on this page.
     expect(root.querySelector("#sec-seal")).toBeNull();
-    expect(button(steps()[0]!, /^Create with iPhone/)).toBeTruthy();
     expect(button(card("seal"), "Activate…").disabled).toBe(true);
     expect(button(card("seal"), "Cancel this task…")).toBeTruthy();
+    expect(card("seal").textContent!.toLowerCase()).not.toContain("unlock");
 
-    // The wrap ceremony is the existing one: its canonical is checked before any tap.
-    button(steps()[0]!, /^Create with iPhone/).click();
-    await until(() => !!button(card("seal"), "Create unlock wrap with passkey"));
-    expect(card("seal").querySelector(".signed pre")!.textContent).toContain('"action":"wrap-enroll"');
-
-    // (The fake authenticator has no PRF, so the test moves the import on itself.)
-    m.store.setup.wrap = "tested";
-    m.store.setup.wrapCredential = m.store.passkeys[0]!.id;
-    await until(() => steps()[1]?.dataset["done"] === "true");
+    // Four taps: two create, two test. Each shows what it does and its canonical before the tap.
+    for (const [n, verb, title] of [
+      [1, "Create", "Create this passkey's keys"],
+      [2, "Create", "Create this passkey's keys"],
+      [3, "Test", "Test this passkey's keys"],
+      [4, "Test", "Test this passkey's keys"],
+    ] as const) {
+      await until(() => !!card("seal").querySelector(".setup-tap") && card("seal").querySelector(".setup-tap")!.textContent!.startsWith(`Tap ${n} of 4`), 8000);
+      button(card("seal"), new RegExp(`^${verb} with iPhone`)).click();
+      await until(() => !!button(card("seal"), `${title} with passkey`) || !!card("seal").querySelector(".setup-run .error"));
+      expect(card("seal").querySelector(".setup-run .error")).toBeNull();
+      expect(card("seal").querySelector(".signed pre")!.textContent).toContain('"object":"seal-stage"');
+      expect(card("seal").querySelector(".open-lines")!.textContent).toContain(verb === "Create" ? "Creates this passkey's key" : "Tests this passkey's key");
+      const gets = auth.gets.length;
+      button(card("seal"), `${title} with passkey`).click();
+      expect(auth.gets.length).toBe(gets + 1);
+      await until(() => m.store.setup.stageKeks.length === n, 8000);
+    }
+    await until(() => steps()[1]?.dataset["done"] === "true", 8000);
     expect(steps().map((s) => s.dataset["done"])).toEqual(["true", "true", "false", "false"]);
     expect(button(card("seal"), "Activate…").disabled).toBe(true);
 
@@ -457,16 +470,45 @@ describe("Setup through the App and the mock", () => {
     // Activate: the manifest stays visible; the passkey prompt starts inside the tap.
     await until(() => !button(card("seal"), "Activate…").disabled);
     button(card("seal"), "Activate…").click();
-    await until(() => !!button(card("seal"), "Activate sealed installation with passkey"));
+    await until(() => !!button(card("seal"), "Activate the bucket store with passkey"));
     expect(card("seal").querySelector(".signed")!.hasAttribute("open")).toBe(true);
     expect(card("seal").querySelector(".signed pre")!.textContent).toContain("recovery_recipient");
     const gets = auth.gets.length;
-    button(card("seal"), "Activate sealed installation with passkey").click();
+    button(card("seal"), "Activate the bucket store with passkey").click();
     expect(auth.gets.length).toBe(gets + 1);
     await until(() => m.store.setup.sealed, 8000);
     await until(() => state("seal") === "done", 8000);
     expect(card("seal").textContent).toContain("The store is sealed.");
     expect(card("seal").querySelector(".setup-checklist")).toBeNull();
+  }, 30000);
+
+  test("Move to per-credential buckets: one-way in plain words, signs {purge_backups}, then the open-legacy tap", async () => {
+    m.store.setup.format1 = true; // as if sealed by the previous version
+    await until(() => state("buckets") === "available", 8000);
+    const c = card("buckets");
+    expect(c.textContent).toContain("One-way.");
+    expect(c.textContent).toContain("no rollback");
+    expect(c.textContent).toContain("the backup taken before the move is the only way back");
+    expect(c.textContent).toContain("approve-only until you enable them");
+    const signed = await run("buckets");
+    expect(signed).toMatchObject({ action: "run", object: "setup", id: "buckets", params: '{"purge_backups":true}', secrets_sha256: "" });
+    await until(() => state("buckets") === "waiting", 8000);
+    await until(() => card("buckets").querySelectorAll(".setup-checklist > li").length === 5, 8000);
+    const steps = [...card("buckets").querySelectorAll<HTMLElement>(".setup-checklist > li")];
+    expect(steps.map((x) => x.querySelector("strong")!.textContent)).toEqual(["Open the old store", "Create your passkey's keys", "Test them", "Prove the recovery key", "Activate"]);
+    expect(card("buckets").querySelector(".setup-tap")!.textContent).toBe("Tap 1 of 4: Installation");
+    button(card("buckets"), /^Open with iPhone/).click();
+    await until(() => !!button(card("buckets"), "Open the old store and create the first key with passkey"));
+    const before = m.store.setup.stageKeks.length;
+    button(card("buckets"), "Open the old store and create the first key with passkey").click();
+    await until(() => m.store.setup.stageKeks.length === before + 1, 8000);
+    expect(m.store.setup.stageKeks.at(-1)!.keks.length).toBe(2);
+    await until(() => card("buckets").querySelector(".setup-tap")?.textContent === "Tap 2 of 4: Personal and Client A", 8000);
+    // Put everything back for the next tests.
+    button(card("buckets"), "Cancel this task…").click();
+    button(card("buckets"), "Yes, cancel and put everything back").click();
+    await until(() => state("buckets") === "failed", 8000);
+    m.store.setup.format1 = false;
   }, 30000);
 
   test("enable self-update: API addresses follow the repository, host keys are fetched to compare, tokens go sealed", async () => {

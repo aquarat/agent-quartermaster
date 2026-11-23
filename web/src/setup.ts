@@ -13,6 +13,8 @@ import { decode, encode } from "./b64url";
 import { challengeCommitsTo, mismatches, parseCanonical } from "./canonical";
 import { CHALLENGE_LIFETIME_MS, FlowError } from "./flows";
 import { decodeRequestOptions, encodeAssertion, unwrapPublicKey, type Authenticator } from "./webauthn";
+import { canonicalJSON, prepareTap } from "./buckets";
+import type { SealView, StageChoice, StageView } from "./sealPanel";
 
 // ---- wire types (internal/server/setup.go, internal/maint/status.go) ----
 
@@ -58,7 +60,8 @@ export interface SetupPasskey {
 
 /** GET /api/ui/setup. */
 export interface SetupView {
-  mode: "serve" | "cutover" | "seal-setup";
+  /** "seal-setup": a seal import or a bucket migration is staged ("bucket-migrate" accepted too). */
+  mode: "serve" | "cutover" | "seal-setup" | "bucket-migrate";
   runner_installed: boolean;
   runner_version?: string;
   /** HPKE public key (base64url, P-256 uncompressed) pasted secrets are sealed to. */
@@ -262,6 +265,9 @@ export function canonicalParams(task: string, params: Record<string, unknown>): 
     case "seal":
       out = `{"recipient":${f.str("recipient")},"purge_backups":${f.bool("purge_backups")},"lock_alert":${f.bool("lock_alert")}}`;
       break;
+    case "buckets":
+      out = `{"purge_backups":${f.bool("purge_backups")}}`;
+      break;
     case "enable-updates": {
       const hosts = f.list("known_hosts").map((line) => {
         if (typeof line !== "string") throw new Error("enable-updates: known_hosts must be strings");
@@ -442,4 +448,107 @@ export async function sendDrill(api: Api, seal: { drill_key?: string; installati
     plaintext.fill(0);
   }
   await api.sealPost!("drill", { packet });
+}
+
+/** True while the broker stages a seal import or a bucket migration. */
+export const staging = (mode: string | undefined) => mode === "seal-setup" || mode === "bucket-migrate";
+
+// ---- the staged store (seal import and bucket migration; docs/BUCKETS.md §8) ----
+
+export type StageStep = "open-legacy" | "create" | "test";
+const PURPOSE: Record<StageStep, string> = { "open-legacy": "migrate", create: "stage", test: "test" };
+
+/** What the next tap does, and how many taps the whole staging takes. */
+export interface StagePlan {
+  migrate: boolean;
+  /** The next passkey step, or null when every scope is wrapped and tested. */
+  next: { step: StageStep; scopes: string[] } | null;
+  /** 1-based number of the next tap, and the total. */
+  tap: number;
+  taps: number;
+  legacyDone: boolean;
+  created: boolean;
+  tested: boolean;
+}
+
+export function stagePlan(st: StageView): StagePlan {
+  const migrate = st.source === "format-1";
+  const all = st.scopes;
+  const n = all.length;
+  const legacyDone = !migrate || !!st.legacy_unlocked;
+  const unwrapped = all.filter((x) => !x.wrapped).map((x) => x.scope);
+  const untested = all.filter((x) => x.wrapped && !x.tested).map((x) => x.scope);
+  const wrapped = n - unwrapped.length;
+  const testedN = all.filter((x) => x.tested).length;
+  // Open-legacy carries exactly one scope (the installation first); then two per tap.
+  const taps = migrate ? 1 + Math.ceil(Math.max(0, n - 1) / 2) + Math.ceil(n / 2) : Math.ceil(n / 2) * 2;
+  const doneTaps = migrate ? (legacyDone ? 1 : 0) + Math.ceil(Math.max(0, wrapped - (legacyDone ? 1 : 0)) / 2) + Math.ceil(testedN / 2) : Math.ceil(wrapped / 2) + Math.ceil(testedN / 2);
+  let next: StagePlan["next"] = null;
+  if (!legacyDone) {
+    const first = unwrapped.includes("installation") ? "installation" : unwrapped[0];
+    next = first ? { step: "open-legacy", scopes: [first] } : null;
+  } else if (unwrapped.length) next = { step: "create", scopes: unwrapped.slice(0, 2) };
+  else if (untested.length) next = { step: "test", scopes: untested.slice(0, 2) };
+  return { migrate, next, tap: Math.min(doneTaps + 1, taps), taps, legacyDone, created: legacyDone && unwrapped.length === 0, tested: unwrapped.length === 0 && untested.length === 0 };
+}
+
+const STAGE_KEYS = ["action", "credential", "epoch", "id", "issued_at", "nonce", "object", "scopes", "v"];
+
+/** One staging tap: challenge, checks of the canonical ("seal-stage") and the scope-enrol
+ * descriptor, then `finish` (call from the tap: the prompt starts before any other await). */
+export async function stageStep(api: Api, v: SealView, step: StageStep, choice: StageChoice, scopes: string[], rpId: string) {
+  if (!v.stage || v.mode !== "setup") throw new FlowError("Nothing is staged.");
+  if (step === "open-legacy" && (!choice.legacy || scopes.length !== 1)) throw new FlowError("This passkey cannot open the format-1 store.");
+  if (!scopes.length || scopes.length > 2) throw new FlowError("One tap covers one or two scopes.");
+  const b = await api.sealPost!<{ challenge_id: string; canonical: string; public_key: unknown; open?: { descriptor: string } }>("stage/challenge", { step, credential: choice.id, scopes });
+  if (!b || typeof b.challenge_id !== "string" || typeof b.canonical !== "string") throw new FlowError("The server sent no challenge.");
+  let c: Record<string, unknown>;
+  try {
+    c = JSON.parse(b.canonical);
+  } catch {
+    throw new FlowError("Not signing: the staging text is not JSON.");
+  }
+  const keys = Object.keys(c).sort();
+  let nonceOk = false;
+  try {
+    nonceOk = typeof c.nonce === "string" && decode(c.nonce).byteLength === 32 && encode(decode(c.nonce)) === c.nonce;
+  } catch {
+    nonceOk = false;
+  }
+  if (
+    c.v !== 3 ||
+    c.object !== "seal-stage" ||
+    c.action !== step ||
+    c.id !== v.installation ||
+    c.epoch !== v.epoch ||
+    c.credential !== choice.id ||
+    JSON.stringify(c.scopes) !== JSON.stringify(scopes) ||
+    !nonceOk ||
+    typeof c.issued_at !== "string" ||
+    !ISSUED_RE.test(c.issued_at) ||
+    keys.join() !== STAGE_KEYS.join() ||
+    canonicalJSON(c) !== b.canonical
+  )
+    throw new FlowError("Not signing: the staging step differs from the one you chose.");
+  let tap;
+  try {
+    tap = await prepareTap(b, rpId, { object: "scope-enrol", purposes: [PURPOSE[step]], installation: v.installation, epoch: v.epoch, requireOpen: true, selected: choice.credential_id });
+  } catch (e) {
+    throw new FlowError(`Not signing: ${(e as Error).message}.`);
+  }
+  const d = tap.open!.descriptor;
+  if (d.credential_id !== choice.credential_id || JSON.stringify(d.scopes) !== JSON.stringify(scopes)) throw new FlowError("Not signing: the tap is for other scopes or another passkey.");
+  if (step === "open-legacy" && canonicalJSON(d.legacy) !== canonicalJSON(choice.legacy)) throw new FlowError("Not signing: the format-1 binding differs from the staged one.");
+  let used = false;
+  return {
+    canonical: b.canonical,
+    lines: tap.lines,
+    async finish(auth: Authenticator): Promise<void> {
+      if (used) throw new FlowError("Already used: start the step again.");
+      used = true;
+      const signed = await tap.sign(auth);
+      if (!signed.open) throw new FlowError("This passkey returned no PRF result, so it cannot hold the store's keys. Use a passkey that supports PRF.");
+      await api.sealPost!("stage/finish", { challenge_id: b.challenge_id, assertion: signed.assertion, open: signed.open });
+    },
+  };
 }

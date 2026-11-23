@@ -130,7 +130,8 @@ export type PasskeyIcon =
 
 /** One registered owner passkey (api.PasskeyInfo). */
 export interface PasskeyInfo {
-  raw_id?:string; unlock_tested_at?:string;
+  /** The raw credential ID (base64url); sealed installations only. */
+  raw_id?: string;
   /** Hex of the first 16 bytes of SHA-256(credential ID); the canonical "passkey" id. */
   id: string;
   nickname: string;
@@ -195,6 +196,8 @@ export interface ChallengeResponse {
   challenge_id: string;
   canonical: string;
   public_key: unknown;
+  /** Seal format 2: the buckets the tap opens (docs/BUCKETS.md §4.2). */
+  open?: { descriptor: string };
 }
 
 /** Response of login/begin and register/begin (api.CeremonyBegin). */

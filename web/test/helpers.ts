@@ -81,3 +81,71 @@ export function jarFetch(log: Sent[] = []): typeof fetch & { log: Sent[]; cookie
   f.cookie = () => cookie;
   return f;
 }
+
+/** A fake passkey with WebAuthn PRF (HMAC-SHA-256 over "WebAuthn PRF\0" ‖ input, like a
+ * real authenticator's hmac-secret). `prf: false` = a passkey without PRF. */
+export interface PrfAuth extends FakeAuth {
+  rawId: Uint8Array;
+  id: string;
+  /** What the authenticator would return for `salt` (test oracle). */
+  evaluate(salt: Uint8Array): Promise<Uint8Array>;
+  /** Every PRF output handed out, to check they were wiped. */
+  handed: Uint8Array[];
+}
+export function prfAuth(origin = "http://localhost", opts: { prf?: boolean; rawId?: Uint8Array } = {}): PrfAuth {
+  const rawId = opts.rawId ?? rnd(32);
+  const secret = rnd(32);
+  const userHandle = rnd(16);
+  const evaluate = async (salt: Uint8Array) => {
+    const k = await crypto.subtle.importKey("raw", buf(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const input = new Uint8Array(13 + salt.length);
+    input.set(te.encode("WebAuthn PRF\0"));
+    input.set(salt, 13);
+    const inner = new Uint8Array(await crypto.subtle.digest("SHA-256", input));
+    return new Uint8Array(await crypto.subtle.sign("HMAC", k, inner));
+  };
+  const asBytes = (x: BufferSource) => (x instanceof ArrayBuffer ? new Uint8Array(x) : new Uint8Array(x.buffer, x.byteOffset, x.byteLength));
+  const a: PrfAuth = {
+    rawId,
+    id: encode(rawId),
+    handed: [],
+    evaluate,
+    gets: [],
+    creates: [],
+    async get(o) {
+      a.gets.push(o);
+      const ch = a.forceChallenge ?? (o.challenge as ArrayBuffer);
+      const cd = JSON.stringify({ type: "webauthn.get", challenge: encode(ch), origin, crossOrigin: false });
+      const prf = (o.extensions as { prf?: { eval?: AuthenticationExtensionsPRFValues; evalByCredential?: Record<string, AuthenticationExtensionsPRFValues> } } | undefined)?.prf;
+      const values = prf?.evalByCredential?.[encode(rawId)] ?? prf?.eval;
+      let results: { first: ArrayBuffer; second?: ArrayBuffer } | undefined;
+      if (opts.prf !== false && values) {
+        const first = await evaluate(asBytes(values.first));
+        const second = values.second ? await evaluate(asBytes(values.second)) : undefined;
+        a.handed.push(first, ...(second ? [second] : []));
+        results = second ? { first: first.buffer as ArrayBuffer, second: second.buffer as ArrayBuffer } : { first: first.buffer as ArrayBuffer };
+      }
+      return {
+        id: encode(rawId),
+        rawId: buf(rawId),
+        type: "public-key",
+        authenticatorAttachment: "platform",
+        getClientExtensionResults: () => (results ? { prf: { results } } : {}),
+        response: { clientDataJSON: buf(te.encode(cd)), authenticatorData: buf(rnd(37)), signature: buf(rnd(71)), userHandle: buf(userHandle) },
+      };
+    },
+    async create(o) {
+      a.creates.push(o);
+      const cd = JSON.stringify({ type: "webauthn.create", challenge: encode(o.challenge as ArrayBuffer), origin });
+      return {
+        id: encode(rawId),
+        rawId: buf(rawId),
+        type: "public-key",
+        authenticatorAttachment: "platform",
+        getClientExtensionResults: () => ({ credProps: { rk: true }, ...(opts.prf !== false ? { prf: { enabled: true } } : {}) }),
+        response: { clientDataJSON: buf(te.encode(cd)), attestationObject: buf(rnd(120)), getTransports: () => ["internal"] },
+      };
+    },
+  };
+  return a;
+}

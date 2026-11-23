@@ -117,6 +117,33 @@ export function helpPage(c: HelpConfig) {
       command(`aqmas ssh alice@web-1 --fresh --ttl ${c.owner_max_seconds}s --why "owner maintenance"`),
     ),
     card(
+      "Credential buckets",
+      p(
+        "Every secret aqmas keeps (the SSH user CA, the internal CA, each organisation's Cloudflare proxy token, each env set and each signer key) is in its own encrypted bucket. Writing a value needs nothing open: it is encrypted to the bucket's public key. Reading one needs the bucket open, and only an approval opens it.",
+      ),
+      p(
+        "Buckets belong to a scope: the installation (the two CAs) or one organisation. Each scope has its own key, wrapped once for every passkey enabled for it and once for your offline recovery key. One passkey tap opens at most two scope keys, for the length of the tap: the broker unwraps exactly the buckets the card lists and wipes the scope key at once.",
+      ),
+      p(
+        "Before you tap, the card says what the tap opens and for how long, for example “Opens SSH user CA: for this action only” or “Opens personal Cloudflare proxy token: while the grant lasts”. The passkey signs that list together with the decision; a page that changes it is refused. A bucket stays open only while something holds it: one operation (instant), a Cloudflare grant, an env release until collected (10 minutes at most), a signing grant, a standing rule, auto-approval, or an approval window. Admin → Buckets shows every hold and the header says how many buckets are open, or “nothing open”.",
+      ),
+      p(
+        "After a restart nothing is open, and nothing needs to be until it is used. Grants that need a bucket pause; agents wait with “closed: waiting for the owner to reopen it” and keep their deadline. Admin → Buckets lists them with Reopen (one tap opens up to two scopes). A standing rule or auto-approval needs one tap per restart, then none until the rule ends.",
+      ),
+      p(
+        "Close all (Admin → Buckets, one tap) wipes every open bucket key and hold and ends every approval window, without a restart. Use it when you step away or suspect something.",
+      ),
+      p(
+        "Enabling a passkey: in Admin → Passkeys, Enable on the new passkey. The passkey you are signed in with taps first (that tap opens the scope keys), then the new one taps once per two scopes. Test checks a passkey can open its scopes. A passkey without the PRF extension signs in, denies, revokes and approves while buckets are already open, but cannot open a closed one; the card says which passkey can.",
+      ),
+      p(
+        "Recovery: if no passkey can open a scope any more, Admin → Recovery key enrols a passkey from your offline recovery key, and the recovery drill proves the key works without writing anything. This pastes the recovery key into a web page, so prefer enabling from another passkey. If a passkey or a backup is lost or stolen, remove it and Rekey its scopes (Admin → Buckets): removing a passkey does not revoke copies of its wraps in old backups.",
+      ),
+      p(
+        "Honest limits: buckets protect snapshots (a stolen disk or backup, a memory dump, brief root). They do not protect against an attacker who stays on the machine with root: every bucket is exposed as it is used. A window keeps its bucket open for its whole length, and auto-approval keeps the Cloudflare proxy token open from the first approval after a restart until the next restart; what may be approved meanwhile is limited by policy, not by cryptography. A malicious approval page can still turn your tap into another action, as before, and learn the keys of the scopes that tap opens.",
+      ),
+    ),
+    card(
       "Troubleshooting",
       p(
         "5 — Server unreachable or TLS failed: check the agent API URL, route and certificate validity. On a pin mismatch, stop and verify the CA independently; do not bypass the check. For an expired client certificate, verify the pin and re-enroll with --force; review the replacement card.",

@@ -133,7 +133,7 @@ export function recoveryUI(root: HTMLElement) {
   };
   function show(s: Step | void) {
     if (!s) {
-      replace(root, "Replacement committed. Stop recovery and restart locked.");
+      replace(root, "Replacement committed. Stop recovery and restart the broker: nothing is open until an approval needs it.");
       return;
     }
     const go = h(
@@ -170,7 +170,7 @@ export function recoveryUI(root: HTMLElement) {
   };
   replace(
     root,
-    h("h2", null, "Offline recovery · replacement login and unlock key"),
+    h("h2", null, "Offline recovery · replacement passkey"),
     h("label", null, "One-use operator ticket ", ticket),
     name,
     pin,

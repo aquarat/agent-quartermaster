@@ -1,10 +1,11 @@
 // Mock of Admin → Setup (docs/SETUP.md) for `bun run mock` and the tests: the setup view, the
 // signed run of each task with a fake runner (running → waiting → done, the broker "down" in
-// between), cancel, the cutover review, the supervised seal import with the recovery drill,
-// and an upgrade to approve.
+// between), cancel, the cutover review, the staged store (seal import, or the move of a
+// format-1 store to per-credential buckets) with its passkey taps and the recovery drill, and
+// an upgrade to approve.
 //
-//   GET /mock/setup?installed=0|1&pinned=0|1&scoped=0|1&sealed=0|1&updates=0|1
-//                  &mode=serve|cutover|seal-setup&wrap=none|created|tested&drilled=0|1
+//   GET /mock/setup?installed=0|1&pinned=0|1&scoped=0|1&sealed=0|1&format1=0|1&updates=0|1
+//                  &mode=serve|cutover|seal-setup|bucket-migrate&wrap=none|created|tested&drilled=0|1
 //     jumps the mock to a state (development and screenshots only).
 //
 // Like the rest of the mock, signatures are not verified. Sealed packets are opened for
@@ -13,10 +14,16 @@
 import { createECDH, createHash, randomBytes } from "node:crypto";
 import { Aes128Gcm, CipherSuite, DhkemP256HkdfSha256, HkdfSha256 } from "@hpke/core";
 import { bech32Decode, recipientOf } from "./age";
+import { MockBuckets } from "./buckets";
+import { stagePlan, type StageStep } from "../src/setup";
+import type { StageView } from "../src/sealPanel";
 
 const b64url = (b: Uint8Array | Buffer) => Buffer.from(b).toString("base64url");
 const sha256hex = (b: string | Uint8Array) => createHash("sha256").update(b).digest("hex");
 const nowISO = (ms = Date.now()) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+/** A neutral recovery recipient for a jump straight into a migration (the drill then fails). */
+const MOCK_RECIPIENT = "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq";
+const canonicalJSON = (v: Record<string, unknown>) => JSON.stringify(v, Object.keys(v).sort());
 const suite = new CipherSuite({ kem: new DhkemP256HkdfSha256(), kdf: new HkdfSha256(), aead: new Aes128Gcm() });
 
 /** Sorted keys, no whitespace, no HTML escaping: canon.Build's encoding. */
@@ -71,10 +78,17 @@ const SPECS = [
   {
     id: "seal",
     title: "Seal the store",
-    summary: "Encrypts the SSH CA, the internal CA key, the notification URL and the Cloudflare parent tokens under a key that only your passkey can unlock. After every restart the broker starts locked until you unlock it.",
-    steps: ["Stop the broker and back up", "Record the recovery key (public half) in the root-owned configuration", "Start the broker in import mode (agents are refused)", "You create and test the passkey wrap, prove the recovery key works, and activate", "Pin the activation, delete the plaintext key files and old backups", "Set up the lock alert if you gave it a credential", "Restart locked"],
+    summary: "Puts the SSH CA, the internal CA key, the Cloudflare parent token and every credential set into encrypted buckets that open only with the approval that needs them. After a restart nothing is open.",
+    steps: ["Stop the broker and back up", "Record the recovery key (public half) in the root-owned configuration", "Start the broker in import mode (agents are refused)", "You create and test your passkey's scope keys, prove the recovery key works, and activate", "Pin the activation, delete the plaintext key files and old backups", "Set up the restart alert if you gave it a credential", "Restart with nothing open"],
     reversible: "Until you activate, cancelling restores the configuration. After activation there is no way back to plaintext: recovery is your passkeys or the recovery key.",
     secrets: ["ntfy_topic_url", "ntfy_token"],
+  },
+  {
+    id: "buckets",
+    title: "Move to per-credential buckets",
+    summary: "Moves a store sealed by an older version under one key into per-credential buckets: each approval then opens only the credential it needs.",
+    steps: ["Check the store and stop the broker", "Back up the database, configuration and keys", "Start the broker in migration mode (agents are refused)", "You open the old store once, create and test your passkey's scope keys, prove the recovery key and activate", "Pin the new manifest, restart and delete the old backups unless told not to"],
+    reversible: "One-way. Until you activate, cancelling restores everything. After activation there is no rollback: the pre-migration backup, with the previous version, is the only way back.",
   },
   {
     id: "enable-updates",
@@ -190,15 +204,23 @@ export class MockSetup {
   secretsKey = newKey();
   drillKey = newKey();
   deployKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockDeployKeyMockDeployKeyMockDeployKey0 aqmas-update@bastion";
-  // The staged seal import.
-  wrap: "none" | "created" | "tested" = "none";
-  wrapCredential = "";
+  // The staged store (seal import or bucket migration).
+  format1 = false;
+  stageSource: "unsealed" | "format-1" = "unsealed";
+  stageScopes: { scope: string; title: string; buckets: number; wrapped: boolean; tested: boolean; kek?: string; salt?: string }[] = [];
+  stageCred = "";
+  legacyUnlocked = false;
+  legacy = { mk_version: 3, prf_salt: b64url(createHash("sha256").update("mock legacy salt").digest()), installation: b64url(createHash("sha256").update("mock legacy installation").digest()) };
+  /** Tests: every staged tap's KEKs (hex), as the broker received them. */
+  stageKeks: { step: StageStep; cred: string; keks: string[] }[] = [];
+  private stageAsks = new Map<string, { step: StageStep; scopes: string[]; salts: string[] }>();
+  private stageChallenges = new Map<string, { canonical: Record<string, unknown>; session: string | undefined; challenge: string; used: boolean; expires: number }>();
+  private stager: MockBuckets;
   drilled = false;
   activated = false;
   recipient = "";
   installation = b64url(randomBytes(32));
   epoch = b64url(randomBytes(32));
-  attempts = new Map<string, string>();
   /** The API answers 502 until then: the broker is restarting. */
   downUntil = 0;
   /** Tests: what the runner received, opened. Secrets appear here and nowhere else. */
@@ -208,7 +230,71 @@ export class MockSetup {
   constructor(
     private host: MockHost,
     public stepMs = 1500,
-  ) {}
+  ) {
+    this.stager = new MockBuckets(
+      {
+        passkeys: () => host.passkeys(),
+        sessionPasskey: (session) => host.sessionPasskey(session),
+        // Staging challenges are bound to the open descriptor, so they are kept here, not by the host.
+        issue: (_text, canonical, session, challenge) => {
+          const id = b64url(randomBytes(16));
+          this.stageChallenges.set(id, { canonical, session, challenge: b64url(challenge), used: false, expires: Date.now() + 120_000 });
+          return { id, challenge: b64url(challenge) };
+        },
+        redeem: (cid, assertion, session) => {
+          const rec = typeof cid === "string" ? this.stageChallenges.get(cid) : undefined;
+          if (!rec) return host.fail(404, "not_found", "unknown challenge");
+          if (rec.used) host.fail(409, "conflict", "challenge already used");
+          if (rec.expires < Date.now()) host.fail(410, "expired", "challenge expired; start again");
+          if (rec.session !== session) host.fail(403, "forbidden", "challenge belongs to another session");
+          rec.used = true;
+          let cd: { type?: unknown; challenge?: unknown } = {};
+          try {
+            cd = JSON.parse(Buffer.from(String((assertion as { response?: { clientDataJSON?: unknown } })?.response?.clientDataJSON ?? ""), "base64url").toString("utf8"));
+          } catch {
+            host.fail(400, "bad_request", "assertion: clientDataJSON is not base64url JSON");
+          }
+          if (cd.type !== "webauthn.get") host.fail(400, "bad_request", "assertion: clientDataJSON.type must be webauthn.get");
+          if (cd.challenge !== rec.challenge) host.fail(403, "forbidden", "assertion is for a different challenge");
+          return rec.canonical;
+        },
+        requestOptions: (req, challenge) => host.requestOptions(req, challenge) as { publicKey: Record<string, unknown> },
+        fail: host.fail,
+        audit: (a, o, d) => host.audit(a, o, d),
+      },
+      this.installation,
+      this.epoch,
+    );
+    this.stager.enabled = true;
+  }
+
+  /** Reset the staged store for a seal import or a migration. */
+  private stage(source: "unsealed" | "format-1"): void {
+    this.stageSource = source;
+    this.stageScopes = [
+      { scope: "installation", title: "Installation", buckets: 2, wrapped: false, tested: false },
+      { scope: "org-personal", title: "Personal", buckets: 3, wrapped: false, tested: false },
+      { scope: "org-client-a", title: "Client A", buckets: 2, wrapped: false, tested: false },
+    ];
+    this.stageCred = "";
+    this.legacyUnlocked = false;
+    this.stageAsks.clear();
+    this.drilled = this.activated = false;
+  }
+  private stageView(): StageView {
+    const migrate = this.stageSource === "format-1";
+    const keys = this.host.passkeys().filter((k) => !this.stageCred || k.id === this.stageCred);
+    const st: StageView = {
+      source: this.stageSource,
+      scopes: this.stageScopes.map(({ scope, title, buckets, wrapped, tested }) => ({ scope, title, buckets, wrapped, tested })),
+      drilled: this.drilled,
+      drill_key: this.drillKey.pub,
+      choices: keys.map((k) => ({ id: k.hex, name: k.name, credential_id: k.id, ...(migrate ? { legacy: this.legacy } : {}) })),
+    };
+    if (migrate) st.legacy_unlocked = this.legacyUnlocked;
+    if (this.stageScopes.every((x) => x.tested) && this.drilled) st.manifest = this.manifest();
+    return st;
+  }
 
   stop(): void {
     for (const t of this.timers) clearTimeout(t);
@@ -275,15 +361,24 @@ export class MockSetup {
         break;
       case "seal":
         this.recipient = String(params["recipient"]);
-        this.wrap = "none";
-        this.wrapCredential = "";
-        this.drilled = this.activated = false;
+        this.stage("unsealed");
         this.begin(task, at(0));
         this.later(1, () => this.step(at(1), true));
         this.later(2, () => {
           this.step(at(2));
           this.mode = "seal-setup";
-          this.wait("the passkey wrap, the recovery key check and your activation", 30);
+          this.wait("your passkey's scope keys, the recovery key check and your activation", 30);
+        });
+        break;
+      case "buckets":
+        this.recipient ||= MOCK_RECIPIENT;
+        this.stage("format-1");
+        this.begin(task, at(0));
+        this.later(1, () => this.step(at(1), true));
+        this.later(2, () => {
+          this.step(at(2));
+          this.mode = "seal-setup";
+          this.wait("opening the old store, your passkey's scope keys, the recovery key check and your activation", 30);
         });
         break;
       case "enable-updates":
@@ -324,16 +419,19 @@ export class MockSetup {
 
   private activatedSeal(): void {
     this.activated = true;
-    this.step("Pin the activation, delete the plaintext key files and old backups");
-    this.later(1, () => this.step("Restart locked", true));
+    const migrate = this.stageSource === "format-1";
+    this.step(migrate ? "Pin the new manifest, restart and delete the old backups unless told not to" : "Pin the activation, delete the plaintext key files and old backups");
+    this.later(1, () => this.step("Restart with nothing open", true));
     this.later(2, () => {
       this.sealed = true;
-      this.finish("done", "The store is sealed. Unlock the broker with your passkey after every restart.", { manifest_sha256: sha256hex(this.manifest()), sealed_bundle: "/var/lib/aqmas-backups/sealed-" + nowISO().replace(/[-:]/g, "") });
+      this.format1 = false;
+      this.finish("done", migrate ? "Every credential is in its own bucket. Nothing is open until an approval needs it." : "The store is sealed. Nothing is open until an approval needs it.", { manifest_sha256: sha256hex(this.manifest()), backup: "/var/lib/aqmas-backups/sealed-" + nowISO().replace(/[-:]/g, "") });
     });
   }
 
   private manifest(): string {
-    return JSON.stringify({ installation: this.installation, recovery_recipient: this.recipient, roles: ["ssh-ca", "tls-ca", "ntfy", "cloudflare-parent"], wrapped_credentials: [this.wrapCredential] });
+    const others = this.stageSource === "format-1" ? this.host.passkeys().map((k) => k.id).filter((id) => id !== this.stageCred) : [];
+    return JSON.stringify({ format: 2, installation: this.installation, recovery_recipient: this.recipient, scopes: this.stageScopes.map((x) => x.scope), wrapped_credentials: [this.stageCred], approve_only_until_enabled: others });
   }
 
   // ---- views ----
@@ -356,6 +454,10 @@ export class MockSetup {
         case "seal":
           if (this.sealed) t.state = "done";
           else if (!this.scoped) [t.state, blocked] = ["blocked", "Switch to organisations first."];
+          break;
+        case "buckets":
+          if (this.sealed && !this.format1) t.state = "done";
+          else if (!this.sealed) [t.state, blocked] = ["blocked", "Only for a store sealed by an older version. Sealing now uses buckets already."];
           break;
         case "enable-updates":
           rerunnable = true;
@@ -407,21 +509,9 @@ export class MockSetup {
     };
   }
 
-  private sealView(req: Request) {
-    const mode = this.activated ? "activated" : "setup";
-    const rp = new URL(req.url).hostname;
-    const keys = this.host.passkeys().filter((k) => this.wrap === "none" || k.id === this.wrapCredential);
-    const choices =
-      this.wrap === "tested" || this.activated
-        ? []
-        : keys.map((k) => ({
-            id: k.hex,
-            name: k.name,
-            selection: { action: "wrap-enroll", credential_id: k.id, installation: this.installation, epoch: this.epoch, rp_id: rp, mk_version: 1, prf_salt: b64url(createHash("sha256").update("salt:" + k.id).digest()), registration_id: `reg-${k.hex.slice(0, 8)}-${this.wrap === "none" ? "create" : "test"}` },
-          }));
-    const v: Record<string, unknown> = { mode, epoch: this.epoch, installation: this.installation, choices, drill_key: this.drillKey.pub, drilled: this.drilled };
-    if (this.wrap === "tested" && !this.activated) v.manifest = this.manifest();
-    return v;
+  private sealView() {
+    if (this.activated) return { mode: "activated", epoch: this.epoch, installation: this.installation };
+    return { mode: "setup", epoch: this.epoch, installation: this.installation, stage: this.stageView() };
   }
 
   // ---- parameters as the broker canonicalises them ----
@@ -450,6 +540,11 @@ export class MockSetup {
           fail("recipient must be a native age X25519 public key (age1…)");
         }
         return { text: `{"recipient":${q(v.recipient)},"purge_backups":${v.purge_backups},"lock_alert":${v.lock_alert}}`, value: v, secrets: v.lock_alert ? ["ntfy_token", "ntfy_topic_url"] : [] };
+      }
+      case "buckets": {
+        only(o, ["purge_backups"]);
+        const v = { purge_backups: b(o.purge_backups) };
+        return { text: `{"purge_backups":${v.purge_backups}}`, value: v, secrets: [] };
       }
       case "enable-updates": {
         only(o, ["repo", "forgejo_api", "github_api", "known_hosts", "forgejo_token", "github_token"]);
@@ -616,35 +711,47 @@ export class MockSetup {
     if (p.startsWith("/api/ui/seal/")) {
       if (this.mode !== "seal-setup") return undefined;
       const rest = p.slice("/api/ui/seal/".length);
-      if (rest === "status" && !post) return this.sealView(req);
+      if (rest === "status" && !post) return this.sealView();
       if (!post) return undefined;
       if (this.activated) fail(409, "conflict", "already activated");
-      if (rest === "unlock/challenge") {
+      if (rest === "stage/challenge") {
+        const next = stagePlan(this.stageView()).next;
+        const step = body.step as StageStep;
+        const scopes = body.scopes;
+        if (!next || next.step !== step || JSON.stringify(scopes) !== JSON.stringify(next.scopes)) fail(409, "conflict", "the staging moved on; reload the page");
         const key = this.host.passkeys().find((k) => k.hex === body.credential);
-        const want = `reg-${key?.hex.slice(0, 8)}-${this.wrap === "none" ? "create" : "test"}`;
-        if (!key || this.wrap === "tested" || body.registration_id !== want || (this.wrap === "created" && key.id !== this.wrapCredential)) fail(409, "conflict", "the import moved on; reload the page");
-        const attempt = b64url(randomBytes(32));
-        const salt = b64url(createHash("sha256").update("salt:" + key!.id).digest());
-        const rp = new URL(req.url).hostname;
-        const canonical = { v: 3, object: "seal", suite: 1, action: "wrap-enroll", id: attempt, credential_id: key!.id, epoch: this.epoch, installation: this.installation, mk_version: 1, prf_salt: salt, rp_id: rp, registration_id: want, recipient: this.drillKey.pub, nonce: b64url(randomBytes(32)), issued_at: nowISO() };
-        const text = plainCanonical(canonical);
-        this.attempts.set(attempt, key!.id);
-        return {
-          canonical: text,
-          attempt_id: attempt,
-          publicKey: { rpId: rp, userVerification: "required", timeout: 120000, challenge: b64url(createHash("sha256").update(text, "utf8").digest()), allowCredentials: [{ id: key!.id, type: "public-key" }], extensions: { prf: { eval: { first: salt } } } },
-        };
+        if (!key || (this.stageCred && key.id !== this.stageCred)) fail(409, "conflict", "another passkey is staging this store; continue with it");
+        const canonical = { v: 3, object: "seal-stage", action: step, id: this.installation, epoch: this.epoch, credential: key!.hex, scopes: next!.scopes, nonce: b64url(randomBytes(32)), issued_at: nowISO() };
+        const text = canonicalJSON(canonical);
+        const salts = step === "test" ? next!.scopes.map((x) => this.stageScopes.find((y) => y.scope === x)!.salt!) : undefined;
+        const purpose = step === "open-legacy" ? "migrate" : step === "create" ? "stage" : "test";
+        const offer = await this.stager.enrolOffer(req, text, canonical, session, { purpose, credential: key!.id, scopes: next!.scopes, salts, legacy: step === "open-legacy" ? this.legacy : undefined });
+        this.stageAsks.set(offer.challenge_id, { step, scopes: next!.scopes, salts: JSON.parse(offer.open.descriptor).salts });
+        return offer;
       }
-      if (rest === "unlock/finish") {
-        const cred = this.attempts.get(String(body.attempt_id));
-        if (!cred || typeof body.enc !== "string" || typeof body.ciphertext !== "string") fail(400, "bad_request", "unknown attempt");
-        this.attempts.clear();
-        this.wrapCredential = cred!;
-        this.wrap = this.wrap === "none" ? "created" : "tested";
+      if (rest === "stage/finish") {
+        const ask = this.stageAsks.get(String(body.challenge_id));
+        if (!ask) fail(404, "not_found", "unknown challenge");
+        this.stageAsks.delete(String(body.challenge_id));
+        const f = await this.stager.finish(body, session);
+        const keks = f.keks!.map((k) => Buffer.from(k).toString("hex"));
+        this.stageKeks.push({ step: ask!.step, cred: f.cred, keks });
+        const scopeKeks = ask!.step === "open-legacy" ? keks.slice(1) : keks;
+        if (scopeKeks.length !== ask!.scopes.length) fail(400, "bad_request", "wrong number of keys");
+        ask!.scopes.forEach((scope, i) => {
+          const x = this.stageScopes.find((y) => y.scope === scope)!;
+          const h = sha256hex(Buffer.from(scopeKeks[i]!, "hex"));
+          if (ask!.step === "test") {
+            if (x.kek !== h) fail(403, "forbidden", "the key does not open the staged scope key");
+            x.tested = true;
+          } else Object.assign(x, { wrapped: true, kek: h, salt: ask!.salts[i] });
+        });
+        if (ask!.step === "open-legacy") this.legacyUnlocked = true;
+        this.stageCred = f.cred;
         return { ok: true };
       }
       if (rest === "control/challenge") {
-        if (body.action !== "activate" || this.wrap !== "tested") fail(409, "conflict", "the wrap has not been tested yet");
+        if (body.action !== "activate" || !this.stageScopes.every((x) => x.tested) || !this.drilled) fail(409, "conflict", "every scope key must be tested and the recovery key proven first");
         const canonical = { v: 3, object: "seal-control", action: "activate", id: this.installation, epoch: this.epoch, manifest: this.manifest(), nonce: b64url(randomBytes(32)), issued_at: nowISO() };
         const text = plainCanonical(canonical);
         const c = this.host.issue(text, canonical, session);
@@ -699,22 +806,35 @@ export class MockSetup {
     this.updatesReady = flag("updates") ?? this.updatesReady;
     if (flag("pinned") === false) this.pins = [];
     if (flag("pinned") === true) this.pins = null;
+    this.format1 = flag("format1") ?? this.format1;
     const mode = q.get("mode");
-    if (mode === "serve" || mode === "cutover" || mode === "seal-setup") {
-      this.mode = mode;
+    if (mode === "serve" || mode === "cutover" || mode === "seal-setup" || mode === "bucket-migrate") {
+      this.mode = mode === "bucket-migrate" ? "seal-setup" : mode;
       if (mode !== "serve") {
-        const task = mode === "cutover" ? "cutover" : "seal";
+        const task = mode === "cutover" ? "cutover" : mode === "bucket-migrate" ? "buckets" : "seal";
         this.begin(task, "Start the broker for your review (agents are refused)");
-        this.wait(mode === "cutover" ? "your review and activation of the plan" : "the passkey wrap, the recovery key check and your activation", 15);
-        if (mode === "seal-setup") this.scoped = true;
+        this.wait(mode === "cutover" ? "your review and activation of the plan" : "your passkey's scope keys, the recovery key check and your activation", 15);
+        if (mode !== "cutover") {
+          this.scoped = true;
+          this.stage(mode === "bucket-migrate" ? "format-1" : "unsealed");
+          if (mode === "bucket-migrate") {
+            this.sealed = this.format1 = true;
+            this.recipient ||= MOCK_RECIPIENT;
+          }
+        }
       }
     }
     const wrap = q.get("wrap");
     if (wrap === "none" || wrap === "created" || wrap === "tested") {
-      this.wrap = wrap;
-      this.wrapCredential = wrap === "none" ? "" : (this.host.passkeys()[0]?.id ?? "");
+      const cred = wrap === "none" ? "" : (this.host.passkeys()[0]?.id ?? "");
+      this.stageCred = cred;
+      if (wrap !== "none") this.legacyUnlocked = true;
+      for (const x of this.stageScopes) {
+        const kek = b64url(randomBytes(32));
+        Object.assign(x, { wrapped: wrap !== "none", tested: wrap === "tested", salt: wrap === "none" ? undefined : b64url(randomBytes(32)), kek: wrap === "none" ? undefined : sha256hex(kek) });
+      }
     }
     this.drilled = flag("drilled") ?? this.drilled;
-    return { mode: this.mode, installed: this.installed, scoped: this.scoped, sealed: this.sealed, updates: this.updatesReady, wrap: this.wrap, drilled: this.drilled };
+    return { mode: this.mode, installed: this.installed, scoped: this.scoped, sealed: this.sealed, format1: this.format1, updates: this.updatesReady, source: this.stageSource, drilled: this.drilled };
   }
 }

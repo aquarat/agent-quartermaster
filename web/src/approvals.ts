@@ -1,7 +1,7 @@
 import { type Api } from "./api";
 import { type SealView } from "./sealPanel";
 import { type Authenticator, encodeAssertion } from "./webauthn";
-import { binary32, checkReview, type Review } from "./review";
+import { binary32, checkReview, checkTap, type Review } from "./review";
 import { encode, decode } from "./b64url";
 import { type PendingItem, type PasskeyInfo } from "./types";
 import { mismatches, parseCanonical, describe } from "./canonical";
@@ -189,7 +189,7 @@ export async function batchReview(
       throw Error("Mixed organisations");
     return facts(t, s);
   });
-  const opts = await checkReview(
+  const tap = await checkTap(
     b,
     {
       v: 3,
@@ -207,10 +207,12 @@ export async function batchReview(
   );
   return {
     text: details.join("\n\n"),
+    /** What the tap opens, for the card (format 2). */
+    opens: tap.lines,
     tap: async (auth: Authenticator) =>
       api.sealPost!("batch/finish", {
         challenge_id: b.challenge_id,
-        assertion: encodeAssertion(await auth.get(opts)),
+        ...(await tap.sign(auth)),
       }),
   };
 }
@@ -346,6 +348,12 @@ export function eligible(v: SealView) {
       )
     : undefined;
 }
+/** What a tap opens and for how long (format 2), shown before the tap. */
+export function opensList(lines: string[]): HTMLElement {
+  return lines.length
+    ? h("ul", { class: "open-lines" }, lines.map((l) => h("li", null, visibleText(l))))
+    : h("p", { class: "muted open-lines" }, "This tap opens no bucket.");
+}
 const button = (label: string, run: () => Promise<void>, err: HTMLElement) =>
   h(
     "button",
@@ -386,6 +394,7 @@ export function multiPanel(
       const p = await batchReview(api, v, selected, location.hostname);
       replace(
         review,
+        opensList(p.opens),
         h("pre", null, visibleText(p.text)),
         button(
           `Decide ${selected.length} with passkey`,
@@ -571,7 +580,7 @@ export function windowAdmin(
               );
               const id = JSON.parse(b.canonical).id,
                 terms = op.terms(id);
-              const opts = await checkReview(
+              const tap = await checkTap(
                 b,
                 {
                   object: "window",
@@ -583,10 +592,11 @@ export function windowAdmin(
                   terms,
                 },
                 location.hostname,
-                k.raw_id,
+                { selected: k.raw_id },
               );
               replace(
                 review,
+                opensList(tap.lines),
                 h("pre", null, visibleText(terms)),
                 button(
                   "Delegate these decisions with passkey",
@@ -596,7 +606,7 @@ export function windowAdmin(
                       op,
                       await api.sealPost!<Receipt>("windows/open/finish", {
                         challenge_id: b.challenge_id,
-                        assertion: encodeAssertion(await auth.get(opts)),
+                        ...(await tap.sign(auth)),
                       }),
                       id,
                       v.installation,

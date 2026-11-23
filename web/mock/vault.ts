@@ -3,10 +3,11 @@
 // signer keys, so the page's own crypto and canonical checks are exercised. Like the rest of
 // the mock, passkey signatures are not verified.
 //
-//   GET /mock/vault?locked=0|1   turns the sealed, organisation-scoped view on (mock only)
+//   GET /mock/vault?mode=buckets|migration-required&closed=1   turns the sealed, organisation-scoped view on (mock only)
 
 import { createECDH, createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import { suite, tuple } from "../src/seal";
+import type { MockBuckets } from "./buckets";
 import { canonicalJSON, editChanges, editCommitment, type Edit, type SignItem, type SignRequest, type VaultOrg, type VaultSet } from "../src/vault";
 
 const b64url = (b: Uint8Array | Buffer) => Buffer.from(b).toString("base64url");
@@ -80,7 +81,8 @@ interface Attempt {
 
 export class MockVault {
   enabled = false;
-  locked = false;
+  /** Seal format 2: reveal and sign-approve open the set's bucket (mock/buckets.ts). */
+  buckets?: MockBuckets;
   readonly installation = b64url(sha256("mock installation"));
   readonly epoch = b64url(randomBytes(32));
   orgs: VaultOrg[] = [];
@@ -139,9 +141,6 @@ export class MockVault {
     request(imageKey, "01MOCKSIGNREQUEST0000C5R1WZ", "laptop", "198.51.100.7", "bench images", [{ name: "bench.bin", size: 120044, sha256: hex(sha256("mock bench")) }], 3600, 10, "approved", 4);
   }
 
-  sealStatus() {
-    return { mode: this.locked ? "locked" : "unlocked", epoch: this.epoch, installation: this.installation, choices: [] };
-  }
   catalogue() {
     return {
       owner_id: id32("owner"),
@@ -156,7 +155,7 @@ export class MockVault {
     };
   }
   private state() {
-    return { unlocked: !this.locked, schemes: SCHEMES, organisations: this.orgs, sets: this.sets.map((s) => ({ ...s, allow_reveal: this.orgs.find((o) => o.id === s.org_id)!.allow_reveal })), requests: this.requests.filter((r) => r.status === "pending" || r.status === "approved") };
+    return { schemes: SCHEMES, organisations: this.orgs, sets: this.sets.map((s) => ({ ...s, allow_reveal: this.orgs.find((o) => o.id === s.org_id)!.allow_reveal })), requests: this.requests.filter((r) => r.status === "pending" || r.status === "approved") };
   }
   private target(s: VaultSet) {
     return { org_id: s.org_id, org_slug: s.org_slug, org_title: s.org_title, service_id: s.service_id, service_slug: s.service_slug, service_title: s.service_title, set_id: s.set_id, set_slug: s.set_slug, set_title: s.set_title, kind: s.kind, revision: s.revision };
@@ -188,20 +187,15 @@ export class MockVault {
     const fail = this.deps.fail;
     const facts: Record<string, unknown> = {};
     const setOf = (id: unknown) => this.sets.find((s) => s.set_id === id) ?? fail(404, "not_found", "not found");
-    const needUnlocked = () => {
-      if (this.locked) fail(423, "locked", "waiting for owner unlock; retry within the original deadline");
-    };
     switch (c.action) {
       case "policy": {
         const o = this.orgs.find((x) => x.id === c.id) ?? fail(404, "not_found", "not found");
         if (typeof c.allow_reveal !== "boolean" || c.allow_reveal === o.allow_reveal) fail(409, "conflict", "policy already has that value; reload");
-        if (c.allow_reveal) needUnlocked();
         return { meta: { org_id: o.id, org_slug: o.slug, org_title: o.title, old_allow_reveal: o.allow_reveal, allow_reveal: c.allow_reveal }, facts };
       }
       case "commit": {
         const s = setOf(c.id);
         if (s.kind !== "env-set") fail(400, "bad_request", "not an env set");
-        needUnlocked();
         const a = begin ? this.submit(session, c, "edit", s.set_id) : this.live(session, c.attempt_id);
         if (a.purpose !== "edit" || a.target !== s.set_id) fail(409, "conflict", "upload attempt expired; start again");
         const edit = JSON.parse((await this.open(a, "edit", c.attempt_id as string, s.set_id)).toString("utf8")) as Edit & { salt: string };
@@ -224,7 +218,6 @@ export class MockVault {
         const o = this.orgs.find((x) => x.id === s.org_id)!;
         if (s.kind !== "env-set") fail(403, "forbidden", "a signer key is never revealed");
         if (!o.allow_reveal) fail(403, "forbidden", "this organisation does not allow reveal");
-        needUnlocked();
         const names = c.names as string[];
         if (!Array.isArray(names) || !names.length || names.some((n, i) => !s.names.includes(n) || (i > 0 && names[i - 1]! >= n))) fail(400, "bad_request", "name the keys to reveal, sorted, each once");
         const pub = typeof c.recipient === "string" ? Buffer.from(c.recipient, "base64url") : Buffer.alloc(0);
@@ -236,7 +229,6 @@ export class MockVault {
         const scheme = SCHEMES.find((x) => x.id === c.scheme);
         if (!scheme || typeof c.id !== "string" || !/^[0-9a-f]{32}$/.test(c.id) || typeof c.set_slug !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(c.set_slug) || typeof c.set_title !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,63}$/.test(c.set_title)) return fail(400, "bad_request", "invalid signer set");
         if (this.sets.some((s) => s.set_id === c.id || (s.service_id === parent.service_id && s.set_slug === c.set_slug))) fail(409, "conflict", "a set with that name or ID exists; reload");
-        needUnlocked();
         let attempt = c.attempt_id as string | undefined;
         let pub: Buffer;
         let recipient = "";
@@ -273,7 +265,6 @@ export class MockVault {
         const s = setOf(r.set);
         const ttl = Number(c.ttl_seconds ?? 0), max = Number(c.max_signatures ?? 0);
         if (c.action === "sign-approve") {
-          needUnlocked();
           const single = ttl === 0 && max === r.items.length;
           const timed = r.ttl_seconds > 0 && ttl > 0 && ttl <= r.ttl_seconds && max >= 1 && max <= r.max_signatures;
           if (!single && !timed) fail(400, "bad_request", "duration or count exceeds the request");
@@ -292,18 +283,23 @@ export class MockVault {
     return fail(400, "bad_request", "unknown vault action");
   }
 
+  /** The bucket a reveal or a signing approval opens (format 2). */
+  private bucketFor(c: Record<string, unknown>): string | undefined {
+    const set = c.action === "reveal" ? this.sets.find((s) => s.set_id === c.id) : c.action === "sign-approve" ? this.sets.find((s) => s.set_id === this.requests.find((r) => r.id === c.id)?.set) : undefined;
+    if (!set) return undefined;
+    return this.buckets?.buckets.find((b) => b.label === `${set.org_slug}/${set.service_slug}/${set.set_slug}`)?.id;
+  }
+
   /** Returns undefined for a path that is not the vault's (or when the view is off). */
   async handle(req: Request, url: URL, body: Record<string, unknown>, session: string | undefined): Promise<unknown> {
     if (!this.enabled) return undefined;
     const p = url.pathname, post = req.method === "POST", fail = this.deps.fail;
-    if (p === "/api/ui/seal/status" && !post) return this.sealStatus();
     if (p === "/api/ui/seal/env/state" && !post) return { drafts: [], releases: [] };
     if (p === "/api/ui/catalogue" && !post) return this.catalogue();
     if (!p.startsWith("/api/ui/seal/vault/")) return undefined;
     const verb = p.slice("/api/ui/seal/vault/".length);
     if (verb === "state" && !post) return this.state();
     if (verb === "attempt" && post) {
-      if (this.locked) fail(423, "locked", "waiting for owner unlock; retry within the original deadline");
       const e = createECDH("prime256v1");
       e.generateKeys();
       const priv = Buffer.alloc(32);
@@ -317,11 +313,17 @@ export class MockVault {
       delete facts.edit;
       const canonical = { v: 3, object: "vault", action: body.action, id: body.id, installation: this.installation, epoch: this.epoch, issued_at: nowISO(), nonce: b64url(randomBytes(32)), metadata: canonicalJSON(meta) };
       const text = canonicalJSON(canonical);
+      const bucket = this.bucketFor(body);
+      if (bucket && this.buckets?.enabled) {
+        const ttl = Number(body.ttl_seconds ?? 0);
+        const hold = body.action === "sign-approve" ? { hold: "sign", until: new Date(Date.now() + (ttl > 0 ? ttl : 600) * 1000).toISOString().replace(/\.\d+Z$/, "Z") } : { hold: "instant", until: "" };
+        return { ...(await this.buckets.bucketOffer(req, text, { ...canonical, text }, session, { buckets: [{ id: bucket, ...hold }] })), facts };
+      }
       const ch = this.deps.issue(text, { ...canonical, text }, session);
       return { canonical: text, challenge_id: ch.id, public_key: this.deps.requestOptions(req, ch.challenge), facts };
     }
     if (verb === "finish" && post) {
-      const c = this.deps.redeem(body.challenge_id, body.assertion, session);
+      const c = this.buckets?.enabled ? (await this.buckets.finish(body, session)).canonical : this.deps.redeem(body.challenge_id, body.assertion, session);
       if (c.object !== "vault") fail(409, "conflict", "wrong ceremony");
       const signed = JSON.parse(c.metadata as string) as Record<string, unknown>;
       const choice: Record<string, unknown> = { action: c.action, id: c.id, attempt_id: signed.attempt_id, names: signed.names, recipient: signed.recipient, allow_reveal: signed.allow_reveal, service_id: signed.service_id, set_slug: signed.set_slug, set_title: signed.set_title, scheme: signed.scheme, source: signed.source, ttl_seconds: signed.ttl_seconds, max_signatures: signed.max_signatures };

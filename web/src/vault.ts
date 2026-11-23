@@ -5,10 +5,10 @@
 // ciphertext for a key generated here for that one reveal.
 import { type Api } from "./api";
 import { decode, encode } from "./b64url";
-import { checkReview, type Review } from "./review";
+import { checkTap, type Review } from "./review";
 import { suite, tuple } from "./seal";
 import { type SealView } from "./sealPanel";
-import { type Authenticator, encodeAssertion } from "./webauthn";
+import { type Authenticator } from "./webauthn";
 
 const utf8 = new TextEncoder();
 
@@ -89,7 +89,6 @@ export interface SignRequest {
   used: number;
 }
 export interface VaultState {
-  unlocked: boolean;
   schemes: Scheme[];
   organisations: VaultOrg[];
   sets: VaultSet[];
@@ -368,14 +367,16 @@ async function review(api: Api, v: SealView, action: string, id: string, body: R
   const b = await api.vaultPost!<VaultReview>("challenge", { action, id, ...body });
   const facts = b.facts && typeof b.facts === "object" ? b.facts : {};
   const meta = canonicalJSON(await metadata(facts));
-  const opts = await checkReview(b, { v: 3, object: "vault", action, id, installation: v.installation, epoch: v.epoch, metadata: meta }, rp);
+  // Reveal and sign-approve open the set's bucket (format 2); every other vault action opens nothing.
+  const tap = await checkTap(b, { v: 3, object: "vault", action, id, installation: v.installation, epoch: v.epoch, metadata: meta }, rp, { allowOpen: action === "reveal" || action === "sign-approve" });
   let used = false;
   return {
     canonical: b.canonical,
+    opens: tap.lines,
     async finish<T>(auth: Authenticator): Promise<T> {
       if (used) throw Error("Ceremony already used");
       used = true;
-      return api.vaultPost!<T>("finish", { challenge_id: b.challenge_id, assertion: encodeAssertion(await auth.get(opts)) });
+      return api.vaultPost!<T>("finish", { challenge_id: b.challenge_id, ...(await tap.sign(auth)) });
     },
   };
 }
@@ -428,6 +429,7 @@ export async function vaultReveal(api: Api, v: SealView, set: VaultSet, names: s
   const r = await review(api, v, "reveal", set.set_id, { names: sorted, recipient }, () => ({ ...targetFields(set), names: sorted, recipient }), rp);
   return {
     detail: `Reveal ${sorted.join(", ")} of ${pathOf(set)} revision ${set.revision} to this page`,
+    opens: r.opens,
     async tap(auth: Authenticator): Promise<Entry[]> {
       const out = await r.finish<{ enc: string; ciphertext: string }>(auth);
       return openReveal(pair, install, epoch, r.canonical, set.set_id, raw(out.enc, 65), raw(out.ciphertext, 17, 64 << 10), sorted);
@@ -535,6 +537,7 @@ export async function vaultSignDecision(api: Api, v: SealView, set: VaultSet, re
   }), rp);
   const what = action === "sign-approve" ? (ttl === 0 ? `sign exactly ${items.length} artifact(s), once` : `up to ${max} signatures over anything ${req.host} submits for ${ttl} seconds${ttl > req.soft_cap_seconds ? " — BEYOND SOFT CAP" : ""}`) : action === "sign-deny" ? "deny" : "revoke";
   return {
+    opens: r.opens,
     detail: `${pathOf(set)} (${req.scheme}) for ${req.host}, ${req.address}: ${what}\n` + items.map((it) => `${it.name} · ${it.size < 0 ? "size not given" : it.size + " bytes"} · sha256 ${it.sha256}`).join("\n"),
     tap: (auth: Authenticator) => r.finish<unknown>(auth),
   };

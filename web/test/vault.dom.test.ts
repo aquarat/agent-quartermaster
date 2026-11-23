@@ -5,7 +5,7 @@ import { Window } from "happy-dom";
 import { createApi } from "../src/api";
 import { completeLogin, prepareLogin } from "../src/flows";
 import { startMock } from "../mock/server";
-import { fakeAuth, jarFetch } from "./helpers";
+import { jarFetch, prfAuth } from "./helpers";
 import type { VaultPage as Page, VaultHost } from "../src/vaultPage";
 import type { VaultState } from "../src/vault";
 import type { SealView } from "../src/sealPanel";
@@ -27,7 +27,9 @@ async function until(cond: () => boolean, ms = 3000): Promise<void> {
 
 describe("Credential sets page in a DOM", () => {
   const api = createApi({ base: m.url, fetch: jarFetch() });
-  const auth = fakeAuth(m.url);
+  const auth = prfAuth(m.url);
+  m.store.addPasskey("apple", "PRF test passkey", Date.now(), undefined, auth.id);
+  m.store.buckets.enableAll(auth.id);
   let page: Page;
   let state: VaultState;
   let seal: SealView;
