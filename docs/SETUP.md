@@ -1,6 +1,6 @@
 # Setup queue and the maintenance runner
 
-**Admin → Setup** runs the remaining setup steps and every later upgrade from the approval
+**Settings → Setup** runs the remaining setup steps and every later upgrade from the approval
 page. Each task is one passkey approval over a canonical description ([API.md](API.md)); a
 small root program on the bastion, the *maintenance runner*, verifies that approval itself and
 carries the task out. After the runner is installed there is nothing left to do in a terminal.

@@ -24,7 +24,7 @@ export function updateCard(view: UpdateView,approve:(target:ActionTarget)=>void)
   const c=view.candidate, f=c.forgejo??{}, g=c.github??{};
   const show=(s:string)=>s.split('\n').map(line=>visibleText(line)).join('\n');
   const match=assets.every(a=>/^[a-f0-9]{64}$/.test(f[a]??'')&&f[a]===g[a]);
-  // Shown inside the “Upgrade aqmas” card of Admin → Setup.
+  // Shown inside the “Upgrade aqmas” card of Settings → Setup.
   return h('div',{class:'update'},h('p',null,`Running ${view.current} (${view.commit})`),
     view.status && h('p',null,show(view.status)),view.error && h('p',{role:'status'},show(view.error)),
     c.version ? [h('h3',null,`Available: ${c.version} (${c.commit})`),h('p',null,match?'Release hashes agree':'Release hashes disagree or are unavailable'),

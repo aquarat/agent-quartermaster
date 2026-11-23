@@ -1,4 +1,4 @@
-# Root maintenance runner behind Admin → Setup (docs/SETUP.md). It runs only tasks compiled
+# Root maintenance runner behind Settings → Setup (docs/SETUP.md). It runs only tasks compiled
 # into aqmasd, each one requested by a passkey-signed approval that it verifies itself against
 # /etc/aqmas/update-passkeys.json. Installed by `aqmasd maint-init`.
 [Unit]

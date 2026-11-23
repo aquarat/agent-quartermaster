@@ -139,7 +139,7 @@ const FAKE_PASSKEY = `navigator.credentials.get = async (o) => {
 
 const ENV_FILE = "# staging\nAPP_SECRET=mock-rotated-secret\nAPP_TOKEN=mock-new-token\nTLS_KEY=\"-----BEGIN PRIVATE KEY-----\nTU9DSyBLRVkgTUFURVJJQUwgUk9UQVRFRA==\n-----END PRIVATE KEY-----\n\"\n";
 
-/** Admin → Credential sets and the signing cards, against the mock's made-up organisations. */
+/** Vault and the signing cards, against the mock's made-up organisations. */
 async function vaultShots(w: number) {
   const m = startMock({ port: 0, distDir: dist, vault: true });
   const origin = `http://localhost:${m.server.port}`;

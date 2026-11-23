@@ -1,6 +1,6 @@
 # Sealed-store operations (per-credential buckets)
 
-> **Admin → Setup** ([SETUP.md](SETUP.md)) runs the import and the move from format 1 from
+> **Settings → Setup** ([SETUP.md](SETUP.md)) runs the import and the move from format 1 from
 > the approval page: the runner does the root-owned parts, and the recovery drill runs on the
 > bastion with a key you may generate in the browser. That is the convenient path the owner
 > chose. The manual procedures here are the stricter ones (recovery key never on the bastion,
@@ -75,7 +75,7 @@ run `seal-preflight.py CONFIG SOURCES.json` as root, before starting the unit. T
 unit requires root-protected config ancestors; use `-require-root-config` for maintenance
 commands too.
 
-In Admin → Passkeys, **Enable** a second, independently held passkey for every scope (one
+In Security → Passkeys, **Enable** a second, independently held passkey for every scope (one
 tap by a passkey that already opens them, then one by the new passkey per two scopes) and
 **Test** it. Watch the agent TLS leaf expiry on the broker card and sign **Renew leaf**
 (it opens the internal CA for an instant, then the broker restarts) well before expiry.
@@ -88,7 +88,7 @@ such a store reports `migration-required`: sign-in, request queueing, deny/revok
 Setup page work, nothing secret does, and upgrades are refused.
 
 The move is **one-way**: after activation there is no rollback and v0.4.1 cannot read the
-store. Run it from **Admin → Setup → Move to per-credential buckets** (task `buckets`):
+store. Run it from **Settings → Setup → Move to per-credential buckets** (task `buckets`):
 
 1. **Run** (tap). The runner checks schema 8 and the format-1 pin, stops the broker, backs up
    database, keys and configuration, and starts it in `bucket-migrate` mode (no agent
@@ -112,13 +112,13 @@ restarts the format-1 broker, and the task can be run again. After activation it
 finishes forward. Pre-migration backups and offsite copies keep format-1 strength: anyone
 with such a copy and one tap from a malicious page asking for an old salt gets the master
 key. Delete or crypto-erase them once the new store is checked. After the move, enable your
-other passkeys (Admin → Passkeys → **Enable**).
+other passkeys (Security → Passkeys → **Enable**).
 
 ## Recovery drill
 
 Prove the recovery identity opens a real backup. Do both from time to time.
 
-* **Browser** (Admin → Recovery drill): paste the identity; the page seals it to a one-time
+* **Browser** (Security → Recovery key drill): paste the identity; the page seals it to a one-time
   broker key, one ordinary tap signs `recovery drill` with the packet's SHA-256, and the
   broker opens every scope key from its recovery wrap, every bucket and every record, then
   wipes everything. It reports counts only. This puts the identity into the approval page:
@@ -140,20 +140,20 @@ Prove the recovery identity opens a real backup. Do both from time to time.
 
 ## Lost one passkey
 
-1. **Remove** it (Admin → Passkeys, signed tap). The broker refuses if it is the only passkey
+1. **Remove** it (Security → Passkeys, signed tap). The broker refuses if it is the only passkey
    that opens some scope: first enable another passkey for that scope, or enrol one with the
-   recovery key (Admin → Recovery, the rare path). Removal deletes its wraps and ends the
+   recovery key (Security → Recovery key, the rare path). Removal deletes its wraps and ends the
    web sessions that signed in with it.
-2. **Rekey** each scope it opened (Admin → Buckets → **Rekey**, one tap by a passkey that
+2. **Rekey** each scope it opened (Security → Buckets → **Rekey**, one tap by a passkey that
    opens the scope). The scope and every bucket in it get new key pairs, every record is
    re-encrypted, drafts are dropped and the scope's open buckets close (their users pause until
    **Reopen**). Only the tapping passkey keeps a wrap, of the new key at a fresh PRF salt
    (the same tap's second evaluation). Copies of the old wraps in backups then expose only
    values as they were at the copy.
 3. **Test** the rekeying passkey: the page asks for this tap right after the rekey (later:
-   Admin → Passkeys → **Test**). Its new wrap is untested until it opens once, Admin shows the
+   Security → Passkeys → **Test**). Its new wrap is untested until it opens once, Admin shows the
    scope as **Untested after rekey**, and new sets in the scope wait for that. If the test
-   fails, use the recovery key (Admin → Recovery: enrol that passkey for the scope; it may
+   fails, use the recovery key (Security → Recovery key: enrol that passkey for the scope; it may
    replace the untested wrap). Then **enable** your other passkeys again from it (Enable ends
    with their test).
 

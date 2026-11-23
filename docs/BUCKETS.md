@@ -240,7 +240,7 @@ session starts and shows the list on its red card.
 
 ## 6. Admin
 
-**Admin → Buckets** lists every bucket (kind, path, scope), whether it is open, each hold (why,
+**Security → Buckets** lists every bucket (kind, path, scope), whether it is open, each hold (why,
 ref, until), paused users with **Reopen**, per-scope **Rekey**, and **Close all**. Per passkey:
 **Opens N of M buckets**, scopes enabled and tested, **Not enabled for …**. A keyed scope no
 passkey has opened since it was created or rekeyed carries `tested: false` and the badge
@@ -297,7 +297,7 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
 
 ## 8. Migration and sealing (one-way)
 
-**From v0.4.1 sealed (schema 8): Admin → Setup → "Move to per-credential buckets"** (task
+**From v0.4.1 sealed (schema 8): Settings → Setup → "Move to per-credential buckets"** (task
 `buckets`, params `{"purge_backups":bool}`). One way: no rollback and no v0.4.1 readability
 afterwards.
 
@@ -347,7 +347,7 @@ config; then scope wraps (create, test), drill and activation as above.
 
 ## 10. Recovery
 
-* **Drill (browser):** Admin → Recovery drill (§7).
+* **Drill (browser):** Security → Recovery key drill (§7).
 * **Drill (offline):** `aqmasd seal-drill BACKUP.db RECIPIENT <identity.txt` opens every scope
   key and bucket of a standalone backup and prints only counts and the manifest digest.
 * **Lost one passkey:** remove it, rekey its scopes, enable a new passkey from another.

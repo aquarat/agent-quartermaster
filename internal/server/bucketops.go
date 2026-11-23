@@ -246,7 +246,7 @@ func (s *Server) ensureSetBucket(ctx context.Context, q *store.Q, kind, set, org
 	}
 	sc, err := q.Scope(ctx, org)
 	if errors.Is(err, store.ErrNotFound) {
-		return row, errConflict("this organisation has no scope key yet: create the scope first (Admin → Buckets)")
+		return row, errConflict("this organisation has no scope key yet: create the scope first (Security → Buckets)")
 	}
 	if err != nil {
 		return row, err
@@ -256,7 +256,7 @@ func (s *Server) ensureSetBucket(ctx context.Context, q *store.Q, kind, set, org
 	if ok, err := q.ScopeTested(ctx, org); err != nil {
 		return row, err
 	} else if !ok {
-		return row, errConflict("test the new scope first: no passkey has opened " + scopeName(ctx, q, org) + " yet (Admin → Passkeys → Test)")
+		return row, errConflict("test the new scope first: no passkey has opened " + scopeName(ctx, q, org) + " yet (Security → Passkeys → Test)")
 	}
 	if err = s.insertBucket(ctx, q, sc, kind, set, nil); err != nil {
 		return row, err

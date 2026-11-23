@@ -54,17 +54,23 @@ import { hostCard, type HostInfo } from './admin';
 import { SetupPage, setupSummary } from './setupPage';
 import type { SetupView } from './setup';
 import { helpPage, type HelpConfig } from './help';
-import {cataloguePage,type Catalogue} from './catalogue';
-import { bucketIndicator, bucketsPanel, sealBanner, serving, type SealView } from './sealPanel';
+import { admissionButton, policyForm, type Catalogue } from './catalogue';
+import { bucketsPanel, sealBanner, serving, type SealView } from './sealPanel';
 import { capabilityForm, createScope, testAfterRekey } from './capabilities';
 import { recoveryPanel } from './recoveryPanel';
 import { opensList } from './approvals';
 import {TabWindow,multiPanel,windowAdmin} from './approvals';
 import {envPanel,type EnvState} from './envsets';
-import { VaultPage, signCards, type VaultHost } from './vaultPage';
+import { signCards } from './vaultPage';
 import type { VaultState } from './vault';
+import { VaultView, type VaultViewHost } from './vaultView';
+import { buildItems } from './vaultItems';
+import { PAGES, navBar, pageTitle, parseRoute, updateNav, type PageId } from './nav';
+import { readiness, readinessHeadline, readinessPanel } from './readiness';
+import { SearchBox } from './search';
+import { Tray } from './tray';
 
-function route() { return location.hash === '#/admin' ? 'admin' : location.hash === '#/setup' ? 'setup' : location.hash === '#/help' ? 'help' : 'queue'; }
+const route = () => parseRoute(location.hash);
 function nav(label:string,hash:string,title:string) { const a=h('a',{title,'aria-label':title},label); a.href=hash; return a; }
 function scopeHeading(f?:Record<string,string|number>){return f?h('h3',null,...['org_title','service_title','set_title'].map((k,i)=>h('span',null,i?' › ':'',h('bdi',null,vt(String(f[k]??'?')))))):null;}
 import { browserAuthenticator, type Authenticator } from "./webauthn";
@@ -91,16 +97,36 @@ export class App {
   private view: "loading" | "signin" | "main" = "loading";
   private pollTimer: number | undefined;
   private refreshing = false;
-  private page = route();
+  private page: PageId = route().page;
   private seal?: SealView;
   private tab=new TabWindow();
   private envState?:EnvState;
   /** Credential sets (docs/API.md "Vault"): undefined when this server has none. */
   private vaultState?: VaultState;
-  private vaultPage?: VaultPage;
-  private vaultHost(): VaultHost { return { api: this.api, auth: this.auth, changed: () => this.changed(), propose: (t, c) => this.sheet.openCatalogue(t, c) }; }
+  private vaultView?: VaultView;
+  private vaultHost(): VaultViewHost {
+    return {
+      api: this.api,
+      auth: this.auth,
+      changed: () => this.changed(),
+      propose: (t, c) => this.sheet.openCatalogue(t, c),
+      createScope: (scope, review) => createScope(this.api, this.auth, this.seal!, this.state?.passkeys ?? [], scope, review, () => this.changed()),
+      readinessNote: () => this.readinessNote(),
+    };
+  }
+  private tray?: Tray;
+  private search = new SearchBox(() => ({
+    items: buildItems(this.vaultState, this.catalogue, this.seal),
+    hosts: this.hosts,
+    passkeys: this.state?.passkeys ?? [],
+    pending: this.state?.pending ?? [],
+    canAdd: !!this.vaultState,
+    toEnable: readiness(this.seal)?.fixable.length ?? 0,
+  }), () => void this.loadDirectory());
+  /** Which page hosts and the catalogue were last loaded for ("" = never). */
+  private directoryAt = 0;
   private hosts: HostInfo[]=[];
-  /** Admin: a one-line summary of Admin → Setup (null = this server has none). */
+  /** Admin: a one-line summary of Settings → Setup (null = this server has none). */
   private setupView?: SetupView | null;
   /** The Setup page polls and redraws by itself while it is open. */
   private setupPage?: SetupPage;
@@ -124,15 +150,17 @@ export class App {
     this.api = api;
     this.auth = auth;
     this.sheet = new Sheet(this);
-    const m = /^#r=([A-Za-z0-9_-]{1,64})$/.exec(location.hash);
-    this.focusId = m ? m[1]! : null;
+    this.focusId = route().focus ?? null;
   }
 
   start(): void {
-    window.addEventListener('pagehide',()=>{this.tab.end();this.vaultPage?.clearSecrets();});window.addEventListener('pageshow',ev=>{if(ev.persisted){this.tab.forget();location.reload()}});
+    window.addEventListener('pagehide',()=>{this.tab.end();this.vaultView?.clearSecrets();});this.search.bindKeys();window.addEventListener('pageshow',ev=>{if(ev.persisted){this.tab.forget();location.reload()}});
     window.addEventListener('hashchange',()=>{
-      this.sheet.close(true); this.focusId=/^#r=([A-Za-z0-9_-]{1,64})$/.exec(location.hash)?.[1] ?? null;
-      if(this.view==='main') void this.refresh();
+      this.sheet.close(true); this.focusId=route().focus ?? null;
+      if(this.view!=='main') return;
+      // Moving inside the Vault (another item, Add item) redraws at once from what is loaded.
+      if(route().page===this.page&&this.page==='vault') this.renderSections();
+      void this.refresh();
     });
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "visible") return;
@@ -159,7 +187,7 @@ export class App {
   async refresh(): Promise<void> {
     if (this.refreshing) return;
     this.refreshing = true;
-    const requested=route();
+    const requested=route().page;
     try {
       const s = await this.api.state();
       this.seal=s.seal_enabled?await this.api.sealStatus!():undefined;
@@ -167,10 +195,11 @@ export class App {
       this.vaultState=serving(this.seal)&&s.catalogue_enabled&&this.api.vaultState?await this.api.vaultState().catch((e)=>{if(e instanceof ApiError&&e.status===404)return undefined;throw e;}):undefined;
       if(this.tab.id()&&!this.seal?.active_windows?.some(w=>w.id===this.tab.id()))this.tab.forget();
       this.migration=s.migration;
-      if(requested==='admin') [this.hosts,this.setupView]=await Promise.all([this.api.hosts(),this.api.setupGet?this.api.setupGet<SetupView>('').catch(()=>null):null]);
-      if(requested==='admin')this.catalogue=s.catalogue_enabled?await this.api.catalogue?.():null;
+      if(requested==='hosts') this.hosts=await this.api.hosts();
+      if(requested==='settings') this.setupView=this.api.setupGet?await this.api.setupGet<SetupView>('').catch(()=>null):null;
+      if(requested==='vault'||requested==='hosts'||requested==='settings')this.catalogue=s.catalogue_enabled?await this.api.catalogue?.():null;
       if(requested==='help') this.help=await this.api.help();
-      if(requested!==route()) return;
+      if(requested!==route().page) return;
       this.state = normalise(s);
       this.lastOk = Date.now();
       this.offline = false;
@@ -188,7 +217,21 @@ export class App {
       }
     } finally {
       this.refreshing = false;
-      if(requested!==route()) void this.refresh();
+      if(requested!==route().page) void this.refresh();
+    }
+  }
+
+  /** Hosts and the catalogue for the global search, whatever page is open (at most every 30 s). */
+  private async loadDirectory(): Promise<void> {
+    if (!this.state || Date.now() - this.directoryAt < 30_000) return;
+    this.directoryAt = Date.now();
+    try {
+      const [hosts, cat] = await Promise.all([this.api.hosts(), this.state.catalogue_enabled ? this.api.catalogue?.() : null]);
+      this.hosts = hosts;
+      this.catalogue = cat;
+      this.search.refresh();
+    } catch {
+      this.directoryAt = 0; // the search still has the vault items, passkeys and pages
     }
   }
 
@@ -236,11 +279,11 @@ export class App {
         h("h1", { class: "brand" }, "aqmas"),
         h("p", { class: "error", role: "alert" }, vt(explainError(e))),
         h("button", { class: "btn primary big", type: "button", on: { click: () => void this.refresh() } }, "Try again"),
-        route() === "setup" ? h("p", { class: "muted", role: "status" }, "The broker may be restarting. This page keeps trying by itself.") : null,
+        route().page === "setup" ? h("p", { class: "muted", role: "status" }, "The broker may be restarting. This page keeps trying by itself.") : null,
       ),
     );
     // Setup tasks restart the broker: a reload in that window must not end on a dead page.
-    if (route() === "setup") window.setTimeout(() => { if (this.view === "loading") void this.refresh(); }, 2000);
+    if (route().page === "setup") window.setTimeout(() => { if (this.view === "loading") void this.refresh(); }, 2000);
   }
 
   private loginStatus: HTMLElement | null = null;
@@ -392,7 +435,7 @@ export class App {
   }
 
   private showMain(): void {
-    this.page=route();
+    this.page=route().page;
     this.view = "main";
     this.rendered.clear();
     this.loginStatus = this.signBtn = this.loginDetails = null;
@@ -415,24 +458,34 @@ export class App {
         ),
       ),
     );
+    const def = PAGES[this.page];
+    this.tray ??= new Tray(this.api, this.auth, () => this.changed());
+    let main: HTMLElement;
+    switch (this.page) {
+      case "approvals":
+        main = h(
+          "main",
+          { class: "sections" },
+          h("div", { class: "col col-queue" }, section("signing", "Signatures to approve"), section("env", "Env releases and staged edits"), section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
+          h("div", { class: "col col-access" }, section("grants", "Active access", "tiles"), section("standing", "Auto-approvals", "tiles")),
+        );
+        break;
+      case "activity":
+        main = h("main", { class: "subpage wide" }, section("recent", "Activity", "", filters));
+        break;
+      case "setup":
+        main = h("main",{class:'subpage'},h('p',{class:'crumb'},nav('‹ Settings','#/settings','Back to Settings')),h('h2',null,'Setup'),h('p',{class:'muted'},'Each step is one passkey approval. A small root program on this machine checks your signature itself and does the work.'),h('div',{id:'setup-root',class:'setup'}));
+        break;
+      default:
+        main = h("main", { class: `subpage${this.page === "vault" ? " wide vault-page" : ""}` }, this.page === "vault" || this.page === "help" ? null : h("h2", { class: "page-title" }, def.title), def.sections.map(([id, title]) => section(id, title)));
+    }
     replace(
       this.root,
-      h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Request queue')), h("p", { class: "status", id: "status" }), h("span", { id: "buckets-indicator", class: "buckets-indicator", "aria-live": "polite" }),h('nav',{'aria-label':'Pages'},nav('Help','#/help','Help'),nav('⚙','#/admin','Admin'))),
-      this.page==='help' ? h('main',{class:'subpage'},h('h2',null,'Help'),section('help','Operator cheat sheet')) : this.page==='setup' ? h('main',{class:'subpage'},h('p',{class:'crumb'},nav('‹ Admin','#/admin','Back to Admin')),h('h2',null,'Setup'),h('p',{class:'muted'},'Each step is one passkey approval. A small root program on this machine checks your signature itself and does the work.'),h('div',{id:'setup-root',class:'setup'})) : this.page==='admin' ? h('main',{class:'subpage'},h('h2',null,'Admin'),section('setup','Setup and upgrades'),section('buckets','Buckets'),section('orgs','Organisations'),section('vault','Credential sets'),section('passkeys','Passkeys'),section('recovery','Recovery key'),section('hosts','Enrolled hosts')) : h(
-        "main",
-        { class: "sections" },
-        h("div", { class: "col col-queue" }, section("signing", "Signatures to approve"), section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
-        h(
-          "div",
-          { class: "col col-access" },
-          section("grants", "Active access", "tiles"),
-          section("standing", "Auto-approvals", "tiles"),
-        ),
-        h("aside", { class: "col col-activity", "aria-labelledby": "sec-recent-h" }, section("recent", "Recent activity", "", filters)),
-      ),
+      h("header", { class: "topbar" }, h("h1", { class: "brand" }, nav('aqmas','#/','Approvals')), navBar(), h("div", { class: "top-tools" }, this.search.button, this.tray.el, h("p", { class: "status", id: "status" }))),
+      main,
     );
     if(this.sealOnTop())this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));
-    if(this.page!=='admin')this.vaultPage?.clearSecrets();
+    if(this.page!=='vault')this.vaultView?.clearSecrets();
     if(this.page==='setup'){
       this.setupPage=new SetupPage($('#setup-root',this.root),this.api,this.auth,{
         openMigration:t=>this.sheet.openMigration(t),
@@ -452,35 +505,130 @@ export class App {
     return !!this.seal && !(this.page === "setup" && this.seal.mode === "setup");
   }
 
+  /** Requests of every kind that wait for a decision (the Approvals tab's badge, the title). */
+  private waiting(): number {
+    const s = this.state;
+    return (s?.pending ?? []).length + (this.vaultState?.requests ?? []).filter((r) => r.status === "pending").length + (this.envState?.releases ?? []).filter((r) => r.status === "pending").length + (this.envState?.drafts ?? []).length;
+  }
+
+  /** One line for the tray and the Vault's empty pane when some passkey opens too little. */
+  private readinessNote(): Child {
+    const r = readiness(this.seal);
+    if (!r || !r.fixable.length) return null;
+    const a = h("a", null, r.fixable.length === 1 ? "Enable the other one" : `Enable the other ${r.fixable.length}`);
+    a.href = "#/security";
+    return h("span", { class: "readiness-note" }, readinessHeadline(r), " ", a, ".");
+  }
+
   private renderSections(): void {
     const s = this.state;
     if (!s || this.view !== "main") return;
-    if(this.seal&&this.envState&&this.page!=='help'){if(!this.root.querySelector('#sec-env'))this.root.insertBefore(section('env','Env credential sets'),this.root.querySelector('main'));this.section('env',[this.envState,this.page,this.catalogue,this.seal.mode],()=>[envPanel(this.api,this.auth,this.seal!,this.envState!,this.page==='admin'?this.catalogue:null,()=>this.changed())]);}
+    const page = this.page, seal = this.seal, live = serving(seal);
     if(!this.sealOnTop()){this.root.querySelector('#sec-seal')?.remove();this.rendered.delete('seal');}
-    else{if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));const seal=this.seal!;const batch=serving(seal)&&this.page==='queue'&&(s.pending??[]).length>0;this.section('seal',[seal.mode,this.page,batch?s.pending:null,batch?seal.epoch:null,this.tab.id()],()=>[sealBanner(seal),batch&&multiPanel(this.api,this.auth,seal,this.tab,s.pending??[],()=>this.changed())],!sealBanner(seal)&&!batch);}
-    this.renderIndicator();
-    if(this.page!=='queue'){
-      document.title=`${this.page==='admin'?'Admin':this.page==='setup'?'Setup':'Help'} · aqmas`;
-      if(this.page==='admin') {this.section('passkeys',[s.owner,s.passkeys,this.seal?.passkeys,this.seal?.scopes,this.seal?.mode],()=>this.passkeys(s),false,!!this.root.querySelector('#sec-passkeys .capabilities button.confirm'));this.section('hosts',this.hosts,()=>this.hosts.length?this.hosts.map(host=>hostCard(host,t=>this.sheet.openRevoke(t))):['No enrolled hosts.']);this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);}
-      else if(this.page==='help'&&this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
-      if(this.page==='admin'){
-        const seal=this.seal, live=serving(seal);
-        // A step waiting for its tap (Create's or Rekey's follow-up test) keeps the panel until it is done.
+    else{if(!this.root.querySelector('#sec-seal'))this.root.insertBefore(section('seal','Broker keys'),this.root.querySelector('main'));const batch=serving(seal)&&page==='approvals'&&(s.pending??[]).length>0;this.section('seal',[seal!.mode,page,batch?s.pending:null,batch?seal!.epoch:null,this.tab.id()],()=>[sealBanner(seal!),batch&&multiPanel(this.api,this.auth,seal!,this.tab,s.pending??[],()=>this.changed())],!sealBanner(seal!)&&!batch);}
+    const waiting = this.waiting();
+    const ready = readiness(seal);
+    this.tray?.update(seal, waiting, this.readinessNote());
+    updateNav(this.root, page, { approvals: waiting }, ready?.fixable.length ? { security: `${ready.fixable.length} passkey${ready.fixable.length === 1 ? "" : "s"} cannot open your credentials yet` } : {});
+    document.title = pageTitle(page, waiting);
+    switch (page) {
+      case "approvals":
+        this.renderApprovals(s);
+        return;
+      case "activity": {
+        const shown = this.shownIds();
+        this.section("recent", [s.recent, this.filter, [...shown].sort()], () => this.activity(s.recent!, shown), false, false, 0);
+        break;
+      }
+      case "vault": {
+        const v = this.vaultState;
+        this.section('vault',!!v,()=>v?[(this.vaultView??=new VaultView(this.vaultHost())).el]:[h('p',{class:'empty'},seal?.mode==='migration-required'?'Available after the move to per-credential buckets (Settings → Setup).':'The vault opens once organisations are active and the store is sealed (Settings → Setup).')]);
+        if(v&&seal)this.vaultView!.update(v,seal,this.catalogue,route().item);
+        break;
+      }
+      case "hosts":
+        this.section('hosts',[this.hosts,this.catalogue,(s.pending??[]).filter(p=>p.kind==='enrollment').length],()=>this.hostsPage(s),false,false,this.hosts.length);
+        break;
+      case "security": {
+        // A step waiting for its tap (the guided Enable, Create's or Rekey's follow-up test) keeps its panel until it is done.
+        this.section('readiness',[seal?.passkeys,seal?.scopes,s.passkeys],()=>ready?[readinessPanel({api:this.api,auth:this.auth,passkeys:()=>this.state?.passkeys??[],refresh:()=>this.changed()},seal!,ready)]:[],!ready,!!this.root.querySelector('#sec-readiness .wizard'),0);
+        this.section('passkeys',[s.owner,s.passkeys,seal?.passkeys,seal?.scopes,seal?.mode],()=>this.passkeys(s),false,!!this.root.querySelector('#sec-passkeys .capabilities button.confirm'),s.passkeys?.length??0);
         const stepping=!!this.root.querySelector('#sec-buckets .buckets-review button.confirm');
-        this.section('buckets',[seal,s.passkeys,this.tab.id()],()=>live?[bucketsPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed(),this.tab,{createScope:(scope,review)=>createScope(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed()),testAfterRekey:(scope,review)=>testAfterRekey(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed())}),windowAdmin(this.api,this.auth,seal!,this.tab,s.passkeys??[],()=>this.changed())]:[h('p',{class:'empty'},seal?.mode==='migration-required'?'Available after the move to per-credential buckets (Setup).':'Available once the store is sealed (Setup).')],!seal,stepping);
-        this.section('recovery',[seal?.mode,seal?.installation,seal?.epoch,seal?.scopes,s.passkeys],()=>live?[recoveryPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed())]:[],!live);
+        this.section('buckets',[seal,s.passkeys,this.tab.id()],()=>live?[bucketsPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed(),this.tab,{createScope:(scope,review)=>createScope(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed()),testAfterRekey:(scope,review)=>testAfterRekey(this.api,this.auth,seal!,s.passkeys??[],scope,review,()=>this.changed())}),windowAdmin(this.api,this.auth,seal!,this.tab,s.passkeys??[],()=>this.changed())]:[h('p',{class:'empty'},seal?.mode==='migration-required'?'Available after the move to per-credential buckets (Settings → Setup).':'Available once the store is sealed (Settings → Setup).')],!seal,stepping,0);
+        this.section('recovery',[seal?.mode,seal?.installation,seal?.epoch,seal?.scopes,s.passkeys],()=>live?[recoveryPanel(this.api,this.auth,seal!,s.passkeys??[],()=>this.changed())]:[],!live,false,0);
+        break;
       }
-      if(this.page==='admin')this.section('orgs',this.catalogue,()=>this.catalogue?[cataloguePage(this.catalogue,(t,c)=>this.sheet.openCatalogue(t,c))]:['Available after personal activation.']);
-      if(this.page==='admin'){
-        const v=this.vaultState;
-        this.section('vault',!!v,()=>v?[(this.vaultPage??=new VaultPage(this.vaultHost())).el]:[h('p',{class:'empty'},'Available once organisations are active and the store is sealed (Setup).')]);
-        if(v&&this.seal)this.vaultPage!.update(v,this.seal,this.catalogue);
-      }
-      this.updateStatus();return;
+      case "settings":
+        this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);
+        this.section('orgs',[this.catalogue,this.vaultState?.organisations],()=>this.orgsPage(),false,!!this.root.querySelector('#sec-orgs .vault-confirm'),this.catalogue?.organisations.length??0);
+        break;
+      case "help":
+        if(this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
+        break;
+      case "setup":
+        break;
     }
+    this.updateStatus();
+  }
+
+  /** Hosts: each enrolled host with the organisations it may ask for. */
+  private hostsPage(s: UIState): Child[] {
+    const cat = this.catalogue;
+    const joining = (s.pending ?? []).filter((p) => p.kind === "enrollment").length;
+    const out: Child[] = [];
+    if (joining) {
+      const a = nav(joining === 1 ? "1 host is asking to join" : `${joining} hosts are asking to join`, "#/", "Approvals");
+      a.className = "btn approve";
+      out.push(h("p", { class: "hosts-joining" }, a));
+    }
+    if (!this.hosts.length) out.push(h("p", { class: "empty" }, "No enrolled hosts. Help has the command that enrolls one."));
+    for (const host of this.hosts) {
+      const card = hostCard(host, (t) => this.sheet.openRevoke(t));
+      if (cat && !host.revoked_at) {
+        const rows = cat.organisations.map((o) => ({ o, x: o.hosts.find((x) => x.enrollment === host.id) })).filter((r) => r.x);
+        card.insertBefore(
+          h(
+            "div",
+            { class: "admissions" },
+            h("h4", null, "May ask for credentials of"),
+            rows.length
+              ? h("ul", { class: "admission-list" }, rows.map(({ o, x }) => h("li", { class: x!.active ? "in" : "out" }, h("bdi", null, vt(o.title)), h("span", { class: "badge" }, x!.active ? "admitted" : "not admitted"), admissionButton(cat, o, x!, (t, c) => this.sheet.openCatalogue(t, c)))))
+              : h("p", { class: "muted" }, "No organisation lists this host."),
+          ),
+          card.querySelector("button.deny"),
+        );
+      }
+      out.push(card);
+    }
+    return out;
+  }
+
+  /** Settings: each organisation's policies (items and admissions live on Vault and Hosts). */
+  private orgsPage(): Child[] {
+    const cat = this.catalogue;
+    if (!cat) return ["Available after personal activation (Setup)."];
+    const forms = this.vaultState ? (this.vaultView ??= new VaultView(this.vaultHost())).forms : undefined;
+    if (forms && this.seal) forms.bind(this.vaultState!, this.seal);
+    return [
+      h("p", { class: "muted" }, "Create organisations, services and items from Vault → Add item; admit hosts under Hosts."),
+      ...cat.organisations.map((o) => {
+        const vo = this.vaultState?.organisations.find((x) => x.id === o.id);
+        const sets = o.services.reduce((n, v) => n + v.sets.filter((x) => !x.archived).length, 0);
+        return h(
+          "article",
+          { class: "card org-card" },
+          h("h3", null, h("bdi", null, vt(o.title))),
+          h("p", { class: "muted" }, h("span", { class: "mono" }, vt(o.slug)), ` · ${o.services.length} service${o.services.length === 1 ? "" : "s"} · ${sets} item${sets === 1 ? "" : "s"} · ${o.hosts.filter((x) => x.active).length} admitted host${o.hosts.filter((x) => x.active).length === 1 ? "" : "s"}`),
+          forms && vo ? forms.policyLine(vo) : null,
+          policyForm(cat, o, (t, c) => this.sheet.openCatalogue(t, c)),
+        );
+      }),
+    ];
+  }
+
+  private renderApprovals(s: UIState): void {
     const requests = s.pending!.filter((p) => p.kind !== "enrollment");
     const enrolls = s.pending!.filter((p) => p.kind === "enrollment");
-    document.title = requests.length + enrolls.length > 0 ? `(${requests.length + enrolls.length}) aqmas` : "aqmas";
     // While a finger is on the screen, leave the lists alone (the next poll catches up).
     const touching = this.pointerDown || Date.now() - this.lastTouch < TOUCH_SETTLE_MS;
 
@@ -498,6 +646,11 @@ export class App {
       const v = this.vaultState, reqs = v?.requests ?? [];
       const busy = !!this.root.querySelector("#sec-signing .vault-confirm");
       this.section("signing", [reqs, this.seal?.epoch], () => (v && this.seal ? signCards(this.vaultHost(), this.seal, v) : []), reqs.length === 0, touching || busy, reqs.filter((r) => r.status === "pending").length);
+    }
+    {
+      // Env releases hosts asked for and edits staged from the CLI: approve, deny, revoke, commit.
+      const e = this.envState, n = (e?.releases.length ?? 0) + (e?.drafts.length ?? 0);
+      this.section("env", [e, this.seal?.mode], () => (e && this.seal ? [envPanel(this.api, this.auth, this.seal, e, null, () => this.changed())] : []), n === 0, touching || !!this.root.querySelector("#sec-env [role=status] button"), n);
     }
     this.section("enroll", enrolls, () => enrolls.map((p) => this.enrollCard(p)), enrolls.length === 0, touching);
     this.section(
@@ -518,8 +671,6 @@ export class App {
       false,
       touching,
     );
-    const shown = this.shownIds();
-    this.section("recent", [s.recent, this.filter, [...shown].sort()], () => this.activity(s.recent!, shown), false, false, 0);
     this.updateStatus();
     this.tick();
     if (this.focusId) {
@@ -552,7 +703,11 @@ export class App {
   /** Scroll to a card and highlight it for a moment. */
   private jumpTo(id: string): void {
     const el = this.root.querySelector<HTMLElement>(`[data-id="${CSS.escape(id)}"]`);
-    if (!el) return;
+    if (!el) {
+      // The cards live on Approvals: go there and focus it (the #r= address the CLI prints).
+      if (this.page !== "approvals" && /^[A-Za-z0-9_-]{1,64}$/.test(id)) location.hash = `#r=${id}`;
+      return;
+    }
     for (const f of this.root.querySelectorAll(".focus")) f.classList.remove("focus");
     el.classList.add("focus");
     el.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -678,14 +833,6 @@ export class App {
     return h("span", { class: "badge", title: k.missing.length ? "Not enabled for " + k.missing.map((m) => this.seal!.scopes?.find((x) => x.scope === m)?.title ?? m).join(", ") : "Enabled for every scope" }, `Opens ${k.opens} of ${k.of} buckets`);
   }
 
-  /** The header's "N buckets open" / "nothing open". */
-  private renderIndicator(): void {
-    const el = this.root.querySelector<HTMLElement>("#buckets-indicator");
-    if (!el) return;
-    if (serving(this.seal)) replace(el, bucketIndicator(this.seal!));
-    else replace(el);
-  }
-
   /** Raw credential IDs → nicknames (to say which passkey can open a bucket). */
   passkeyNames(raw: string[]): string[] {
     const list = this.state?.passkeys ?? [];
@@ -797,7 +944,7 @@ export class App {
   }
 
   private renderSectionsIfDeferred(): void {
-    if(this.page!=='queue') return;
+    if(this.page!=='approvals') return;
     const s = this.state;
     if (!s) return;
     const req = s.pending!.filter((p) => p.kind !== "enrollment");

@@ -43,7 +43,7 @@ aqmas sign client-a/releases/firmware-key --why "CI digest" --digest sha256:9f86
 
 ## For the owner
 
-**Admin → Credential sets → New signer.** Choose the organisation, service,
+**Vault → New signer.** Choose the organisation, service,
 a name and a scheme, then either
 
 * **Generate in aqmas**: the key is made on the bastion and never exists

@@ -247,20 +247,20 @@ export const untestedAfterRekey = (v: SealView, scope: string) => {
 };
 const untestedWords = (v: SealView, scope: string) => (untestedAfterRekey(v, scope) ? "untested after rekey: Test it now" : "not tested yet");
 
-export const REKEY_TEST_FAILED = "The rekeyed scope did not open from this passkey. Try the test again; if it keeps failing, use the recovery key: Admin → Recovery.";
+export const REKEY_TEST_FAILED = "The rekeyed scope did not open from this passkey. Try the test again; if it keeps failing, use the recovery key: Security → Recovery key.";
 
 /** Right after a rekey: the rekeying passkey tests its new wrap (one tap). Until it does, the
  * scope opens only from the recovery key. A failed test says so. */
 export async function testAfterRekey(api: Api, auth: Authenticator, v: SealView, pks: PasskeyInfo[], scope: string, review: HTMLElement, refresh: () => void): Promise<void> {
   const me = pks.find((p) => p.current);
-  if (!me?.raw_id) throw Error("Sign in with the passkey that rekeyed, then Admin → Passkeys → Test. " + REKEY_TEST_FAILED);
+  if (!me?.raw_id) throw Error("Sign in with the passkey that rekeyed, then Security → Passkeys → Test. " + REKEY_TEST_FAILED);
   const step = await startCapability(api, v, { action: "test", capability: "unlock", nickname: me.nickname, credential_id: me.raw_id, scopes: [scope] }, location.hostname);
   runSteps(review, auth, { ...step, title: `Rekey done: test ${me.nickname}'s new key for ${titleOf(v, scope)}`, tap: (a) => step.tap(a).catch((e: unknown) => {
     throw Error(`${(e as Error).message}. ${REKEY_TEST_FAILED}`);
   }) }, refresh);
 }
 
-/** Admin → Buckets "Create": the signed-in passkey creates an organisation's scope key, then
+/** Security → Buckets "Create": the signed-in passkey creates an organisation's scope key, then
  * tests it (three taps): the broker writes nothing into a scope no passkey has opened yet. */
 export async function createScope(api: Api, auth: Authenticator, v: SealView, pks: PasskeyInfo[], scope: string, review: HTMLElement, refresh: () => void): Promise<void> {
   const me = pks.find((p) => p.current);

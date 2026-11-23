@@ -255,7 +255,7 @@ func (s *Server) offerScopesRekey(ctx context.Context, sess, canonical string, n
 		if what == "" {
 			what = "the keys of " + strings.Join(scopes, ", ")
 		}
-		return nil, nil, &apiErr{423, "locked", "no passkey can open " + what + " yet: enable one in Admin → Passkeys, or use the recovery key"}
+		return nil, nil, &apiErr{423, "locked", "no passkey can open " + what + " yet: enable one in Security → Passkeys, or use the recovery key"}
 	}
 	o.creds = allowed
 	t := &tapOpen{session: sess, attempt: attempt, descriptor: desc, needs: needs, scopes: scopes, expires: s.now().Add(ChallengeTTL), rekeySalt: rekeySalt}
@@ -478,7 +478,7 @@ func (s *Server) unwrapScopes(ctx context.Context, row int64, scopes []string, k
 		sw, err := q.ScopeWrap(ctx, row, scope)
 		if err != nil {
 			destroyKeys(out)
-			return nil, &apiErr{423, "locked", "this passkey cannot open " + scopeName(ctx, q, scope) + " buckets: enable it in Admin → Passkeys"}
+			return nil, &apiErr{423, "locked", "this passkey cannot open " + scopeName(ctx, q, scope) + " buckets: enable it in Security → Passkeys"}
 		}
 		sc, err := q.Scope(ctx, scope)
 		if err != nil {

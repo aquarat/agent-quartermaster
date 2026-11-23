@@ -90,7 +90,7 @@ type ManifestWrap struct {
 }
 
 func migrationErr() *apiErr {
-	return &apiErr{423, "locked", "migration required: this store is still sealed in format 1; move it to per-credential buckets in Admin → Setup"}
+	return &apiErr{423, "locked", "migration required: this store is still sealed in format 1; move it to per-credential buckets in Settings → Setup"}
 }
 
 // bucketsReady is nil when buckets can be used at all (format 2 serving).

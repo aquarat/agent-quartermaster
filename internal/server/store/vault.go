@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/envset"
 	"github.com/aquarat/agent-quartermaster/internal/signer"
 )
@@ -250,4 +251,29 @@ func (q *Q) SignPending(ctx context.Context, host int64, now time.Time) (int, er
 	var n int
 	err := q.q.QueryRowContext(ctx, `SELECT count(*) FROM sign_requests WHERE host=? AND status='pending' AND deadline>?`, host, ms(now)).Scan(&n)
 	return n, err
+}
+
+// SetHistory is the newest n audit rows about one application set, newest
+// first, for the owner's item view: owner actions on the set itself (object
+// set:ID), what admitted hosts asked for and collected (their detail starts
+// with the set's path, which the broker wrote from its own rows) and the
+// owner's decisions on those. It is a display aid read from the append-only
+// log; nothing is decided from it.
+func (q *Q) SetHistory(ctx context.Context, set, path string, n int) ([]api.AuditEntry, error) {
+	out := []api.AuditEntry{}
+	err := q.rows(ctx, `SELECT at,actor,action,object,detail FROM audit WHERE object='set:'||?1
+ OR (actor LIKE 'host:%' AND (action LIKE 'env~_%' ESCAPE '~' OR action='sign' OR action LIKE 'sign~_%' ESCAPE '~') AND (detail=?2 OR substr(detail,1,length(?2)+1)=?2||' '))
+ OR (actor='owner' AND action LIKE 'vault~_sign~_%' ESCAPE '~' AND instr(detail,' '||?2||' host=')>0)
+ OR (actor='owner' AND action LIKE 'env~_%' ESCAPE '~' AND (instr(detail,?2||'"')>0 OR instr(detail,?2||'\')>0))
+ ORDER BY id DESC LIMIT ?3`, func(rs *sql.Rows) error {
+		var e api.AuditEntry
+		var at int64
+		if err := rs.Scan(&at, &e.Actor, &e.Action, &e.Object, &e.Detail); err != nil {
+			return err
+		}
+		e.At = fromMS(at)
+		out = append(out, e)
+		return nil
+	}, set, path, n)
+	return out, err
 }

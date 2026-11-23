@@ -874,7 +874,7 @@ not recalled by closing a window. A window click is not a passkey signature.
 # Env sets: immutable revisions and collection
 
 The sealed runtime resolves `GET /v2/env/set?path=org/service/set` only for
-the authenticated host's current admission. Admin → Env credential sets
+the authenticated host's current admission. Vault (an env set's “More”)
 issues a one-use, five-minute upload ticket bound to session, enrolled
 owner-device, operation, immutable path IDs and base revision. Enter the
 ticket at the CLI prompt (`--ticket-fd N` for a protected input stream).

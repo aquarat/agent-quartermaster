@@ -1,4 +1,4 @@
-// Admin → Setup (docs/SETUP.md), DOM-free: the wire types of GET /api/ui/setup, the task
+// Settings → Setup (docs/SETUP.md), DOM-free: the wire types of GET /api/ui/setup, the task
 // parameter encoding the runner accepts, sealing of pasted secrets, the recovery key made in
 // the browser, and the signed "run this task" flow.
 //

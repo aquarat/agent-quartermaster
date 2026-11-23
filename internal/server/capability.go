@@ -271,7 +271,7 @@ func (s *Server) orphanErr(ctx context.Context, q *store.Q, row int64, orphans [
 		}
 	}
 	if len(untested) == len(orphans) {
-		return errConflict("no other passkey has opened " + strings.Join(names, ", ") + " yet: " + strings.Join(untested, "; ") + " first (Admin → Passkeys → Test)")
+		return errConflict("no other passkey has opened " + strings.Join(names, ", ") + " yet: " + strings.Join(untested, "; ") + " first (Security → Passkeys → Test)")
 	}
 	msg := "this is the only passkey that can open " + strings.Join(names, ", ") + ": enable another passkey for it first"
 	if len(untested) > 0 {

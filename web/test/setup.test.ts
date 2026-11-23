@@ -1,4 +1,4 @@
-// Admin → Setup, DOM-free: the parameter encoding the runner accepts, sealed packets, the
+// Settings → Setup, DOM-free: the parameter encoding the runner accepts, sealed packets, the
 // recovery key made in the browser, and the pre-signing checks of a setup run.
 import { afterAll, describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";

@@ -1,4 +1,4 @@
-// Admin → Recovery (docs/BUCKETS.md §7, §10): the recovery drill and enrolling a passkey with
+// Security → Recovery key (docs/BUCKETS.md §7, §10): the recovery drill and enrolling a passkey with
 // the recovery key, for when no passkey can open a scope any more. The identity is read once
 // from the textarea, which is cleared at once, sealed to a fresh broker key and never stored.
 

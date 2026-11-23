@@ -1,4 +1,4 @@
-// Admin → Setup in happy-dom: the queue's cards against a scripted server, then the whole
+// Settings → Setup in happy-dom: the queue's cards against a scripted server, then the whole
 // thing (cutover, seal with the recovery key, self-update, upgrade) through the App and the mock.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Window } from "happy-dom";
@@ -293,8 +293,8 @@ describe("Setup through the App and the mock", () => {
   });
   afterAll(() => m.stop());
 
-  test("Admin has one Setup entry (no separate Updates section), which opens the queue", async () => {
-    win.location.hash = "#/admin";
+  test("Settings has one Setup entry (no separate Updates section), which opens the queue", async () => {
+    win.location.hash = "#/settings";
     win.dispatchEvent(new win.Event("hashchange"));
     await until(() => !!root.querySelector("#sec-setup a"));
     expect(root.querySelector("#sec-updates")).toBeNull();

@@ -163,7 +163,7 @@ func (s *Server) vaultUploadAAD(attempt, set string) ([]byte, error) {
 
 func (s *Server) vaultRoutes(m *http.ServeMux) {
 	s.sealedEndpoint(m, "POST /api/ui/seal/vault/attempt", s.vaultAttempt)
-	for path, fn := range map[string]capHandler{"GET /api/ui/seal/vault/state": s.vaultState, "POST /api/ui/seal/vault/challenge": s.vaultChallenge, "POST /api/ui/seal/vault/finish": s.vaultFinish} {
+	for path, fn := range map[string]capHandler{"GET /api/ui/seal/vault/state": s.vaultState, "GET /api/ui/seal/vault/history": s.vaultHistory, "POST /api/ui/seal/vault/challenge": s.vaultChallenge, "POST /api/ui/seal/vault/finish": s.vaultFinish} {
 		s.sealedEndpoint(m, path, fn)
 	}
 }
@@ -221,6 +221,44 @@ func (s *Server) vaultState(ctx context.Context, r *http.Request, sess string) (
 		}
 		out.Requests, err = q.OwnerSignRequests(ctx)
 		return err
+	})
+	return out, err
+}
+
+// vaultHistory is the owner's read-only view of one set's recent audit rows
+// and, from them, when it last changed and was last used (0: not in the rows
+// read). Display only: no value, and nothing a decision is taken from.
+func (s *Server) vaultHistory(ctx context.Context, r *http.Request, sess string) (any, error) {
+	out := struct {
+		Entries     []api.AuditEntry `json:"entries"`
+		LastChanged int64            `json:"last_changed_at"`
+		LastUsed    int64            `json:"last_used_at"`
+	}{Entries: []api.AuditEntry{}}
+	err := s.store.Tx(ctx, func(q *store.Q) error {
+		if _, err := s.vaultOwner(ctx, q, sess); err != nil {
+			return err
+		}
+		if !q.Scoped() {
+			return errNotFound()
+		}
+		t, err := q.VaultSet(ctx, r.URL.Query().Get("set"))
+		if err != nil {
+			return err
+		}
+		rows, err := q.SetHistory(ctx, t.SetID, t.OrgSlug+"/"+t.ServiceSlug+"/"+t.SetSlug, 200)
+		if err != nil {
+			return err
+		}
+		for _, e := range rows {
+			switch {
+			case out.LastChanged == 0 && (e.Action == "vault_commit" || e.Action == "vault_signer_create" || e.Action == "env_commit"):
+				out.LastChanged = e.At.UnixMilli()
+			case out.LastUsed == 0 && (e.Action == "sign" || strings.HasPrefix(e.Action, "env_collect_")):
+				out.LastUsed = e.At.UnixMilli()
+			}
+		}
+		out.Entries = rows[:min(len(rows), 20)]
+		return nil
 	})
 	return out, err
 }
@@ -630,7 +668,7 @@ func (s *Server) canWrite(ctx context.Context, q *store.Q, kind, set, org string
 		return nil
 	}
 	if _, err := q.Scope(ctx, org); err != nil {
-		return errConflict("this organisation has no scope key yet: create the scope first (Admin → Buckets)")
+		return errConflict("this organisation has no scope key yet: create the scope first (Security → Buckets)")
 	}
 	return nil
 }

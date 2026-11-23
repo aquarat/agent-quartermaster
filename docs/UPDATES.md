@@ -31,7 +31,7 @@ Start on a known-good bastion with an enrolled owner passkey, a merged-`/usr` Li
 host and the maintenance runner installed (`sudo aqmasd maint-init`, [SETUP.md](SETUP.md)).
 `maint-init --repo … --forgejo-api … --github-api …` pins the release sources at the machine;
 requests from the page can then never choose or change them.
-Then use **Admin → Setup → Enable self-update**. One approval does all of this as root, with
+Then use **Settings → Setup → Enable self-update**. One approval does all of this as root, with
 nothing taken from the request but the typed values you see and sign:
 
 1. Installs the build tools (bubblewrap, git, jq, make, a C compiler for the Go tests, unzip,

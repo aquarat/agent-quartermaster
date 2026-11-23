@@ -175,6 +175,9 @@ describe("Cloudflare cards", () => {
   });
 
   test("Cloudflare activity rows: own glyphs and colours, a cloud mark, their own filter", async () => {
+    win.location.hash = "#/activity";
+    win.dispatchEvent(new win.Event("hashchange"));
+    await until(() => !!root.querySelector("#sec-recent"));
     const sec = root.querySelector<HTMLElement>("#sec-recent")!;
     await until(() => !!sec.querySelector(".ev-cf"));
     const rows = [...sec.querySelectorAll<HTMLElement>(".ev")];

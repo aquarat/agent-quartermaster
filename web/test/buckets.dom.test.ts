@@ -1,4 +1,4 @@
-// Admin → Buckets, the header indicator and the approval card in happy-dom against the sealed
+// Security → Buckets, the header indicator and the approval card in happy-dom against the sealed
 // mock: what is open is shown, the card lists what a tap opens before the tap, Close all and
 // Rekey say what they do, and no unlock wording is left.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -60,8 +60,7 @@ describe("buckets in the UI", () => {
   });
 
   test("the header says how much is open", async () => {
-    await until(() => !!root.querySelector("#buckets-indicator .badge"));
-    expect(root.querySelector("#buckets-indicator")!.textContent).toBe("1 bucket open");
+    await until(() => root.querySelector(".tray-button")?.textContent === "1 bucket open");
   });
 
   test("the approval card lists what the tap opens, before the tap", async () => {
@@ -81,8 +80,8 @@ describe("buckets in the UI", () => {
     button(dlg, /^Done$|^Close$/)?.click();
   });
 
-  test("Admin → Buckets: scopes, holds, paused users with Reopen, Create, Rekey and Close all", async () => {
-    go("#/admin");
+  test("Security → Buckets: scopes, holds, paused users with Reopen, Create, Rekey and Close all", async () => {
+    go("#/security");
     await until(() => !!root.querySelector("#sec-buckets .buckets"));
     const sec = root.querySelector<HTMLElement>("#sec-buckets")!;
     expect([...sec.querySelectorAll(".scope h3")].map((x) => x.textContent)).toEqual(["Installation", "Personal", "Client A", "Club"]);
@@ -106,7 +105,7 @@ describe("buckets in the UI", () => {
     // A rekey closes its buckets: they are re-keyed, not listed as opened.
     expect(sec.querySelector(".buckets-review .open-lines")!.textContent).toContain("Re-keys SSH user CA");
     expect(sec.querySelector(".buckets-review .open-lines")!.textContent).not.toContain("Opens SSH user CA");
-    expect(REKEY_WARNING).toContain("Admin → Recovery");
+    expect(REKEY_WARNING).toContain("Security → Recovery key");
     // Close all: one signed tap, opens nothing, closes everything.
     button(sec, /^Close all…$/)!.click();
     await until(() => sec.querySelector(".buckets-review")!.textContent!.includes(CLOSE_ALL_TEXT));
@@ -115,7 +114,7 @@ describe("buckets in the UI", () => {
     const before = auth.gets.length;
     sign.click();
     expect(auth.gets.length).toBe(before + 1);
-    await until(() => root.querySelector("#buckets-indicator")!.textContent === "nothing open", 4000);
+    await until(() => root.querySelector(".tray-button")!.textContent === "nothing open", 4000);
     expect(m.store.buckets.buckets.every((b) => !b.open)).toBe(true);
   });
 
@@ -136,7 +135,7 @@ describe("buckets in the UI", () => {
     expect(text).not.toMatch(/\bunlock|Lock now|\blocked\b/i);
   });
 
-  test("migration required: a banner points to Admin → Setup", async () => {
+  test("migration required: a banner points to Settings → Setup", async () => {
     await fetch(m.url + "/mock/vault?mode=migration-required");
     go("#/");
     await until(() => !!root.querySelector("#sec-seal .card"), 4000);
