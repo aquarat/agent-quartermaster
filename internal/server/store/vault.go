@@ -257,14 +257,15 @@ func (q *Q) SignPending(ctx context.Context, host int64, now time.Time) (int, er
 // first, for the owner's item view: owner actions on the set itself (object
 // set:ID), what admitted hosts asked for and collected (their detail starts
 // with the set's path, which the broker wrote from its own rows) and the
-// owner's decisions on those. It is a display aid read from the append-only
+// owner's decisions on those (a signing decision names " PATH host="; an env
+// decision carries the signed metadata, which names the set by ID). It is a display aid read from the append-only
 // log; nothing is decided from it.
 func (q *Q) SetHistory(ctx context.Context, set, path string, n int) ([]api.AuditEntry, error) {
 	out := []api.AuditEntry{}
 	err := q.rows(ctx, `SELECT at,actor,action,object,detail FROM audit WHERE object='set:'||?1
  OR (actor LIKE 'host:%' AND (action LIKE 'env~_%' ESCAPE '~' OR action='sign' OR action LIKE 'sign~_%' ESCAPE '~') AND (detail=?2 OR substr(detail,1,length(?2)+1)=?2||' '))
  OR (actor='owner' AND action LIKE 'vault~_sign~_%' ESCAPE '~' AND instr(detail,' '||?2||' host=')>0)
- OR (actor='owner' AND action LIKE 'env~_%' ESCAPE '~' AND (instr(detail,?2||'"')>0 OR instr(detail,?2||'\')>0))
+ OR (actor='owner' AND action LIKE 'env~_%' ESCAPE '~' AND instr(detail,'\"set\":\"'||?1||'\"')>0)
  ORDER BY id DESC LIMIT ?3`, func(rs *sql.Rows) error {
 		var e api.AuditEntry
 		var at int64

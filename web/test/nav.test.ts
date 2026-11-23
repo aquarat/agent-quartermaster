@@ -128,12 +128,15 @@ describe("search", () => {
     hosts: [{ id: "e1", name: "web-1", address: "192.0.2.21", class: "agent", enrolled_at: "", not_before: "", not_after: "", last_request_at: null, revoked_at: null }],
     passkeys: [{ id: "p1", nickname: "Phone", authenticator: "Apple Passwords" } as never],
     pending: [{ id: "01ABCDEFGH", kind: "ssh", requesting_host: "web-1", ssh: { target_host: "db-1", login_user: "alice" } } as never],
+    signing: [{ id: "01SIGNREQ9", path: "personal/fw/release", host: "build-1" }],
+    releases: [{ id: "01ENVREL77", path: "client-a/paas/staging", host: "build-1" }],
     canAdd: true,
     toEnable: 2,
   });
   test("no query: what waits, what to do, where to go", () => {
     const hits = searchHits(index, "");
     expect(hits[0]).toMatchObject({ group: "Waiting", href: "#r=01ABCDEFGH" });
+    expect(hits.filter((x) => x.group === "Waiting").map((x) => x.href)).toEqual(["#r=01ABCDEFGH", "#r=01SIGNREQ9", "#/"]);
     expect(hits.some((x) => x.title === "Add a credential" && x.href === "#/vault/new")).toBe(true);
     expect(hits.some((x) => x.group === "Vault")).toBe(false);
     expect(hits.filter((x) => x.group === "Go to").map((x) => x.href)).toEqual(TABS.map((t) => t.hash));
@@ -146,7 +149,7 @@ describe("search", () => {
     expect(searchHits(index, "zzz")).toEqual([]);
   });
   test("the enable action is offered only while a passkey opens too little", () => {
-    const none = buildIndex({ items: [], hosts: [], passkeys: [], pending: [], canAdd: false, toEnable: 0 });
+    const none = buildIndex({ items: [], hosts: [], passkeys: [], pending: [], signing: [], releases: [], canAdd: false, toEnable: 0 });
     expect(searchHits(none, "enable passkey").some((x) => x.title.startsWith("Enable passkeys"))).toBe(false);
     expect(searchHits(none, "credential").some((x) => x.title === "Add a credential")).toBe(false);
   });

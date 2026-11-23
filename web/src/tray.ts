@@ -69,7 +69,7 @@ export class Tray {
       waiting > 0 ? h("p", { class: "tray-waiting" }, link(waiting === 1 ? "1 request is waiting for you" : `${waiting} requests are waiting for you`, "#/", "btn approve small")) : h("p", { class: "muted" }, "Nothing is waiting for you."),
       h("h3", null, n === 0 ? "No bucket is open" : n === 1 ? "1 bucket is open" : `${n} buckets are open`),
       open.length
-        ? h("ul", { class: "tray-list" }, open.map((b) => h("li", null, h("strong", null, vt(b.label)), " ", h("span", { class: "muted" }, vt(kindWords(b.kind)), b.holds.length ? ` · ${b.holds.map((x) => x.reason || x.kind).join("; ")}` : ""))))
+        ? h("ul", { class: "tray-list" }, open.map((b) => h("li", null, h("strong", null, vt(b.label)), " ", h("span", { class: "muted" }, vt(kindWords(b.kind)), b.holds.length ? vt(` · ${b.holds.map((x) => x.reason || x.kind).join("; ")}`) : ""))))
         : h("p", { class: "muted" }, "Every credential is encrypted at rest. A bucket opens only for the approval that needs it."),
       note ? h("p", { class: "tray-note" }, note) : null,
       h(

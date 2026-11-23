@@ -6,7 +6,6 @@
 // state-changing action is a form of vaultPage.ts or a catalogue proposal, with the same
 // canonical checks and the same passkey tap as before. No value is fetched to draw anything
 // here: the list shows key names, and a value appears only after its own Reveal tap.
-import { ApiError } from "./api";
 import { classify, actor } from "./audit";
 import { proposeCreate, type Catalogue } from "./catalogue";
 import { type Child, append, h, replace } from "./dom";
@@ -55,6 +54,7 @@ export class VaultView {
   private extra = h("div", { class: "vault-extra" });
   private detail = h("section", { class: "vault-detail", "aria-label": "Selected item" });
   private history?: { id: string; at: number; data?: SetHistory; rev: string };
+  private selectedAt = 0;
   private add?: AddForm;
 
   constructor(private host: VaultViewHost) {
@@ -86,8 +86,19 @@ export class VaultView {
     this.el.append(this.side, h("section", { class: "vault-list", "aria-label": "Items" }, h("div", { class: "vault-list-head" }, this.search, addLink), this.count, this.list), this.detail);
   }
 
+  /** Leaving the Vault (another tab, pagehide): revealed, typed and pasted values go, and
+   * the forms that held them are dropped, so coming back builds fresh ones. */
   clearSecrets(): void {
     this.forms.clearSecrets();
+    this.dropPane();
+  }
+
+  private dropPane(): void {
+    replace(this.bar);
+    replace(this.main);
+    replace(this.extra);
+    this.keys.main = this.keys.extra = this.keys.bar = this.keys.add = "";
+    this.add = undefined;
   }
 
   /** `item` comes from the address (#/vault/ID): the selection survives reload and Back. */
@@ -98,10 +109,11 @@ export class VaultView {
     this.forms.bind(state, seal);
     this.items = buildItems(state, catalogue, seal);
     if ((item ?? "") !== this.selected) {
+      // Another item: nothing of the previous one stays, whatever was open in it (a
+      // confirmation, a revealed value, a half-typed form).
       this.selected = item ?? "";
+      this.selectedAt = Date.now();
       this.clearSecrets();
-      this.keys.main = this.keys.extra = this.keys.bar = this.keys.add = "";
-      if (this.selected !== NEW) this.add = undefined;
     }
     this.el.dataset["pane"] = this.selected ? "detail" : "list";
     this.drawSide();
@@ -198,7 +210,8 @@ export class VaultView {
     if (this.selected === NEW) return this.drawAdd();
     const it = this.items.find((i) => i.id === this.selected);
     if (!it) {
-      const key = "none:" + this.selected;
+      const settling = !!this.selected && Date.now() - this.selectedAt < 4000;
+      const key = `none:${this.selected}:${settling}`;
       if (key === this.keys.main) return;
       this.keys.main = key;
       replace(this.bar, this.selected ? this.back() : null);
@@ -206,7 +219,7 @@ export class VaultView {
       replace(
         this.main,
         this.selected
-          ? h("p", { class: "empty" }, "That item is not in the vault (any more).")
+          ? h("p", { class: "empty", role: "status" }, settling ? "Looking for that item…" : "That item is not in the vault (any more).")
           : h("div", { class: "vault-placeholder" }, h("p", { class: "empty" }, "Pick an item to see its fields, who may ask for it and what happened to it."), this.host.readinessNote?.()),
       );
       return;
@@ -233,7 +246,7 @@ export class VaultView {
     const mk = JSON.stringify([it.id, it.set, org, this.seal!.epoch, it.set ? null : [it.bucket, it.kind]]);
     if (mk !== this.keys.main) {
       this.keys.main = mk;
-      this.clearSecrets();
+      this.forms.clearSecrets();
       replace(this.main, it.set ? (it.set.kind === "signer" ? this.forms.signerView(it.set) : this.forms.editor(it.set)) : this.infoCard(it));
     }
     this.loadHistory(it);
@@ -241,9 +254,13 @@ export class VaultView {
     const who = requesters(it, this.catalogue);
     const ek = JSON.stringify([it.id, who, mine, this.history?.id === it.id ? this.history.data : null, org, it.type, this.seal!.epoch, !!this.catalogue]);
     // A signing card waiting for its tap stays as it is.
-    if (ek !== this.keys.extra && !this.extra.querySelector(".vault-confirm, button.confirm")) {
+    // (the selection has not changed here: a new selection emptied the pane above). A CLI
+    // ticket on show stays too, and "More" stays open across a redraw.
+    if (ek !== this.keys.extra && !this.extra.querySelector(".vault-confirm, button.confirm, .vault-more [role=status]:not(:empty)")) {
       this.keys.extra = ek;
+      const more = !!this.extra.querySelector<HTMLDetailsElement>("details.vault-more")?.open;
       replace(this.extra, this.extras(it, who, mine));
+      if (more) this.extra.querySelector<HTMLDetailsElement>("details.vault-more")!.open = true;
     }
   }
 
@@ -260,9 +277,8 @@ export class VaultView {
         mine.data = data;
         if (this.selected === it.id) this.drawDetail();
       },
-      (e) => {
-        // An older server has no history: the card just is not shown.
-        if (!(e instanceof ApiError)) throw e;
+      () => {
+        // An older server has no history, or the broker is away: the card just is not shown.
       },
     );
   }
@@ -294,7 +310,7 @@ export class VaultView {
         it.serviceTitle ? [h("dt", null, "Service"), h("dd", null, h("bdi", null, vt(it.serviceTitle)))] : null,
         h("dt", null, "Kind"),
         h("dd", null, vt(b ? kindWords(b.kind) : it.kind)),
-        b ? [h("dt", null, "Bucket"), h("dd", null, b.open ? "Open" : "Closed", b.holds.length ? ` · held by ${b.holds.map((x) => x.reason || x.kind).join("; ")}` : "", b.paused.length ? ` · ${b.paused.length} waiting for a Reopen` : "")] : null,
+        b ? [h("dt", null, "Bucket"), h("dd", null, b.open ? "Open" : "Closed", b.holds.length ? vt(` · held by ${b.holds.map((x) => x.reason || x.kind).join("; ")}`) : "", b.paused.length ? ` · ${b.paused.length} waiting for a Reopen` : "")] : null,
       ),
       h("p", { class: "hint muted" }, "This item is managed elsewhere: ", b ? [link("Security → Buckets", "#/security"), " (reopen, rekey, close), "] : null, link("Settings", "#/settings"), " (policies, setup)", it.orgId !== INSTALLATION ? [" and ", link("Hosts", "#/hosts"), " (who may ask)"] : null, "."),
     );
@@ -476,7 +492,8 @@ class AddForm {
     const options = (el: HTMLSelectElement, list: { id: string; title: string; slug: string }[], what: string) => {
       const was = el.value;
       replace(el, list.map((o) => h("option", { value: o.id }, vt(`${o.title} (${o.slug})`))), h("option", { value: NEW }, `New ${what}…`));
-      el.value = [...el.options].some((o) => o.value === was) ? was : (list[0]?.id ?? NEW);
+      // A choice that no longer exists is not replaced by its neighbour: the owner chooses again.
+      el.value = [...el.options].some((o) => o.value === was) ? was : was ? NEW : (list[0]?.id ?? NEW);
     };
     options(this.org, cat?.organisations ?? [], "organisation");
     const org = cat?.organisations.find((o) => o.id === this.org.value);
@@ -550,15 +567,24 @@ class AddForm {
       this.error.textContent = "";
       return { id: n.id, slug, title, revision: 0 };
     };
-    const propose = host.propose && cat ? (kind: "organisation" | "service" | "credential_set", n: NewNode, taken: { slug: string }[], what: string) => {
-      const node = valid(n, taken, what);
-      if (node) proposeCreate(cat, host.propose!, kind, node, org, service);
+    // The parents are read from the catalogue at the click, not from the poll that drew the
+    // button: the proposal names the rows (and revisions) as they are now.
+    const propose = host.propose && cat ? (kind: "organisation" | "service" | "credential_set", n: NewNode, what: string) => {
+      const c = this.view.ctx().catalogue;
+      const o = c?.organisations.find((x) => x.id === this.org.value);
+      const v = o?.services.find((x) => x.id === this.service.value);
+      if (!c || (kind !== "organisation" && !o) || (kind === "credential_set" && !v)) {
+        this.error.textContent = "The catalogue changed. Choose the place again.";
+        return;
+      }
+      const node = valid(n, kind === "organisation" ? c.organisations : kind === "service" ? o!.services : v!.sets, what);
+      if (node) proposeCreate(c, host.propose!, kind, node, o, v);
     } : undefined;
     const review = h("div", { role: "status", class: "wizard-step" });
     if (!propose) return replace(this.action);
     switch (stage) {
       case "org":
-        return replace(this.action, h("div", { class: "actions start" }, btn("Create organisation…", "approve", () => propose("organisation", this.newOrg, cat!.organisations, "Organisation"))));
+        return replace(this.action, h("div", { class: "actions start" }, btn("Create organisation…", "approve", () => propose("organisation", this.newOrg, "Organisation"))));
       case "key":
         return replace(
           this.action,
@@ -578,10 +604,10 @@ class AddForm {
           review,
         );
       case "service":
-        return replace(this.action, h("div", { class: "actions start" }, btn("Create service…", "approve", () => propose("service", this.newService, org!.services, "Service"))));
+        return replace(this.action, h("div", { class: "actions start" }, btn("Create service…", "approve", () => propose("service", this.newService, "Service"))));
       case "set":
-        if (signer) return replace(this.action, forms.newSigner({ org: org!, service: service! }, (id) => (location.hash = vaultHash(id))));
-        return replace(this.action, h("div", { class: "actions start" }, btn("Create env set…", "approve", () => propose("credential_set", this.set, service!.sets, "Item"))));
+        if (signer) return replace(this.action, forms.newSigner({ org: org!, service: service! }, (id) => (location.hash = vaultHash(id)), this.el));
+        return replace(this.action, h("div", { class: "actions start" }, btn("Create env set…", "approve", () => propose("credential_set", this.set, "Item"))));
     }
   }
 }

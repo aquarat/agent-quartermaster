@@ -363,6 +363,19 @@ func TestVaultFormAndReveal(t *testing.T) {
 				return err
 			}
 		}
+		// The owner's decisions: only the ones whose signed metadata names this set, or
+		// whose detail names exactly this path; a path this one is the tail of stays out.
+		for _, d := range []string{
+			`passkey=1 canonical={"metadata":"{\"path\":\"xclient-a/paas/staging\",\"set\":\"0123456789abcdef0123456789abcdef\"}"}`,
+			`passkey=1 canonical={"metadata":"{\"path\":\"client-a/paas/staging\",\"set\":\"` + v.set + `\"}"}`,
+		} {
+			if err := q.Audit(context.Background(), v.s.now(), "owner", "env_approve", "env:01Z", d); err != nil {
+				return err
+			}
+		}
+		if err := q.Audit(context.Background(), v.s.now(), "owner", "vault_sign_approve", "request:01S", "passkey=1 nonce=n xclient-a/paas/staging host=build-1 ttl=0"); err != nil {
+			return err
+		}
 		return q.Audit(context.Background(), v.s.now(), "host:build-1", "env_collect_run", "grant:01Y", "client-a/paas/staging revision=2 enrollment=e")
 	}))
 	var hist struct {
@@ -371,7 +384,7 @@ func TestVaultFormAndReveal(t *testing.T) {
 		LastUsed    int64            `json:"last_used_at"`
 	}
 	mustStatus(t, "history", v.web("GET", "/api/ui/seal/vault/history?set="+v.set, nil, &hist), 200)
-	if len(hist.Entries) != 5 || hist.Entries[0].Action != "env_collect_run" || hist.Entries[1].Action != "vault_reveal" || hist.Entries[4].Action != "vault_commit" || hist.LastChanged == 0 || hist.LastUsed == 0 {
+	if len(hist.Entries) != 6 || hist.Entries[0].Action != "env_collect_run" || hist.Entries[1].Action != "env_approve" || !strings.Contains(hist.Entries[1].Detail, v.set) || hist.Entries[2].Action != "vault_reveal" || hist.Entries[5].Action != "vault_commit" || hist.LastChanged == 0 || hist.LastUsed == 0 {
 		t.Fatalf("history: %+v", hist)
 	}
 	mustStatus(t, "history of an unknown set", v.web("GET", "/api/ui/seal/vault/history?set=nope", nil, nil), 404)

@@ -630,7 +630,7 @@ export class VaultForms {
   }
 
   /** The new-signing-key form for one service. `created` gets the new set's id. */
-  newSigner({ org, service }: Place, created?: (setId: string) => void): HTMLElement {
+  newSigner({ org, service }: Place, created?: (setId: string) => void, frozen?: HTMLElement): HTMLElement {
     const state = this.state!;
     const slug = h("input", { type: "text", class: "text", id: "ns-slug", maxlength: "63", placeholder: "release-key", autocomplete: "off", spellcheck: "false" });
     const title = h("input", { type: "text", class: "text", id: "ns-title", maxlength: "64", placeholder: "Release key", autocomplete: "off" });
@@ -650,6 +650,7 @@ export class VaultForms {
     const pasteField = h("div", { class: "field", hidden: true }, h("label", { for: "ns-key" }, "Private key (pasted once)"), pasted, h("p", { class: "hint muted" }, "Encrypted in this tab for the sealed store, then cleared from this field. aqmas shows you the matching public key before you confirm."));
     for (const el of [gen, imp]) el.addEventListener("change", () => (pasteField.hidden = !imp.checked));
     const slot = h("div", { class: "vault-slot" });
+    const root = h("div", { class: "card vault-new-signer" });
     const error = h("p", { class: "error", role: "alert" });
     this.forget.push(() => (pasted.value = ""));
     const parent = { org_id: org.id, org_slug: org.slug, org_title: org.title, service_id: service.id, service_slug: service.slug, service_title: service.title };
@@ -687,15 +688,16 @@ export class VaultForms {
           created?.(out.set_id);
           this.host.changed();
         },
+        undefined,
+        // While the key waits for its tap, neither this form nor the one around it can move.
+        frozen ?? root,
       );
     });
     title.addEventListener("input", () => {
       if (!slug.dataset["typed"]) slug.value = slugify(title.value);
     });
     slug.addEventListener("input", () => (slug.dataset["typed"] = slug.value ? "1" : ""));
-    return h(
-      "div",
-      { class: "card vault-new-signer" },
+    append(root, [
       h("h3", null, "New signing key in ", h("bdi", null, vt(org.title)), " › ", h("bdi", null, vt(service.title))),
       h("p", { class: "hint muted" }, "A signing key lives in the sealed store and is never delivered: hosts send digests and get signatures back, each one approved or covered by a time-boxed grant, each one logged."),
       h("div", { class: "vault-selects" }, h("div", { class: "field" }, h("label", { for: "ns-title" }, "Name"), title), h("div", { class: "field" }, h("label", { for: "ns-slug" }, "Slug (in the path agents use)"), slug), h("div", { class: "field" }, h("label", { for: "ns-scheme" }, "Scheme"), scheme)),
@@ -705,6 +707,7 @@ export class VaultForms {
       error,
       h("div", { class: "actions" }, go),
       slot,
-    );
+    ]);
+    return root;
   }
 }

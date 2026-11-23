@@ -94,8 +94,14 @@ describe("Vault tab in a DOM", () => {
     await until(() => !!page.el.querySelector(".revealed-value"));
     expect(auth.gets.length).toBe(before + 1);
     expect(page.el.querySelector(".revealed-value")!.textContent).toBe("mock-app-secret-2f9c1e");
-    page.clearSecrets();
+    const shown = page.el.querySelector(".revealed-value")!;
+    page.clearSecrets(); // what leaving the tab does
+    expect(shown.textContent).toBe("");
     expect(page.el.querySelector(".revealed-value")).toBeNull();
+    expect(page.el.querySelector(".vault-editor")).toBeNull(); // the form goes too
+    expect(page.el.textContent).not.toContain("mock-app-secret");
+    page.update(state, seal, catalogue, sel); // coming back builds a fresh one
+    expect(page.el.querySelector(".vault-editor")).not.toBeNull();
     expect(page.el.textContent).not.toContain("mock-app-secret");
   });
 
@@ -138,6 +144,7 @@ describe("Vault tab in a DOM", () => {
     expect(page.el.querySelector("script")).toBeNull();
     expect((win as unknown as { pwned?: number }).pwned).toBeUndefined();
     page.clearSecrets();
+    page.update(state, seal, catalogue, sel);
   });
 
   test("signer sets offer no reveal and no value form; reveal-off organisations offer none", () => {
@@ -253,7 +260,18 @@ describe("Vault tab in a DOM", () => {
     page.update(state, opened, catalogue, sel);
     expect(page.el.querySelector<HTMLInputElement>(".kv-row input")!.value).toBe("KEEP_ME");
     expect(page.el.querySelector(".vault-bar .badge")!.textContent).toBe("Open now");
-    page.clearSecrets();
+    // Another item: nothing of this one stays, not even a confirmation left open in it.
+    page.el.querySelector<HTMLDetailsElement>("details.vault-more")!.open = true;
+    click(page.el.querySelector(".vault-more")!, "Turn reveal off…");
+    await until(() => !!page.el.querySelector(".vault-more .vault-confirm"));
+    page.update(state, opened, catalogue, sel); // a poll leaves the open confirmation alone
+    expect(page.el.querySelector(".vault-more .vault-confirm")).not.toBeNull();
+    select("club/website/deploy");
+    expect(page.el.querySelector(".vault-confirm")).toBeNull();
+    expect(page.el.querySelector(".vault-extra")!.textContent).not.toContain("client-a/paas/staging");
+    expect(page.el.querySelector(".vault-use")!.textContent).toContain("aqmas run club/website/deploy");
+    expect(page.el.querySelector<HTMLInputElement>(".kv-row input")).toBeNull();
+    select("client-a/paas/staging");
     const evil: VaultState = JSON.parse(JSON.stringify(state));
     for (const x of evil.sets) x.set_title = x.org_title = x.service_title = EVIL;
     page.update(evil, seal, null, sel);

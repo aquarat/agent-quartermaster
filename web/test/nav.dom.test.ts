@@ -114,6 +114,13 @@ describe("navigation", () => {
       expect(doc.title).toMatch(/^\(\d+\) /);
     }
     expect(root.querySelector(".crumb a")).toBeNull();
+    // Following a tab with the keyboard leaves the focus on the tabs (the header is redrawn).
+    root.querySelector<HTMLElement>('.tab[data-tab="hosts"]')!.focus();
+    go("#/hosts");
+    await until(() => current()[0] === "Hosts");
+    expect((doc.activeElement as HTMLElement).dataset["tab"]).toBe("hosts");
+    go("#/");
+    await until(() => current()[0] === "Approvals" && sections().length === 6);
   });
 
   test("Vault: the address selects the item; no value without its own tap", async () => {
@@ -143,8 +150,22 @@ describe("navigation", () => {
     await until(() => !!root.querySelector(".vault-editor"));
     expect(root.querySelector(".revealed-value")).toBeNull();
     expect(root.textContent).not.toContain("mock-app-secret");
+    // An address that names no item: a moment's grace (an item created a second ago), no item shown.
     go("#/vault/nope");
-    await until(() => /not in the vault/.test(root.querySelector(".vault-main")!.textContent!));
+    await until(() => /Looking for that item|not in the vault/.test(root.querySelector(".vault-main")!.textContent!));
+    expect(root.querySelector(".vault-editor")).toBeNull();
+    // Typed values go with the tab, every time (the forms are rebuilt on the way back).
+    for (const round of [1, 2]) {
+      go(link.getAttribute("href")!);
+      await until(() => !!root.querySelector(".vault-editor"));
+      button(root.querySelector(".vault-editor")!, /^Add a key$/)!.click();
+      const typed = root.querySelector<HTMLTextAreaElement>(".kv-row textarea")!;
+      typed.value = "typed-secret-" + round;
+      go("#/hosts");
+      await until(() => current()[0] === "Hosts");
+      expect(typed.value).toBe("");
+      expect(typed.isConnected).toBe(false);
+    }
   });
 
   test("Hosts: each host with its admissions; admitting is a signed catalogue change", async () => {

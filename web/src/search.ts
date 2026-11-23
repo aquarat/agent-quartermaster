@@ -25,6 +25,9 @@ export interface SearchSource {
   hosts: HostInfo[];
   passkeys: PasskeyInfo[];
   pending: PendingItem[];
+  /** Signature requests and env releases waiting for a decision. */
+  signing: { id: string; path: string; host: string }[];
+  releases: { id: string; path: string; host: string }[];
   /** Whether the vault can take a new item (organisations active, store sealed). */
   canAdd: boolean;
   /** Passkeys that cannot open every bucket yet. */
@@ -49,6 +52,8 @@ export function buildIndex(src: SearchSource): Hit[] {
     const ref = p.id.slice(-6).toUpperCase();
     add("Waiting", p.kind === "enrollment" ? `Host asking to join: ${p.requesting_host}` : `${p.kind} request from ${p.requesting_host}`, `Ref ${ref}`, `#r=${p.id}`, "approvals", `${p.ssh?.target_host ?? ""} ${p.ssh?.login_user ?? ""} ${p.cloudflare?.scope ?? ""}`);
   }
+  for (const r of src.signing) add("Waiting", `Signature request from ${r.host}`, `Ref ${r.id.slice(-6).toUpperCase()} · ${r.path}`, `#r=${r.id}`, "approvals");
+  for (const r of src.releases) add("Waiting", `Env release for ${r.host}`, `Ref ${r.id.slice(-6).toUpperCase()} · ${r.path}`, "#/", "approvals");
   for (const x of src.hosts) add("Hosts", x.name, `${x.class} · ${x.address}${x.revoked_at ? " · revoked" : ""}`, "#/hosts", "hosts");
   for (const p of src.passkeys) add("Passkeys", p.nickname, p.authenticator || "Passkey", "#/security", "security");
   if (src.canAdd) add("Do", "Add a credential", "Vault → Add item", vaultHash("new"), "vault", "new create env set signing key secret api key token");

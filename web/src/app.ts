@@ -120,6 +120,8 @@ export class App {
     hosts: this.hosts,
     passkeys: this.state?.passkeys ?? [],
     pending: this.state?.pending ?? [],
+    signing: (this.vaultState?.requests ?? []).filter((r) => r.status === "pending"),
+    releases: (this.envState?.releases ?? []).filter((r) => r.status === "pending"),
     canAdd: !!this.vaultState,
     toEnable: readiness(this.seal)?.fixable.length ?? 0,
   }), () => void this.loadDirectory());
@@ -459,6 +461,8 @@ export class App {
       ),
     );
     const def = PAGES[this.page];
+    // The header is rebuilt with the page: a keyboard user who followed a tab stays on the tabs.
+    const fromTab = !!(document.activeElement as HTMLElement | null)?.closest?.(".tabs");
     this.tray ??= new Tray(this.api, this.auth, () => this.changed());
     let main: HTMLElement;
     switch (this.page) {
@@ -496,6 +500,7 @@ export class App {
       this.setupPage.start();
     }
     this.renderSections();
+    if (fromTab) this.root.querySelector<HTMLElement>('.tab[aria-current="page"]')?.focus();
     this.schedulePoll();
   }
 
@@ -559,8 +564,10 @@ export class App {
         break;
       }
       case "settings":
+        // The reveal policy lines sign against the broker's current epoch.
+        if (this.vaultState && seal) (this.vaultView ??= new VaultView(this.vaultHost())).forms.bind(this.vaultState, seal);
         this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);
-        this.section('orgs',[this.catalogue,this.vaultState?.organisations],()=>this.orgsPage(),false,!!this.root.querySelector('#sec-orgs .vault-confirm'),this.catalogue?.organisations.length??0);
+        this.section('orgs',[this.catalogue,this.vaultState?.organisations,seal?.epoch],()=>this.orgsPage(),false,!!this.root.querySelector('#sec-orgs .vault-confirm'),this.catalogue?.organisations.length??0);
         break;
       case "help":
         if(this.help) this.section('help',this.help,()=>[helpPage(this.help!)]);
@@ -595,7 +602,7 @@ export class App {
               ? h("ul", { class: "admission-list" }, rows.map(({ o, x }) => h("li", { class: x!.active ? "in" : "out" }, h("bdi", null, vt(o.title)), h("span", { class: "badge" }, x!.active ? "admitted" : "not admitted"), admissionButton(cat, o, x!, (t, c) => this.sheet.openCatalogue(t, c)))))
               : h("p", { class: "muted" }, "No organisation lists this host."),
           ),
-          card.querySelector("button.deny"),
+          card.querySelector("dl.facts"),
         );
       }
       out.push(card);
@@ -607,8 +614,7 @@ export class App {
   private orgsPage(): Child[] {
     const cat = this.catalogue;
     if (!cat) return ["Available after personal activation (Setup)."];
-    const forms = this.vaultState ? (this.vaultView ??= new VaultView(this.vaultHost())).forms : undefined;
-    if (forms && this.seal) forms.bind(this.vaultState!, this.seal);
+    const forms = this.vaultState && this.seal ? (this.vaultView ??= new VaultView(this.vaultHost())).forms : undefined;
     return [
       h("p", { class: "muted" }, "Create organisations, services and items from Vault → Add item; admit hosts under Hosts."),
       ...cat.organisations.map((o) => {

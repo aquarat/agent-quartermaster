@@ -98,6 +98,8 @@ audit rows with last change and last use ([API.md](API.md#vault-web-form-reveal-
   to happen after the passkey prompt, which Safari may refuse. Copy sits next to each
   revealed value instead.
 * **Last used in the list** (it is in the item) would need the history for every set per poll.
+* **History is read from the audit log** by scanning it for the set (every 30 s while an item is
+  open). Fine at today's size; a set column on audit rows, or an index, when the log grows.
 * The seven-tab bottom bar is tight at 375 px; five tabs with Hosts and Settings under "More"
   is the alternative.
 * `web/screenshots/*.png` in the repository still show the old layout (`capture.ts` is updated;
