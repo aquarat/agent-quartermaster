@@ -279,6 +279,8 @@ func (r *Runner) Run(ctx context.Context) error {
 		done, err = r.cutover(ctx)
 	case SealParams:
 		done, err = r.seal(ctx, p, secrets)
+	case BucketsParams:
+		done, err = r.buckets(ctx, p)
 	case UpdatesParams:
 		done, err = r.enableUpdates(ctx, p, secrets)
 	case PinsParams:

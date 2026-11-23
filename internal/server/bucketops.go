@@ -140,11 +140,14 @@ func (s *Server) cfRow(ctx context.Context, q *store.Q) (store.BucketRow, error)
 
 // CFRecordFields are the context fields of a cf-proxy record (§3.2).
 func (s *Server) cfRecordFields(row store.BucketRow) [][]byte {
+	return s.cfFields(row.OrgID, row.ServiceID, row.Ref)
+}
+func (s *Server) cfFields(org, service, set string) [][]byte {
 	issuer := s.cfg.Cloudflare.APIBase
 	if issuer == "" {
 		issuer = "https://api.cloudflare.com/client/v4"
 	}
-	return [][]byte{[]byte(row.OrgID), []byte(row.ServiceID), []byte(row.Ref), []byte(issuer), []byte(s.cfg.Cloudflare.AccountID)}
+	return [][]byte{[]byte(org), []byte(service), []byte(set), []byte(issuer), []byte(s.cfg.Cloudflare.AccountID)}
 }
 
 // cfParentToken decrypts the proxy parent for one upstream call. The Go

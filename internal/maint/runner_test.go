@@ -370,14 +370,14 @@ func sealParams() SealParams {
 // activation builds what the import process records at activation: the manifest and the
 // owner's signature over the seal-control canonical that carries it.
 func activation(signer *vauth.Authenticator, recipient string) (manifest, digest, canonical string, assertion json.RawMessage) {
-	m, _ := json.Marshal(map[string]any{"seal_format": 1, "offline_recipient": recipient, "inventory_digest": "x"})
+	m, _ := json.Marshal(map[string]any{"seal_format": 2, "offline_recipient": recipient, "installation": "x"})
 	sum := sha256.Sum256(m)
 	c, _ := json.Marshal(map[string]any{"v": 3, "action": "activate", "object": "seal-control", "nonce": canon.NewNonce(), "issued_at": "2026-11-22T10:00:00Z", "id": "inst", "epoch": "e", "manifest": string(m)})
 	return string(m), hex.EncodeToString(sum[:]), string(c), signer.Assert(canon.Challenge(string(c)))
 }
 
 // activateSeal plays the owner finishing the import: staging files, a signed activation for
-// the recipient of sealParams, schema 8, and the import process exiting.
+// the recipient of sealParams, schema 9, and the import process exiting.
 func (b *lab) activateSeal() string { return b.activateSealAs(b.auth, sealParams().Recipient) }
 
 func (b *lab) activateSealAs(signer *vauth.Authenticator, recipient string) string {
@@ -386,7 +386,7 @@ func (b *lab) activateSealAs(signer *vauth.Authenticator, recipient string) stri
 	b.write(0600, "proof", "data", "seal-stage-1", "recovery.proof")
 	var digest string
 	_, digest, b.facts.Activation, b.facts.ActivationProof = activation(signer, recipient)
-	b.setFacts(8, digest)
+	b.setFacts(9, digest)
 	_ = os.Remove(b.path("active")) // the import process exits after activation
 	return digest
 }
@@ -567,7 +567,7 @@ func TestRecoveryRetriesAreBounded(t *testing.T) {
 }
 
 // Root finishes a sealing only on its own evidence: an activation signed by a pinned passkey
-// for the recovery key of the signed task. A database that merely says "schema 8" (which the
+// for the recovery key of the signed task. A database that merely says "schema 9" (which the
 // broker's account can write) gets nothing pinned and nothing deleted.
 func TestSealNeedsTheOwnersActivation(t *testing.T) {
 	for name, forge := range map[string]func(b *lab){
@@ -576,11 +576,11 @@ func TestSealNeedsTheOwnersActivation(t *testing.T) {
 		"no activation record": func(b *lab) {
 			b.activateSeal()
 			b.facts.Activation, b.facts.ActivationProof = "", nil
-			b.setFacts(8, b.facts.Manifest)
+			b.setFacts(9, b.facts.Manifest)
 		},
 		"manifest swapped after signing": func(b *lab) {
 			b.activateSeal()
-			b.setFacts(8, strings.Repeat("0", 64))
+			b.setFacts(9, strings.Repeat("0", 64))
 		},
 	} {
 		b := newLab(t)
@@ -1167,5 +1167,201 @@ func TestConfigEdits(t *testing.T) {
 		if _, err = pinSeal(s, strings.Repeat("a", 64)); err == nil {
 			t.Fatal("edited a layout it cannot prove")
 		}
+	}
+}
+
+// ---- "Move to per-credential buckets" (docs/BUCKETS.md §8) ----
+
+// format1Lab is a bastion sealed by v0.4.1: schema 8 and a pinned format-1 manifest.
+func format1Lab(t *testing.T) (*lab, string) {
+	t.Helper()
+	b := newLab(t)
+	old := strings.Repeat("a", 64)
+	r := b.runner()
+	staged, err := addSeal(r.raw, sealParams().Recipient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := pinSeal(staged, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.write(0640, string(pinned), "etc", "config.toml")
+	for _, f := range []string{"ssh_user_ca", "client_ca.key"} {
+		_ = os.Remove(b.path("data", "ca", f))
+	}
+	b.setFacts(8, old)
+	return b, old
+}
+
+// activateBuckets plays the owner finishing the migration: the stage's manifest, a signed
+// activation for the pinned recipient, schema 9, and the migration process exiting.
+func (b *lab) activateBuckets() string {
+	b.write(0600, `{"seal_format":2}`, "data", "seal-stage-1", "manifest.json")
+	var digest string
+	_, digest, b.facts.Activation, b.facts.ActivationProof = activation(b.auth, sealParams().Recipient)
+	b.setFacts(9, digest)
+	_ = os.Remove(b.path("active"))
+	return digest
+}
+
+func TestBuckets(t *testing.T) {
+	b, old := format1Lab(t)
+	if err := os.MkdirAll(filepath.Join(b.l.Backups, "20260101T000000Z-seal", "state"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	var manifest string
+	b.queue(b.sign(TaskBuckets, BucketsParams{PurgeBackups: true}, nil))
+	owner := b.when("bucket-migrate", func() {
+		if cfg := b.read("etc", "config.toml"); !strings.Contains(cfg, old) {
+			t.Error("migration mode started with another pin")
+		}
+		manifest = b.activateBuckets()
+	})
+	if err := b.runner().Run(context.Background()); err != nil {
+		t.Fatal(err, b.last(TaskBuckets))
+	}
+	<-owner
+	s := b.last(TaskBuckets)
+	cfg := b.read("etc", "config.toml")
+	switch {
+	case s.State != "done" || s.Result["manifest_sha256"] != manifest:
+		t.Fatalf("%+v", s)
+	case !strings.Contains(cfg, `manifest_sha256 = "`+manifest+`"`) || strings.Contains(cfg, old) || !strings.Contains(cfg, "# owner's notes stay"):
+		t.Fatal("configuration not repinned:\n" + cfg)
+	case strings.TrimSpace(b.read("active")) != "serve":
+		t.Fatal("broker not serving")
+	case !strings.Contains(b.read("hook.log"), "start bucket-migrate"):
+		t.Fatal("migration mode never started")
+	}
+	left, _ := os.ReadDir(b.l.Backups)
+	if len(left) != 1 || left[0].Name() != "sealed-"+manifest[:16] || b.read("backups", left[0].Name(), "manifest.json") == "" {
+		t.Fatalf("pre-migration and older backups not purged down to the new manifest: %v", left)
+	}
+	if stages, _ := filepath.Glob(b.path("data", "seal-stage-*")); len(stages) != 0 {
+		t.Fatal("staging directory left")
+	}
+	if _, err := os.Stat(b.l.journal()); err == nil {
+		t.Fatal("journal left")
+	}
+	// Once moved it is refused, before anything is touched.
+	log := b.read("hook.log")
+	b.queue(b.sign(TaskBuckets, BucketsParams{}, nil))
+	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskBuckets).Message, "already uses") || b.read("hook.log") != log {
+		t.Fatalf("schema 9 not refused: %v", err)
+	}
+	b.noSecrets()
+}
+
+// Cancelled or failed before activation: configuration and database as before, the format-1
+// broker serving again, and the task can simply run again.
+func TestBucketsCancelAndFailureBeforeActivation(t *testing.T) {
+	for name, act := range map[string]func(b *lab){
+		"cancel": func(b *lab) { _ = os.WriteFile(b.l.cancel(), nil, 0600) },
+		"died":   func(b *lab) { _ = os.Remove(b.path("active")) },
+	} {
+		b, old := format1Lab(t)
+		before, db := b.read("etc", "config.toml"), b.read("data", "aqmas.db")
+		b.queue(b.sign(TaskBuckets, BucketsParams{PurgeBackups: true}, nil))
+		owner := b.when("bucket-migrate", func() { act(b) })
+		if err := b.runner().Run(context.Background()); err == nil {
+			t.Fatalf("%s: reported success", name)
+		}
+		<-owner
+		s := b.last(TaskBuckets)
+		if s.State != "failed" || !strings.Contains(s.Message, "unchanged") || b.read("etc", "config.toml") != before || b.read("data", "aqmas.db") != db || strings.TrimSpace(b.read("active")) != "serve" {
+			t.Fatalf("%s: not returned to the previous store: %+v", name, s)
+		}
+		if _, err := os.Stat(b.l.journal()); err == nil {
+			t.Fatalf("%s: journal left", name)
+		}
+		// The pre-migration backup is kept (it is the way back).
+		if left, _ := os.ReadDir(b.l.Backups); len(left) != 1 || !strings.HasSuffix(left[0].Name(), "-buckets") {
+			t.Fatalf("%s: backups %v", name, left)
+		}
+		// A second run starts from the same state and finishes.
+		b.queue(b.sign(TaskBuckets, BucketsParams{PurgeBackups: false}, nil))
+		var manifest string
+		owner = b.when("bucket-migrate", func() { manifest = b.activateBuckets() })
+		if err := b.runner().Run(context.Background()); err != nil {
+			t.Fatalf("%s: re-run: %v", name, err)
+		}
+		<-owner
+		s = b.last(TaskBuckets)
+		if s.State != "done" || !strings.Contains(b.read("etc", "config.toml"), manifest) || strings.Contains(b.read("etc", "config.toml"), old) || s.Result["format1_backups"] == "" {
+			t.Fatalf("%s: re-run did not finish: %+v", name, s)
+		}
+		if left, _ := os.ReadDir(b.l.Backups); len(left) != 3 {
+			t.Fatalf("%s: backups were deleted although purge_backups was false: %v", name, left)
+		}
+	}
+}
+
+// A crash or reboot mid-task: before activation the previous store comes back, after it the
+// runner only moves forward.
+func TestBucketsRecovery(t *testing.T) {
+	for _, activated := range []bool{false, true} {
+		b, old := format1Lab(t)
+		before := b.read("etc", "config.toml")
+		r := b.runner()
+		r.st = ReadStatus(b.l.status())
+		dir, err := r.backup(context.Background(), "buckets")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = r.writeJournal(journal{Task: TaskBuckets, Backup: dir, Purge: true})
+		b.write(0600, "bucket-migrate\n", "active")
+		manifest := "never activated"
+		if activated {
+			manifest = b.activateBuckets()
+		}
+		err = b.runner().Run(context.Background())
+		s := b.last(TaskBuckets)
+		cfg := b.read("etc", "config.toml")
+		if activated {
+			if err != nil || s.State != "done" || !strings.Contains(cfg, manifest) || strings.Contains(cfg, old) {
+				t.Fatalf("did not finish forward: %v %+v", err, s)
+			}
+		} else if err == nil || s.State != "failed" || cfg != before {
+			t.Fatalf("did not return to the previous store: %v %+v", err, s)
+		}
+		if _, err := os.Stat(b.l.journal()); err == nil || strings.TrimSpace(b.read("active")) != "serve" {
+			t.Fatal("journal left or broker down")
+		}
+	}
+	// Root finishes only on the owner's pinned activation.
+	b, old := format1Lab(t)
+	b.queue(b.sign(TaskBuckets, BucketsParams{PurgeBackups: true}, nil))
+	owner := b.when("bucket-migrate", func() {
+		b.write(0600, `{}`, "data", "seal-stage-1", "manifest.json")
+		var digest string
+		_, digest, b.facts.Activation, b.facts.ActivationProof = activation(newAuth(), sealParams().Recipient)
+		b.setFacts(9, digest)
+		_ = os.Remove(b.path("active"))
+	})
+	err := b.runner().Run(context.Background())
+	<-owner
+	var h *Handled
+	if err == nil || errors.As(err, &h) || !strings.Contains(b.read("etc", "config.toml"), old) {
+		t.Fatalf("an activation by an unpinned passkey was finished: %v", err)
+	}
+	if left, _ := os.ReadDir(b.l.Backups); len(left) != 1 {
+		t.Fatal("backups deleted without the owner's activation")
+	}
+}
+
+// The task's parameters are canonical like every other task's.
+func TestBucketsParams(t *testing.T) {
+	text, err := Canonical(TaskBuckets, BucketsParams{PurgeBackups: true})
+	if err != nil || text != `{"purge_backups":true}` {
+		t.Fatal(text, err)
+	}
+	for _, bad := range []string{`{"purge_backups":true,"x":1}`, `{ "purge_backups":true}`, `{}`} {
+		if _, err := Parse(TaskBuckets, bad); err == nil {
+			t.Errorf("accepted %s", bad)
+		}
+	}
+	if spec, ok := Lookup(TaskBuckets); !ok || !strings.HasPrefix(spec.Reversible, "No: one-way") {
+		t.Fatal("spec")
 	}
 }

@@ -277,3 +277,6 @@ func (q *Q) SignerKey(ctx context.Context, set string) (scheme string, public []
 	err = q.q.QueryRowContext(ctx, `SELECT scheme,public_key,blob,payload,wrap FROM signer_keys WHERE set_id=?`, set).Scan(&scheme, &public, &rec.Blob, &rec.Payload, &rec.Wrap)
 	return scheme, public, rec, notFound(err)
 }
+
+// Raw is the underlying querier (the activation transaction's own statements).
+func (q *Q) Raw() querier { return q.q }

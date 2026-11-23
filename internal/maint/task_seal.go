@@ -235,8 +235,8 @@ func (r *Runner) seal(ctx context.Context, p SealParams, secrets map[string]stri
 		return "", r.unseal(ctx, j, errors.New("the import mode did not start"))
 	}
 	deadline := r.now().Add(r.SealWait)
-	r.wait("seal", "Waiting for you: create and test the passkey wrap, prove the recovery key, then activate", deadline)
-	switch o := r.await(ctx, deadline, func(f Facts) bool { return f.Schema == 8 }); o {
+	r.wait("seal", "Waiting for you: create and test your passkey's scope keys, prove the recovery key, then activate", deadline)
+	switch o := r.await(ctx, deadline, func(f Facts) bool { return f.Schema == schemaBuckets }); o {
 	case reached:
 	case interrupted:
 		return "", errInterrupted
@@ -257,7 +257,7 @@ func (r *Runner) unseal(ctx context.Context, j journal, cause error) error {
 	if err != nil {
 		return errors.New(cause.Error() + " The database could not be checked, so nothing was undone yet; the runner keeps trying.")
 	}
-	if f.Schema == 8 {
+	if f.Schema == schemaBuckets {
 		_, err := r.finishSeal(ctx, j)
 		return err
 	}
@@ -295,7 +295,7 @@ func (r *Runner) finishSeal(ctx context.Context, j journal) (string, error) {
 	if err != nil {
 		return fail(err)
 	}
-	if f.Schema != 8 || !release.ValidHash(f.Manifest) {
+	if f.Schema != schemaBuckets || !release.ValidHash(f.Manifest) {
 		return fail(errors.New("activation record is missing"))
 	}
 	if err = r.loadConfig(); err != nil {
@@ -364,7 +364,7 @@ func (r *Runner) finishSeal(ctx context.Context, j journal) (string, error) {
 			r.result("lock_alert", "installed")
 		}
 	}
-	r.step("Starting the sealed broker (locked)")
+	r.step("Starting the sealed broker (every bucket closed)")
 	if err = r.l.start(ctx, "serve"); err == nil {
 		err = r.l.healthy(ctx, r.cfg.ListenWeb)
 	}
@@ -395,7 +395,7 @@ func (r *Runner) finishSeal(ctx context.Context, j journal) (string, error) {
 		r.result("plaintext_backups", r.l.Backups+" still holds pre-seal copies of the private keys")
 	}
 	r.clearJournal()
-	return "Sealed. The broker is locked: unlock it with your passkey.", nil
+	return "Sealed in per-credential buckets. Nothing is open: each approval opens only the credentials it needs.", nil
 }
 
 // lockAlert installs the separate alert service. Its credentials are already in place.

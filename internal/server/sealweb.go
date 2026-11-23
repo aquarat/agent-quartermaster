@@ -24,8 +24,25 @@ func (s *Server) sealRoutes(m *http.ServeMux) {
 	s.recoveryRoutes(m)
 	m.Handle("GET /api/ui/seal/status", s.requireSession(s.sealStatus))
 	m.Handle("POST /api/ui/seal/drill", s.requireSession(s.sealDrill))
-	s.sealedEndpoint(m, "POST /api/ui/seal/control/challenge", s.sealControlBegin)
-	s.sealedEndpoint(m, "POST /api/ui/seal/control/finish", s.sealControlFinish)
+	s.stageRoutes(m)
+	// Seal control also serves "activate" while a stage waits for it.
+	for path, fn := range map[string]capHandler{"challenge": s.sealControlBegin, "finish": s.sealControlFinish} {
+		m.Handle("POST /api/ui/seal/control/"+path, s.requireSession(func(w http.ResponseWriter, r *http.Request, sess string) {
+			if s.seal == nil || s.seal.mode != modeSetup {
+				if err := s.bucketsReady(); err != nil {
+					s.writeErr(w, r, err)
+					return
+				}
+			}
+			out, err := fn(r.Context(), r, sess)
+			if err != nil {
+				s.writeErr(w, r, mapNotFound(err))
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			writeJSON(w, 200, out)
+		}))
+	}
 }
 func (s *Server) sealOwner(ctx context.Context, q *store.Q, sess string, pk int64) error {
 	if v, _ := ctx.Value(verifiedSignerKey{}).(*verifiedIdentity); v != nil && v.row != 0 {
@@ -41,16 +58,6 @@ func (s *Server) sealOwner(ctx context.Context, q *store.Q, sess string, pk int6
 		return errForbidden("session no longer valid")
 	}
 	return nil
-}
-
-// sealDrill is the on-box recovery drill of the staging page.
-// STAGE-AGENT: open every staged scope key from its recovery wrap.
-func (s *Server) sealDrill(w http.ResponseWriter, r *http.Request, sess string) {
-	if s.seal == nil || s.seal.mode != modeSetup {
-		s.writeErr(w, r, errConflict("no seal import is staged"))
-		return
-	}
-	s.writeErr(w, r, errConflict(errStage("the staging drill").Error()))
 }
 
 // ---- status (contract "GET /api/ui/seal/status") ----
@@ -103,7 +110,7 @@ type sealView struct {
 	VerifiedAccess bool              `json:"verified_access,omitempty"`
 	LeafExpires    string            `json:"leaf_expires,omitempty"`
 	LeafRepair     string            `json:"leaf_repair,omitempty"`
-	Stage          any               `json:"stage,omitempty"` // STAGE-AGENT: setup mode only
+	Stage          *stageView        `json:"stage,omitempty"` // setup mode only
 }
 
 func (s *Server) sealStatus(w http.ResponseWriter, r *http.Request, sess string) {
@@ -133,6 +140,13 @@ func (s *Server) sealView(ctx context.Context, sess string) (sealView, error) {
 		v.LeafExpires = s.pki.ServerLeaf.NotAfter.UTC().Format(time.RFC3339)
 	}
 	v.LeafRepair = s.leafRepair()
+	if z.stage != nil && z.mode == modeSetup {
+		row, err := s.store.Q().SessionPasskeyID(ctx, sess)
+		if err == nil && s.sealOwner(ctx, s.store.Q(), sess, row) == nil {
+			v.Stage, err = s.stageStatus(ctx, sess)
+		}
+		return v, err
+	}
 	if z.mode != modeBuckets {
 		return v, nil
 	}
@@ -253,6 +267,9 @@ type controlBucket struct {
 // canonical's own fields and the buckets the tap must open.
 func (s *Server) controlPlan(ctx context.Context, q *store.Q, c controlChoice, openCount int) (map[string]any, []bucketNeed, error) {
 	fields := map[string]any{}
+	if s.seal.mode == modeSetup && c.Action != "activate" {
+		return nil, nil, errConflict("finish staging first")
+	}
 	switch c.Action {
 	case "close-all":
 		if c.Scope != "" || len(c.Buckets) > 0 {
@@ -312,11 +329,25 @@ func (s *Server) controlPlan(ctx context.Context, q *store.Q, c controlChoice, o
 		}
 		return fields, needs, nil
 	case "activate":
-		// STAGE-AGENT: activation of a staged format-2 store (plain signature, no open).
-		if s.seal.mode != modeSetup {
+		// A plain signature over the manifest: the root runner verifies it with its pins.
+		st := s.seal.stage
+		if s.seal.mode != modeSetup || st == nil {
 			return nil, nil, errConflict("nothing is staged to activate")
 		}
-		return nil, nil, errConflict(errStage("activation").Error())
+		if c.Scope != "" || len(c.Buckets) > 0 {
+			return nil, nil, errBad("activate takes no buckets or scope")
+		}
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		if !st.ready() {
+			return nil, nil, errConflict("create and test every scope key and prove the recovery key first")
+		}
+		text, err := s.stageManifest(st)
+		if err != nil {
+			return nil, nil, err
+		}
+		fields["manifest"] = text
+		return fields, nil, nil
 	}
 	return nil, nil, errBad("invalid seal action")
 }
@@ -410,6 +441,27 @@ func (s *Server) sealControlFinish(ctx context.Context, r *http.Request, sess st
 	}
 	if meta.Action == "rekey" {
 		return s.rekey(ctx, sess, c, in)
+	}
+	if meta.Action == "activate" {
+		if in.Open != nil {
+			return nil, errBad("activation opens nothing")
+		}
+		row, err := s.verifyAssertion(ctx, sha256Bytes(c.Canonical), in.Assertion)
+		if err != nil {
+			return nil, err
+		}
+		// When the runner drives the stage it verifies this signature against its pins
+		// before it finishes: refuse an unpinned passkey while that is only a message.
+		if _, installed := s.runnerStatus(); installed {
+			if err = s.pinnedFor(ctx, row); err != nil {
+				return nil, err
+			}
+		}
+		if err = s.activateStage(ctx, sess, row, c.Canonical, in.Assertion); err != nil {
+			return nil, err
+		}
+		defer s.stopSealed()
+		return api.OK{OK: true}, nil
 	}
 	row, settle, err := s.verifyTap(ctx, sess, c.ID, c.Canonical, in.Assertion, in.Open)
 	if err != nil {

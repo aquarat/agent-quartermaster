@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,7 +20,6 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
 	"github.com/aquarat/agent-quartermaster/internal/server/organisations"
 	"github.com/aquarat/agent-quartermaster/internal/server/pki"
-	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/webui"
 	"golang.org/x/crypto/ssh"
 )
@@ -30,10 +30,13 @@ var version = "dev"
 const usage = `usage: aqmasd [-config PATH] <command>
 
 commands:
-  seal-import           isolated signed import of an activated personal installation
-  seal-drill BUNDLE SHA256 RECIPIENT   verify an offline bundle; reads age identity on stdin
-  seal-transfer BUNDLE SHA256 RECIPIENT  offline owner only; protected pipe to seal-recover
-  seal-recover DIRECTORY    isolated recovery socket and ticket; DIRECTORY must not exist
+  seal-import           seal an unsealed store into per-credential buckets (started by the runner)
+  bucket-migrate        move a format-1 sealed store to per-credential buckets (started by the runner)
+  seal-drill BACKUP.db RECIPIENT   offline: open every scope key, bucket and record of a
+                        standalone backup with the age identity on stdin; prints only counts
+  seal-recover DIRECTORY    isolated recovery: the age identity on stdin opens every scope key,
+                        then a private socket and ticket in DIRECTORY (which must not exist)
+                        register a replacement passkey
   serve                 run the agent API and the approval web UI
   organisations-plan BACKUP   preview the personal cutover from a standalone SQLite online backup
   organisations-cutover       fence fleet access, create a recovery point and serve owner review
@@ -78,8 +81,8 @@ func main() {
 		}
 	}
 	needsArg := fs.Arg(0) == "revoke-host" || fs.Arg(0) == "organisations-plan" || fs.Arg(0) == "seal-recover"
-	offline := fs.Arg(0) == "seal-drill" || fs.Arg(0) == "seal-transfer"
-	if !(offline && fs.NArg() == 4) && (fs.NArg() < 1 || needsArg != (fs.NArg() == 2) || fs.NArg() > 2 || offline) {
+	offline := fs.Arg(0) == "seal-drill"
+	if !(offline && fs.NArg() == 3) && (fs.NArg() < 1 || needsArg != (fs.NArg() == 2) || fs.NArg() > 2 || offline) {
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -90,49 +93,27 @@ func main() {
 }
 
 func run(cmd, cfgPath string, out io.Writer, args ...string) error {
-	if cmd == "seal-drill" || cmd == "seal-transfer" {
-		if len(args) != 3 {
-			return fmt.Errorf("bundle, owner-recorded digest and recipient required")
+	if cmd == "seal-drill" {
+		if len(args) != 2 {
+			return fmt.Errorf("a standalone backup and the recovery recipient required")
 		}
 		if err := restrictDumps(); err != nil {
 			return err
 		}
-		st, err := os.Stdin.Stat()
-		if err != nil || st.Mode()&os.ModeCharDevice != 0 {
-			return fmt.Errorf("redirect offline identity on stdin")
-		}
-		id, err := io.ReadAll(io.LimitReader(os.Stdin, 4097))
+		id, err := readIdentity()
 		defer clear(id)
-		if err != nil || len(id) > 4096 {
-			return fmt.Errorf("invalid identity input")
-		}
-		f, err := os.Open(args[0])
 		if err != nil {
 			return err
 		}
-		defer f.Close()
-		b, err := io.ReadAll(io.LimitReader(f, 524289))
-		if err != nil || len(b) > 524288 {
-			return fmt.Errorf("invalid bundle")
+		// The configuration names the Cloudflare issuer and account its record is bound
+		// to; offline without it that one record is reported unchecked.
+		var cf *config.Cloudflare
+		if cfg, err := config.Load(cfgPath); err == nil {
+			cf = &cfg.Cloudflare
 		}
-		if cmd == "seal-transfer" {
-			dst, ok := out.(*os.File)
-			if !ok {
-				return fmt.Errorf("protected pipe required")
-			}
-			st, err := dst.Stat()
-			if err != nil || st.Mode()&os.ModeNamedPipe == 0 {
-				return fmt.Errorf("refusing to write MK to a terminal or file; use a private pipe")
-			}
-			var inv seal.Inventory
-			if seal.Digest(b) != args[1] || json.Unmarshal(b, &inv) != nil || inv.Recipient != args[2] {
-				return fmt.Errorf("offline bundle mismatch")
-			}
-			return inv.Transfer(id, dst)
-		}
-		proof, err := server.RecoveryDrill(b, args[1], args[2], id)
+		res, err := server.DrillBackup(args[0], args[1], id, cf)
 		if err == nil {
-			_, err = fmt.Fprintln(out, proof)
+			_, err = fmt.Fprintln(out, res)
 		}
 		return err
 	}
@@ -165,9 +146,10 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		if err = restrictDumps(); err != nil {
 			return err
 		}
-		fi, err := os.Stdin.Stat()
-		if err != nil || fi.Mode()&(os.ModeNamedPipe|os.ModeSocket) == 0 {
-			return fmt.Errorf("protected stdin pipe required")
+		id, err := readIdentity()
+		defer clear(id)
+		if err != nil {
+			return err
 		}
 		s, err := server.New(server.Options{Config: cfg, ConfigPath: cfgPath, Recovery: true})
 		if err != nil {
@@ -176,7 +158,7 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		defer s.Close()
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
-		return s.Recover(ctx, args[0], os.Stdin)
+		return s.Recover(ctx, args[0], bytes.NewReader(id))
 	case "organisations-plan":
 		if len(args) != 1 {
 			return fmt.Errorf("organisations-plan requires a standalone SQLite backup")
@@ -192,12 +174,12 @@ func run(cmd, cfgPath string, out io.Writer, args ...string) error {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(plan)
-	case "serve", "organisations-cutover", "seal-import":
+	case "serve", "organisations-cutover", "seal-import", "bucket-migrate":
 		if err := restrictDumps(); err != nil {
 			return fmt.Errorf("disable process dumps: %w", err)
 		}
 		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-		srv, err := server.New(server.Options{Config: cfg, ConfigPath: cfgPath, Logger: log, Maintenance: cmd == "organisations-cutover", SealSetup: cmd == "seal-import"})
+		srv, err := server.New(server.Options{Config: cfg, ConfigPath: cfgPath, Logger: log, Maintenance: cmd == "organisations-cutover", SealSetup: cmd == "seal-import", BucketMigrate: cmd == "bucket-migrate"})
 		if err != nil {
 			return err
 		}
@@ -315,6 +297,20 @@ func maintenance(cmd string, args []string) error {
 		return nil
 	}
 	return err
+}
+
+// readIdentity reads the age identity from a redirected stdin (never a terminal).
+func readIdentity() ([]byte, error) {
+	st, err := os.Stdin.Stat()
+	if err != nil || st.Mode()&os.ModeCharDevice != 0 {
+		return nil, fmt.Errorf("redirect the age identity on stdin")
+	}
+	id, err := io.ReadAll(io.LimitReader(os.Stdin, 4097))
+	if err != nil || len(id) > 4096 {
+		clear(id)
+		return nil, fmt.Errorf("invalid identity input")
+	}
+	return id, nil
 }
 
 // Only public CA material is needed on the machine inspecting the backup.

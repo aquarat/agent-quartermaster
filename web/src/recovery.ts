@@ -7,8 +7,7 @@ import {
   type Authenticator,
 } from "./webauthn";
 import { encode } from "./b64url";
-import { prepareSeal, type SealBegin, type Selection } from "./seal";
-import { binary32, checkReview, type Review } from "./review";
+import { binary32, checkReview, checkTap, type Review } from "./review";
 const effects =
   "Replace all owner login keys and wraps. End every session, pending request, grant, standing rule and host admission; require new host enrollment. Preserve audit and SSH serials. Issued certificates, copied values and upstream children are not recalled.";
 type Call = (stage: string, token: string, body: unknown) => Promise<any>;
@@ -16,8 +15,11 @@ interface Step {
   detail: string;
   apply(auth: Authenticator): Promise<Step | void>;
 }
-// Runs only against the isolated recovery socket mapped to the trusted RP.
-// The UI never sees an age identity, recovery packet plaintext or MK.
+const SCOPE = /^[^\s]{1,256}$/;
+// Runs only against the isolated recovery socket mapped to the trusted RP. The broker opened
+// every scope key from the recovery key before this page could start; the page never sees
+// an age identity, a scope key or a KEK in the clear: each tap's KEKs travel HPKE-sealed.
+// Steps: begin → create → (evaluate → finish)… → replace (docs/SEAL-OPERATIONS.md).
 export async function recoverSteps(
   call: Call,
   ticket: string,
@@ -34,76 +36,88 @@ export async function recoverSteps(
     !options.extensions?.prf ||
     !binary32(b.epoch) ||
     !binary32(b.installation) ||
-    !binary32(b.registration_id)
+    !binary32(b.registration_id) ||
+    !Array.isArray(b.scopes) ||
+    !b.scopes.length ||
+    b.scopes.some((x: unknown) => typeof x !== "string" || !SCOPE.test(x))
   )
     throw Error("Invalid recovery registration");
+  const scopes: string[] = b.scopes;
   const post = (step: string, body: unknown) => call(step, b.session, body);
   return {
-    detail: `Create replacement ${name} for ${rp}`,
+    detail: `Create replacement ${name} for ${rp}. It will hold the keys of: ${scopes.join(", ")}.`,
     async apply(auth) {
       const cr = await auth.create(options),
         raw = encode(cr.rawId);
-      const sel: Selection = await post("create", {
-        credential: encodeAttestation(cr),
-      });
-      if (
-        sel.credential_id !== raw ||
-        sel.rp_id !== rp ||
-        sel.action !== "wrap-enroll" ||
-        sel.epoch !== b.epoch ||
-        sel.installation !== b.installation ||
-        sel.mk_version !== b.mk_version ||
-        sel.registration_id !== b.registration_id + "-create"
-      )
+      const c = await post("create", { credential: encodeAttestation(cr) });
+      if (c.credential_id !== raw || JSON.stringify(c.scopes) !== JSON.stringify(scopes))
         throw Error("Wrong replacement credential");
-      async function evaluate(step: "create" | "test"): Promise<Step> {
+      // One tap per one or two scopes: first create their wraps, then test them.
+      async function next(): Promise<Step> {
+        const r: Review = await post("evaluate", {});
+        const c = JSON.parse(r.canonical);
+        const purpose = c.action;
+        if ((purpose !== "enrol" && purpose !== "test") || !Array.isArray(c.scopes) || !c.scopes.length || c.scopes.length > 2 || c.scopes.some((x: unknown) => !scopes.includes(x as string)))
+          throw Error("Invalid replacement step");
         const expected = {
-            ...sel,
-            registration_id: b.registration_id + "-" + step,
-          },
-          packet: SealBegin = await post("evaluate", {});
-        const p = await prepareSeal(expected, packet, rp);
+          v: 3,
+          object: "recovery-enrol",
+          action: purpose,
+          id: b.registration_id,
+          installation: b.installation,
+          epoch: b.epoch,
+          credential_id: raw,
+          nickname: name,
+          scopes: c.scopes,
+        };
+        const tap = await checkTap(r, expected, rp, { object: "scope-enrol", purposes: [purpose], requireOpen: true, selected: raw });
+        const d = tap.open!.descriptor;
+        if (d.credential_id !== raw || JSON.stringify(d.scopes) !== JSON.stringify(c.scopes))
+          throw Error("The tap is for another passkey or other scopes");
         return {
-          detail: p.canonical,
+          detail: (purpose === "enrol" ? "Create" : "Test") + ` the replacement passkey's key for: ${c.scopes.join(", ")}\n` + r.canonical,
           async apply(auth) {
-            const result = await post("finish", await p.finish(auth));
-            if (step === "create") return evaluate("test");
-            const c = JSON.parse(result.canonical);
+            const signed = await tap.sign(auth);
+            if (!signed.open)
+              throw Error("This passkey returned no PRF result, so it cannot hold the store's keys. Use a passkey that supports PRF.");
+            const res = await post("finish", { assertion: signed.assertion, open: signed.open });
+            if (res.next === "evaluate") return next();
+            if (res.next !== "replace") throw Error("Unexpected recovery step");
+            const f = JSON.parse(res.canonical);
             if (
-              !/^[0-9a-f]{64}$/.test(c.backup_sha256)||! /^(0|[1-9]\d{0,18})$/.test(c.serial_high_water)||typeof c.retire_credentials !== "string" ||
-              c.retire_credentials
-                .split(",")
-                .some((id: string) => !/^[a-zA-Z0-9_-]{1,1364}$/.test(id))
+              !/^[0-9a-f]{64}$/.test(f.backup_sha256) ||
+              !/^(0|[1-9]\d{0,18})$/.test(f.serial_high_water) ||
+              typeof f.retire_credentials !== "string" ||
+              f.retire_credentials.split(",").some((id: string) => !/^[a-zA-Z0-9_-]{1,1364}$/.test(id))
             )
               throw Error("Invalid retiring credentials");
-            const expected = {
+            const want = {
               v: 3,
               id: b.registration_id,
               installation: b.installation,
               epoch: b.epoch,
-              mk_version: b.mk_version,
               object: "recovery",
               action: "replace",
               credential_id: raw,
               nickname: name,
               effects,
               manifest_sha256: pin,
-              backup_sha256:c.backup_sha256,serial_high_water:c.serial_high_water,
-              retire_credentials: c.retire_credentials,
+              backup_sha256: f.backup_sha256,
+              serial_high_water: f.serial_high_water,
+              retire_credentials: f.retire_credentials,
+              scopes,
             };
-            const opts = await checkReview(result as Review, expected, rp, raw);
+            const opts = await checkReview(res as Review, want, rp, raw);
             return {
-              detail: effects + "\n" + result.canonical,
+              detail: effects + "\n" + res.canonical,
               async apply(auth) {
-                await post("replace", {
-                  assertion: encodeAssertion(await auth.get(opts)),
-                });
+                await post("replace", { assertion: encodeAssertion(await auth.get(opts)) });
               },
             };
           },
         };
       }
-      return evaluate("create");
+      return next();
     },
   };
 }

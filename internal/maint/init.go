@@ -137,7 +137,7 @@ func Init(ctx context.Context, l Layout, repin bool, sources *Sources, out io.Wr
 // serving; otherwise the journal stays and the runner is started again.
 func (r *Runner) recover(ctx context.Context, j journal) (string, error) {
 	switch j.Task {
-	case TaskCutover, TaskSeal, TaskUpdates:
+	case TaskCutover, TaskSeal, TaskBuckets, TaskUpdates:
 	default:
 		// Nothing this release knows how to finish: do not touch the broker.
 		r.clearJournal()
@@ -161,10 +161,15 @@ func (r *Runner) recover(ctx context.Context, j journal) (string, error) {
 		}
 		return "", r.resume(ctx, errors.New("The cutover was interrupted before activation; nothing was changed."))
 	case TaskSeal:
-		if f.Schema == 8 {
+		if f.Schema == schemaBuckets {
 			return r.finishSeal(ctx, j)
 		}
 		return "", r.unseal(ctx, j, errors.New("Sealing was interrupted before activation: the store is unchanged and unsealed."))
+	case TaskBuckets:
+		if f.Schema == schemaBuckets {
+			return r.finishBuckets(ctx, j)
+		}
+		return "", r.unmigrate(ctx, j, errors.New("The move to buckets was interrupted before activation: the store is unchanged."))
 	}
 	// TaskUpdates. A missing copy means the task had already finished its switch.
 	msg := "Enabling self-update was interrupted; the previous configuration was restored."

@@ -222,7 +222,7 @@ func (l Layout) active(ctx context.Context) bool {
 // start starts the broker in mode: "serve" (the installed unit), or a maintenance mode
 // selected by a drop-in under /run that disappears on reboot.
 func (l Layout) start(ctx context.Context, mode string) error {
-	if mode != "serve" && mode != "organisations-cutover" && mode != "seal-import" {
+	if mode != "serve" && mode != "organisations-cutover" && mode != "seal-import" && mode != "bucket-migrate" {
 		return errors.New("unknown broker mode")
 	}
 	if l.test {

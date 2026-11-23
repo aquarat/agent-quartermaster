@@ -49,13 +49,16 @@ const (
 
 // Options configures a Server.
 type Options struct {
-	Recovery    bool   // isolated Unix socket only, no agent or network workers
-	ConfigPath  string // reread frozen source configuration before supervised import commits
-	SealSetup   bool   // supervised seal import, never serve agents
-	Maintenance bool   // supervised, login and personal cutover only
-	Config      *config.Config
-	Logger      *slog.Logger
-	Now         func() time.Time // for tests; default time.Now
+	Recovery   bool   // isolated Unix socket only, no agent or network workers
+	ConfigPath string // reread frozen source configuration before supervised import commits
+	SealSetup  bool   // supervised seal import, never serve agents
+	// BucketMigrate is the supervised move of a format-1 store to buckets
+	// (implies SealSetup: the same staging page, never serving agents).
+	BucketMigrate bool
+	Maintenance   bool // supervised, login and personal cutover only
+	Config        *config.Config
+	Logger        *slog.Logger
+	Now           func() time.Time // for tests; default time.Now
 	// HTTPClient is used for ntfy and Cloudflare Access certs (tests inject one).
 	HTTPClient *http.Client
 	// AccessCertsURL overrides the Access JWKS URL (tests).
@@ -71,6 +74,7 @@ type Server struct {
 	configPath      string
 	seal            *sealRuntime
 	sealSetup       bool
+	bucketMigrate   bool
 	maintenance     bool
 	cutover         *cutoverReview // installed before opening the maintenance web listener
 	profileRevision string
@@ -98,6 +102,9 @@ func CADir(dataDir string) string { return filepath.Join(dataDir, "ca") }
 // New opens the store, loads or generates key material and prepares the handlers.
 func New(o Options) (*Server, error) {
 	cfg := o.Config
+	if o.BucketMigrate {
+		o.SealSetup = true
+	}
 	if !o.Recovery && (cfg.Seal.RecoverySerial != nil || cfg.Seal.RecoveryBackupSHA256 != "") {
 		return nil, errors.New("broker fenced for recovery; install the replacement transition pin before serving")
 	}
@@ -134,7 +141,7 @@ func New(o Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	mode, err := sealBoot(cfg, st, o.SealSetup)
+	mode, err := sealBoot(cfg, st, o.SealSetup, o.BucketMigrate)
 	if err != nil {
 		st.Close()
 		return nil, err
@@ -193,8 +200,8 @@ func New(o Options) (*Server, error) {
 	s := &Server{
 		recovery:   o.Recovery,
 		configPath: o.ConfigPath,
-		sealSetup:  o.SealSetup,
-		cfg:        cfg, log: o.Logger, now: o.Now, store: st, pki: p, wa: wa, rpID: rpID, ownerID: ownerID, maintenance: o.Maintenance,
+		sealSetup:  o.SealSetup, bucketMigrate: o.BucketMigrate,
+		cfg: cfg, log: o.Logger, now: o.Now, store: st, pki: p, wa: wa, rpID: rpID, ownerID: ownerID, maintenance: o.Maintenance,
 		notify: &notify.Notifier{TopicURL: cfg.Ntfy.TopicURL, Client: o.HTTPClient, Log: o.Logger},
 	}
 	for _, t := range cfg.Targets {
@@ -242,6 +249,11 @@ func New(o Options) (*Server, error) {
 // Close releases the store.
 func (s *Server) Close() error {
 	if z := s.seal; z != nil {
+		if st := z.stage; st != nil {
+			st.mu.Lock()
+			st.wipe()
+			st.mu.Unlock()
+		}
 		z.opens.Close()
 		z.taps.clear()
 		z.capabilities.wipe()
@@ -335,6 +347,10 @@ func (s *Server) Run(ctx context.Context) error {
 	select {
 	case <-lockStop:
 		err = errors.New("broker restarting (agent TLS leaf renewed)")
+		if s.seal.mode == modeActivated {
+			err = nil
+			s.log.Info("activated: exiting for the runner to finish")
+		}
 	case <-ctx.Done():
 	case err = <-errc:
 	}

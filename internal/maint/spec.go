@@ -24,6 +24,7 @@ import (
 const (
 	TaskCutover = "cutover"
 	TaskSeal    = "seal"
+	TaskBuckets = "buckets"
 	TaskUpdates = "enable-updates"
 	TaskPins    = "sync-passkeys"
 	TaskUpgrade = "upgrade"
@@ -53,6 +54,11 @@ var Specs = []Spec{
 			"You create and test the passkey wrap, prove the recovery key works, and activate", "Pin the activation, delete the plaintext key files and old backups", "Set up the lock alert if you gave it a credential", "Restart locked"},
 		Reversible: "Until you activate, cancelling restores the configuration. After activation there is no way back to plaintext: recovery is your passkeys or the recovery key.",
 		Secrets:    []string{"ntfy_topic_url", "ntfy_token"}},
+	{ID: TaskBuckets, Title: "Move to per-credential buckets",
+		Summary: "Moves a store sealed by aqmas 0.4.1 (one key for everything) to per-credential buckets: each approval then opens only the credentials it needs, and nothing is open after a restart.",
+		Steps: []string{"Stop the broker and back up the database, keys and configuration", "Start the broker in migration mode (agents are refused)",
+			"You open the old store once with a passkey, create and test its scope keys, prove the recovery key and activate", "Pin the new activation and restart the broker", "Delete the pre-migration and older backups unless you keep them"},
+		Reversible: "No: one-way; the pre-migration backup is the way back if it fails before activation"},
 	{ID: TaskUpdates, Title: "Enable self-update",
 		Summary: "Prepares this machine to rebuild and install new releases itself, each one approved by you on this page.",
 		Steps: []string{"Install build tools, the pinned Go and Bun toolchains and a locked build user", "Create the read-only deploy key and trust the forge's host key", "Store the release-reading tokens",
@@ -88,6 +94,13 @@ type SealParams struct {
 	PurgeBackups bool   `json:"purge_backups"`
 	LockAlert    bool   `json:"lock_alert"`
 }
+
+// BucketsParams: whether to delete the backups that still hold format-1 data afterwards.
+type BucketsParams struct {
+	PurgeBackups bool `json:"purge_backups"`
+}
+
+func (BucketsParams) validate() error { return nil }
 
 // UpdatesParams names the release sources. The token flags say which sealed secrets follow.
 type UpdatesParams struct {
@@ -208,6 +221,8 @@ func blank(task string) (any, error) {
 		return CutoverParams{}, nil
 	case TaskSeal:
 		return SealParams{}, nil
+	case TaskBuckets:
+		return BucketsParams{}, nil
 	case TaskUpdates:
 		return UpdatesParams{}, nil
 	case TaskPins:
@@ -238,6 +253,9 @@ func Parse(task, text string) (any, error) {
 		err, v = strict(&p), p
 	case TaskSeal:
 		var p SealParams
+		err, v = strict(&p), p
+	case TaskBuckets:
+		var p BucketsParams
 		err, v = strict(&p), p
 	case TaskUpdates:
 		var p UpdatesParams

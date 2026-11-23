@@ -100,7 +100,7 @@ type setupTask struct {
 }
 
 type setupView struct {
-	Mode      string            `json:"mode"` // serve | cutover | seal-setup
+	Mode      string            `json:"mode"` // serve | cutover | seal-setup | bucket-migrate
 	Installed bool              `json:"runner_installed"`
 	Version   string            `json:"runner_version,omitempty"`
 	SecretKey string            `json:"secrets_key,omitempty"`
@@ -145,6 +145,8 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 		Current: st.Current, Refused: st.Refused, Passkeys: []setupPasskey{}, Updates: map[string]string{}}
 	if s.maintenance {
 		v.Mode = "cutover"
+	} else if s.bucketMigrate {
+		v.Mode = "bucket-migrate"
 	} else if s.sealSetup {
 		v.Mode = "seal-setup"
 	}
@@ -169,7 +171,8 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 		v.Passkeys = append(v.Passkeys, p)
 	}
 	scoped := q.Scoped()
-	sealed := s.seal != nil && !s.sealSetup
+	sealed := s.seal != nil && !s.sealSetup || s.bucketMigrate
+	migration := s.seal != nil && s.seal.mode == modeMigration
 	s.updates.RLock()
 	candidate := s.updates.view.Error == "" && s.updates.view.Candidate.Valid()
 	s.updates.RUnlock()
@@ -185,6 +188,16 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 				t.State = "done"
 			} else if !scoped {
 				t.State, t.Blocked = "blocked", "Switch to organisations first."
+			}
+		case maint.TaskBuckets:
+			switch {
+			case s.sealServing():
+				t.State = "done"
+			case migration || s.bucketMigrate:
+			case s.seal == nil && !s.sealSetup:
+				t.State, t.Blocked = "blocked", "Not needed: sealing this store creates per-credential buckets directly."
+			default:
+				t.State, t.Blocked = "blocked", "Only a store sealed by aqmas 0.4.1 needs this."
 			}
 		case maint.TaskUpdates:
 			t.Rerunnable = true
@@ -367,6 +380,9 @@ func (s *Server) setupParams(ctx context.Context, task string, raw json.RawMessa
 		err, v = strict(&p), p
 	case maint.TaskSeal:
 		var p maint.SealParams
+		err, v = strict(&p), p
+	case maint.TaskBuckets:
+		var p maint.BucketsParams
 		err, v = strict(&p), p
 	case maint.TaskUpdates:
 		var p maint.UpdatesParams

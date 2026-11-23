@@ -115,3 +115,20 @@ func setUpdates(raw []byte, u config.Updates) ([]byte, error) {
 	}
 	return checked(old, []byte(s), func(c *config.Config) { c.Updates = u })
 }
+
+var manifestLine = regexp.MustCompile(`(?m)^[ \t]*manifest_sha256[ \t]*=[ \t]*"([0-9a-f]{64})"[ \t]*\n`)
+
+// repinSeal replaces the activation pin (format 1 → format 2 after the move to buckets).
+func repinSeal(raw []byte, old, manifest string) ([]byte, error) {
+	cfg, err := config.Parse(raw)
+	if err != nil || !cfg.Seal.Required || cfg.Seal.Manifest != old {
+		return nil, errors.New("configuration does not pin the store being moved")
+	}
+	s := ensureNewline(raw)
+	loc := manifestLine.FindAllStringSubmatchIndex(s, -1)
+	if len(loc) != 1 || s[loc[0][2]:loc[0][3]] != old {
+		return nil, errConfigShape
+	}
+	s = s[:loc[0][2]] + manifest + s[loc[0][3]:]
+	return checked(cfg, []byte(s), func(c *config.Config) { c.Seal.Manifest = manifest })
+}

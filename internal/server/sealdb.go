@@ -30,7 +30,7 @@ const sealActiveDDL = `CREATE TABLE IF NOT EXISTS seal_active(singleton INTEGER 
 const (
 	modeBuckets   = "buckets"            // format 2, serving
 	modeMigration = "migration-required" // schema-8 format-1 store under this binary
-	modeSetup     = "setup"              // seal-import or bucket-migrate staging (STAGE-AGENT)
+	modeSetup     = "setup"              // seal-import or bucket-migrate staging (bucketstage.go)
 )
 
 // Bucket refs (buckets.ref): the installation-wide CAs use caBucketRef; a
@@ -50,7 +50,7 @@ type sealRuntime struct {
 	scopeMu      sync.Mutex // serialises scope creation, passkey wraps and rekey
 	stop         chan struct{}
 	once         sync.Once
-	stage        *sealStage // STAGE-AGENT: seal-import / bucket-migrate staging
+	stage        *sealStage // seal-import / bucket-migrate staging (bucketstage.go)
 }
 
 // BucketManifest is the root-pinned format-2 activation manifest
@@ -68,6 +68,8 @@ type BucketManifest struct {
 	Buckets      []ManifestBucket `json:"buckets"`
 	Passkeys     []ManifestWrap   `json:"passkeys,omitempty"`
 	ApproveOnly  []string         `json:"approve_only,omitempty"`
+	// Dropped names format-1 records not carried over (the Cloudflare minter parent).
+	Dropped []string `json:"dropped,omitempty"`
 }
 type ManifestScope struct {
 	Scope  string `json:"scope"`
@@ -149,7 +151,7 @@ func (s *Server) publishLockStatus(state string) {
 // sealBoot decides the seal mode from the pin, the schema and the activation
 // marker before anything else is loaded: "" (unsealed), modeBuckets,
 // modeMigration or modeSetup.
-func sealBoot(cfg *config.Config, st *store.Store, setup bool) (string, error) {
+func sealBoot(cfg *config.Config, st *store.Store, setup, migrate bool) (string, error) {
 	var v, active, wraps, buckets int
 	db := st.DB()
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
@@ -166,7 +168,9 @@ func sealBoot(cfg *config.Config, st *store.Store, setup bool) (string, error) {
 	}
 	pinned := cfg.Seal.Required && len(cfg.Seal.Manifest) == 64 && cfg.Ntfy.TopicURL == ""
 	switch {
-	case setup && cfg.Seal.Required && v >= 6 && v <= 7 && active+wraps+buckets == 0:
+	case setup && !migrate && cfg.Seal.Required && v >= 6 && v <= 7 && active+wraps+buckets == 0:
+		return modeSetup, nil
+	case setup && migrate && pinned && v == 8 && active == 1 && wraps == 1 && buckets == 0:
 		return modeSetup, nil
 	case !setup && pinned && v == store.SchemaBuckets && active == 1 && buckets == 1 && wraps == 0:
 		return modeBuckets, nil
@@ -295,23 +299,4 @@ func writeExclusive(path string, b []byte) error {
 		err = ce
 	}
 	return err
-}
-
-// errStage marks what the staging build stage still has to provide.
-func errStage(what string) error {
-	return fmt.Errorf("%s is not implemented in this build stage", what)
-}
-
-// STAGE-AGENT: seal-import and bucket-migrate staging (docs/BUCKETS.md §8,
-// contract "Stage"). The format-1 staging (one MK, one wrap) was removed.
-type sealStage struct{}
-
-// STAGE-AGENT: build the format-2 stage (scope keys, buckets, records,
-// recovery wraps in memory) from the plaintext sources or the format-1 store.
-func (s *Server) newStage() error { return errStage("seal-import staging") }
-
-// RecoveryDrill was the format-1 offline drill over an inventory bundle.
-// STAGE-AGENT: replace with `aqmasd seal-drill BACKUP.db RECIPIENT` (§10).
-func RecoveryDrill(b []byte, digest, recipient string, identity []byte) (string, error) {
-	return "", errStage("the offline recovery drill")
 }
