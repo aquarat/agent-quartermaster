@@ -42,6 +42,15 @@ type APIError struct {
 	Message    string
 }
 
+// lockedNotice is what the CLI prints while a bucket it needs is closed (423
+// "locked"): the broker's own words when it names the bucket, else a generic line.
+func lockedNotice(e *APIError) string {
+	if e != nil && strings.Contains(e.Message, "waiting for the owner") && len(e.Message) <= 200 && !strings.ContainsFunc(e.Message, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		return e.Message
+	}
+	return "waiting for the owner to reopen the credential's bucket"
+}
+
 func (e *APIError) Error() string {
 	msg := e.Message
 	if msg == "" {

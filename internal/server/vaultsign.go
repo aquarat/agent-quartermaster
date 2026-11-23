@@ -12,6 +12,7 @@ import (
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
+	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
 	"github.com/aquarat/agent-quartermaster/internal/signer"
 )
@@ -24,8 +25,8 @@ import (
 func (s *Server) signAgentRoutes(m *http.ServeMux) {
 	route := func(pattern string, f func(context.Context, *store.Q, *http.Request, *store.Host) (any, error)) {
 		m.Handle(pattern, s.requireHost(func(w http.ResponseWriter, r *http.Request, h *store.Host) {
-			if s.seal == nil || s.seal.stage != nil {
-				s.writeErr(w, r, errNotFound())
+			if err := s.bucketsReady(); err != nil {
+				s.writeErr(w, r, err)
 				return
 			}
 			call := &signCall{}
@@ -36,28 +37,28 @@ func (s *Server) signAgentRoutes(m *http.ServeMux) {
 					return
 				}
 			}
-			s.optionalLease(r.Context(), func(ctx context.Context) {
-				var out any
-				err := s.store.Tx(ctx, func(q *store.Q) error {
-					if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
-						return err
-					}
-					if err := q.SweepSign(ctx, s.now()); err != nil {
-						return err
-					}
-					var err error
-					out, err = f(context.WithValue(ctx, signCallKey{}, call), q, r, h)
+			ctx := r.Context()
+			var out any
+			err := s.store.Tx(ctx, func(q *store.Q) error {
+				if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
 					return err
-				})
-				if err != nil {
-					s.writeErr(w, r, mapNotFound(err))
-					return
 				}
-				if call.after != nil {
-					call.after()
+				if err := q.SweepSign(ctx, s.now()); err != nil {
+					return err
 				}
-				writeJSON(s.deliveryWriter(ctx, w), 200, out)
+				var err error
+				out, err = f(context.WithValue(ctx, signCallKey{}, call), q, r, h)
+				return err
 			})
+			if err != nil {
+				s.writeErr(w, r, mapNotFound(err))
+				return
+			}
+			if call.after != nil {
+				call.after()
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			writeJSON(w, 200, out)
 		}))
 	}
 	route("GET /v2/sign/key", func(ctx context.Context, q *store.Q, r *http.Request, h *store.Host) (any, error) {
@@ -210,6 +211,7 @@ func (s *Server) signEnd(ctx context.Context, q *store.Q, r *http.Request, h *st
 	if err = q.DecideSign(ctx, v.ID, status, "", 0, 0, 0); err != nil {
 		return nil, errConflict("request no longer active")
 	}
+	s.releaseAfter(ctx, "sign:"+v.ID)
 	return api.OK{OK: true}, q.Audit(ctx, s.now(), "host:"+h.Name, "sign_"+status, "request:"+v.ID, v.Path)
 }
 
@@ -248,9 +250,6 @@ func (s *Server) signWith(ctx context.Context, q *store.Q, r *http.Request, h *s
 	} else if v.Used+len(in.Items) > v.Max {
 		return nil, errConflict("grant has too few signatures left")
 	}
-	if !s.authorisedWork(ctx) {
-		return nil, lockedErr()
-	}
 	t, err := q.VaultSet(ctx, v.Set)
 	if err != nil || t.Kind != "signer" || t.Scheme != v.Scheme || string(t.PublicKey) != string(v.PublicKey) {
 		return nil, errConflict("signer no longer available")
@@ -259,18 +258,37 @@ func (s *Server) signWith(ctx context.Context, q *store.Q, r *http.Request, h *s
 	if err != nil {
 		return nil, err
 	}
-	var key signerSecret
-	if _, err = s.signerCipher(ctx, t, rec, &key, false); err != nil {
+	row, err := s.setRow(ctx, q, "signer", v.Set)
+	if err != nil || string(rec.Wrap) != string(row.ID) {
+		return nil, errConflict("signer no longer available")
+	}
+	out := signer.Signed{}
+	// The key is decrypted from the open signer bucket for this call only.
+	err = s.withBucket(row, func(b seal.Bucket, k *seal.Key) error {
+		p, err := b.Open(k, seal.RoleSignerKey, signerFields(t), rec.Payload)
+		if err != nil {
+			return errConflict("signer record failed authentication")
+		}
+		var key signerSecret
+		err = json.Unmarshal(p, &key)
+		clear(p)
+		defer clear(key.Private)
+		if err != nil || key.Scheme != t.Scheme || len(key.Private) != 32 {
+			return errConflict("signer record failed authentication")
+		}
+		for _, it := range in.Items {
+			sig, err := sc.Sign(key.Private, it)
+			if err != nil || !sc.Verify(t.PublicKey, it, sig) {
+				return errConflict("signing failed its own verification")
+			}
+			out.Signatures = append(out.Signatures, signer.Signature{Name: it.Name, SHA256: it.SHA256, Signature: sig})
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	defer clear(key.Private)
-	out := signer.Signed{}
 	for _, it := range in.Items {
-		sig, err := sc.Sign(key.Private, it)
-		if err != nil || !sc.Verify(t.PublicKey, it, sig) {
-			return nil, errConflict("signing failed its own verification")
-		}
-		out.Signatures = append(out.Signatures, signer.Signature{Name: it.Name, SHA256: it.SHA256, Signature: sig})
 		if err = q.Audit(ctx, now, "host:"+h.Name, "sign", "grant:"+v.Grant, fmt.Sprintf("%s scheme=%s sha256=%s sha512=%s size=%d name=%q enrollment=%s address=%s", v.Path, v.Scheme, it.SHA256, it.SHA512, it.Size, it.Name, v.Enrollment, v.Peer)); err != nil {
 			return nil, err
 		}
@@ -280,6 +298,7 @@ func (s *Server) signWith(ctx context.Context, q *store.Q, r *http.Request, h *s
 	}
 	if v.Used += len(in.Items); v.Used >= v.Max {
 		v.Status = "used"
+		s.releaseAfter(ctx, "sign:"+v.ID) // the last signature ends the hold
 	}
 	out.Request = v
 	return out, nil

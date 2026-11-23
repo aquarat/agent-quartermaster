@@ -49,6 +49,8 @@ func Open(path string) (*Store, error) {
 	v.Add("_pragma", "journal_mode(WAL)")
 	v.Add("_pragma", "busy_timeout(10000)")
 	v.Add("_pragma", "synchronous(NORMAL)")
+	// Freed pages are zeroed: removed wraps and records do not linger (docs/BUCKETS.md §7).
+	v.Add("_pragma", "secure_delete(1)")
 	v.Add("_txlock", "immediate")
 	db, err := sql.Open("sqlite", "file:"+path+"?"+v.Encode())
 	if err != nil {
@@ -85,8 +87,8 @@ func (s *Store) migrate(ctx context.Context) error {
 	if ver > len(migrations) {
 		// Version 6 is applied exclusively by the supervised signed cutover.
 		// Opening a schema-5 store must never select it (self-update rollback).
-		if (ver == 6 || ver == 7 || ver == 8) && len(migrations) == 5 {
-			if ver == 8 {
+		if ver >= 6 && ver <= SchemaBuckets && len(migrations) == 5 {
+			if ver >= 8 {
 				var marker int
 				if err := s.db.QueryRowContext(ctx, `SELECT singleton FROM seal_active WHERE singleton=1`).Scan(&marker); err != nil {
 					return fmt.Errorf("store: incomplete sealed activation: %w", err)

@@ -17,6 +17,7 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/pki"
 	"github.com/aquarat/agent-quartermaster/internal/server/policy"
+	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/server/sshcert"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
 )
@@ -43,9 +44,7 @@ func (s *Server) AgentHandler() http.Handler {
 	mux.Handle("GET /v1/releases/{version}/{asset}", s.requireHost(s.releaseAsset))
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
 	mux.HandleFunc("GET /v1/enroll/{id}", s.handleEnrollStatus)
-	create := func(w http.ResponseWriter, r *http.Request, h *store.Host) {
-		s.optionalLease(r.Context(), func(ctx context.Context) { s.handleCreateRequest(w, r.WithContext(ctx), h) })
-	}
+	create := s.handleCreateRequest
 	mux.Handle("POST /v1/requests", s.requirePersonal(create))
 	if s.store.Q().Scoped() {
 		mux.Handle("POST /v2/personal/requests", s.requirePersonal(create))
@@ -254,26 +253,20 @@ func (s *Server) handleEnrollStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
-	s.optionalLease(ctx, func(ctx context.Context) {
-		w := s.deliveryWriter(ctx, w)
-		out := api.EnrollStatus{ID: e.ID, Status: e.Status}
-		if e.Status == api.StatusApproved && !e.CertDelivered {
-			if !s.authorisedWork(ctx) {
-				s.writeErr(w, r, lockedErr())
-				return
-			}
-			ok, err := s.store.Q().MarkCertDelivered(ctx, e.ID)
-			if err != nil {
-				s.writeErr(w, r, err)
-				return
-			}
-			if ok {
-				out.ClientCertPEM = e.CertPEM
-				out.CACertPEM = string(s.pki.CAPEM)
-			}
+	// An already-signed certificate is public material: delivering it needs no bucket.
+	out := api.EnrollStatus{ID: e.ID, Status: e.Status}
+	if e.Status == api.StatusApproved && !e.CertDelivered {
+		ok, err := s.store.Q().MarkCertDelivered(ctx, e.ID)
+		if err != nil {
+			s.writeErr(w, r, err)
+			return
 		}
-		writeJSON(w, http.StatusOK, out)
-	})
+		if ok {
+			out.ClientCertPEM = e.CertPEM
+			out.CACertPEM = string(s.pki.CAPEM)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ---- access requests ----
@@ -397,6 +390,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		return
 	}
 	ctx := r.Context()
+	var standingUsed *store.Standing
 	err = s.store.Tx(ctx, func(q *store.Q) error {
 		if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
 			return err
@@ -420,11 +414,12 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 		if err != nil {
 			return err
 		}
+		// A standing rule issues without a tap only while the SSH CA is open (§5).
+		if !s.caOpen(ctx, q, seal.RoleSSHCA) {
+			rules = nil
+		}
 		cand := policy.Candidate{HostID: h.ID, PeerAddress: req.PeerAddress, Kind: req.Kind, Target: req.TargetHost, LoginUser: req.LoginUser, TTL: ttl}
 		for _, st := range rules {
-			if !s.authorisedWork(ctx) {
-				break
-			}
 			rule := policy.Rule{HostID: st.HostID, PeerAddress: st.PeerAddress, Kind: st.Kind, Target: st.TargetHost, LoginUser: st.LoginUser,
 				MaxTTL: st.MaxTTL, ExpiresAt: st.ExpiresAt, Revoked: st.RevokedAt != nil}
 			if !policy.Matches(rule, cand, now) {
@@ -451,6 +446,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 			if err != nil {
 				return err
 			}
+			standingUsed = st
 			return q.Audit(ctx, now, "system", "auto_approve", "request:"+req.ID,
 				fmt.Sprintf("standing=%s grant=%s host=%s %s@%s ttl=%d key=%s from=%s", st.ID, g.ID, h.Name, req.LoginUser, req.TargetHost, ttl, req.KeyFingerprint, req.PeerAddress))
 		}
@@ -468,6 +464,9 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, h *
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
+	}
+	if standingUsed != nil {
+		s.holdCA(ctx, seal.RoleSSHCA, standingHold(standingUsed))
 	}
 	s.bcast.notify()
 	url := s.approveURL(req.ID)
@@ -507,29 +506,25 @@ func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request, h *
 	if ctx.Err() != nil {
 		return
 	}
-	s.optionalLease(ctx, func(ctx context.Context) {
-		w := s.deliveryWriter(ctx, w)
-		r := r.WithContext(ctx)
-		var out *api.RequestStatus
-		err = s.store.Tx(ctx, func(q *store.Q) error {
-			req, err := q.PersonalStatus(ctx, id, h.ID, s.now())
-			if err != nil {
-				return mapNotFound(err)
-			}
-			out, err = s.requestStatus(ctx, q, req)
-			return err
-		})
+	var out *api.RequestStatus
+	err = s.store.Tx(ctx, func(q *store.Q) error {
+		req, err := q.PersonalStatus(ctx, id, h.ID, s.now())
 		if err != nil {
-			s.writeErr(w, r, err)
-			return
+			return mapNotFound(err)
 		}
-		// Token mode: the first poll after approval mints the child token and carries its value.
-		if err := s.deliverToken(w, r, h, out); err != nil {
-			s.writeErr(w, r, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, out)
+		out, err = s.requestStatus(ctx, q, req)
+		return err
 	})
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	// Token mode: the first poll after approval mints the child token and carries its value.
+	if err := s.deliverToken(w, r, h, out); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // requestStatus builds the agent-facing status; the grant (with certificate) is included only
@@ -539,9 +534,7 @@ func (s *Server) requestStatus(ctx context.Context, q *store.Q, req *store.Reque
 	if req.Status != api.StatusApproved {
 		return out, nil
 	}
-	if !s.authorisedWork(ctx) {
-		return nil, lockedErr()
-	}
+	// An approved grant's certificate is already signed: no bucket is needed to deliver it.
 	g, err := q.GrantByRequest(ctx, req.ID)
 	if err != nil {
 		return nil, err

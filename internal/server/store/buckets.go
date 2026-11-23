@@ -188,3 +188,92 @@ func (q *Q) SetNoticeTopic(ctx context.Context, topic string) error {
 	_, err := q.q.ExecContext(ctx, `INSERT INTO notice_channel VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET topic_url=excluded.topic_url`, topic)
 	return err
 }
+
+// CFProxySet is the personal organisation's Cloudflare proxy set (the ref of its cf-proxy bucket).
+func (q *Q) CFProxySet(ctx context.Context) (string, error) {
+	var id string
+	err := q.q.QueryRowContext(ctx, `SELECT t.id FROM personal_cutover c JOIN services v ON v.org_id=c.org_id JOIN credential_sets t ON t.service_id=v.id WHERE t.kind='cloudflare-proxy' AND v.slug='dns-cdn'`).Scan(&id)
+	return id, notFound(err)
+}
+
+// UpdateBucket replaces a bucket's key pair, wrap and record (rekey).
+func (q *Q) UpdateBucket(ctx context.Context, id, public, wrap, payload []byte) error {
+	return one(q.q.ExecContext(ctx, `UPDATE buckets SET public_key=?,wrap=?,payload=? WHERE id=?`, public, wrap, payload, id))
+}
+
+// ReplaceScope replaces a scope's key pair and recovery wrap (rekey).
+func (q *Q) ReplaceScope(ctx context.Context, x ScopeRow) error {
+	return one(q.q.ExecContext(ctx, `UPDATE bucket_scopes SET public_key=?,recovery=? WHERE scope=?`, x.Public, x.Recovery, x.Scope))
+}
+
+// ScopeBuckets lists the buckets of one scope.
+func (q *Q) ScopeBuckets(ctx context.Context, scope string) ([]BucketRow, error) {
+	var out []BucketRow
+	err := q.rows(ctx, `SELECT `+bucketCols+` WHERE b.scope=? ORDER BY b.id`, func(r *sql.Rows) error {
+		b, err := scanBucket(r)
+		out = append(out, b)
+		return err
+	}, scope)
+	return out, err
+}
+
+// RekeyEnv re-encrypts the current revision of a set (older revisions hold no values).
+func (q *Q) RekeyEnv(ctx context.Context, set string, revision int, payload, wrap []byte) error {
+	return one(q.q.ExecContext(ctx, `UPDATE env_revisions SET payload=?,wrap=? WHERE set_id=? AND revision=? AND wrap IS NOT NULL`, payload, wrap, set, revision))
+}
+
+// RekeySigner re-encrypts a signer key record.
+func (q *Q) RekeySigner(ctx context.Context, set string, payload, wrap []byte) error {
+	return one(q.q.ExecContext(ctx, `UPDATE signer_keys SET payload=?,wrap=? WHERE set_id=?`, payload, wrap, set))
+}
+
+// DropScopeDrafts deletes every env draft of the sets in a scope (rekey).
+func (q *Q) DropScopeDrafts(ctx context.Context, scope string) error {
+	_, err := q.q.ExecContext(ctx, `DELETE FROM env_drafts WHERE set_id IN (SELECT ref FROM buckets WHERE scope=? AND kind='env-set') OR wrap IN (SELECT id FROM buckets WHERE scope=?)`, scope, scope)
+	return err
+}
+
+// DeletePasskeyScopeWraps removes one passkey's wraps of these scopes, or all (disable).
+func (q *Q) DeletePasskeyScopeWraps(ctx context.Context, passkey int64, scopes []string) error {
+	if len(scopes) == 0 {
+		_, err := q.q.ExecContext(ctx, `DELETE FROM scope_wraps WHERE passkey=?`, passkey)
+		return err
+	}
+	for _, sc := range scopes {
+		if _, err := q.q.ExecContext(ctx, `DELETE FROM scope_wraps WHERE passkey=? AND scope=?`, passkey, sc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// OrphanedScopes lists scopes whose only passkey wraps belong to this passkey.
+func (q *Q) OrphanedScopes(ctx context.Context, passkey int64) ([]string, error) {
+	var out []string
+	err := q.rows(ctx, `SELECT w.scope FROM scope_wraps w WHERE w.passkey=? AND NOT EXISTS(SELECT 1 FROM scope_wraps x WHERE x.scope=w.scope AND x.passkey!=w.passkey) ORDER BY w.scope`, func(r *sql.Rows) error {
+		var s string
+		err := r.Scan(&s)
+		out = append(out, s)
+		return err
+	}, passkey)
+	return out, err
+}
+
+// CheckpointWAL truncates the WAL after removals so freed pages do not keep old wraps (§7).
+func (s *Store) CheckpointWAL(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
+}
+
+// SetRevision is a credential set's current revision (archived or not).
+func (q *Q) SetRevision(ctx context.Context, set string) (int, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, `SELECT revision FROM credential_sets WHERE id=?`, set).Scan(&n)
+	return n, notFound(err)
+}
+
+// SignerKey is a signer's public description and sealed record (archived or not).
+func (q *Q) SignerKey(ctx context.Context, set string) (scheme string, public []byte, rec CipherRecord, err error) {
+	err = q.q.QueryRowContext(ctx, `SELECT scheme,public_key,blob,payload,wrap FROM signer_keys WHERE set_id=?`, set).Scan(&scheme, &public, &rec.Blob, &rec.Payload, &rec.Wrap)
+	return scheme, public, rec, notFound(err)
+}

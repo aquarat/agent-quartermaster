@@ -150,35 +150,21 @@ func (p *vaultPool) logout(sess string) {
 }
 
 func (s *Server) vaultInfo(purpose string) []byte {
-	return seal.Tuple("hpke-vault", s.seal.inv.Installation[:], []byte(purpose))
+	return seal.Tuple("hpke-vault", s.seal.installation[:], []byte(purpose))
 }
 func (s *Server) vaultUploadAAD(attempt, set string) ([]byte, error) {
 	raw, err := strictB64(attempt, 32)
 	if err != nil || len(raw) != 32 {
 		return nil, errBad("invalid attempt id")
 	}
-	epoch := s.seal.attempts.Epoch()
+	epoch := s.seal.opens.Epoch()
 	return seal.Tuple("hpke-vault-aad", raw, epoch[:], []byte(set)), nil
 }
 
 func (s *Server) vaultRoutes(m *http.ServeMux) {
 	s.sealedEndpoint(m, "POST /api/ui/seal/vault/attempt", s.vaultAttempt)
 	for path, fn := range map[string]capHandler{"GET /api/ui/seal/vault/state": s.vaultState, "POST /api/ui/seal/vault/challenge": s.vaultChallenge, "POST /api/ui/seal/vault/finish": s.vaultFinish} {
-		m.Handle(path, s.requireSession(func(w http.ResponseWriter, r *http.Request, sess string) {
-			if s.seal == nil || s.seal.stage != nil {
-				s.writeErr(w, r, errNotFound())
-				return
-			}
-			s.optionalLease(r.Context(), func(ctx context.Context) {
-				v, err := fn(ctx, r, sess)
-				if err != nil {
-					s.writeErr(w, r, mapNotFound(err))
-					return
-				}
-				w.Header().Set("Cache-Control", "no-store")
-				writeJSON(s.deliveryWriter(ctx, w), 200, v)
-			})
-		}))
+		s.sealedEndpoint(m, path, fn)
 	}
 }
 
@@ -201,12 +187,11 @@ type vaultSetView struct {
 
 func (s *Server) vaultState(ctx context.Context, r *http.Request, sess string) (any, error) {
 	out := struct {
-		Unlocked bool             `json:"unlocked"`
 		Schemes  []signer.Scheme  `json:"schemes"`
 		Orgs     []store.VaultOrg `json:"organisations"`
 		Sets     []vaultSetView   `json:"sets"`
 		Requests []signer.Request `json:"requests"`
-	}{Unlocked: s.authorisedWork(ctx), Schemes: signer.All(), Sets: []vaultSetView{}}
+	}{Schemes: signer.All(), Sets: []vaultSetView{}}
 	err := s.store.Tx(ctx, func(q *store.Q) error {
 		if _, err := s.vaultOwner(ctx, q, sess); err != nil {
 			return err
@@ -363,7 +348,6 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		}
 		return nil
 	}
-	unlocked := s.authorisedWork(ctx)
 	var m map[string]any
 	facts = map[string]any{}
 	switch c.Action {
@@ -378,9 +362,6 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		if c.AllowReveal == nil || *c.AllowReveal == o.AllowReveal {
 			return "", nil, errConflict("policy already has that value; reload")
 		}
-		if !unlocked && *c.AllowReveal {
-			return "", nil, lockedErr()
-		}
 		m = map[string]any{"org_id": o.ID, "org_slug": o.Slug, "org_title": o.Title, "old_allow_reveal": o.AllowReveal, "allow_reveal": *c.AllowReveal}
 	case "commit":
 		t, err := q.VaultSet(ctx, c.ID)
@@ -393,8 +374,8 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		if t.Kind != "env-set" {
 			return "", nil, errBad("not an env set")
 		}
-		if !unlocked {
-			return "", nil, lockedErr()
+		if err = s.canWrite(ctx, q, "env-set", t.SetID, t.OrgID); err != nil {
+			return "", nil, err
 		}
 		var p *vaultPending
 		if begin {
@@ -436,9 +417,6 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		if !t.AllowReveal {
 			return "", nil, errForbidden("this organisation does not allow reveal")
 		}
-		if !unlocked {
-			return "", nil, lockedErr()
-		}
 		names := slices.Clone(c.Names)
 		slices.Sort(names)
 		if len(names) == 0 || !slices.Equal(names, slices.Compact(slices.Clone(names))) || !slices.Equal(names, c.Names) {
@@ -473,8 +451,8 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		if free, err := q.SetSlugFree(ctx, t.ServiceID, c.ID, c.Slug); err != nil || !free {
 			return "", nil, errConflict("a set with that name or ID exists; reload")
 		}
-		if !unlocked {
-			return "", nil, lockedErr()
+		if err = s.canWrite(ctx, q, "signer", c.ID, t.OrgID); err != nil {
+			return "", nil, err
 		}
 		t.SetID, t.SetSlug, t.SetTitle, t.Kind, t.Revision = c.ID, c.Slug, c.Title, "signer", 0
 		var pub []byte
@@ -540,9 +518,6 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 			return "", nil, errConflict("signer no longer available")
 		}
 		if c.Action == "sign-approve" {
-			if !unlocked {
-				return "", nil, lockedErr()
-			}
 			b, err := q.SignBinding(ctx, host, v.Path, s.now())
 			if err != nil || !signBindingEqual(b, v.Binding) {
 				return "", nil, errConflict("admission or signer changed")
@@ -588,12 +563,16 @@ func (s *Server) vaultChallenge(ctx context.Context, r *http.Request, sess strin
 	}
 	var meta string
 	var facts map[string]any
+	var needs []bucketNeed
 	err := s.store.Tx(ctx, func(q *store.Q) error {
 		pk, err := q.SessionPasskeyID(ctx, sess)
 		if err != nil {
 			return err
 		}
-		meta, facts, err = s.vaultReview(ctx, q, sess, pk, in, true)
+		if meta, facts, err = s.vaultReview(ctx, q, sess, pk, in, true); err != nil {
+			return err
+		}
+		needs, err = s.vaultNeeds(ctx, q, in)
 		return err
 	})
 	if err != nil {
@@ -606,11 +585,54 @@ func (s *Server) vaultChallenge(ctx context.Context, r *http.Request, sess strin
 	m := s.reviewFields("vault", in.Action, in.ID)
 	m["metadata"] = meta
 	text, _ := reviewJSON(m)
-	ch, err := s.beginReview(ctx, sess, "vault", in.Action, text, nil)
+	ch, err := s.beginTap(ctx, sess, "vault", in.Action, text, needs, nil)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"canonical": ch.Canonical, "challenge_id": ch.ChallengeID, "public_key": ch.PublicKey, "facts": facts}, nil
+	out := map[string]any{"canonical": ch.Canonical, "challenge_id": ch.ChallengeID, "public_key": ch.PublicKey, "facts": facts}
+	if ch.Open != nil {
+		out["open"] = ch.Open
+	}
+	return out, nil
+}
+
+// vaultNeeds: a reveal opens the set for an instant; approving signing keeps
+// the signer open until the grant is used up, expires or is revoked.
+func (s *Server) vaultNeeds(ctx context.Context, q *store.Q, c vaultChoice) ([]bucketNeed, error) {
+	switch c.Action {
+	case "reveal":
+		row, err := s.setRow(ctx, q, "env-set", c.ID)
+		if err != nil {
+			return nil, err
+		}
+		return []bucketNeed{s.need(row)}, nil
+	case "sign-approve":
+		v, _, err := q.SignRequest(ctx, c.ID, false)
+		if err != nil {
+			return nil, err
+		}
+		row, err := s.setRow(ctx, q, "signer", v.Set)
+		if err != nil {
+			return nil, err
+		}
+		until := s.now().Add(signer.CollectSeconds * time.Second)
+		if c.TTL > 0 {
+			until = s.now().Add(secs(c.TTL))
+		}
+		return []bucketNeed{s.need(row, signHold(c.ID, until))}, nil
+	}
+	return nil, nil
+}
+
+// canWrite refuses a first write in an organisation without a scope key.
+func (s *Server) canWrite(ctx context.Context, q *store.Q, kind, set, org string) error {
+	if _, err := q.BucketByRef(ctx, kind, set); err == nil {
+		return nil
+	}
+	if _, err := q.Scope(ctx, org); err != nil {
+		return errConflict("this organisation has no scope key yet: create the scope first (Admin → Buckets)")
+	}
+	return nil
 }
 
 func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) (any, error) {
@@ -620,10 +642,11 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 	}
 	// The only way in: a single-use stored challenge and a fresh user-verified
 	// assertion over it. Nothing here consults an approval window.
-	c, pk, err := s.takeReview(ctx, sess, "vault", in)
+	c, pk, settle, err := s.takeReview(ctx, sess, "vault", in)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { settle(err == nil) }()
 	var m struct {
 		Action       string
 		ID           string
@@ -631,8 +654,9 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 		Epoch        seal.ID
 		Installation seal.ID
 	}
-	if json.Unmarshal([]byte(c.Canonical), &m) != nil || m.Action != c.ObjectID || m.Epoch != s.seal.attempts.Epoch() || m.Installation != s.seal.inv.Installation {
-		return nil, errBad("invalid vault decision")
+	if json.Unmarshal([]byte(c.Canonical), &m) != nil || m.Action != c.ObjectID || m.Epoch != s.seal.opens.Epoch() || m.Installation != s.seal.installation {
+		err = errBad("invalid vault decision")
+		return nil, err
 	}
 	// Rebuild the choice from the signed metadata alone.
 	var f struct {
@@ -651,7 +675,8 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 		PublicKey   string   `json:"public_key"`
 	}
 	if json.Unmarshal([]byte(m.Metadata), &f) != nil {
-		return nil, errBad("invalid vault decision")
+		err = errBad("invalid vault decision")
+		return nil, err
 	}
 	choice := vaultChoice{Action: m.Action, ID: m.ID, Attempt: f.Attempt}
 	switch m.Action {
@@ -710,24 +735,26 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 					edit.Entries[i].Value = ""
 				}
 			}()
+			// Tapless: new values are sealed to the set's public key; the
+			// entries this edit does not touch keep their ciphertext.
 			b := t.Binding()
-			old, err := s.values(ctx, q, b)
+			row, err := s.ensureSetBucket(ctx, q, "env-set", t.SetID, t.OrgID)
 			if err != nil {
 				return err
 			}
-			values, err := edit.Apply(old)
+			old, _, err := s.revisionRecords(ctx, q, b)
 			if err != nil {
-				return errBad("result exceeds env-set limits")
+				return err
+			}
+			sealed, err := s.sealEntries(s.sealBucket(row), t.SetID, edit.Entries)
+			if err != nil {
+				return err
+			}
+			if err = s.writeRevision(ctx, q, b, row, mergeRecords(old, edit.Op, sealed, edit.Remove)); err != nil {
+				return err
 			}
 			next := b
 			next.Revision++
-			rec, err := s.envCipher(ctx, next, "", store.CipherRecord{}, values, true)
-			if err != nil {
-				return err
-			}
-			if err = q.ReplaceEnv(ctx, b, envset.Names(values), rec); err != nil {
-				return err
-			}
 			path := t.OrgSlug + "/" + t.ServiceSlug + "/" + t.SetSlug
 			auditObject, detail, note = "set:"+t.SetID, fmt.Sprintf("%s revision=%d operation=%s changes=%s commitment=%s", path, next.Revision, edit.Op, f.Changes, p.commit), fmt.Sprintf("Saved %s revision %d", path, next.Revision)
 		case "reveal":
@@ -756,7 +783,7 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 			}
 			defer clear(plain)
 			pub, _ := strictB64(f.Recipient, 65)
-			epoch := s.seal.attempts.Epoch()
+			epoch := s.seal.opens.Epoch()
 			enc, ct, err := seal.SealTo(pub, s.vaultInfo("reveal"), seal.Tuple("hpke-vault-aad", canon.Challenge(c.Canonical), epoch[:], []byte(t.SetID)), plain)
 			if err != nil {
 				return errBad("invalid reveal recipient")
@@ -791,11 +818,22 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 				return err
 			}
 			t.SetID, t.SetSlug, t.SetTitle, t.Kind, t.Scheme, t.PublicKey, t.Origin = m.ID, f.Slug, f.Title, "signer", sc.ID, pub, origin
-			rec, err := s.signerCipher(ctx, t, store.CipherRecord{}, &signerSecret{Scheme: sc.ID, Private: priv}, true)
+			// The signer's bucket is created with it; the key is sealed to its public half.
+			row, err := s.ensureSetBucket(ctx, q, "signer", t.SetID, t.OrgID)
 			if err != nil {
 				return err
 			}
-			if err = q.CreateSigner(ctx, t, rec, now); err != nil {
+			plain, err := json.Marshal(signerSecret{Scheme: sc.ID, Private: priv})
+			if err != nil {
+				return err
+			}
+			rec, err := s.sealBucket(row).Seal(seal.RoleSignerKey, signerFields(t), plain)
+			clear(plain)
+			if err != nil {
+				return err
+			}
+			blob := seal.RandomID()
+			if err = q.CreateSigner(ctx, t, store.CipherRecord{Blob: blob[:], Payload: rec, Wrap: row.ID}, now); err != nil {
 				return errConflict("a set with that name or ID exists; reload")
 			}
 			path := t.OrgSlug + "/" + t.ServiceSlug + "/" + t.SetSlug
@@ -827,6 +865,7 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 			if err = q.DecideSign(ctx, m.ID, status, "", 0, 0, 0); err != nil {
 				return err
 			}
+			s.seal.pool.release("sign:" + m.ID)
 			auditObject, detail, note = "request:"+m.ID, v.Path+" host="+v.Host, fmt.Sprintf("Signing with %s for %s: %s", v.Path, v.Host, status)
 		}
 		return q.Audit(ctx, now, "owner", "vault_"+strings.ReplaceAll(m.Action, "-", "_"), auditObject, fmt.Sprintf("passkey=%d nonce=%s %s", pk, canonNonce(c.Canonical), detail))
@@ -858,39 +897,4 @@ func canonNonce(canonical string) string {
 type signerSecret struct {
 	Scheme  string `json:"scheme"`
 	Private []byte `json:"private"`
-}
-
-// signerCipher seals or opens a signer's private key. It is opened to sign
-// (signWith) and to check a recovery inventory (verifyEnvInventory); its
-// plaintext is never marshalled anywhere else.
-func (s *Server) signerCipher(ctx context.Context, t store.VaultTarget, rec store.CipherRecord, data *signerSecret, encrypt bool) (store.CipherRecord, error) {
-	k, _ := ctx.Value(leaseKey{}).(*seal.Key)
-	if k == nil || ctx.Err() != nil {
-		return rec, lockedErr()
-	}
-	blob := seal.RandomID()
-	if !encrypt {
-		if len(rec.Blob) != 32 {
-			s.stopSealed()
-			return rec, errConflict("damaged sealed record")
-		}
-		copy(blob[:], rec.Blob)
-	}
-	o := seal.Object{Org: t.OrgID, Service: t.ServiceID, Set: t.SetID, Role: "signer-key", Revision: 1, Blob: blob}
-	if encrypt {
-		p, err := json.Marshal(data)
-		if err != nil {
-			return rec, err
-		}
-		defer clear(p)
-		e, err := o.Encrypt(s.seal.inv.Generation, k, p)
-		return store.CipherRecord{Blob: blob[:], Payload: e.Payload, Wrap: e.WrappedDEK}, err
-	}
-	p, err := o.Decrypt(s.seal.inv.Generation, k, seal.Envelope{Payload: rec.Payload, WrappedDEK: rec.Wrap})
-	defer clear(p)
-	if err != nil || json.Unmarshal(p, data) != nil || data.Scheme != t.Scheme || len(data.Private) != 32 {
-		s.stopSealed()
-		return rec, errConflict("sealed record failed authentication; relocking")
-	}
-	return rec, nil
 }

@@ -233,7 +233,7 @@ func mustB64(t *testing.T, s string) []byte {
 type bucketVectors struct {
 	Installation, RPID, Cred, Scope, Salt, PRF, KEKInfo, KEK string
 	Canonical, Descriptor, Challenge                         string
-	AttemptID, Epoch, RecipientPriv, RecipientPub           string
+	AttemptID, Epoch, RecipientPriv, RecipientPub            string
 	Info, AAD                                                string
 	Browser                                                  *struct{ Enc, Ciphertext, KEK2 string } `json:"browser_packet,omitempty"`
 }

@@ -200,6 +200,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess strin
 	if s.seal != nil {
 		s.seal.windows.logout(sess)
 		s.seal.vault.logout(sess)
+		s.reconcileHolds(r.Context()) // the session's windows end: their holds go
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 	writeJSON(w, http.StatusOK, api.OK{OK: true})
@@ -341,7 +342,8 @@ func (s *Server) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
 			s.writeErr(w, r, errUnauth("log in first"))
 			return
 		}
-		sg, pkID, err := s.verifyAction(ctx, sess, canon.ObjectPasskey, "", in.ChallengeID, in.Assertion)
+		sg, pkID, settle, err := s.verifyAction(ctx, sess, canon.ObjectPasskey, "", in.ChallengeID, in.Assertion, nil)
+		settle(false)
 		if err != nil {
 			s.writeErr(w, r, err)
 			return
@@ -550,7 +552,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 	}
 	out := api.UIState{Owner: api.UIOwner{Name: s.cfg.OwnerName, Passkeys: n}, Pending: []api.PendingItem{}, Standing: []api.StandingApproval{}, Grants: []api.GrantSummary{}}
 	reqs, err := q.PendingRequests(ctx, now)
-	out.CatalogueEnabled = q.Scoped() && !s.isLocked()
+	out.CatalogueEnabled = q.Scoped() && (s.seal == nil || s.seal.mode == modeBuckets)
 	out.SealEnabled = s.seal != nil
 	if err != nil {
 		s.writeErr(w, r, err)
@@ -621,10 +623,18 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request, sess string
 		p := pks[i].info(cur)
 		if s.seal != nil {
 			p.RawID = encodeID(pks[i].CredentialID)
-			p.TestedAt, err = q.TestedWrap(ctx, pks[i].ID, s.seal.inv.Version)
-			if err != nil {
-				s.writeErr(w, r, err)
-				return
+			if s.sealServing() {
+				// The last time this passkey's wraps were proven: the latest tested scope wrap.
+				wraps, err := q.ScopeWraps(ctx, pks[i].ID)
+				if err != nil {
+					s.writeErr(w, r, err)
+					return
+				}
+				for _, w := range wraps {
+					if w.Tested != nil && (p.TestedAt == nil || w.Tested.After(*p.TestedAt)) {
+						p.TestedAt = w.Tested
+					}
+				}
 			}
 		}
 		out.Passkeys = append(out.Passkeys, p)
@@ -866,8 +876,14 @@ func (s *Server) challengeHandler(object string) func(http.ResponseWriter, *http
 				return
 			}
 		}
-		if !s.authorisedWork(ctx) && !lockedDecision(object, in.Action) {
-			s.writeErr(w, r, lockedErr())
+		if object == "update" && s.seal != nil && s.seal.mode == modeMigration {
+			s.writeErr(w, r, migrationErr())
+			return
+		}
+		// The buckets this decision needs come from stored state and the choice (§4.1).
+		needs, err := s.decisionNeeds(ctx, s.store.Q(), a)
+		if err != nil {
+			s.writeErr(w, r, err)
 			return
 		}
 		now := s.now()
@@ -876,12 +892,7 @@ func (s *Server) challengeHandler(object string) func(http.ResponseWriter, *http
 			s.writeErr(w, r, err)
 			return
 		}
-		o, err := s.loadOwner(ctx)
-		if err != nil {
-			s.writeErr(w, r, err)
-			return
-		}
-		opts, err := s.requestOptions(o, canon.Challenge(text))
+		opts, t, err := s.actionOptions(ctx, sess, text, needs, nil)
 		if err != nil {
 			s.writeErr(w, r, err)
 			return
@@ -892,35 +903,49 @@ func (s *Server) challengeHandler(object string) func(http.ResponseWriter, *http
 			s.writeErr(w, r, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, api.ChallengeResponse{ChallengeID: c.ID, Canonical: text, PublicKey: opts})
+		if t != nil {
+			s.seal.taps.put(c.ID, t, now)
+		}
+		writeJSON(w, http.StatusOK, api.ChallengeResponse{ChallengeID: c.ID, Canonical: text, PublicKey: opts, Open: t.offer()})
 	}
 }
 
 // verifyAction consumes an action challenge and verifies the assertion against exactly the
-// stored canonical text. id "" skips the object-id check (passkey registration).
-func (s *Server) verifyAction(ctx context.Context, sess, object, id, challengeID string, assertion json.RawMessage) (canon.Signed, int64, error) {
+// stored canonical text (bound to its open descriptor when the challenge offered one). id ""
+// skips the object-id check (passkey registration). settle is never nil; see verifyTap.
+func (s *Server) verifyAction(ctx context.Context, sess, object, id, challengeID string, assertion json.RawMessage, pkt *api.OpenPacket) (canon.Signed, int64, func(bool), error) {
+	noop := func(bool) {}
 	c, err := s.consume(ctx, challengeID, "action", s.now())
 	if err != nil {
-		return canon.Signed{}, 0, err
+		return canon.Signed{}, 0, noop, err
+	}
+	drop := func() {
+		if s.seal != nil {
+			s.seal.taps.take(c.ID)
+		}
 	}
 	if c.SessionHash != sess {
-		return canon.Signed{}, 0, errForbidden("challenge was issued to another session")
+		drop()
+		return canon.Signed{}, 0, noop, errForbidden("challenge was issued to another session")
 	}
 	if c.ObjectType != object || (id != "" && c.ObjectID != id) {
-		return canon.Signed{}, 0, errBad("challenge is for a different object")
+		drop()
+		return canon.Signed{}, 0, noop, errBad("challenge is for a different object")
 	}
 	sg, err := canon.Parse(c.Canonical)
 	if err != nil {
-		return canon.Signed{}, 0, err
+		drop()
+		return canon.Signed{}, 0, noop, err
 	}
 	if sg.Object != object || sg.ID != c.ObjectID {
-		return canon.Signed{}, 0, errBad("challenge is for a different object")
+		drop()
+		return canon.Signed{}, 0, noop, errBad("challenge is for a different object")
 	}
-	pkID, err := s.verifyAssertion(ctx, canon.Challenge(c.Canonical), assertion)
+	pkID, settle, err := s.verifyTap(ctx, sess, c.ID, c.Canonical, assertion, pkt)
 	if err != nil {
-		return canon.Signed{}, 0, err
+		return canon.Signed{}, 0, noop, err
 	}
-	return sg, pkID, nil
+	return sg, pkID, settle, nil
 }
 
 func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Request, string) {
@@ -932,16 +957,18 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 			return
 		}
 		id := r.PathValue("id")
-		sg, pkID, err := s.verifyAction(ctx, sess, object, id, in.ChallengeID, in.Assertion)
+		sg, pkID, settle, err := s.verifyAction(ctx, sess, object, id, in.ChallengeID, in.Assertion, in.Open)
 		if err != nil {
 			s.writeErr(w, r, err)
 			return
 		}
-		if object == "update" {
-			if !s.authorisedWork(ctx) {
-				s.writeErr(w, r, lockedErr())
-				return
+		settled := false
+		defer func() {
+			if !settled {
+				settle(false)
 			}
+		}()
+		if object == "update" {
 			s.queueUpdate(w, r, sg, in.Assertion, pkID)
 			return
 		}
@@ -964,13 +991,14 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 			writeJSON(w, 200, api.OK{OK: true})
 			return
 		}
-		if !s.authorisedWork(ctx) && !lockedDecision(object, sg.Action.Action) {
-			s.writeErr(w, r, lockedErr())
-			return
-		}
 		if err := s.apply(context.WithValue(ctx, sessionBindingKey{}, sess), sg, pkID); err != nil {
 			s.writeErr(w, r, err)
 			return
+		}
+		settle(true)
+		settled = true
+		if s.seal != nil {
+			s.reconcileHolds(ctx) // revokes end holds; new standing rules get their own
 		}
 		if object == canon.ObjectGrant {
 			s.afterGrantRevoke(ctx, id) // token grants: delete the child token upstream now
@@ -1014,11 +1042,16 @@ func (s *Server) passkeyChangeHandler(verb string) func(http.ResponseWriter, *ht
 			return
 		}
 		id := r.PathValue("id")
-		sg, pkID, err := s.verifyAction(ctx, sess, canon.ObjectPasskey, id, in.ChallengeID, in.Assertion)
+		if in.Open != nil {
+			s.writeErr(w, r, errBad("this action opens no bucket"))
+			return
+		}
+		sg, pkID, settle, err := s.verifyAction(ctx, sess, canon.ObjectPasskey, id, in.ChallengeID, in.Assertion, nil)
 		if err != nil {
 			s.writeErr(w, r, err)
 			return
 		}
+		settle(false)
 		if sg.Action.Action != verb {
 			s.writeErr(w, r, errBad("the signed action is "+sg.Action.Action+", not "+verb))
 			return
@@ -1031,11 +1064,10 @@ func (s *Server) passkeyChangeHandler(verb string) func(http.ResponseWriter, *ht
 		s.notifyDecision(sg)
 		out := api.PasskeyChange{OK: true, ID: id, Action: verb, Nickname: sg.Nickname}
 		if verb == canon.ActionRemove && s.seal != nil {
-			s.seal.attempts.Invalidate()
-			pool := &s.seal.capabilities
-			pool.Lock()
-			clear(pool.entries)
-			pool.Unlock()
+			s.seal.opens.Invalidate()
+			s.seal.taps.clear()
+			s.seal.capabilities.wipe()
+			_ = s.store.CheckpointWAL(ctx)
 		}
 		if verb == canon.ActionRename {
 			out.Nickname = sg.NewNickname

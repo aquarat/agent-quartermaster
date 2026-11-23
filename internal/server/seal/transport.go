@@ -3,8 +3,13 @@ package seal
 import (
 	"crypto/ecdh"
 	"crypto/hpke"
+	"encoding/base64"
 	"errors"
 )
+
+var kem = hpke.DHKEM(ecdh.P256())
+
+func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
 // Vault transport: one HPKE base-mode message per fresh key pair, in either
 // direction, with the same suite as the unlock finish (DHKEM(P-256,

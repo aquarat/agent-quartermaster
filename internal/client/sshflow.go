@@ -240,7 +240,7 @@ func (e *Env) waitRequest(ctx context.Context, c *APIClient, created *api.Reques
 			var ae *APIError
 			if errors.As(err, &ae) && ae.HTTPStatus == 423 && ae.Code == "locked" {
 				if !lockNotice {
-					e.logf("waiting for owner unlock")
+					e.logf("%s", lockedNotice(ae))
 					lockNotice = true
 				}
 				if !deadline.IsZero() && time.Now().After(deadline) {

@@ -4,7 +4,6 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -16,11 +15,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/envset"
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
@@ -30,10 +31,11 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/signer"
 )
 
-// vaultEnv is a sealed, unlocked, organisation-scoped broker with one client
+// vaultEnv is a format-2, organisation-scoped broker with one client
 // organisation, an env set and two admitted hosts. Its helpers play the page:
 // they seal to the broker's attempt key, rebuild every canonical from what the
-// owner chose, and open reveals with a key of their own.
+// owner chose, open buckets with the software PRF and open reveals with a key
+// of their own.
 type vaultEnv struct {
 	*env
 	logs       *syncBuffer
@@ -43,9 +45,7 @@ type vaultEnv struct {
 	set        string
 	agent      *http.Client
 	other      *http.Client
-	open       *seal.Gate
-	gen        seal.Generation
-	check      []byte
+	fix        *bucketFix
 	target     map[string]any
 	recipient  string // of the last upload attempt
 	lastReveal map[string]any
@@ -66,14 +66,9 @@ const (
 	vOrg, vService, vSet = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccccccccccc"
 )
 
-func newVault(t *testing.T) *vaultEnv {
+// organise activates organisations on an unsealed env (as the cutover does).
+func organise(t *testing.T, e *env) {
 	t.Helper()
-	logs := &syncBuffer{}
-	e := newEnvWith(t, testConfig(t.TempDir()), func(o *Options) {
-		o.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	})
-	e.setupOwner()
-	a, b := e.enrollHost("workload"), e.enrollHost("other")
 	ctx := t.Context()
 	s := e.s
 	now := s.now()
@@ -89,18 +84,17 @@ func newVault(t *testing.T) *vaultEnv {
 	requireNoError(t, err)
 	requireNoError(t, s.verifyPersonalConfig())
 	requireNoError(t, s.store.InitWindows(ctx))
-	requireNoError(t, s.store.InitEnv(ctx))
-	requireNoError(t, s.store.InitVault(ctx))
-	v := &vaultEnv{env: e, logs: logs, org: vOrg, service: vService, set: vSet, agent: e.agentClient(&a), other: e.agentClient(&b)}
-	v.gen = seal.Generation{Installation: seal.RandomID(), Version: 1}
-	k, err := seal.RandomKey()
-	requireNoError(t, err)
-	v.check, err = v.gen.CheckRecord(k)
-	requireNoError(t, err)
-	v.open, err = seal.NewGate(v.gen, v.check)
-	requireNoError(t, err)
-	requireNoError(t, v.open.Install(k, func() error { return nil }))
-	s.seal = &sealRuntime{inv: seal.Inventory{Generation: v.gen}, gate: v.open, attempts: seal.NewAttempts(s.now), stop: make(chan struct{})}
+}
+
+func newVault(t *testing.T) *vaultEnv {
+	t.Helper()
+	logs := &syncBuffer{}
+	e := newEnvWith(t, testConfig(t.TempDir()), func(o *Options) {
+		o.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	})
+	e.setupOwner()
+	a, b := e.enrollHost("workload"), e.enrollHost("other")
+	organise(t, e)
 	for _, q := range []string{
 		`INSERT INTO organisations(id,slug,title,revision) VALUES('` + vOrg + `','client-a','Client A',1)`,
 		`INSERT INTO org_policies VALUES('` + vOrg + `',1,3600,86400,1,3600,86400,1)`,
@@ -109,20 +103,17 @@ func newVault(t *testing.T) *vaultEnv {
 		`INSERT INTO credential_sets(id,service_id,provider,slug,title,kind,revision) VALUES('` + vSet + `','` + vService + `','application','staging','Staging env','env-set',0)`,
 		`INSERT INTO org_hosts SELECT '` + vOrg + `',id,1,1 FROM hosts`,
 	} {
-		_, err = s.store.DB().Exec(q)
+		_, err := e.s.store.DB().Exec(q)
 		requireNoError(t, err)
 	}
+	fix := sealBuckets(t, e, logs)
+	v := &vaultEnv{env: e, logs: logs, org: vOrg, service: vService, set: vSet, agent: e.agentClient(&a), other: e.agentClient(&b), fix: fix}
 	v.target = map[string]any{"org_id": vOrg, "org_slug": "client-a", "org_title": "Client A", "service_id": vService, "service_slug": "paas", "service_title": "PaaS", "set_id": vSet, "set_slug": "staging", "set_title": "Staging env", "kind": "env-set"}
 	return v
 }
 
-// lock swaps in a gate with no key (a cold-started broker); unlock restores it.
-func (v *vaultEnv) lock() {
-	g, err := seal.NewGate(v.gen, v.check)
-	requireNoError(v.t, err)
-	v.s.seal.gate = g
-}
-func (v *vaultEnv) unlock() { v.s.seal.gate = v.open }
+// lock closes every bucket (format 2 has no lock: this is Close all).
+func (v *vaultEnv) lock() { v.s.closeAll() }
 
 func (v *vaultEnv) web(method, path string, body, out any) int {
 	v.t.Helper()
@@ -178,7 +169,12 @@ type vaultReviewResp struct {
 	Canonical   string          `json:"canonical"`
 	ChallengeID string          `json:"challenge_id"`
 	PublicKey   json.RawMessage `json:"public_key"`
+	Open        *api.OpenOffer  `json:"open"`
 	Facts       map[string]any  `json:"facts"`
+}
+
+func (r vaultReviewResp) tap() tapResp {
+	return tapResp{ChallengeID: r.ChallengeID, Canonical: r.Canonical, PublicKey: r.PublicKey, Open: r.Open}
 }
 
 // expect rebuilds the canonical from the owner's side and requires the
@@ -191,16 +187,15 @@ func (v *vaultEnv) expect(r vaultReviewResp, action, id string, meta map[string]
 	}
 	requireNoError(v.t, json.Unmarshal([]byte(r.Canonical), &c))
 	m, _ := reviewJSON(meta)
-	want, _ := reviewJSON(map[string]any{"v": 3, "object": "vault", "action": action, "id": id, "installation": v.gen.Installation, "epoch": v.s.seal.attempts.Epoch(), "issued_at": c.IssuedAt, "nonce": c.Nonce, "metadata": m})
+	want, _ := reviewJSON(map[string]any{"v": 3, "object": "vault", "action": action, "id": id, "installation": v.fix.inst, "epoch": v.s.seal.opens.Epoch(), "issued_at": c.IssuedAt, "nonce": c.Nonce, "metadata": m})
 	if want != r.Canonical {
 		v.t.Fatalf("canonical is not what the owner chose:\n got %s\nwant %s", r.Canonical, want)
 	}
 }
 func (v *vaultEnv) tap(r vaultReviewResp, out any) int {
 	v.t.Helper()
-	as, err := v.auth.AssertOptions(r.PublicKey)
-	requireNoError(v.t, err)
-	return v.web("POST", "/api/ui/seal/vault/finish", map[string]any{"challenge_id": r.ChallengeID, "assertion": as}, out)
+	as, pkt := v.fix.tapWith(v.t, v.s, v.auth, r.tap())
+	return v.web("POST", "/api/ui/seal/vault/finish", map[string]any{"challenge_id": r.ChallengeID, "assertion": as, "open": pkt}, out)
 }
 func with(base map[string]any, kv ...any) map[string]any {
 	m := map[string]any{}
@@ -228,8 +223,8 @@ func (v *vaultEnv) sealUpload(purpose, set string, plain []byte) (attempt, enc, 
 	mustStatus(v.t, "attempt", v.web("POST", "/api/ui/seal/vault/attempt", map[string]any{}, &a), 200)
 	pub, _ := b64url(a.Recipient)
 	raw, _ := b64url(a.ID)
-	epoch := v.s.seal.attempts.Epoch()
-	e, c, err := seal.SealTo(pub, seal.Tuple("hpke-vault", v.gen.Installation[:], []byte(purpose)), seal.Tuple("hpke-vault-aad", raw, epoch[:], []byte(set)), plain)
+	epoch := v.s.seal.opens.Epoch()
+	e, c, err := seal.SealTo(pub, seal.Tuple("hpke-vault", v.fix.inst[:], []byte(purpose)), seal.Tuple("hpke-vault-aad", raw, epoch[:], []byte(set)), plain)
 	requireNoError(v.t, err)
 	v.recipient = a.Recipient
 	return a.ID, encodeID(e), encodeID(c)
@@ -274,8 +269,8 @@ func (v *vaultEnv) revealChallenge(names []string) (vaultReviewResp, *seal.Recip
 func (v *vaultEnv) openReveal(r vaultReviewResp, k *seal.Recipient, enc, ct string) ([]envset.Entry, error) {
 	e, _ := b64url(enc)
 	c, _ := b64url(ct)
-	epoch := v.s.seal.attempts.Epoch()
-	b, err := k.Open(seal.Tuple("hpke-vault", v.gen.Installation[:], []byte("reveal")), seal.Tuple("hpke-vault-aad", canon.Challenge(r.Canonical), epoch[:], []byte(v.set)), e, c)
+	epoch := v.s.seal.opens.Epoch()
+	b, err := k.Open(seal.Tuple("hpke-vault", v.fix.inst[:], []byte("reveal")), seal.Tuple("hpke-vault-aad", canon.Challenge(r.Canonical), epoch[:], []byte(v.set)), e, c)
 	if err != nil {
 		return nil, err
 	}
@@ -362,8 +357,7 @@ func TestVaultFormAndReveal(t *testing.T) {
 	// A .env import replaces the whole set.
 	v.commit(envset.Edit{Op: "import", Entries: []envset.Entry{{Name: "APP_TOKEN", Value: sentinel}, {Name: "APP_KEY", Value: vaultPEM}}}, []string{"APP_KEY", "APP_TOKEN"})
 	var state struct {
-		Unlocked bool
-		Sets     []struct {
+		Sets []struct {
 			SetID       string `json:"set_id"`
 			Kind        string
 			Revision    int
@@ -372,7 +366,7 @@ func TestVaultFormAndReveal(t *testing.T) {
 		}
 	}
 	mustStatus(t, "state", v.web("GET", "/api/ui/seal/vault/state", nil, &state), 200)
-	if !state.Unlocked || len(state.Sets) != 1 || state.Sets[0].Revision != 3 || strings.Join(state.Sets[0].Names, ",") != "APP_KEY,APP_TOKEN" || !state.Sets[0].AllowReveal {
+	if len(state.Sets) != 1 || state.Sets[0].Revision != 3 || strings.Join(state.Sets[0].Names, ",") != "APP_KEY,APP_TOKEN" || !state.Sets[0].AllowReveal {
 		t.Fatalf("state: %+v", state)
 	}
 	// The existing delivery path hands an admitted host exactly what the form stored.
@@ -416,10 +410,10 @@ func TestVaultRevealIsAlwaysAFreshTap(t *testing.T) {
 	}
 	// A good tap works once; the same challenge and assertion do not work again.
 	r, k, _ = v.revealChallenge(names)
-	as, _ := v.auth.AssertOptions(r.PublicKey)
+	as, pkt := v.fix.tapWith(t, v.s, v.auth, r.tap())
 	var out struct{ Enc, Ciphertext string }
-	mustStatus(t, "reveal", v.web("POST", "/api/ui/seal/vault/finish", map[string]any{"challenge_id": r.ChallengeID, "assertion": as}, &out), 200)
-	mustStatus(t, "replay", finish(map[string]any{"challenge_id": r.ChallengeID, "assertion": as}), 409)
+	mustStatus(t, "reveal", v.web("POST", "/api/ui/seal/vault/finish", map[string]any{"challenge_id": r.ChallengeID, "assertion": as, "open": pkt}, &out), 200)
+	mustStatus(t, "replay", finish(map[string]any{"challenge_id": r.ChallengeID, "assertion": as, "open": pkt}), 409)
 	if _, err := v.openReveal(r, k, out.Enc, out.Ciphertext); err != nil {
 		t.Fatal(err)
 	}
@@ -449,18 +443,15 @@ func TestVaultRevealIsAlwaysAFreshTap(t *testing.T) {
 	r, _, _ = v.revealChallenge(names)
 	v.commit(envset.Edit{Op: "merge", Entries: []envset.Entry{{Name: "APP_ID", Value: "3"}}}, names)
 	mustStatus(t, "stale reveal", v.tap(r, nil), 409)
-	// Locked: no review and no finish, even for a review made while unlocked.
+	// Close all: a review made before it is void; a new review's tap opens the set
+	// for an instant only, and uploads need nothing open.
 	r, _, _ = v.revealChallenge(names)
 	v.lock()
-	mustStatus(t, "locked finish", v.tap(r, nil), 423)
-	mustStatus(t, "locked challenge", bad(names, good), 423)
-	mustStatus(t, "locked attempt", v.web("POST", "/api/ui/seal/vault/attempt", map[string]any{}, nil), 423)
-	var state struct{ Unlocked bool }
-	mustStatus(t, "locked state", v.web("GET", "/api/ui/seal/vault/state", nil, &state), 200)
-	if state.Unlocked {
-		t.Fatal("state claims unlocked")
+	mustStatus(t, "review from before Close all", v.tap(r, nil), 400)
+	if len(v.reveal(names2(v))) != 3 || len(openBuckets(t, v.s)) != 0 {
+		t.Fatal("a reveal left its bucket open")
 	}
-	v.unlock()
+	mustStatus(t, "attempt with everything closed", v.web("POST", "/api/ui/seal/vault/attempt", map[string]any{}, nil), 200)
 	// Organisation policy: off refuses, and turning it back on needs an unlocked broker.
 	policy := func(allow bool) (vaultReviewResp, int) {
 		var r vaultReviewResp
@@ -479,11 +470,6 @@ func TestVaultRevealIsAlwaysAFreshTap(t *testing.T) {
 	mustStatus(t, "policy tap", v.tap(p, nil), 200)
 	mustStatus(t, "reveal reviewed before the switch", v.tap(stale, nil), 403)
 	mustStatus(t, "reveal with policy off", bad(names2(v), good), 403)
-	v.lock()
-	if _, st := policy(true); st != 423 {
-		t.Fatal("reveal re-enabled while locked")
-	}
-	v.unlock()
 	p, _ = policy(true)
 	mustStatus(t, "policy on", v.tap(p, nil), 200)
 	if len(v.reveal(names2(v))) != 3 {
@@ -491,11 +477,12 @@ func TestVaultRevealIsAlwaysAFreshTap(t *testing.T) {
 	}
 	// Another session cannot finish this session's review.
 	r, _, _ = v.revealChallenge(names2(v))
-	as, _ = v.auth.AssertOptions(r.PublicKey)
-	mine := v.sess
+	as, pkt = v.fix.tapWith(t, v.s, v.auth, r.tap())
 	v.login()
-	mustStatus(t, "other session", v.web("POST", "/api/ui/seal/vault/finish", map[string]any{"challenge_id": r.ChallengeID, "assertion": as}, nil), 409)
-	_ = mine
+	mustStatus(t, "other session", v.web("POST", "/api/ui/seal/vault/finish", map[string]any{"challenge_id": r.ChallengeID, "assertion": as, "open": pkt}, nil), 409)
+	if len(openBuckets(t, v.s)) != 0 {
+		t.Fatal("another session's packet opened a bucket")
+	}
 }
 func names2(v *vaultEnv) []string { return []string{"APP_ID", "APP_SECRET", "APP_TOKEN"} }
 
@@ -545,13 +532,15 @@ func TestVaultCommitBinding(t *testing.T) {
 	}
 	// A review cannot be finished twice, and its attempt is gone afterwards.
 	mustStatus(t, "replayed commit", v.tap(first, nil), 409)
-	// Locked: nothing is staged or applied.
+	// Writes are tapless: a commit needs no open bucket and opens none.
 	third, _ := v.commitChallenge(envset.Edit{Op: "merge", Entries: []envset.Entry{{Name: "APP_ID", Value: "4"}}}, []string{"APP_SECRET", "APP_TOKEN"})
 	v.lock()
-	mustStatus(t, "locked commit", v.tap(third, nil), 423)
-	v.unlock()
-	if v.revision() != 2 {
-		t.Fatal("locked commit applied")
+	if third.Open != nil {
+		t.Fatal("a commit offered an open")
+	}
+	mustStatus(t, "commit with everything closed", v.tap(third, nil), 200)
+	if v.revision() != 3 || len(openBuckets(t, v.s)) != 0 {
+		t.Fatal("commit not applied, or it opened a bucket")
 	}
 	// Limits are those of an env set.
 	big := envset.Edit{Op: "merge", Entries: []envset.Entry{{Name: "APP_KEY", Value: strings.Repeat("k", 8193)}}}
@@ -699,9 +688,9 @@ func TestSignerSingleUse(t *testing.T) {
 	}
 	v.lock()
 	if _, st := v.sign(v.agent, grant, a, b); st != 423 {
-		t.Fatal("signed while locked")
+		t.Fatal("signed with the signer closed")
 	}
-	v.unlock()
+	v.reopenPaused()
 	out, st := v.sign(v.agent, grant, a, b)
 	mustStatus(t, "sign", st, 200)
 	if len(out.Signatures) != 2 || !ed25519.Verify(f.pub, manifest, out.Signatures[0].Signature) || !ed25519.Verify(f.pub, []byte("release notes"), out.Signatures[1].Signature) || out.Request.Used != 2 {
@@ -842,16 +831,15 @@ func TestSignerGrantsAndSchemes(t *testing.T) {
 	if _, st := v.sign(v.agent, grantEC, signItemFor(ec.scheme, "late.tar", []byte("late"))); st != 409 && st != 404 {
 		t.Fatalf("expired grant signed (%d)", st)
 	}
-	// Deny and revoke work while locked; approve does not.
+	// Deny opens nothing.
 	req, _ = v.askSign(v.agent, ph, 600, 5, signItemFor(ph.scheme, "p.bin", image))
 	v.lock()
-	if _, st := v.signChallenge(ph, req, "sign-approve", 600, 5); st != 423 {
-		t.Fatal("approved while locked")
-	}
 	r, st := v.signChallenge(ph, req, "sign-deny", 0, 0)
 	mustStatus(t, "deny challenge", st, 200)
+	if r.Open != nil {
+		t.Fatal("deny offered an open")
+	}
 	mustStatus(t, "deny", v.tap(r, nil), 200)
-	v.unlock()
 	req, _ = v.askSign(v.agent, ph, 600, 5, signItemFor(ph.scheme, "p.bin", image))
 	grantPH := v.approveSign(ph, req, 600, 5)
 	outPH, st := v.sign(v.agent, grantPH, signItemFor(ph.scheme, "p.bin", image))
@@ -957,30 +945,16 @@ func TestSignerCreateBinding(t *testing.T) {
 		t.Fatal("created a key other than the one shown")
 	}
 	mustStatus(t, "second create with the same id", v.tap(one, nil), 409)
-	v.lock()
-	if _, st := challenge("id", "ffffffffffffffffffffffffffffffff", "set_slug", "k2"); st != 423 {
-		t.Fatal("signer created while locked")
-	}
-	v.unlock()
 	// The key row cannot be rewritten in place.
 	if _, err := v.s.store.DB().Exec(`UPDATE signer_keys SET scheme='ed25519ph' WHERE set_id=?`, id); err == nil {
 		t.Fatal("signer scheme changed in place")
 	}
 	// A sealed record moved to another set, or relabelled with another scheme, fails authentication.
 	f := v.createSigner("ffffffffffffffffffffffffffffffff", "second-key", "ed25519", "")
-	ctx := t.Context()
-	err := v.s.withLease(ctx, func(ctx context.Context) error {
-		q := v.s.store.Q()
-		rec, err := q.SignerCipher(ctx, id)
-		requireNoError(t, err)
-		tgt, err := q.VaultSet(ctx, f.id)
-		requireNoError(t, err)
-		var key signerSecret
-		v.s.seal.once.Do(func() {}) // keep the test broker running when authentication fails
-		_, err = v.s.signerCipher(ctx, tgt, rec, &key, false)
-		return err
-	})
-	if err == nil {
+	requireNoError(t, v.drill())
+	_, err := v.s.store.DB().Exec(`UPDATE signer_keys SET payload=(SELECT payload FROM signer_keys WHERE set_id=?) WHERE set_id=?`, id, f.id)
+	requireNoError(t, err)
+	if v.drill() == nil {
 		t.Fatal("a signer record opened under another set's binding")
 	}
 }
@@ -1006,13 +980,62 @@ func TestSignerRowsAreInertForEnv(t *testing.T) {
 	}
 	// v0.3.3 accepts a request only for a set with a revision and names: a signer has neither.
 	requireNoError(t, v.s.store.InitVault(t.Context())) // idempotent on restart
-	var key *seal.Key
-	requireNoError(t, v.open.WithKey(t.Context(), func(_ context.Context, k *seal.Key) error { key = k; return nil }))
-	requireNoError(t, v.s.verifyEnvInventory(t.Context(), key))
-	// A damaged signer record fails the inventory (the trigger forbids in-place edits, so swap the row).
+	requireNoError(t, v.drill())
+	// A damaged signer record fails the drill (the trigger forbids in-place edits, so swap the row).
 	_, err := v.s.store.DB().Exec(`DROP TRIGGER signer_key_immutable; UPDATE signer_keys SET public_key=zeroblob(32) WHERE set_id=?`, f.id)
 	requireNoError(t, err)
-	if v.s.verifyEnvInventory(t.Context(), key) == nil {
-		t.Fatal("inventory accepted a signer whose key does not match its public half")
+	if v.drill() == nil {
+		t.Fatal("drill accepted a signer whose key does not match its public half")
 	}
+}
+
+// drill opens every scope from its recovery wrap and authenticates every record.
+func (v *vaultEnv) drill() error {
+	ctx := v.t.Context()
+	q := v.s.store.Q()
+	scopes, err := q.Scopes(ctx)
+	requireNoError(v.t, err)
+	for _, x := range scopes {
+		k, err := seal.Scope{Installation: v.fix.inst, Name: x.Scope, Public: x.Public}.Recover(v.fix.identity, v.fix.recipient, x.Recovery)
+		if err != nil {
+			return err
+		}
+		_, err = v.s.drillScope(ctx, q, x, k)
+		k.Destroy()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reopenPaused reopens, in one tap, every bucket with paused users.
+func (v *vaultEnv) reopenPaused() {
+	v.t.Helper()
+	var st struct {
+		Buckets []struct {
+			ID     string
+			Paused []struct{ Ref string }
+		}
+	}
+	mustStatus(v.t, "status", v.web("GET", "/api/ui/seal/status", nil, &st), 200)
+	var ids []string
+	for _, b := range st.Buckets {
+		if len(b.Paused) > 0 {
+			ids = append(ids, b.ID)
+		}
+	}
+	slices.Sort(ids)
+	mustStatus(v.t, "reopen", v.control(map[string]any{"action": "reopen", "buckets": ids}, nil), 200)
+}
+
+// control runs one seal-control ceremony with the owner's passkey.
+func (v *vaultEnv) control(choice map[string]any, out any) int {
+	v.t.Helper()
+	var r tapResp
+	if st := v.web("POST", "/api/ui/seal/control/challenge", choice, &r); st != 200 {
+		return st
+	}
+	as, pkt := v.fix.tapWith(v.t, v.s, v.auth, r)
+	return v.web("POST", "/api/ui/seal/control/finish", map[string]any{"challenge_id": r.ChallengeID, "assertion": as, "open": pkt}, out)
 }

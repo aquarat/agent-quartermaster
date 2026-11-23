@@ -15,8 +15,6 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
 	"github.com/aquarat/agent-quartermaster/internal/server/cfaccess"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
-	"github.com/aquarat/agent-quartermaster/internal/server/organisations"
-	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
 	"net/http/httptest"
 	"testing"
@@ -31,37 +29,18 @@ func requireNoError(t *testing.T, err error) {
 }
 func TestDelegationBoundaries(t *testing.T) {
 	ctx := t.Context()
+	logs := &syncBuffer{}
 	e := newEnv(t)
 	e.setupOwner()
 	cert := e.enrollHost("workload")
+	organise(t, e)
+	fix := sealBuckets(t, e, logs)
 	agent := e.agentClient(&cert)
 	s := e.s
-	now := s.now()
-	tx, err := s.store.DB().BeginTx(ctx, nil)
-	requireNoError(t, err)
-	plan, err := organisations.Inventory(ctx, tx, s.cfg, s.sshPin(), s.pki.CAPin(), now)
-	requireNoError(t, err)
-	b, _ := json.Marshal(plan)
-	requireNoError(t, organisations.Backfill(ctx, tx, s.cfg, s.sshPin(), s.pki.CAPin(), now, string(b)))
-	requireNoError(t, tx.Commit())
-	s.store.Close()
-	s.store, err = store.Open(DBPath(s.cfg.DataDir))
-	requireNoError(t, err)
-	requireNoError(t, s.verifyPersonalConfig())
-	requireNoError(t, s.store.InitWindows(ctx))
 	one, _, status := e.request(agent, "db-1", "alice", 300)
 	mustStatus(t, "first", status, 201)
 	two, _, status := e.request(agent, "db-1", "alice", 300)
 	mustStatus(t, "second", status, 201)
-	gen := seal.Generation{Installation: seal.RandomID(), Version: 1}
-	k, err := seal.RandomKey()
-	requireNoError(t, err)
-	check, err := gen.CheckRecord(k)
-	requireNoError(t, err)
-	g, err := seal.NewGate(gen, check)
-	requireNoError(t, err)
-	requireNoError(t, g.Install(k, func() error { return nil }))
-	s.seal = &sealRuntime{inv: seal.Inventory{Generation: gen}, gate: g, attempts: seal.NewAttempts(s.now), stop: make(chan struct{})}
 	sess := ids.Hash(e.sess)
 	pk, err := s.store.Q().SessionPasskeyID(ctx, sess)
 	requireNoError(t, err)
@@ -73,6 +52,9 @@ func TestDelegationBoundaries(t *testing.T) {
 	beg, err := s.batchBegin(ctx, req(choices), sess)
 	requireNoError(t, err)
 	ch := beg.(api.ChallengeResponse)
+	if ch.Open != nil {
+		t.Fatal("a batch of denials offered an open")
+	}
 	_, err = s.store.DB().Exec(`UPDATE requests SET status='cancelled' WHERE id=?`, two.ID)
 	requireNoError(t, err)
 	_, err = s.batchFinish(ctx, req(api.DecideRequest{ChallengeID: ch.ChallengeID, Assertion: e.auth.Assert(canon.Challenge(ch.Canonical))}), sess)
@@ -112,7 +94,7 @@ func TestDelegationBoundaries(t *testing.T) {
 	requireNoError(t, err)
 	prop := prep.(map[string]string)
 	in.Proposal = prop["proposal_id"]
-	sigHash := sha256.Sum256(windowMessage(gen.Installation[:], rec.ID, in.Proposal, canon.Challenge(prop["canonical"])))
+	sigHash := sha256.Sum256(windowMessage(fix.inst[:], rec.ID, in.Proposal, canon.Challenge(prop["canonical"])))
 	rr, ss, err := ecdsa.Sign(rand.Reader, key, sigHash[:])
 	requireNoError(t, err)
 	in.Proof = encodeID(append(rr.FillBytes(make([]byte, 32)), ss.FillBytes(make([]byte, 32))...))

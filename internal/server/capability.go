@@ -4,26 +4,38 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
+
 	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
-	"github.com/go-webauthn/webauthn/protocol"
-	"github.com/go-webauthn/webauthn/webauthn"
-	"net/http"
-	"sync"
-	"time"
 )
+
+// Passkey capabilities in format 2 (docs/BUCKETS.md §7, contract "Passkey
+// enable"). An existing passkey signs the capability and, in the same tap,
+// opens the keys of at most two scopes; the target passkey then taps once
+// with fresh salts and the broker wraps each open scope key under its KEKs.
+// A scope without a key yet gets one at that point (fresh skS, recovery wrap).
 
 type capabilityStages struct {
 	sync.Mutex
 	entries map[string]*capStage
 }
 type capIntent struct {
-	Action     string `json:"action"`
-	Name       string `json:"nickname"`
-	Capability string `json:"capability"`
-	Target     string `json:"credential_id"`
+	Action     string   `json:"action"`
+	Name       string   `json:"nickname"`
+	Capability string   `json:"capability"`
+	Target     string   `json:"credential_id"`
+	Scopes     []string `json:"scopes"`
 }
 type capStage struct {
 	session, id string
@@ -35,30 +47,42 @@ type capStage struct {
 	sd          *webauthn.SessionData
 	credential  *webauthn.Credential
 	target      int64
-	salt        seal.ID
-	wrapped     []byte
+	keys        map[string]*seal.Key // open scope keys, wiped at finish or expiry
+	created     map[string]store.ScopeRow
 }
+
+func (st *capStage) wipe() {
+	for k, v := range st.keys {
+		v.Destroy()
+		delete(st.keys, k)
+	}
+}
+func (p *capabilityStages) wipe() {
+	p.Lock()
+	defer p.Unlock()
+	for id, st := range p.entries {
+		st.wipe()
+		delete(p.entries, id)
+	}
+}
+
 type capHandler func(context.Context, *http.Request, string) (any, error)
 
+// sealedEndpoint serves a format-2 session route: 404 unsealed, 423 while a
+// format-1 store waits for migration.
 func (s *Server) sealedEndpoint(m *http.ServeMux, pattern string, fn capHandler) {
 	m.Handle(pattern, s.requireSession(func(w http.ResponseWriter, r *http.Request, sess string) {
-		if s.seal == nil || s.seal.stage != nil {
-			s.writeErr(w, r, errNotFound())
+		if err := s.bucketsReady(); err != nil {
+			s.writeErr(w, r, err)
 			return
 		}
-		err := s.withLease(r.Context(), func(ctx context.Context) error {
-			out, err := fn(ctx, r, sess)
-			if err == nil {
-				writeJSON(w, 200, out)
-			}
-			return err
-		})
+		out, err := fn(r.Context(), r, sess)
 		if err != nil {
-			if err == seal.ErrLocked {
-				err = lockedErr()
-			}
-			s.writeErr(w, r, err)
+			s.writeErr(w, r, mapNotFound(err))
+			return
 		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, 200, out)
 	}))
 }
 func (s *Server) capabilityRoutes(m *http.ServeMux) {
@@ -66,6 +90,28 @@ func (s *Server) capabilityRoutes(m *http.ServeMux) {
 		s.sealedEndpoint(m, "POST /api/ui/seal/passkeys/"+path, f)
 	}
 }
+
+// validScopes checks a requested scope list: at most two, known, each once,
+// returned installation first.
+func (s *Server) validScopes(ctx context.Context, q *store.Q, in []string) ([]string, error) {
+	if len(in) > 2 {
+		return nil, errBad("one tap covers at most two scopes; repeat for the others")
+	}
+	out := slices.Clone(in)
+	for i, sc := range out {
+		if slices.Contains(out[:i], sc) {
+			return nil, errBad("each scope once")
+		}
+		if sc == seal.ScopeInstallation {
+			continue
+		}
+		if _, err := q.VaultOrg(ctx, sc); err != nil {
+			return nil, errBad("unknown scope")
+		}
+	}
+	return sortScopes(out), nil
+}
+
 func (s *Server) checkIntent(ctx context.Context, q *store.Q, in capIntent) (*storedPasskey, error) {
 	if in.Capability != "unlock" && in.Capability != "approve-only" {
 		return nil, errBad("select an explicit passkey capability")
@@ -73,6 +119,14 @@ func (s *Server) checkIntent(ctx context.Context, q *store.Q, in capIntent) (*st
 	name, err := normalizeNickname(in.Name)
 	if err != nil || in.Name != name {
 		return nil, errBad("invalid nickname")
+	}
+	scopes, err := s.validScopes(ctx, q, in.Scopes)
+	if err != nil || !slices.Equal(scopes, in.Scopes) {
+		return nil, errBad("invalid scopes")
+	}
+	unlock := in.Capability == "unlock"
+	if unlock != (len(scopes) > 0) && in.Action != "disable" {
+		return nil, errBad("an unlock capability names one or two scopes; approve-only names none")
 	}
 	all, err := loadPasskeys(ctx, q)
 	if err != nil {
@@ -88,15 +142,28 @@ func (s *Server) checkIntent(ctx context.Context, q *store.Q, in capIntent) (*st
 		if encodeID(p.CredentialID) != in.Target || p.Name != name {
 			continue
 		}
-		tested, err := q.TestedWrap(ctx, p.ID, s.seal.inv.Version)
+		wraps, err := q.ScopeWraps(ctx, p.ID)
 		if err != nil {
 			return nil, err
 		}
-		switch {
-		case in.Action == "enable" && in.Capability == "unlock" && tested == nil:
-			return &all[i], nil
-		case in.Action == "disable" && in.Capability == "approve-only" && tested != nil:
-			if err = s.keepUnlock(ctx, q, p.ID); err != nil {
+		has := func(sc string) bool {
+			return slices.ContainsFunc(wraps, func(w store.ScopeWrapRow) bool { return w.Scope == sc })
+		}
+		switch in.Action {
+		case "enable":
+			if unlock {
+				return &all[i], nil
+			}
+		case "test":
+			if unlock && !slices.ContainsFunc(scopes, func(sc string) bool { return !has(sc) }) {
+				return &all[i], nil
+			}
+		case "disable":
+			// In rounds of at most two scopes; no scope named means all of them.
+			if len(wraps) == 0 || slices.ContainsFunc(scopes, func(sc string) bool { return !has(sc) }) {
+				return nil, errConflict("this passkey does not open that scope")
+			}
+			if err = s.keepScopes(ctx, q, p.ID, scopes); err != nil {
 				return nil, err
 			}
 			return &all[i], nil
@@ -104,81 +171,224 @@ func (s *Server) checkIntent(ctx context.Context, q *store.Q, in capIntent) (*st
 	}
 	return nil, errConflict("passkey or capability changed")
 }
-func (s *Server) keepUnlock(ctx context.Context, q *store.Q, row int64) error {
-	if s.seal == nil {
-		return nil
+
+// keepScopes is keepUnlock for a subset of the passkey's scopes (none: all).
+func (s *Server) keepScopes(ctx context.Context, q *store.Q, row int64, scopes []string) error {
+	if len(scopes) == 0 {
+		return s.keepUnlock(ctx, q, row)
 	}
-	ok, err := q.CanRemoveWrap(ctx, row, s.seal.inv.Version)
-	if err == nil && !ok {
-		return errConflict("cannot remove the last tested unlock credential")
+	orphans, err := q.OrphanedScopes(ctx, row)
+	if err != nil {
+		return err
 	}
-	return err
+	for _, sc := range scopes {
+		if slices.Contains(orphans, sc) {
+			return errConflict("this is the only passkey that can open " + scopeName(ctx, q, sc) + ": enable another passkey for it first")
+		}
+	}
+	return nil
 }
+
+// keepUnlock refuses to take away the last passkey that can open a scope
+// (the trigger keep_one_scope_passkey refuses the last one overall).
+func (s *Server) keepUnlock(ctx context.Context, q *store.Q, row int64) error {
+	if !s.sealServing() {
+		return nil // format 1 awaiting migration: its own trigger guards the wraps
+	}
+	orphans, err := q.OrphanedScopes(ctx, row)
+	if err != nil {
+		return err
+	}
+	if len(orphans) > 0 {
+		var names []string
+		for _, sc := range orphans {
+			names = append(names, scopeName(ctx, q, sc))
+		}
+		return errConflict("this is the only passkey that can open " + strings.Join(names, ", ") + ": enable another passkey for it first")
+	}
+	return nil
+}
+
+func (s *Server) capCanonical(action, id string, in capIntent) (string, error) {
+	m := s.reviewFields("passkey-capability", action, id)
+	m["credential_id"] = in.Target
+	m["nickname"] = in.Name
+	m["capability"] = in.Capability
+	scopes := in.Scopes
+	if scopes == nil {
+		scopes = []string{}
+	}
+	m["scopes"] = scopes
+	return reviewJSON(m)
+}
+
 func (s *Server) capChallenge(ctx context.Context, r *http.Request, sess string) (any, error) {
 	var in capIntent
 	if err := decode(r, &in); err != nil {
 		return nil, err
 	}
-	if _, err := s.checkIntent(ctx, s.store.Q(), in); err != nil {
-		return nil, err
-	}
-	m := s.reviewFields("passkey-capability", in.Action, ids.Secret(32))
-	m["credential_id"] = in.Target
-	m["nickname"] = in.Name
-	m["capability"] = in.Capability
-	m["mk_version"] = s.seal.inv.Version
-	text, err := reviewJSON(m)
+	q := s.store.Q()
+	scopes, err := s.validScopes(ctx, q, in.Scopes)
 	if err != nil {
 		return nil, err
 	}
+	in.Scopes = scopes
+	target, err := s.checkIntent(ctx, q, in)
+	if err != nil {
+		return nil, err
+	}
+	text, err := s.capCanonical(in.Action, ids.Secret(32), in)
+	if err != nil {
+		return nil, err
+	}
+	switch in.Action {
+	case "test":
+		// The target taps at its own salts: proof that its wraps open.
+		wraps, err := q.ScopeWraps(ctx, target.ID)
+		if err != nil {
+			return nil, err
+		}
+		var salts []seal.ID
+		for _, sc := range scopes {
+			for _, w := range wraps {
+				if w.Scope == sc {
+					var x seal.ID
+					copy(x[:], w.Salt)
+					salts = append(salts, x)
+				}
+			}
+		}
+		opts, t, err := s.enrolTap(sess, "test", text, target.cred, scopes, salts)
+		if err != nil {
+			return nil, err
+		}
+		id, err := s.storeChallenge(ctx, sess, "passkey-capability", in.Action, text, t)
+		if err != nil {
+			return nil, err
+		}
+		return api.ChallengeResponse{ChallengeID: id, Canonical: text, PublicKey: opts, Open: t.offer()}, nil
+	case "register", "enable":
+		// The approving tap opens the keys of the listed scopes that have one.
+		var extra []string
+		for _, sc := range scopes {
+			if _, err := q.Scope(ctx, sc); err == nil {
+				extra = append(extra, sc)
+			} else if !isStoreNotFound(err) {
+				return nil, err
+			}
+		}
+		o, err := s.loadOwner(ctx)
+		if err != nil {
+			return nil, err
+		}
+		t, challenge, err := s.offerScopes(ctx, sess, text, nil, extra, o)
+		if err != nil {
+			return nil, err
+		}
+		if t == nil {
+			challenge = sha256Bytes(text)
+		}
+		opts, err := s.requestOptions(o, challenge)
+		if err != nil {
+			return nil, err
+		}
+		if t != nil && t.ext.PRF != nil {
+			opts.Extensions = t.ext
+		}
+		id, err := s.storeChallenge(ctx, sess, "passkey-capability", in.Action, text, t)
+		if err != nil {
+			return nil, err
+		}
+		return api.ChallengeResponse{ChallengeID: id, Canonical: text, PublicKey: opts, Open: t.offer()}, nil
+	}
 	return s.beginReview(ctx, sess, "passkey-capability", in.Action, text, nil)
 }
+
+type capPlan struct {
+	capIntent
+	ID           string
+	Epoch        seal.ID
+	Installation seal.ID
+}
+
 func (s *Server) capAuthorize(ctx context.Context, r *http.Request, sess string) (any, error) {
 	var in api.DecideRequest
 	if err := decode(r, &in); err != nil {
 		return nil, err
 	}
-	c, row, err := s.takeReview(ctx, sess, "passkey-capability", in)
+	c, err := s.consume(ctx, in.ChallengeID, "action", s.now())
 	if err != nil {
 		return nil, err
 	}
-	var plan struct {
-		capIntent
-		ID           string
-		Epoch        seal.ID
-		Installation seal.ID
-		Version      uint64 `json:"mk_version"`
+	t := s.seal.taps.take(c.ID)
+	if c.SessionHash != sess || c.ObjectType != "passkey-capability" {
+		return nil, errConflict("wrong ceremony")
 	}
-	if err = json.Unmarshal([]byte(c.Canonical), &plan); err != nil || plan.Epoch != s.seal.attempts.Epoch() || plan.Installation != s.seal.inv.Installation || plan.Version != s.seal.inv.Version || plan.Action != c.ObjectID {
+	var plan capPlan
+	if err = json.Unmarshal([]byte(c.Canonical), &plan); err != nil || plan.Epoch != s.seal.opens.Epoch() || plan.Installation != s.seal.installation || plan.Action != c.ObjectID {
 		return nil, errConflict("stale capability ceremony")
 	}
-	st := &capStage{id: plan.ID, session: sess, signer: row, intent: plan.capIntent, canonical: c.Canonical, salt: seal.RandomID(), expires: s.now().Add(RegisterTTL)}
+	if want, err := s.capCanonicalFrom(c.Canonical, plan); err != nil || want != c.Canonical {
+		return nil, errConflict("stale capability ceremony")
+	}
+	if plan.Action == "test" {
+		return s.capTest(ctx, sess, c, t, plan, in)
+	}
+	var row int64
+	var keys []*seal.Key
+	if t != nil {
+		if t.session != sess || !s.now().Before(t.expires) || t.purpose != "" {
+			return nil, errConflict("stale approval; review again")
+		}
+		challenge := seal.OpenChallenge([]byte(c.Canonical), []byte(t.descriptor))
+		if row, err = s.verifySelected(ctx, challenge, in.Assertion, nil, t.ext); err != nil {
+			return nil, err
+		}
+		if keys, _, err = s.tapScopeKeys(ctx, t, sess, row, challenge, in.Open); err != nil {
+			return nil, err
+		}
+	} else {
+		if in.Open != nil {
+			return nil, errBad("this approval opens no scope")
+		}
+		if row, err = s.verifyAssertion(ctx, sha256Bytes(c.Canonical), in.Assertion); err != nil {
+			return nil, err
+		}
+	}
+	st := &capStage{id: plan.ID, session: sess, signer: row, intent: plan.capIntent, canonical: c.Canonical, expires: s.now().Add(RegisterTTL), keys: map[string]*seal.Key{}, created: map[string]store.ScopeRow{}}
+	if t != nil {
+		for i, sc := range t.scopes {
+			st.keys[sc] = keys[i]
+		}
+	}
+	stored := false
+	defer func() {
+		if !stored {
+			st.wipe()
+		}
+	}()
+	signer, err := s.passkeyRow(ctx, row)
+	if err != nil {
+		return nil, err
+	}
+	st.signerRaw = signer.CredentialID
 	err = s.store.Tx(ctx, func(q *store.Q) error {
 		if err := s.sealOwner(ctx, q, sess, row); err != nil {
 			return err
 		}
-		all, err := q.Passkeys(ctx)
+		target, err := s.checkIntent(ctx, q, plan.capIntent)
 		if err != nil {
 			return err
 		}
-		for _, pk := range all {
-			if pk.ID == row {
-				st.signerRaw = pk.CredentialID
-			}
-		}
-		pk, err := s.checkIntent(ctx, q, plan.capIntent)
-		if err != nil {
-			return err
-		}
-		if pk != nil {
-			st.credential = &pk.cred
-			st.target = pk.ID
+		if target != nil {
+			st.credential = &target.cred
+			st.target = target.ID
 		}
 		if plan.Action == "disable" {
-			if err = q.DeleteWrap(ctx, pk.ID, plan.Version); err != nil {
+			if err = q.DeletePasskeyScopeWraps(ctx, target.ID, plan.Scopes); err != nil {
 				return err
 			}
-			return q.Audit(ctx, s.now(), "owner", "passkey_disable_unlock", "passkey:"+pk.id, c.Canonical)
+			return q.Audit(ctx, s.now(), "owner", "passkey_disable_unlock", "passkey:"+target.id, c.Canonical)
 		}
 		return nil
 	})
@@ -186,6 +396,8 @@ func (s *Server) capAuthorize(ctx context.Context, r *http.Request, sess string)
 		return nil, err
 	}
 	if plan.Action == "disable" {
+		_ = s.store.CheckpointWAL(ctx)
+		s.bcast.notify()
 		return api.OK{OK: true}, nil
 	}
 	result := map[string]any{"registration_id": st.id}
@@ -204,8 +416,6 @@ func (s *Server) capAuthorize(ctx context.Context, r *http.Request, sess string)
 		}
 		st.sd = sd
 		result["public_key"] = cc.Response
-	} else {
-		result["selection"] = s.capSelection(st)
 	}
 	pool := &s.seal.capabilities
 	pool.Lock()
@@ -215,6 +425,7 @@ func (s *Server) capAuthorize(ctx context.Context, r *http.Request, sess string)
 	}
 	for id, p := range pool.entries {
 		if !s.now().Before(p.expires) || p.session == sess {
+			p.wipe()
 			delete(pool.entries, id)
 		}
 	}
@@ -222,14 +433,74 @@ func (s *Server) capAuthorize(ctx context.Context, r *http.Request, sess string)
 		return nil, errConflict("too many pending registrations")
 	}
 	pool.entries[st.id] = st
+	stored = true
 	return result, nil
 }
-func (s *Server) capSelection(st *capStage) map[string]any {
-	step := "-create"
-	if st.wrapped != nil {
-		step = "-test"
+
+// capCanonicalFrom rebuilds the canonical from its own fields (a changed or
+// extra field is refused).
+func (s *Server) capCanonicalFrom(text string, plan capPlan) (string, error) {
+	var meta struct {
+		IssuedAt string `json:"issued_at"`
+		Nonce    string `json:"nonce"`
 	}
-	return map[string]any{"action": "wrap-enroll", "credential_id": encodeID(st.credential.ID), "epoch": s.seal.attempts.Epoch(), "installation": s.seal.inv.Installation, "mk_version": s.seal.inv.Version, "rp_id": s.rpID, "prf_salt": st.salt, "registration_id": st.id + step}
+	if json.Unmarshal([]byte(text), &meta) != nil {
+		return "", errBad("invalid canonical")
+	}
+	m := map[string]any{"v": 3, "object": "passkey-capability", "action": plan.Action, "id": plan.ID, "installation": plan.Installation, "epoch": plan.Epoch, "issued_at": meta.IssuedAt, "nonce": meta.Nonce,
+		"credential_id": plan.Target, "nickname": plan.Name, "capability": plan.Capability, "scopes": plan.Scopes}
+	if plan.Scopes == nil {
+		m["scopes"] = []string{}
+	}
+	return reviewJSON(m)
+}
+
+// capTest: the target passkey opens its own wraps; nothing else changes.
+func (s *Server) capTest(ctx context.Context, sess string, c *store.Challenge, t *tapOpen, plan capPlan, in api.DecideRequest) (any, error) {
+	if t == nil || t.purpose != "test" || t.session != sess || !s.now().Before(t.expires) {
+		return nil, errConflict("stale passkey test; start again")
+	}
+	challenge := seal.OpenChallenge([]byte(c.Canonical), []byte(t.descriptor))
+	row, err := s.verifySelected(ctx, challenge, in.Assertion, [][]byte{t.cred}, t.ext)
+	if err != nil {
+		return nil, err
+	}
+	q := s.store.Q()
+	if err = s.sealOwner(ctx, q, sess, row); err != nil {
+		return nil, err
+	}
+	pk, err := s.passkeyRow(ctx, row)
+	if err != nil || !bytes.Equal(pk.CredentialID, t.cred) {
+		return nil, errForbidden("wrong passkey for this test")
+	}
+	keks, err := s.enrolKEKs(t, sess, c.Canonical, in.Open)
+	if err != nil {
+		return nil, err
+	}
+	defer destroyKeys(keks)
+	var done []string
+	for i, scope := range t.scopes {
+		sw, err := q.ScopeWrap(ctx, row, scope)
+		if err != nil || !bytes.Equal(sw.Salt, t.salts[i][:]) {
+			return nil, errConflict("this passkey's wraps changed; start again")
+		}
+		sc, err := q.Scope(ctx, scope)
+		if err != nil {
+			return nil, err
+		}
+		k, err := s.passkeyScope(sw).Unwrap(keks[i], sw.Wrap, sc.Public)
+		if err != nil {
+			return nil, errForbidden("this passkey's key for " + scopeName(ctx, q, scope) + " did not open")
+		}
+		k.Destroy()
+		if err = q.MarkScopeWrapTested(ctx, sw.ID, s.now()); err != nil {
+			return nil, err
+		}
+		done = append(done, scope)
+	}
+	_ = q.Audit(ctx, s.now(), "owner", "passkey_test", "passkey:"+passkeyID(pk.CredentialID), "scopes="+strings.Join(done, ","))
+	s.bcast.notify()
+	return map[string]any{"ok": true, "scopes": done}, nil
 }
 
 // Re-check the authorizing credential as well as the logged-in one. A
@@ -238,9 +509,8 @@ func (s *Server) checkStage(ctx context.Context, q *store.Q, sess string, st *ca
 	if st == nil || st.session != sess || !s.now().Before(st.expires) {
 		return errConflict("registration expired or changed")
 	}
-	// A PRF evaluation may be signed by the target, not the credential
-	// that authorized adding it. Check the saved authorizer's exact raw ID
-	// below, independently of the current request's verified signer.
+	// The PRF evaluation is signed by the target, not the credential that
+	// authorized adding it. Check the saved authorizer's exact raw ID below.
 	if err := s.sealOwner(context.WithValue(ctx, verifiedSignerKey{}, (*verifiedIdentity)(nil)), q, sess, st.signer); err != nil {
 		return err
 	}
@@ -256,6 +526,7 @@ func (s *Server) checkStage(ctx context.Context, q *store.Q, sess string, st *ca
 	}
 	return errConflict("authorizing passkey was removed")
 }
+
 func (s *Server) capCreate(ctx context.Context, r *http.Request, sess string) (any, error) {
 	var in struct {
 		ID         string          `json:"registration_id"`
@@ -295,12 +566,15 @@ func (s *Server) capCreate(ctx context.Context, r *http.Request, sess string) (a
 	}
 	st.credential = cred
 	if st.intent.Capability == "approve-only" {
-		defer delete(pool.entries, st.id)
-		return api.OK{OK: true}, s.commitCapability(ctx, st)
+		defer func() { st.wipe(); delete(pool.entries, st.id) }()
+		return api.OK{OK: true}, s.commitCapability(ctx, st, nil)
 	}
-	return map[string]any{"selection": s.capSelection(st)}, nil
+	return api.OK{OK: true}, nil
 }
-func (s *Server) commitCapability(ctx context.Context, st *capStage) error {
+
+// commitCapability inserts a registered passkey and/or its new scope wraps,
+// with any scope key created in this stage, in one transaction.
+func (s *Server) commitCapability(ctx context.Context, st *capStage, wraps []store.ScopeWrapRow) error {
 	return s.store.Tx(ctx, func(q *store.Q) error {
 		if err := s.checkStage(ctx, q, st.session, st); err != nil {
 			return err
@@ -317,14 +591,23 @@ func (s *Server) commitCapability(ctx context.Context, st *capStage) error {
 				return err
 			}
 		}
-		if st.intent.Capability == "unlock" {
-			if err := q.InsertWrap(ctx, row, s.seal.inv.Version, st.salt[:], st.wrapped, now); err != nil {
+		for _, sc := range st.intent.Scopes {
+			if x, ok := st.created[sc]; ok {
+				if err := q.InsertScope(ctx, x); err != nil {
+					return errConflict("the scope was created meanwhile; start again")
+				}
+			}
+		}
+		for _, w := range wraps {
+			w.Passkey = row
+			if err := q.PutScopeWrap(ctx, w); err != nil {
 				return err
 			}
 		}
 		return q.Audit(ctx, now, "owner", "passkey_capability", "passkey:"+passkeyID(st.credential.ID), st.canonical+" signer="+passkeyID(st.signerRaw))
 	})
 }
+
 func (s *Server) capEvaluate(ctx context.Context, r *http.Request, sess string) (any, error) {
 	var in struct {
 		ID string `json:"registration_id"`
@@ -334,94 +617,134 @@ func (s *Server) capEvaluate(ctx context.Context, r *http.Request, sess string) 
 	}
 	pool := &s.seal.capabilities
 	pool.Lock()
+	defer pool.Unlock()
 	st := pool.entries[in.ID]
-	if err := s.checkStage(ctx, s.store.Q(), sess, st); err != nil {
-		pool.Unlock()
+	q := s.store.Q()
+	if err := s.checkStage(ctx, q, sess, st); err != nil {
 		return nil, err
 	}
-	if st.credential == nil {
-		pool.Unlock()
+	if st.credential == nil || st.intent.Capability != "unlock" {
 		return nil, errConflict("registration incomplete")
 	}
-	sel := s.capSelection(st)
-	cred := *st.credential
-	c := seal.Credential{Generation: s.seal.inv.Generation, RPID: s.rpID, RawID: cred.ID, Salt: st.salt}
-	pool.Unlock()
-	b, err := s.seal.attempts.Begin(sess, "wrap-enroll", sel["registration_id"].(string), c)
-	if err != nil {
-		return nil, errConflict("retry passkey evaluation later")
+	var salts []seal.ID
+	for _, sc := range st.intent.Scopes {
+		if st.keys[sc] == nil {
+			// Only a scope without any key may be created here.
+			if _, err := q.Scope(ctx, sc); err == nil {
+				return nil, errConflict("the approving tap did not open " + scopeName(ctx, q, sc) + "; start again")
+			} else if !isStoreNotFound(err) {
+				return nil, err
+			}
+			k, pub, err := seal.NewKeyPair()
+			if err != nil {
+				return nil, err
+			}
+			rec, err := seal.Scope{Installation: s.seal.installation, Name: sc, Public: pub}.RecoveryWrap(s.seal.recipient, k)
+			if err != nil {
+				k.Destroy()
+				return nil, err
+			}
+			st.keys[sc] = k
+			st.created[sc] = store.ScopeRow{Scope: sc, Public: pub, Recovery: rec, Created: s.now()}
+		}
+		salts = append(salts, seal.RandomID())
 	}
-	ch, _ := strictB64(b.Challenge, 32)
-	o := &owner{id: s.ownerID, name: s.cfg.OwnerName, creds: []webauthn.Credential{cred}}
-	opts, err := s.requestOptions(o, ch)
+	m := s.reviewFields("passkey-enrol", "enrol", st.id)
+	m["credential_id"] = encodeID(st.credential.ID)
+	m["scopes"] = st.intent.Scopes
+	text, err := reviewJSON(m)
 	if err != nil {
 		return nil, err
 	}
-	opts.Extensions = protocol.AuthenticationExtensions{PRF: &protocol.PRFInputs{Eval: protocol.PRFValues{First: c.Salt[:]}}}
-	return map[string]any{"attempt_id": b.ID, "canonical": b.Canonical, "publicKey": opts}, nil
+	opts, t, err := s.enrolTap(sess, "enrol", text, *st.credential, st.intent.Scopes, salts)
+	if err != nil {
+		return nil, err
+	}
+	id, err := s.storeChallenge(ctx, sess, "passkey-enrol", st.id, text, t)
+	if err != nil {
+		return nil, err
+	}
+	return api.ChallengeResponse{ChallengeID: id, Canonical: text, PublicKey: opts, Open: t.offer()}, nil
 }
+
 func (s *Server) capFinish(ctx context.Context, r *http.Request, sess string) (any, error) {
 	var in struct {
-		sealPacket
-		Registration string `json:"registration_id"`
+		ID          string          `json:"registration_id"`
+		ChallengeID string          `json:"challenge_id"`
+		Assertion   json.RawMessage `json:"assertion"`
+		Open        *api.OpenPacket `json:"open"`
 	}
 	if err := decode(r, &in); err != nil {
 		return nil, err
 	}
-	enc, _ := strictB64(in.Enc, 65)
-	ct, _ := strictB64(in.CT, maxBody)
-	var result any = api.OK{OK: true}
-	err := s.seal.attempts.FinishBound(sess, "wrap-enroll", in.ID, enc, ct, func(c seal.Credential, reg string, d [32]byte, b []byte, kek *seal.Key) error {
-		pool := &s.seal.capabilities
-		pool.Lock()
-		defer pool.Unlock()
-		st := pool.entries[in.Registration]
-		if err := s.checkStage(ctx, s.store.Q(), sess, st); err != nil {
-			return err
-		}
-		if st.credential == nil || s.capSelection(st)["registration_id"] != reg || c.Salt != st.salt || !bytes.Equal(c.RawID, st.credential.ID) {
-			return errConflict("stale PRF test")
-		}
-		ext := protocol.AuthenticationExtensions{PRF: &protocol.PRFInputs{Eval: protocol.PRFValues{First: c.Salt[:]}}}
-		if st.target != 0 {
-			row, err := s.verifySelected(ctx, d[:], b, [][]byte{c.RawID}, ext)
-			if err != nil || row != st.target {
-				return errForbidden("wrong test credential")
-			}
-		} else {
-			if !publicExtensionsOnly(b, false) {
-				return errForbidden("unexpected extensions")
-			}
-			parsed, err := protocol.ParseCredentialRequestResponseBytes(b)
-			if err != nil {
-				return errForbidden("invalid assertion")
-			}
-			o := &owner{id: s.ownerID, name: s.cfg.OwnerName, creds: []webauthn.Credential{*st.credential}}
-			cred, err := s.wa.ValidateLogin(o, webauthn.SessionData{Challenge: encodeID(d[:]), RelyingPartyID: s.rpID, Origin: s.cfg.PublicBaseURL, UserID: s.ownerID, AllowedCredentialIDs: [][]byte{c.RawID}, UserVerification: protocol.VerificationRequired, Extensions: ext.Session()}, parsed)
-			if err != nil || !cred.Flags.UserVerified || !cred.Flags.UserPresent || cred.Authenticator.CloneWarning {
-				return errForbidden("credential did not verify")
-			}
-			st.credential = cred
-		}
-		if st.wrapped == nil {
-			mk, _ := ctx.Value(leaseKey{}).(*seal.Key)
-			var err error
-			st.wrapped, err = c.Wrap(kek, mk)
-			if err == nil {
-				result = map[string]any{"selection": s.capSelection(st)}
-			}
-			return err
-		}
-		k, err := c.Unwrap(kek, st.wrapped, s.seal.inv.Check)
-		if err != nil {
-			return errForbidden("unstable PRF")
-		}
-		k.Destroy()
-		defer delete(pool.entries, st.id)
-		return s.commitCapability(ctx, st)
-	})
+	c, err := s.consume(ctx, in.ChallengeID, "action", s.now())
 	if err != nil {
-		return nil, errForbidden("passkey wrap test rejected")
+		return nil, err
 	}
-	return result, nil
+	t := s.seal.taps.take(c.ID)
+	if c.SessionHash != sess || c.ObjectType != "passkey-enrol" || c.ObjectID != in.ID || t == nil || t.purpose != "enrol" || t.session != sess || !s.now().Before(t.expires) {
+		return nil, errConflict("stale passkey enrolment; start again")
+	}
+	pool := &s.seal.capabilities
+	pool.Lock()
+	defer pool.Unlock()
+	st := pool.entries[in.ID]
+	if err := s.checkStage(ctx, s.store.Q(), sess, st); err != nil {
+		return nil, err
+	}
+	if st.credential == nil || !bytes.Equal(st.credential.ID, t.cred) || !slices.Equal(t.scopes, st.intent.Scopes) {
+		return nil, errConflict("stale passkey enrolment; start again")
+	}
+	challenge := seal.OpenChallenge([]byte(c.Canonical), []byte(t.descriptor))
+	if st.target != 0 {
+		row, err := s.verifySelected(ctx, challenge, in.Assertion, [][]byte{t.cred}, t.ext)
+		if err != nil || row != st.target {
+			return nil, errForbidden("wrong passkey for this enrolment")
+		}
+	} else {
+		if !publicExtensionsOnly(in.Assertion, false) {
+			return nil, errForbidden("unexpected client extension output")
+		}
+		parsed, err := protocol.ParseCredentialRequestResponseBytes(in.Assertion)
+		if err != nil {
+			return nil, errForbidden("invalid assertion")
+		}
+		o := &owner{id: s.ownerID, name: s.cfg.OwnerName, creds: []webauthn.Credential{*st.credential}}
+		cred, err := s.wa.ValidateLogin(o, webauthn.SessionData{Challenge: encodeID(challenge), RelyingPartyID: s.rpID, Origin: s.cfg.PublicBaseURL, UserID: s.ownerID, AllowedCredentialIDs: [][]byte{t.cred}, UserVerification: protocol.VerificationRequired, Extensions: t.ext.Session()}, parsed)
+		if err != nil || !cred.Flags.UserVerified || !cred.Flags.UserPresent || cred.Authenticator.CloneWarning {
+			return nil, errForbidden("credential did not verify")
+		}
+		st.credential = cred
+	}
+	keks, err := s.enrolKEKs(t, sess, c.Canonical, in.Open)
+	if err != nil {
+		return nil, err
+	}
+	defer destroyKeys(keks)
+	var wraps []store.ScopeWrapRow
+	for i, sc := range t.scopes {
+		pub := st.created[sc].Public
+		if pub == nil {
+			row, err := s.store.Q().Scope(ctx, sc)
+			if err != nil {
+				return nil, err
+			}
+			pub = row.Public
+		}
+		ps := seal.PasskeyScope{Installation: s.seal.installation, RPID: s.rpID, RawID: t.cred, Scope: sc, Salt: t.salts[i]}
+		w, err := ps.Wrap(keks[i], st.keys[sc], pub)
+		if err != nil {
+			return nil, errConflict("could not wrap the scope key; start again")
+		}
+		wraps = append(wraps, store.ScopeWrapRow{Scope: sc, Salt: bytes.Clone(t.salts[i][:]), Wrap: w, Created: s.now()})
+	}
+	defer func() { st.wipe(); delete(pool.entries, st.id) }()
+	if err = s.commitCapability(ctx, st, wraps); err != nil {
+		return nil, err
+	}
+	s.bcast.notify()
+	s.notify.Send("aqmas: passkey", "A passkey can now open "+strings.Join(t.scopes, ", ")+" [ref "+ref(st.id)+"]", s.cfg.PublicBaseURL+"/")
+	return map[string]any{"ok": true, "scopes": t.scopes}, nil
 }
+
+func isStoreNotFound(err error) bool { return errors.Is(err, store.ErrNotFound) }

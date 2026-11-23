@@ -82,11 +82,8 @@ func (s *Server) setupCloudflare(o Options) error {
 	var proxyTok string
 	var provider func(context.Context) (string, error)
 	if s.seal != nil {
-		provider = func(ctx context.Context) (string, error) {
-			b, err := s.secret(ctx, "cf-proxy")
-			defer clear(b)
-			return string(b), err
-		}
+		// Decrypted per upstream call from the open cf-proxy bucket (§5); never kept.
+		provider = s.cfParentToken
 	} else {
 		proxyTok, err = loadParentToken("proxy", cf.ProxyTokenCredential, cf.ProxyTokenFile)
 	}
@@ -316,6 +313,7 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 	}
 	what := cfDesc(req.Scope, req.ScopeParams)
 	ctx := r.Context()
+	var cfHolds []bucketHold
 	err = s.store.Tx(ctx, func(q *store.Q) error {
 		auto, standing := res.Scope.AutoApprove, res.Scope.StandingAllowed
 		if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
@@ -351,8 +349,10 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 			}
 			return s.issueCFGrant(ctx, q, req, ttl, now)
 		}
+		// Without a tap only while the proxy parent's bucket is open (§5).
+		parentOpen := res.Mode == api.CFModeProxy && s.cfBucketOpen(ctx, q)
 		// cf.read and cf.cache.purge in proxy mode need no approval.
-		if s.authorisedWork(ctx) && auto && res.Mode == api.CFModeProxy {
+		if parentOpen && auto {
 			// Auto-approval needs no owner, so cap how many identical grants a host may hold:
 			// the CLI reuses an active grant; a flood is a sign of a loop or a compromise.
 			if n, err := q.CountActiveCFGrantsLike(ctx, h.ID, req.Scope, req.ScopeParams, req.Mode, now); err != nil {
@@ -365,10 +365,11 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 			if err != nil {
 				return err
 			}
+			cfHolds = []bucketHold{s.cfGrantHold(req.ID, g.NotAfter), s.cfAutoHold(ctx, q)}
 			return q.Audit(ctx, now, "system", "cf_auto_approve", "request:"+req.ID,
 				fmt.Sprintf("grant=%s host=%s %s mode=%s ttl=%d from=%s", g.ID, h.Name, what, req.Mode, ttl, peer))
 		}
-		if s.authorisedWork(ctx) && standing && res.Mode == api.CFModeProxy {
+		if parentOpen && standing {
 			rules, err := q.ActiveStanding(ctx, h.ID, now)
 			if err != nil {
 				return err
@@ -388,6 +389,7 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 				if err := q.UseStanding(ctx, st.ID, now); err != nil {
 					return err
 				}
+				cfHolds = []bucketHold{s.cfGrantHold(req.ID, g.NotAfter), standingHold(st)}
 				return q.Audit(ctx, now, "system", "auto_approve", "request:"+req.ID,
 					fmt.Sprintf("standing=%s grant=%s host=%s cloudflare %s mode=%s ttl=%d from=%s", st.ID, g.ID, h.Name, what, req.Mode, ttl, peer))
 			}
@@ -406,6 +408,9 @@ func (s *Server) handleCreateCloudflare(w http.ResponseWriter, r *http.Request, 
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
+	}
+	if len(cfHolds) > 0 {
+		s.holdCF(ctx, cfHolds...)
 	}
 	s.bcast.notify()
 	url := s.approveURL(req.ID)
@@ -901,14 +906,7 @@ func (s *Server) handleCFSnapshots(w http.ResponseWriter, r *http.Request, h *st
 		s.writeErr(w, r, err)
 		return
 	}
-	s.optionalLease(r.Context(), func(ctx context.Context) {
-		if !s.authorisedWork(ctx) {
-			s.writeErr(w, r, lockedErr())
-			return
-		}
-		defer boundDelivery(ctx, w)()
-		s.cf.proxy.ServeSnapshotList(s.deliveryWriter(ctx, w), r.WithContext(ctx), s.cfCaller(r, h))
-	})
+	s.cf.proxy.ServeSnapshotList(w, r, s.cfCaller(r, h))
 }
 
 func (s *Server) handleCFSnapshot(w http.ResponseWriter, r *http.Request, h *store.Host) {
@@ -917,14 +915,7 @@ func (s *Server) handleCFSnapshot(w http.ResponseWriter, r *http.Request, h *sto
 		s.writeErr(w, r, err)
 		return
 	}
-	s.optionalLease(r.Context(), func(ctx context.Context) {
-		if !s.authorisedWork(ctx) {
-			s.writeErr(w, r, lockedErr())
-			return
-		}
-		defer boundDelivery(ctx, w)()
-		s.cf.proxy.ServeSnapshotGet(s.deliveryWriter(ctx, w), r.WithContext(ctx), s.cfCaller(r, h), r.PathValue("id"))
-	})
+	s.cf.proxy.ServeSnapshotGet(w, r, s.cfCaller(r, h), r.PathValue("id"))
 }
 
 // requireHostCF is requireHost for the proxy: refusals get a Cloudflare-shaped body so tools
@@ -939,18 +930,14 @@ func (s *Server) requireHostCF(next func(http.ResponseWriter, *http.Request, *st
 			_, err = s.store.Q().PersonalResource(r.Context(), h.ID, "cloudflare-proxy", "proxy", s.now())
 			err = mapNotFound(err)
 		}
+		if err == nil && s.seal != nil {
+			// The parent token is decrypted per upstream call from the open bucket;
+			// refuse up front while it is closed so the agent keeps its deadline.
+			err = s.cfParentReady(r.Context())
+		}
 		if err == nil {
-			s.optionalLease(r.Context(), func(ctx context.Context) {
-				if !s.authorisedWork(ctx) {
-					err = lockedErr()
-					return
-				}
-				defer boundDelivery(ctx, w)()
-				next(s.deliveryWriter(ctx, w), r.WithContext(ctx), h)
-			})
-			if err == nil {
-				return
-			}
+			next(w, r, h)
+			return
 		}
 		if err != nil {
 			var ae *apiErr

@@ -27,7 +27,7 @@ CREATE INDEX IF NOT EXISTS sign_by_host_status ON sign_requests(host,status);
 CREATE TRIGGER IF NOT EXISTS sign_end_admission AFTER UPDATE ON org_hosts BEGIN UPDATE sign_requests SET status=CASE status WHEN 'pending' THEN 'expired' ELSE 'revoked' END WHERE status IN ('approved','pending') AND host=NEW.host_id AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.org_id);END;
 CREATE TRIGGER IF NOT EXISTS sign_end_policy AFTER UPDATE ON organisations BEGIN UPDATE sign_requests SET status=CASE status WHEN 'pending' THEN 'expired' ELSE 'revoked' END WHERE status IN ('approved','pending') AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.id);END;
 CREATE TRIGGER IF NOT EXISTS sign_end_set AFTER UPDATE ON credential_sets BEGIN UPDATE sign_requests SET status=CASE status WHEN 'pending' THEN 'expired' ELSE 'revoked' END WHERE status IN ('approved','pending') AND set_id=NEW.id;END;
-CREATE TRIGGER IF NOT EXISTS signer_key_immutable BEFORE UPDATE OF set_id,scheme,public_key,origin,blob,payload,wrap ON signer_keys BEGIN SELECT RAISE(ABORT,'immutable signer key'); END;`)
+CREATE TRIGGER IF NOT EXISTS signer_key_immutable BEFORE UPDATE OF set_id,scheme,public_key,origin,blob ON signer_keys BEGIN SELECT RAISE(ABORT,'immutable signer key'); END;`)
 	return err
 }
 

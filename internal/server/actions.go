@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+
+	"golang.org/x/crypto/ssh"
+
 	"errors"
 	"fmt"
 	"strings"
@@ -13,6 +16,7 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/server/ids"
 	"github.com/aquarat/agent-quartermaster/internal/server/pki"
 	"github.com/aquarat/agent-quartermaster/internal/server/policy"
+	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/server/sshcert"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
 )
@@ -48,18 +52,19 @@ func (s *Server) issueGrant(ctx context.Context, q *store.Q, req *store.Request,
 		return nil, err
 	}
 	g.Serial = serial
-	p, err := s.signer(ctx, "ssh-ca")
-	if err != nil {
-		return nil, err
-	}
-	cert, err := sshcert.Sign(p.SSHSigner, sshcert.Params{
-		Serial:        uint64(serial),
-		KeyID:         fmt.Sprintf("aqmas:%s:%s:%s", g.ID, req.HostName, tgt.Name),
-		Principals:    g.Principals,
-		SourceAddress: req.PeerAddress,
-		ApprovedAt:    now,
-		TTL:           secs(ttl),
-		PublicKey:     pub,
+	var cert *ssh.Certificate
+	err = s.withCA(ctx, q, seal.RoleSSHCA, func(p *pki.PKI) error {
+		var err error
+		cert, err = sshcert.Sign(p.SSHSigner, sshcert.Params{
+			Serial:        uint64(serial),
+			KeyID:         fmt.Sprintf("aqmas:%s:%s:%s", g.ID, req.HostName, tgt.Name),
+			Principals:    g.Principals,
+			SourceAddress: req.PeerAddress,
+			ApprovedAt:    now,
+			TTL:           secs(ttl),
+			PublicKey:     pub,
+		})
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -546,12 +551,12 @@ func (s *Server) applyQ(ctx context.Context, q *store.Q, sg canon.Signed, passke
 				return err
 			}
 		}
-		p, err := s.signer(ctx, "internal-ca")
-		if err != nil {
+		var der []byte
+		if err := s.withCA(ctx, q, seal.RoleInternalCA, func(p *pki.PKI) error {
+			var err error
+			der, err = p.IssueClientCert(csr, e.Hostname, now, s.cfg.ClientCertDays)
 			return err
-		}
-		der, err := p.IssueClientCert(csr, e.Hostname, now, s.cfg.ClientCertDays)
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 		if err := q.DecideEnrollment(ctx, e.ID, api.StatusApproved, "approved by owner", pemCert(der), now); err != nil {

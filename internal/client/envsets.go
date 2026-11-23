@@ -184,7 +184,7 @@ func (e *Env) envRelease(ctx context.Context, c *APIClient, b envset.Binding, mo
 		var ae *APIError
 		if errors.As(err, &ae) && ae.HTTPStatus == 423 && ae.Code == "locked" {
 			if !notice {
-				e.logf("waiting for owner unlock")
+				e.logf("%s", lockedNotice(ae))
 				notice = true
 			}
 			continue

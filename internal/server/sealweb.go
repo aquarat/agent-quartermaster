@@ -3,26 +3,17 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
-	"reflect"
+	"slices"
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
-	"github.com/aquarat/agent-quartermaster/internal/maint"
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
-	"github.com/aquarat/agent-quartermaster/internal/server/config"
-	"github.com/aquarat/agent-quartermaster/internal/server/ids"
+	"github.com/aquarat/agent-quartermaster/internal/server/pki"
 	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
-	"github.com/go-webauthn/webauthn/protocol"
 )
 
 func (s *Server) sealRoutes(m *http.ServeMux) {
@@ -30,9 +21,11 @@ func (s *Server) sealRoutes(m *http.ServeMux) {
 	s.approvalRoutes(m)
 	s.envWebRoutes(m)
 	s.vaultRoutes(m)
-	for path, f := range map[string]func(http.ResponseWriter, *http.Request, string){"GET /api/ui/seal/status": s.sealStatus, "POST /api/ui/seal/unlock/challenge": s.sealBegin, "POST /api/ui/seal/unlock/finish": s.sealFinish, "POST /api/ui/seal/control/challenge": s.sealControlBegin, "POST /api/ui/seal/control/finish": s.sealControlFinish, "POST /api/ui/seal/drill": s.sealDrill} {
-		m.Handle(path, s.requireSession(f))
-	}
+	s.recoveryRoutes(m)
+	m.Handle("GET /api/ui/seal/status", s.requireSession(s.sealStatus))
+	m.Handle("POST /api/ui/seal/drill", s.requireSession(s.sealDrill))
+	s.sealedEndpoint(m, "POST /api/ui/seal/control/challenge", s.sealControlBegin)
+	s.sealedEndpoint(m, "POST /api/ui/seal/control/finish", s.sealControlFinish)
 }
 func (s *Server) sealOwner(ctx context.Context, q *store.Q, sess string, pk int64) error {
 	if v, _ := ctx.Value(verifiedSignerKey{}).(*verifiedIdentity); v != nil && v.row != 0 {
@@ -50,94 +43,72 @@ func (s *Server) sealOwner(ctx context.Context, q *store.Q, sess string, pk int6
 	return nil
 }
 
-type sealChoice struct {
-	ID        string         `json:"id"`
-	Name      string         `json:"name"`
-	Selection map[string]any `json:"selection"`
-}
-type sealView struct {
-	LeafExpires    string          `json:"leaf_expires,omitempty"`
-	LeafRepair     string          `json:"leaf_repair,omitempty"`
-	Profiles       []windowProfile `json:"profiles,omitempty"`
-	Active         []windowInfo    `json:"active_windows,omitempty"`
-	VerifiedAccess bool            `json:"verified_access,omitempty"`
-	Mode           string          `json:"mode"`
-	Epoch          seal.ID         `json:"epoch"`
-	Installation   seal.ID         `json:"installation"`
-	Choices        []sealChoice    `json:"choices"`
-	Manifest       string          `json:"manifest,omitempty"`
-	// Setup mode: the key the browser seals the recovery identity to for the on-box drill,
-	// and whether that drill has passed.
-	DrillKey string `json:"drill_key,omitempty"`
-	Drilled  bool   `json:"drilled,omitempty"`
-}
-
-// DrillInfo is the HPKE info string for the recovery-drill packet of one staged installation.
-func DrillInfo(installation seal.ID) []byte {
-	return append([]byte("aqmas-seal-drill-v1\x00"), installation[:]...)
-}
-
-// sealDrill runs the offline recovery drill on the bastion itself (an owner
-// decision, docs/SETUP.md): the browser seals the pasted age identity to this import process, which
-// opens the staged recovery packet with it, authenticates every staged payload and leaves
-// only the acknowledgement that activation requires. The identity is cleared at once; it is
-// never written, logged or kept. This proves the saved key works; it does not prove the
-// machine never saw it.
+// sealDrill is the on-box recovery drill of the staging page.
+// STAGE-AGENT: open every staged scope key from its recovery wrap.
 func (s *Server) sealDrill(w http.ResponseWriter, r *http.Request, sess string) {
-	z := s.seal
-	if z == nil || z.stage == nil {
+	if s.seal == nil || s.seal.mode != modeSetup {
 		s.writeErr(w, r, errConflict("no seal import is staged"))
 		return
 	}
-	var in struct {
-		Packet string `json:"packet"`
-	}
-	if err := decode(r, &in); err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	ctx := r.Context()
-	row, err := s.store.Q().SessionPasskeyID(ctx, sess)
-	if err == nil {
-		err = s.sealOwner(ctx, s.store.Q(), sess, row)
-	}
-	if err != nil {
-		s.writeErr(w, r, errForbidden("owner session required"))
-		return
-	}
-	st := z.stage
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.activated {
-		s.writeErr(w, r, errConflict("already activated"))
-		return
-	}
-	identity, err := maint.OpenPacket(st.drill, DrillInfo(z.inv.Installation), in.Packet)
-	if err != nil {
-		s.writeErr(w, r, errBad("the recovery key packet could not be opened; reload the page and try again"))
-		return
-	}
-	proof, err := z.inv.OfflineProof(identity)
-	clear(identity)
-	sum := sha256.Sum256([]byte(proof))
-	if err != nil || subtle.ConstantTimeCompare(sum[:], st.expectedProof[:]) != 1 {
-		s.writeErr(w, r, errConflict("this is not the recovery key for the public key you gave: nothing was changed"))
-		return
-	}
-	path := filepath.Join(st.dir, "recovery.proof")
-	_ = os.Remove(path)
-	if err = writeExclusive(path, []byte(proof+"\n")); err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	st.drilled = true
-	s.log.Info("recovery drill passed on this machine")
-	writeJSON(w, 200, api.OK{OK: true})
+	s.writeErr(w, r, errConflict(errStage("the staging drill").Error()))
+}
+
+// ---- status (contract "GET /api/ui/seal/status") ----
+
+type scopeView struct {
+	Scope   string `json:"scope"`
+	Title   string `json:"title"`
+	Buckets int    `json:"buckets"`
+	HasKey  bool   `json:"has_key"`
+}
+type pausedView struct {
+	Kind   string `json:"kind"`
+	Ref    string `json:"ref"`
+	Reason string `json:"reason"`
+}
+type bucketView struct {
+	ID         string       `json:"id"`
+	Kind       string       `json:"kind"`
+	Label      string       `json:"label"`
+	Scope      string       `json:"scope"`
+	ScopeTitle string       `json:"scope_title"`
+	Open       bool         `json:"open"`
+	OpenedAt   *time.Time   `json:"opened_at,omitempty"`
+	Holds      []bucketHold `json:"holds"`
+	Paused     []pausedView `json:"paused"`
+}
+type coverageScope struct {
+	Scope  string `json:"scope"`
+	Tested bool   `json:"tested"`
+}
+type passkeyCoverage struct {
+	ID      string          `json:"id"`
+	Name    string          `json:"name"`
+	Current bool            `json:"current"`
+	PRF     bool            `json:"prf"`
+	Scopes  []coverageScope `json:"scopes"`
+	Opens   int             `json:"opens"`
+	Of      int             `json:"of"`
+	Missing []string        `json:"missing"`
+}
+type sealView struct {
+	Mode           string            `json:"mode"`
+	Installation   *seal.ID          `json:"installation,omitempty"`
+	Epoch          *seal.ID          `json:"epoch,omitempty"`
+	Scopes         []scopeView       `json:"scopes"`
+	Buckets        []bucketView      `json:"buckets"`
+	Passkeys       []passkeyCoverage `json:"passkeys"`
+	Active         []windowInfo      `json:"active_windows,omitempty"`
+	Profiles       []windowProfile   `json:"profiles,omitempty"`
+	VerifiedAccess bool              `json:"verified_access,omitempty"`
+	LeafExpires    string            `json:"leaf_expires,omitempty"`
+	LeafRepair     string            `json:"leaf_repair,omitempty"`
+	Stage          any               `json:"stage,omitempty"` // STAGE-AGENT: setup mode only
 }
 
 func (s *Server) sealStatus(w http.ResponseWriter, r *http.Request, sess string) {
 	if s.seal == nil {
-		writeJSON(w, 200, sealView{Mode: "unsealed"})
+		writeJSON(w, 200, sealView{Mode: "unsealed", Scopes: []scopeView{}, Buckets: []bucketView{}, Passkeys: []passkeyCoverage{}})
 		return
 	}
 	view, err := s.sealView(r.Context(), sess)
@@ -145,543 +116,537 @@ func (s *Server) sealStatus(w http.ResponseWriter, r *http.Request, sess string)
 		s.writeErr(w, r, err)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, 200, view)
 }
+
+func (s *Server) leafRepair() string {
+	text, _ := reviewJSON(map[string]any{"ca_pin": s.pki.CAPin(), "configured_sans": s.cfg.TLSSANs, "effect": "Renew the server-only agent TLS leaf, then restart (every bucket closes)"})
+	return text
+}
+
 func (s *Server) sealView(ctx context.Context, sess string) (sealView, error) {
 	z := s.seal
-	v := sealView{Mode: "locked", Installation: z.inv.Installation, Epoch: z.attempts.Epoch(), Choices: []sealChoice{}}
+	epoch := z.opens.Epoch()
+	v := sealView{Mode: z.mode, Installation: &z.installation, Epoch: &epoch, Scopes: []scopeView{}, Buckets: []bucketView{}, Passkeys: []passkeyCoverage{}}
 	if s.pki.ServerLeaf != nil {
 		v.LeafExpires = s.pki.ServerLeaf.NotAfter.UTC().Format(time.RFC3339)
 	}
-	v.LeafRepair, _ = reviewJSON(map[string]any{"ca_pin": s.pki.CAPin(), "configured_sans": s.cfg.TLSSANs, "effect": "Renew the server-only agent TLS leaf, then restart locked"})
-	keys, err := loadPasskeys(ctx, s.store.Q())
+	v.LeafRepair = s.leafRepair()
+	if z.mode != modeBuckets {
+		return v, nil
+	}
+	q := s.store.Q()
+	row, err := q.SessionPasskeyID(ctx, sess)
 	if err != nil {
 		return v, err
 	}
-	if !s.isLocked() {
-		v.Mode = "unlocked"
+	if err = s.sealOwner(ctx, q, sess, row); err != nil {
+		return v, err
 	}
-	if z.stage == nil {
-		q := s.store.Q()
-		row, err := q.SessionPasskeyID(ctx, sess)
-		if err != nil {
-			return v, err
+	v.VerifiedAccess = s.access != nil && accessSub(ctx) != ""
+	if v.Profiles, err = s.windowProfiles(ctx, q, sess, row); err != nil {
+		return v, err
+	}
+	pool := &z.windows
+	pool.Lock()
+	gen, err := q.WindowEpoch(ctx)
+	if err == nil {
+		pool.prune(s.now(), gen)
+		for _, w := range pool.active {
+			v.Active = append(v.Active, windowInfo{w.terms.ID, w.terms.Title, w.opener, w.opened, w.absolute})
 		}
-		v.VerifiedAccess = s.access != nil && accessSub(ctx) != ""
-		v.Profiles, err = s.windowProfiles(ctx, q, sess, row)
-		if err != nil {
-			return v, err
-		}
-		pool := &z.windows
-		pool.Lock()
-		gen, err := q.WindowEpoch(ctx)
-		if err == nil {
-			pool.prune(s.now(), gen)
-			for _, w := range pool.active {
-				v.Active = append(v.Active, windowInfo{w.terms.ID, w.terms.Title, w.opener, w.opened, w.absolute})
+	}
+	pool.Unlock()
+	if err != nil {
+		return v, err
+	}
+	// Scopes: the installation and every organisation, with or without a key.
+	scopes, err := q.Scopes(ctx)
+	if err != nil {
+		return v, err
+	}
+	orgs, err := q.VaultOrgs(ctx)
+	if err != nil {
+		return v, err
+	}
+	buckets, err := q.Buckets(ctx)
+	if err != nil {
+		return v, err
+	}
+	count := map[string]int{}
+	for _, b := range buckets {
+		count[b.Scope]++
+	}
+	has := func(sc string) bool {
+		return slices.ContainsFunc(scopes, func(x store.ScopeRow) bool { return x.Scope == sc })
+	}
+	titles := map[string]string{seal.ScopeInstallation: "Installation"}
+	v.Scopes = append(v.Scopes, scopeView{seal.ScopeInstallation, "Installation", count[seal.ScopeInstallation], has(seal.ScopeInstallation)})
+	for _, o := range orgs {
+		titles[o.ID] = o.Title
+		v.Scopes = append(v.Scopes, scopeView{o.ID, o.Title, count[o.ID], has(o.ID)})
+	}
+	open := z.pool.snapshot()
+	for _, b := range buckets {
+		bv := bucketView{ID: encodeID(b.ID), Kind: b.Kind, Label: b.Label, Scope: b.Scope, ScopeTitle: titles[b.Scope], Holds: []bucketHold{}, Paused: []pausedView{}}
+		if ob, ok := open[bucketSealID(b)]; ok {
+			bv.Open, bv.Holds = true, ob.Holds
+			t := ob.Opened
+			bv.OpenedAt = &t
+			if bv.Holds == nil {
+				bv.Holds = []bucketHold{}
 			}
 		}
-		pool.Unlock()
+		users, err := s.liveUsers(ctx, q, b)
 		if err != nil {
 			return v, err
 		}
-		if v.Mode == "unlocked" {
-			return v, nil
-		}
-	}
-	if st := z.stage; st != nil {
-		st.mu.Lock()
-		defer st.mu.Unlock()
-		v.Mode = "setup"
-		v.DrillKey, v.Drilled = maint.PublicKey(st.drill), st.drilled
-		if st.activated {
-			v.Mode = "activated"
-			return v, nil
-		}
-		if st.wrap.Tested {
-			if sess == st.session {
-				m, err := z.inv.Manifest([]seal.WrappedCredential{st.wrap})
-				if err != nil {
-					return v, err
-				}
-				b, _ := json.Marshal(m)
-				v.Manifest = string(b)
+		for _, u := range users {
+			if !slices.ContainsFunc(bv.Holds, func(h bucketHold) bool { return h.Ref == u.Ref }) {
+				bv.Paused = append(bv.Paused, pausedView{u.Kind, u.Ref, u.Reason})
 			}
-			return v, nil
 		}
+		v.Buckets = append(v.Buckets, bv)
 	}
-	for _, pk := range keys {
-		wrap, reg, err := s.credentialFor(ctx, sess, &pk)
-		if errors.Is(err, errStageBusy) || isNotFound(err) {
-			continue
+	keys, err := loadPasskeys(ctx, q)
+	if err != nil {
+		return v, err
+	}
+	wraps, err := q.ScopeWraps(ctx, 0)
+	if err != nil {
+		return v, err
+	}
+	for _, k := range keys {
+		c := passkeyCoverage{ID: k.id, Name: k.Name, Current: k.ID == row, Scopes: []coverageScope{}, Of: len(buckets), Missing: []string{}}
+		for _, w := range wraps {
+			if w.Passkey == k.ID {
+				c.Scopes = append(c.Scopes, coverageScope{w.Scope, w.Tested != nil})
+				c.Opens += count[w.Scope]
+			}
 		}
-		if err != nil {
-			return v, err
+		c.PRF = len(c.Scopes) > 0
+		for _, sc := range v.Scopes {
+			if !slices.ContainsFunc(c.Scopes, func(x coverageScope) bool { return x.Scope == sc.Scope }) {
+				c.Missing = append(c.Missing, sc.Scope)
+			}
 		}
-		c := wrap.Credential
-		sel := map[string]any{"action": "unlock", "credential_id": encodeID(c.RawID), "installation": c.Installation, "epoch": v.Epoch, "rp_id": c.RPID, "mk_version": c.Version, "prf_salt": c.Salt}
-		if reg != "" {
-			sel["action"] = "wrap-enroll"
-			sel["registration_id"] = reg
-		}
-		v.Choices = append(v.Choices, sealChoice{pk.id, pk.Name, sel})
+		v.Passkeys = append(v.Passkeys, c)
 	}
 	return v, nil
 }
-func isNotFound(err error) bool { var e *apiErr; return errors.As(err, &e) && e.status == 404 }
 
-var errStageBusy = errors.New("another credential or session owns this setup; restart maintenance to discard staging")
+// ---- seal control (v3 object "seal-control") ----
 
-// Caller holds stage.mu if in setup mode. Salts are random and stable only
-// within this maintenance process, then persisted for the tested credential.
-func (s *Server) credentialFor(ctx context.Context, sess string, pk *storedPasskey) (seal.WrappedCredential, string, error) {
-	st := s.seal.stage
-	if st == nil {
-		w, err := s.loadWrap(ctx, pk)
-		return w, "", err
-	}
-	if st.wrap.Passkey != 0 {
-		if st.wrap.Passkey != pk.ID || st.session != sess || st.wrap.Tested {
-			return seal.WrappedCredential{}, "", errStageBusy
-		}
-		return st.wrap, st.registration + "-test", nil
-	}
-	if st.salts == nil {
-		st.salts = make(map[int64]seal.ID)
-		st.registration = ids.Secret(32)
-	}
-	salt, ok := st.salts[pk.ID]
-	if !ok {
-		salt = seal.RandomID()
-		st.salts[pk.ID] = salt
-	}
-	return seal.WrappedCredential{Credential: seal.Credential{Generation: s.seal.inv.Generation, RPID: s.rpID, RawID: pk.CredentialID, Salt: salt}, Passkey: pk.ID}, st.registration + "-create", nil
+type controlChoice struct {
+	Action  string   `json:"action"`
+	Buckets []string `json:"buckets,omitempty"`
+	Scope   string   `json:"scope,omitempty"`
 }
 
-type sealRequest struct {
-	Window       *windowOpen `json:"window,omitempty"`
-	Credential   string      `json:"credential"`
-	Registration string      `json:"registration_id"`
+type controlBucket struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
 }
 
-func (s *Server) sealBegin(w http.ResponseWriter, r *http.Request, sess string) {
-	z := s.seal
-	if z == nil || !s.isLocked() {
-		s.writeErr(w, r, errConflict("not locked or staging"))
-		return
-	}
-	var in sealRequest
-	if err := decode(r, &in); err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	ctx := r.Context()
-	pk, _, err := findPasskey(ctx, s.store.Q(), in.Credential)
-	if err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	if err = s.sealOwner(ctx, s.store.Q(), sess, pk.ID); err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	var wrap seal.WrappedCredential
-	var reg string
-	func() {
-		if st := z.stage; st != nil {
-			st.mu.Lock()
-			defer st.mu.Unlock()
+// controlPlan validates a choice against current state and returns the
+// canonical's own fields and the buckets the tap must open.
+func (s *Server) controlPlan(ctx context.Context, q *store.Q, c controlChoice, openCount int) (map[string]any, []bucketNeed, error) {
+	fields := map[string]any{}
+	switch c.Action {
+	case "close-all":
+		if c.Scope != "" || len(c.Buckets) > 0 {
+			return nil, nil, errBad("close-all takes no buckets or scope")
 		}
-		wrap, reg, err = s.credentialFor(ctx, sess, pk)
-	}()
-	if err != nil || reg != in.Registration {
-		s.writeErr(w, r, errConflict("credential selection changed"))
-		return
-	}
-	purpose := "unlock"
-	if reg != "" {
-		purpose = "wrap-enroll"
-	}
-	if in.Window != nil {
-		if reg != "" || in.Window.Credential != encodeID(pk.CredentialID) {
-			s.writeErr(w, r, errBad("wrong combined ceremony"))
-			return
-		}
-		terms, err := s.windowTerms(ctx, s.store.Q(), sess, pk.ID, ids.Secret(32), *in.Window)
-		if err != nil {
-			s.writeErr(w, r, err)
-			return
-		}
-		purpose = "unlock-window"
-		reg, _ = reviewJSON(terms)
-	}
-	b, err := z.attempts.Begin(sess, purpose, reg, wrap.Credential)
-	if err != nil {
-		s.writeErr(w, r, errConflict("cannot begin seal ceremony; refresh and retry"))
-		return
-	}
-	ch, _ := strictB64(b.Challenge, 32)
-	o, err := s.loadOwner(ctx)
-	if err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	options, err := s.requestOptions(o, ch)
-	if err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	options.AllowedCredentials = []protocol.CredentialDescriptor{pk.cred.Descriptor()}
-	options.Extensions = protocol.AuthenticationExtensions{PRF: &protocol.PRFInputs{Eval: protocol.PRFValues{First: wrap.Salt[:]}}}
-	writeJSON(w, 200, map[string]any{"attempt_id": b.ID, "canonical": b.Canonical, "publicKey": options})
-}
-
-type sealPacket struct {
-	Combined bool   `json:"combined,omitempty"`
-	ID       string `json:"attempt_id"`
-	Enc      string `json:"enc"`
-	CT       string `json:"ciphertext"`
-}
-
-func (s *Server) sealFinish(w http.ResponseWriter, r *http.Request, sess string) {
-	z := s.seal
-	if z == nil || !s.isLocked() {
-		s.writeErr(w, r, errConflict("not locked or staging"))
-		return
-	}
-	var in sealPacket
-	if err := decode(r, &in); err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	enc, _ := strictB64(in.Enc, 65)
-	ct, _ := strictB64(in.CT, maxBody)
-	ctx := r.Context()
-	purpose := "unlock"
-	if z.stage != nil {
-		purpose = "wrap-enroll"
-	}
-	var receipt *windowReceipt
-	if in.Combined && z.stage == nil {
-		purpose = "unlock-window"
-	}
-	err := z.attempts.FinishEvidence(sess, purpose, in.ID, enc, ct, func(c seal.Credential, reg string, d [32]byte, assertion []byte, kek *seal.Key, canonical string) error {
-		pk, _, err := findPasskey(ctx, s.store.Q(), passkeyID(c.RawID))
-		if err != nil {
-			return err
-		}
-		row, err := s.verifySelected(ctx, d[:], assertion, [][]byte{c.RawID}, protocol.AuthenticationExtensions{PRF: &protocol.PRFInputs{Eval: protocol.PRFValues{First: c.Salt[:]}}})
-		if err != nil || row != pk.ID || !bytes.Equal(pk.CredentialID, c.RawID) {
-			return errForbidden("seal assertion rejected")
-		}
-		if st := z.stage; st != nil {
-			st.mu.Lock()
-			defer st.mu.Unlock()
-			wrap, expected, err := s.credentialFor(ctx, sess, pk)
-			if err != nil || reg != expected || wrap.Salt != c.Salt {
-				return errConflict("stale wrap enrollment")
-			}
-			if err = s.sealOwner(ctx, s.store.Q(), sess, row); err != nil {
-				return err
-			}
-			if len(wrap.Wrapped) == 0 {
-				wrap.Wrapped, err = c.Wrap(kek, st.mk)
-				if err != nil {
-					return err
-				}
-				st.wrap = wrap
-				st.session = sess
-				return nil
-			}
-			tested, err := c.Unwrap(kek, wrap.Wrapped, z.inv.Check)
-			if err != nil {
-				return errForbidden("passkey test could not open the wrap")
-			}
-			tested.Destroy()
-			st.wrap.Tested = true
-			manifest, err := z.inv.Manifest([]seal.WrappedCredential{st.wrap})
-			if err != nil {
-				return err
-			}
-			b, _ := json.Marshal(manifest)
-			s.log.Info("tested seal manifest; compare with owner display", "manifest_sha256", seal.Digest(b))
-			return writeExclusive(filepath.Join(st.dir, "manifest.json"), b)
-		}
-		wrap, err := s.loadWrap(ctx, pk)
-		if err != nil || wrap.Salt != c.Salt {
-			return errConflict("wrap no longer active")
-		}
-		mk, err := c.Unwrap(kek, wrap.Wrapped, z.inv.Check)
-		if err != nil {
-			return errForbidden("seal key check failed")
-		}
-		var t windowTerms
-		var pending *window
-		if in.Combined {
-			if json.Unmarshal([]byte(reg), &t) != nil {
-				mk.Destroy()
-				return errBad("invalid window terms")
-			}
-			z.windows.Lock()
-			defer z.windows.Unlock()
-		}
-		err = z.gate.Install(mk, func() error {
-			return s.store.Tx(ctx, func(q *store.Q) error {
-				if err := s.sealOwner(ctx, q, sess, row); err != nil {
-					return err
-				}
-				if err := q.CheckSealWrap(ctx, row, c.Version, c.Salt[:], wrap.Wrapped); err != nil {
-					return err
-				}
-				if in.Combined {
-					var rec windowReceipt
-					pending, rec, err = s.stageWindow(ctx, q, sess, row, t, canonical+" evidence="+openingEvidence(assertion))
-					if err != nil {
-						return err
-					}
-					receipt = &rec
-				}
-				return q.Audit(ctx, s.now(), "owner", "seal_unlock", "seal:"+encodeID(c.Installation[:]), fmt.Sprintf("passkey=%s challenge=%s", pk.id, encodeID(d[:])))
-			})
-		})
-		if err != nil {
-			mk.Destroy()
-		} else if pending != nil {
-			z.windows.publish(pending)
-		}
-		return err
-	})
-	if err != nil {
-		s.writeErr(w, r, errForbidden("invalid, expired or stale seal ceremony"))
-		return
-	}
-	s.bcast.notify()
-	if z.stage == nil {
-		s.afterUnlock()
-	}
-	if receipt != nil {
-		writeJSON(w, 200, receipt)
-	} else {
-		writeJSON(w, 200, api.OK{OK: true})
-	}
-}
-
-func (s *Server) controlCanonical(ctx context.Context, sess, action, nonce, at string) (string, error) {
-	if s.seal == nil {
-		return "", errNotFound()
-	}
-	v, err := s.sealView(ctx, sess)
-	if err != nil {
-		return "", err
-	}
-	fields := map[string]any{"v": 3, "action": action, "object": "seal-control", "nonce": nonce, "issued_at": at, "id": v.Installation, "epoch": v.Epoch}
-	switch action {
-	case "activate":
-		if v.Mode != "setup" || v.Manifest == "" {
-			return "", errConflict("tested wrap required")
-		}
-		fields["manifest"] = v.Manifest
-	case "lock":
-		if v.Mode != "unlocked" {
-			return "", lockedErr()
-		}
+		fields["open_buckets"] = openCount
+		return fields, nil, nil
 	case "renew-leaf":
-		if v.Mode != "unlocked" {
-			return "", lockedErr()
+		if c.Scope != "" || len(c.Buckets) > 0 {
+			return nil, nil, errBad("renew-leaf takes no buckets or scope")
 		}
-		fields["repair"] = v.LeafRepair
-	default:
-		return "", errBad("invalid seal action")
+		row, err := s.caRow(ctx, q, seal.RoleInternalCA)
+		if err != nil {
+			return nil, nil, err
+		}
+		fields["repair"] = s.leafRepair()
+		return fields, []bucketNeed{s.need(row)}, nil
+	case "reopen":
+		if c.Scope != "" || len(c.Buckets) == 0 || len(c.Buckets) > 16 || !slices.IsSorted(c.Buckets) {
+			return nil, nil, errBad("name the buckets to reopen, sorted")
+		}
+		var list []controlBucket
+		var needs []bucketNeed
+		for i, id := range c.Buckets {
+			raw, err := strictB64(id, 32)
+			if err != nil || len(raw) != 32 || i > 0 && c.Buckets[i-1] == id {
+				return nil, nil, errBad("invalid bucket id")
+			}
+			row, err := q.Bucket(ctx, raw)
+			if err != nil {
+				return nil, nil, mapNotFound(err)
+			}
+			users, err := s.liveUsers(ctx, q, row)
+			if err != nil {
+				return nil, nil, err
+			}
+			list = append(list, controlBucket{id, row.Label})
+			needs = append(needs, s.need(row, users...))
+		}
+		fields["buckets"] = list
+		return fields, needs, nil
+	case "rekey":
+		if len(c.Buckets) > 0 || c.Scope == "" {
+			return nil, nil, errBad("name the scope to rekey")
+		}
+		if _, err := q.Scope(ctx, c.Scope); err != nil {
+			return nil, nil, errConflict("this scope has no key")
+		}
+		rows, err := q.ScopeBuckets(ctx, c.Scope)
+		if err != nil {
+			return nil, nil, err
+		}
+		fields["scope"], fields["scope_title"], fields["bucket_count"] = c.Scope, scopeName(ctx, q, c.Scope), len(rows)
+		var needs []bucketNeed
+		for _, row := range rows {
+			needs = append(needs, s.need(row))
+		}
+		return fields, needs, nil
+	case "activate":
+		// STAGE-AGENT: activation of a staged format-2 store (plain signature, no open).
+		if s.seal.mode != modeSetup {
+			return nil, nil, errConflict("nothing is staged to activate")
+		}
+		return nil, nil, errConflict(errStage("activation").Error())
 	}
-	b, err := json.Marshal(fields)
-	return string(b), err
+	return nil, nil, errBad("invalid seal action")
 }
-func (s *Server) sealControlBegin(w http.ResponseWriter, r *http.Request, sess string) {
-	var in struct {
-		Action string `json:"action"`
+
+func (s *Server) controlCanonical(fields map[string]any, action, nonce, at string) (string, error) {
+	m := map[string]any{"v": 3, "object": "seal-control", "action": action, "id": encodeID(s.seal.installation[:]), "epoch": s.seal.opens.Epoch(), "nonce": nonce, "issued_at": at}
+	for k, v := range fields {
+		m[k] = v
 	}
+	return reviewJSON(m)
+}
+
+func (s *Server) sealControlBegin(ctx context.Context, r *http.Request, sess string) (any, error) {
+	var in controlChoice
 	if err := decode(r, &in); err != nil {
-		s.writeErr(w, r, err)
-		return
+		return nil, err
 	}
-	ctx := r.Context()
-	now := s.now()
-	text, err := s.controlCanonical(ctx, sess, in.Action, canon.NewNonce(), now.UTC().Format(time.RFC3339))
+	q := s.store.Q()
+	fields, needs, err := s.controlPlan(ctx, q, in, s.seal.pool.count())
 	if err != nil {
-		s.writeErr(w, r, err)
-		return
+		return nil, err
 	}
-	o, err := s.loadOwner(ctx)
+	text, err := s.controlCanonical(fields, in.Action, canon.NewNonce(), s.now().UTC().Format(time.RFC3339))
 	if err != nil {
-		s.writeErr(w, r, err)
-		return
+		return nil, err
 	}
-	opts, err := s.requestOptions(o, canon.Challenge(text))
-	if err != nil {
-		s.writeErr(w, r, err)
-		return
+	if in.Action == "rekey" && len(needs) == 0 {
+		// A scope without buckets still needs its key opened to rekey it.
+		o, err := s.loadOwner(ctx)
+		if err != nil {
+			return nil, err
+		}
+		t, challenge, err := s.offerScopes(ctx, sess, text, nil, []string{in.Scope}, o)
+		if err != nil {
+			return nil, err
+		}
+		opts, err := s.requestOptions(o, challenge)
+		if err != nil {
+			return nil, err
+		}
+		opts.Extensions = t.ext
+		id, err := s.storeChallenge(ctx, sess, "seal-control", in.Action, text, t)
+		if err != nil {
+			return nil, err
+		}
+		return api.ChallengeResponse{ChallengeID: id, Canonical: text, PublicKey: opts, Open: t.offer()}, nil
 	}
-	c := &store.Challenge{ID: ids.New(), Purpose: "action", ObjectType: "seal-control", ObjectID: in.Action, Canonical: text, SessionHash: sess, CreatedAt: now, ExpiresAt: now.Add(ChallengeTTL)}
-	if err = s.store.Q().InsertChallenge(ctx, c); err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	writeJSON(w, 200, api.ChallengeResponse{ChallengeID: c.ID, Canonical: text, PublicKey: opts})
+	return s.beginTap(ctx, sess, "seal-control", in.Action, text, needs, nil)
 }
-func (s *Server) sealControlFinish(w http.ResponseWriter, r *http.Request, sess string) {
-	ctx := r.Context()
+
+func (s *Server) sealControlFinish(ctx context.Context, r *http.Request, sess string) (any, error) {
 	var in api.DecideRequest
 	if err := decode(r, &in); err != nil {
-		s.writeErr(w, r, err)
-		return
+		return nil, err
 	}
 	c, err := s.consume(ctx, in.ChallengeID, "action", s.now())
 	if err != nil || c.SessionHash != sess || c.ObjectType != "seal-control" {
-		s.writeErr(w, r, errConflict("stale seal action"))
-		return
+		if err == nil && s.seal != nil {
+			s.seal.taps.take(c.ID)
+		}
+		return nil, errConflict("stale seal action")
 	}
 	var meta struct {
-		Nonce string
-		At    string `json:"issued_at"`
+		Action  string
+		Nonce   string
+		At      string          `json:"issued_at"`
+		Count   int             `json:"open_buckets"`
+		Buckets []controlBucket `json:"buckets"`
+		Scope   string          `json:"scope"`
 	}
-	if json.Unmarshal([]byte(c.Canonical), &meta) != nil {
-		s.writeErr(w, r, errBad("bad seal action"))
-		return
+	if json.Unmarshal([]byte(c.Canonical), &meta) != nil || meta.Action != c.ObjectID {
+		s.seal.taps.take(c.ID)
+		return nil, errBad("bad seal action")
 	}
-	expected, err := s.controlCanonical(ctx, sess, c.ObjectID, meta.Nonce, meta.At)
-	if err != nil || expected != c.Canonical {
-		s.writeErr(w, r, errConflict("seal state changed"))
-		return
+	choice := controlChoice{Action: meta.Action, Scope: meta.Scope}
+	for _, b := range meta.Buckets {
+		choice.Buckets = append(choice.Buckets, b.ID)
 	}
-	row, err := s.verifyAssertion(ctx, canon.Challenge(expected), in.Assertion)
+	q := s.store.Q()
+	fields, _, err := s.controlPlan(ctx, q, choice, meta.Count)
+	if err == nil {
+		var expected string
+		expected, err = s.controlCanonical(fields, meta.Action, meta.Nonce, meta.At)
+		if err == nil && expected != c.Canonical {
+			err = errConflict("seal state changed; review again")
+		}
+	}
 	if err != nil {
-		s.writeErr(w, r, err)
-		return
+		s.seal.taps.take(c.ID)
+		return nil, err
 	}
-	if c.ObjectID == "activate" {
-		// When the maintenance runner drives the import it verifies this signature against
-		// its pins before it finishes. Refuse an unpinned passkey here, while that is still
-		// only an error message and not a half-finished sealing.
-		if _, installed := s.runnerStatus(); installed {
-			err = s.pinnedFor(ctx, row)
+	if meta.Action == "rekey" {
+		return s.rekey(ctx, sess, c, in)
+	}
+	row, settle, err := s.verifyTap(ctx, sess, c.ID, c.Canonical, in.Assertion, in.Open)
+	if err != nil {
+		return nil, err
+	}
+	restart := false
+	err = s.store.Tx(ctx, func(q *store.Q) error {
+		if err := s.sealOwner(ctx, q, sess, row); err != nil {
+			return err
 		}
-		if err == nil {
-			err = s.activateSeal(ctx, sess, row, c.Canonical, in.Assertion)
-		}
-	} else if c.ObjectID == "renew-leaf" {
-		err = s.withLease(ctx, func(ctx context.Context) error {
-			return s.store.Tx(ctx, func(q *store.Q) error {
-				if err := s.sealOwner(ctx, q, sess, row); err != nil {
-					return err
-				}
-				p, err := s.signer(ctx, "internal-ca")
-				if err != nil {
-					return err
-				}
-				if err = p.RenewLeaf(s.cfg.TLSSANs); err != nil {
-					return err
-				}
-				return q.Audit(ctx, s.now(), "owner", "renew_tls_leaf", "seal", expected)
-			})
-		})
-	} else {
-		err = s.store.Tx(ctx, func(q *store.Q) error {
-			if err := s.sealOwner(ctx, q, sess, row); err != nil {
+		switch meta.Action {
+		case "renew-leaf":
+			if err := s.withCA(ctx, q, seal.RoleInternalCA, func(p *pki.PKI) error { return p.RenewLeaf(s.cfg.TLSSANs) }); err != nil {
 				return err
 			}
-			return q.Audit(ctx, s.now(), "owner", "seal_lock", "seal", fmt.Sprintf("passkey=%d canonical=%s", row, expected))
-		})
-		if err == nil {
-			s.seal.gate.Drain()
-			s.seal.attempts.Close()
+			restart = true
+			return q.Audit(ctx, s.now(), "owner", "renew_tls_leaf", "seal", c.Canonical)
+		case "reopen":
+			return q.Audit(ctx, s.now(), "owner", "seal_reopen", "seal", fmt.Sprintf("passkey=%d canonical=%s", row, c.Canonical))
+		case "close-all":
+			return q.Audit(ctx, s.now(), "owner", "seal_close_all", "seal", fmt.Sprintf("passkey=%d canonical=%s", row, c.Canonical))
 		}
-	}
+		return errBad("invalid seal action")
+	})
+	settle(err == nil)
 	if err != nil {
-		s.writeErr(w, r, err)
-		return
+		return nil, err
 	}
-	writeJSON(w, 200, api.OK{OK: true})
-	s.stopSealed()
+	switch meta.Action {
+	case "close-all":
+		s.closeAll()
+		s.log.Info("every bucket closed by the owner")
+	case "reopen":
+		s.reconcileHolds(ctx)
+	}
+	s.bcast.notify()
+	if restart {
+		defer s.stopSealed()
+	}
+	return api.OK{OK: true}, nil
 }
 
-func (s *Server) activateSeal(ctx context.Context, sess string, row int64, canonical string, assertion []byte) error {
-	if s.configPath != "" {
-		current, err := config.Load(s.configPath)
-		if err != nil || !reflect.DeepEqual(s.cfg, current) {
-			return errConflict("configuration changed during seal review")
-		}
-	}
+// closeAll wipes every open bucket and hold and ends every window (§5). It is
+// also the hook for the planned bastion-SSH approval.
+func (s *Server) closeAll() {
 	z := s.seal
-	st := z.stage
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.activated || !st.wrap.Tested || sess != st.session {
-		return errConflict("staging no longer available")
+	z.windows.Lock()
+	clear(z.windows.active)
+	z.windows.Unlock()
+	z.taps.clear()
+	z.opens.Invalidate()
+	z.capabilities.wipe()
+	z.pool.closeAll()
+}
+
+// rekey replaces a scope key and every bucket key of the scope, re-encrypts
+// every record, drops drafts, closes the scope's open buckets and keeps only
+// the tapping passkey's wrap (§7).
+func (s *Server) rekey(ctx context.Context, sess string, c *store.Challenge, in api.DecideRequest) (any, error) {
+	z := s.seal
+	t := z.taps.take(c.ID)
+	if t == nil || t.session != sess || !s.now().Before(t.expires) || len(t.scopes) != 1 {
+		return nil, errConflict("stale approval; review again")
 	}
-	m, err := z.inv.Manifest([]seal.WrappedCredential{st.wrap})
+	scope := t.scopes[0]
+	challenge := seal.OpenChallenge([]byte(c.Canonical), []byte(t.descriptor))
+	row, err := s.verifySelected(ctx, challenge, in.Assertion, nil, t.ext)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	manifest, _ := json.Marshal(m)
-	var fields struct{ Manifest string }
-	if json.Unmarshal([]byte(canonical), &fields) != nil || fields.Manifest != string(manifest) {
-		return errConflict("manifest changed")
+	if in.Open == nil {
+		return nil, &apiErr{423, "locked", "rekey must open the scope: use a passkey that can open it"}
 	}
-	proof, err := readSecretFile(filepath.Join(st.dir, "recovery.proof"), true)
-	h := sha256.Sum256(bytes.TrimSpace(proof))
-	if err != nil || subtle.ConstantTimeCompare(h[:], st.expectedProof[:]) != 1 {
-		return errConflict("matching offline recovery proof required")
+	keks, _, err := s.tapKEKs(ctx, t, sess, row, challenge, in.Open)
+	if err != nil {
+		return nil, err
 	}
-	if err = s.importSources(func(o seal.Object, b []byte) error {
-		r, err := z.inv.Record(o.Role)
+	defer destroyKeys(keks)
+	olds, err := s.unwrapScopes(ctx, row, t.scopes, keks)
+	if err != nil {
+		return nil, err
+	}
+	defer destroyKeys(olds)
+	z.scopeMu.Lock()
+	defer z.scopeMu.Unlock()
+	newScope, pubS, err := seal.NewKeyPair()
+	if err != nil {
+		return nil, err
+	}
+	defer newScope.Destroy()
+	var ids []seal.ID
+	var count int
+	err = s.store.Tx(ctx, func(q *store.Q) error {
+		if err := s.sealOwner(ctx, q, sess, row); err != nil {
+			return err
+		}
+		old, err := q.Scope(ctx, scope)
 		if err != nil {
 			return err
 		}
-		o.Blob = r.Blob
-		if o != r.Object {
-			return errConflict("source binding changed")
+		rows, err := q.ScopeBuckets(ctx, scope)
+		if err != nil {
+			return err
 		}
-		prev, err := o.Decrypt(z.inv.Generation, st.mk, r.Envelope)
-		defer clear(prev)
-		if err != nil || !bytes.Equal(prev, b) {
-			return errConflict("source changed; restart setup")
+		for _, b := range rows {
+			if err := s.rekeyBucket(ctx, q, b, olds[0], old.Public, pubS); err != nil {
+				return err
+			}
+			ids = append(ids, bucketSealID(b))
 		}
-		return nil
-	}); err != nil {
-		return err
+		count = len(rows)
+		rec, err := seal.Scope{Installation: z.installation, Name: scope, Public: pubS}.RecoveryWrap(z.recipient, newScope)
+		if err != nil {
+			return err
+		}
+		if err = q.ReplaceScope(ctx, store.ScopeRow{Scope: scope, Public: pubS, Recovery: rec}); err != nil {
+			return err
+		}
+		sw, err := q.ScopeWrap(ctx, row, scope)
+		if err != nil {
+			return err
+		}
+		w, err := s.passkeyScope(sw).Wrap(keks[0], newScope, pubS)
+		if err != nil {
+			return err
+		}
+		if err = q.PutScopeWrap(ctx, store.ScopeWrapRow{Passkey: row, Scope: scope, Salt: sw.Salt, Wrap: w, Created: s.now()}); err != nil {
+			return err
+		}
+		if err = q.MarkScopeWrapTested(ctx, sw.ID, s.now()); err != nil {
+			return err
+		}
+		if err = q.DeleteScopeWraps(ctx, scope, row); err != nil {
+			return err
+		}
+		if err = q.DropScopeDrafts(ctx, scope); err != nil {
+			return err
+		}
+		return q.Audit(ctx, s.now(), "owner", "seal_rekey", "scope:"+scope, fmt.Sprintf("passkey=%d buckets=%d canonical=%s", row, len(rows), c.Canonical))
+	})
+	if err != nil {
+		return nil, err
 	}
-	blob, _ := json.Marshal(z.inv)
-	tx, err := s.store.DB().BeginTx(ctx, nil)
+	z.pool.evict(ids...)
+	_ = s.store.CheckpointWAL(ctx)
+	s.bcast.notify()
+	s.notify.Send("aqmas: rekey", fmt.Sprintf("Scope %s rekeyed: %d bucket(s); other passkeys must be enabled again", scope, count), s.cfg.PublicBaseURL+"/")
+	return map[string]any{"ok": true, "buckets": count}, nil
+}
+
+// rekeyBucket gives one bucket a new key pair under the new scope key and
+// re-encrypts its records. Old keys are wiped before returning.
+func (s *Server) rekeyBucket(ctx context.Context, q *store.Q, row store.BucketRow, oldScope *seal.Key, oldScopePub, newScopePub []byte) error {
+	b := s.sealBucket(row)
+	oldKey, err := b.UnwrapWith(oldScope, oldScopePub, row.Wrap)
+	if err != nil {
+		return errForbidden(row.Label + " did not open; nothing was changed")
+	}
+	defer oldKey.Destroy()
+	newKey, pub, err := seal.NewKeyPair()
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	var ok int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM web_sessions w JOIN passkey_people login ON login.passkey_id=w.passkey_id JOIN people p ON p.id=login.person_id AND p.owner=1 JOIN passkey_people signing ON signing.passkey_id=? AND signing.person_id=p.id JOIN passkeys wrap ON wrap.id=? AND wrap.credential_id=? JOIN passkey_people bound ON bound.passkey_id=wrap.id AND bound.person_id=p.id WHERE w.hash=? AND w.access_sub=? AND w.expires_at>?`, row, st.wrap.Passkey, st.wrap.RawID, sess, accessSub(ctx), s.now().UnixMilli()).Scan(&ok)
-	if errors.Is(err, sql.ErrNoRows) {
-		return errConflict("owner or tested credential changed")
-	}
+	defer newKey.Destroy()
+	nb := b
+	nb.Public = pub
+	wrap, err := nb.WrapTo(newScopePub, newKey)
 	if err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, sealDDL); err != nil {
-		return err
+	reseal := func(role string, fields [][]byte, rec []byte) ([]byte, error) {
+		p, err := b.Open(oldKey, role, fields, rec)
+		if err != nil {
+			return nil, errConflict(row.Label + ": a record failed authentication; nothing was changed")
+		}
+		defer clear(p)
+		return nb.Seal(role, fields, p)
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO seal_active VALUES(1,?,?,?,?)`, string(manifest), blob, canonical, assertion); err != nil {
-		return err
+	var payload []byte
+	switch row.Kind {
+	case seal.RoleSSHCA, seal.RoleInternalCA:
+		if payload, err = reseal(row.Kind, nil, row.Payload); err != nil {
+			return err
+		}
+	case seal.RoleCFProxy:
+		if payload, err = reseal(row.Kind, s.cfRecordFields(row), row.Payload); err != nil {
+			return err
+		}
+	case "env-set":
+		rev, err := q.SetRevision(ctx, row.Ref)
+		if err != nil {
+			return err
+		}
+		if rev > 0 {
+			cur, err := q.EnvCipher(ctx, row.Ref, rev)
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(cur.Wrap, row.ID) {
+				return errConflict(row.Label + ": revision is not sealed to its bucket")
+			}
+			recs, err := parseRecords(cur.Payload, true)
+			if err != nil {
+				return err
+			}
+			for i, r := range recs {
+				id, err1 := strictB64(r.I, 32)
+				c, err2 := strictB64(r.C, 8192+81+16)
+				if err1 != nil || err2 != nil {
+					return errConflict("damaged env record")
+				}
+				n, err := reseal(seal.RoleEnvEntry, entryFields(row.Ref, id, r.N), c)
+				if err != nil {
+					return err
+				}
+				recs[i].C = encodeID(n)
+			}
+			body, err := recordsJSON(recs)
+			if err != nil {
+				return err
+			}
+			if err = q.RekeyEnv(ctx, row.Ref, rev, body, row.ID); err != nil {
+				return err
+			}
+		}
+	case "signer":
+		scheme, public, rec, err := q.SignerKey(ctx, row.Ref)
+		if err != nil {
+			return err
+		}
+		n, err := reseal(seal.RoleSignerKey, signerFields(store.VaultTarget{SetID: row.Ref, Scheme: scheme, PublicKey: public}), rec.Payload)
+		if err != nil {
+			return err
+		}
+		if err = q.RekeySigner(ctx, row.Ref, n, row.ID); err != nil {
+			return err
+		}
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO seal_wraps VALUES(?,?,?,?,?)`, st.wrap.Passkey, st.wrap.Salt[:], st.wrap.Wrapped, st.wrap.Version, s.now().UnixMilli()); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM challenges; DELETE FROM enroll_codes; PRAGMA user_version=8`); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO audit(at,actor,action,object,detail) VALUES(?,'owner','seal_activate','seal',?)`, s.now().UnixMilli(), fmt.Sprintf("passkey=%d manifest=%s", row, seal.Digest(manifest))); err != nil {
-		return err
-	}
-	if err = tx.Commit(); err != nil {
-		return err
-	}
-	st.activated = true
-	return nil
+	return q.UpdateBucket(ctx, row.ID, pub, wrap, payload)
 }

@@ -389,13 +389,29 @@ type ChallengeRequest struct {
 // browser can pass it to navigator.credentials.get after base64url decoding, plus the exact
 // canonical action text the challenge commits to (shown to the owner).
 type ChallengeResponse struct {
-	ChallengeID string `json:"challenge_id"`
-	Canonical   string `json:"canonical"`
-	PublicKey   any    `json:"public_key"`
+	ChallengeID string     `json:"challenge_id"`
+	Canonical   string     `json:"canonical"`
+	PublicKey   any        `json:"public_key"`
+	Open        *OpenOffer `json:"open,omitempty"`
+}
+
+// OpenOffer is the bucket-open descriptor of an approval tap (docs/BUCKETS.md
+// §4.2): canonical JSON the page verifies, shows and binds into the challenge.
+type OpenOffer struct {
+	Descriptor string `json:"descriptor"`
+}
+
+// OpenPacket carries the passkey's key-encryption keys, HPKE-sealed by the page
+// to the descriptor's recipient (docs/BUCKETS.md §4.3). Unpadded base64url.
+type OpenPacket struct {
+	AttemptID  string `json:"attempt_id"`
+	Enc        string `json:"enc"`
+	Ciphertext string `json:"ciphertext"`
 }
 
 // DecideRequest carries the assertion for a previously issued challenge.
 type DecideRequest struct {
 	ChallengeID string          `json:"challenge_id"`
 	Assertion   json.RawMessage `json:"assertion"` // PublicKeyCredential JSON from the browser
+	Open        *OpenPacket     `json:"open,omitempty"`
 }

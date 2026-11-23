@@ -66,11 +66,11 @@ func SetupFacts(dataDir string) (maint.Facts, error) {
 	if err = rows.Err(); err != nil {
 		return f, err
 	}
-	if f.Schema == 8 {
+	if f.Schema == 8 || f.Schema == store.SchemaBuckets {
 		// The manifest and the owner's signed activation, for root to verify against its pins.
 		var m string
 		var assertion []byte
-		if err = db.QueryRow(`SELECT manifest, canonical, assertion FROM seal_active WHERE singleton=1 AND length(manifest)<=32768 AND length(canonical)<=65536 AND length(assertion)<=16384`).Scan(&m, &f.Activation, &assertion); err != nil {
+		if err = db.QueryRow(`SELECT manifest, canonical, assertion FROM seal_active WHERE singleton=1 AND length(manifest)<=1048576 AND length(canonical)<=65536 AND length(assertion)<=16384`).Scan(&m, &f.Activation, &assertion); err != nil {
 			return f, err
 		}
 		sum := sha256.Sum256([]byte(m))
@@ -170,7 +170,6 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 	}
 	scoped := q.Scoped()
 	sealed := s.seal != nil && !s.sealSetup
-	locked := sealed && s.isLocked()
 	s.updates.RLock()
 	candidate := s.updates.view.Error == "" && s.updates.view.Candidate.Valid()
 	s.updates.RUnlock()
@@ -218,10 +217,6 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 			case v.Mode != "serve" || st.Current != nil:
 				if t.State != "done" {
 					t.State, t.Blocked = "blocked", "Another task is in progress."
-				}
-			case locked:
-				if t.State != "done" {
-					t.State, t.Blocked = "blocked", "Unlock the broker first."
 				}
 			}
 		}
@@ -454,10 +449,6 @@ func (s *Server) setupChallenge(w http.ResponseWriter, r *http.Request, sess str
 		s.writeErr(w, r, err)
 		return
 	}
-	if !s.authorisedWork(ctx) {
-		s.writeErr(w, r, lockedErr())
-		return
-	}
 	params, typed, err := s.setupParams(ctx, task, in.Params)
 	if err != nil {
 		s.writeErr(w, r, err)
@@ -507,15 +498,12 @@ func (s *Server) setupRun(w http.ResponseWriter, r *http.Request, sess string) {
 		s.writeErr(w, r, err)
 		return
 	}
-	sg, pkID, err := s.verifyAction(ctx, sess, canon.ObjectSetup, task, in.ChallengeID, in.Assertion)
+	sg, pkID, settle, err := s.verifyAction(ctx, sess, canon.ObjectSetup, task, in.ChallengeID, in.Assertion, nil)
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
 	}
-	if !s.authorisedWork(ctx) {
-		s.writeErr(w, r, lockedErr())
-		return
-	}
+	settle(false)
 	if err = s.setupRunnable(ctx, sess, task); err != nil {
 		s.writeErr(w, r, err)
 		return

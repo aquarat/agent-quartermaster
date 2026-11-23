@@ -84,6 +84,7 @@ func (s *Server) batchBegin(ctx context.Context, r *http.Request, sess string) (
 	slices.SortFunc(in.Items, func(a, b ordinaryChoice) int { return strings.Compare(a.ID, b.ID) })
 	var org, title string
 	items := []string{}
+	var needs []bucketNeed
 	err := s.store.Tx(ctx, func(q *store.Q) error {
 		pk, err := q.SessionPasskeyID(ctx, sess)
 		if err != nil {
@@ -98,6 +99,11 @@ func (s *Server) batchBegin(ctx context.Context, r *http.Request, sess string) (
 				return errBad("duplicate or mixed-organisation selection")
 			}
 			org, title = a.OrgID, a.OrgTitle
+			n, err := s.decisionNeeds(ctx, q, a)
+			if err != nil {
+				return err
+			}
+			needs = append(needs, n...)
 			text, err := canon.Build(a, canon.NewNonce(), s.now())
 			if err != nil {
 				return err
@@ -119,17 +125,19 @@ func (s *Server) batchBegin(ctx context.Context, r *http.Request, sess string) (
 	if err != nil || len(text) > 32<<10 {
 		return nil, errBad("batch exceeds 32 KiB; split it")
 	}
-	return s.beginReview(ctx, sess, "batch", "decide", text, nil)
+	// The union of the items' buckets: at most two scopes in one tap.
+	return s.beginTap(ctx, sess, "batch", "decide", text, needs, nil)
 }
 func (s *Server) batchFinish(ctx context.Context, r *http.Request, sess string) (any, error) {
 	var in api.DecideRequest
 	if err := decode(r, &in); err != nil {
 		return nil, err
 	}
-	c, pk, err := s.takeReview(ctx, sess, "batch", in)
+	c, pk, settle, err := s.takeReview(ctx, sess, "batch", in)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { settle(err == nil) }()
 	var b struct {
 		ID, Items           string
 		Count               int
@@ -137,9 +145,10 @@ func (s *Server) batchFinish(ctx context.Context, r *http.Request, sess string) 
 		Org                 string `json:"org_id"`
 	}
 	var items []string
-	epoch := s.seal.attempts.Epoch()
-	if json.Unmarshal([]byte(c.Canonical), &b) != nil || b.Epoch != encodeID(epoch[:]) || b.Installation != encodeID(s.seal.inv.Installation[:]) || json.Unmarshal([]byte(b.Items), &items) != nil || len(items) != b.Count || b.Count < 1 || b.Count > 10 {
-		return nil, errConflict("stale batch")
+	epoch := s.seal.opens.Epoch()
+	if json.Unmarshal([]byte(c.Canonical), &b) != nil || b.Epoch != encodeID(epoch[:]) || b.Installation != encodeID(s.seal.installation[:]) || json.Unmarshal([]byte(b.Items), &items) != nil || len(items) != b.Count || b.Count < 1 || b.Count > 10 {
+		err = errConflict("stale batch")
+		return nil, err
 	}
 	err = s.store.Tx(ctx, func(q *store.Q) error {
 		if err := s.sealOwner(ctx, q, sess, pk); err != nil {

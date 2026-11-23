@@ -134,17 +134,18 @@ func New(o Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	sealed, err := sealBoot(cfg, st, o.SealSetup)
+	mode, err := sealBoot(cfg, st, o.SealSetup)
 	if err != nil {
 		st.Close()
 		return nil, err
 	}
+	sealed := mode == modeBuckets || mode == modeMigration
 	var p *pki.PKI
 	if sealed || o.SealSetup {
 		p, err = pki.LoadPublic(CADir(cfg.DataDir))
 		if err == nil && !o.SealSetup {
 			if leafErr := p.LoadLeaf(cfg.TLSSANs); leafErr != nil {
-				o.Logger.Error("agent TLS leaf unavailable: agent listener disabled; unlock remains reachable")
+				o.Logger.Error("agent TLS leaf unavailable: agent listener disabled; the web page remains reachable")
 			}
 		}
 	} else {
@@ -218,11 +219,13 @@ func New(o Options) (*Server, error) {
 		return nil, err
 	}
 	if sealed {
-		if err = s.loadSeal(); err != nil {
+		if err = s.loadSeal(mode); err == nil {
+			err = s.setupSealedNotices()
+		}
+		if err != nil {
 			st.Close()
 			return nil, err
 		}
-		s.setupSealedNotices(o.HTTPClient)
 	}
 	if o.SealSetup {
 		s.notify = &notify.Notifier{}
@@ -239,13 +242,10 @@ func New(o Options) (*Server, error) {
 // Close releases the store.
 func (s *Server) Close() error {
 	if z := s.seal; z != nil {
-		z.attempts.Close()
-		if z.gate != nil {
-			z.gate.Drain()
-		}
-		if z.stage != nil {
-			z.stage.mk.Destroy()
-		}
+		z.opens.Close()
+		z.taps.clear()
+		z.capabilities.wipe()
+		z.pool.closeAll()
 	}
 	return s.store.Close()
 }
@@ -334,7 +334,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	select {
 	case <-lockStop:
-		err = errors.New("broker relocking; restart required")
+		err = errors.New("broker restarting (agent TLS leaf renewed)")
 	case <-ctx.Done():
 	case err = <-errc:
 	}
@@ -356,10 +356,11 @@ func (s *Server) sweeper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if s.seal != nil && s.seal.stage == nil {
+			if s.sealServing() {
 				if err := s.store.Q().SweepEnv(ctx, s.now()); err != nil {
 					s.log.Warn("env expiry sweep failed")
 				}
+				s.reconcileHolds(ctx)
 			}
 			n, err := s.store.Q().ExpireStale(ctx, s.now())
 			if err != nil {
@@ -367,11 +368,7 @@ func (s *Server) sweeper(ctx context.Context) {
 			} else if n > 0 {
 				s.bcast.notify()
 			}
-			s.optionalLease(ctx, func(ctx context.Context) {
-				if s.authorisedWork(ctx) {
-					s.cfSweep(ctx)
-				}
-			})
+			s.cfSweep(ctx)
 		}
 	}
 }

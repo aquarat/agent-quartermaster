@@ -2,89 +2,131 @@ package server
 
 import (
 	"context"
-	"crypto/hpke"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
-	"time"
 
-	"github.com/aquarat/agent-quartermaster/internal/maint"
 	"github.com/aquarat/agent-quartermaster/internal/server/config"
-	"github.com/aquarat/agent-quartermaster/internal/server/notify"
 	"github.com/aquarat/agent-quartermaster/internal/server/pki"
 	"github.com/aquarat/agent-quartermaster/internal/server/seal"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
 )
 
-const sealDDL = `CREATE TABLE seal_active(singleton INTEGER PRIMARY KEY CHECK(singleton=1), manifest TEXT NOT NULL, inventory BLOB NOT NULL, canonical TEXT NOT NULL, assertion BLOB NOT NULL) STRICT;
-CREATE TABLE seal_wraps(passkey INTEGER PRIMARY KEY REFERENCES passkeys(id) ON DELETE CASCADE, salt BLOB NOT NULL UNIQUE CHECK(length(salt)=32), wrap BLOB NOT NULL CHECK(length(wrap)=73), generation INTEGER NOT NULL, tested_at INTEGER NOT NULL) STRICT;
-CREATE TRIGGER seal_keep_unlock BEFORE DELETE ON passkeys WHEN EXISTS(SELECT 1 FROM seal_wraps WHERE passkey=OLD.id) AND (SELECT count(*) FROM seal_wraps)<=1 BEGIN SELECT RAISE(ABORT,'last tested unlock credential'); END;`
+// Seal format 2 runtime (docs/BUCKETS.md). There is no global unlock: after a
+// start nothing is open; an approval tap opens exactly the buckets its signed
+// card lists and the pool keeps each only as long as its holds say.
+
+// sealActiveDDL is the root-pinned activation marker, shared by format 1
+// (schema 8) and format 2 (schema 9; inventory '{}').
+const sealActiveDDL = `CREATE TABLE IF NOT EXISTS seal_active(singleton INTEGER PRIMARY KEY CHECK(singleton=1), manifest TEXT NOT NULL, inventory BLOB NOT NULL, canonical TEXT NOT NULL, assertion BLOB NOT NULL) STRICT;`
+
+// Seal modes, as GET /api/ui/seal/status reports them.
+const (
+	modeBuckets   = "buckets"            // format 2, serving
+	modeMigration = "migration-required" // schema-8 format-1 store under this binary
+	modeSetup     = "setup"              // seal-import or bucket-migrate staging (STAGE-AGENT)
+)
+
+// Bucket refs (buckets.ref): the installation-wide CAs use caBucketRef; a
+// Cloudflare proxy parent, an env set and a signer use their credential set ID.
+const caBucketRef = "installation"
 
 type sealRuntime struct {
+	mode         string
+	installation seal.ID
+	recipient    string
+	opens        *seal.OpenAttempts // Epoch() is the boot epoch of every v3 canonical
+	pool         *bucketPool
+	taps         tapRegistry
 	windows      windowPool
 	vault        vaultPool
 	capabilities capabilityStages
-	delayed      atomic.Int64
-	inv          seal.Inventory
-	gate         *seal.Gate
-	attempts     *seal.Attempts
+	scopeMu      sync.Mutex // serialises scope creation, passkey wraps and rekey
 	stop         chan struct{}
 	once         sync.Once
-	stage        *sealStage
+	stage        *sealStage // STAGE-AGENT: seal-import / bucket-migrate staging
 }
 
-func (s *Server) setupSealedNotices(client *http.Client) {
-	if _, err := s.seal.inv.Record("ntfy-topic"); err != nil {
-		return
-	}
-	slots := make(chan struct{}, 4)
-	s.notify.Dispatch = func(title, text, clickURL string) {
-		if s.isLocked() {
-			s.seal.delayed.CompareAndSwap(0, s.now().UnixMilli())
-			return
-		}
-		select {
-		case slots <- struct{}{}:
-		default:
-			s.log.Warn("notification queue full")
-			return
-		}
-		go func() {
-			defer func() { <-slots }()
-			_ = s.withLease(context.Background(), func(ctx context.Context) error {
-				topic, err := s.secret(ctx, "ntfy-topic")
-				if err != nil {
-					return err
-				}
-				defer clear(topic)
-				n := notify.Notifier{TopicURL: string(topic), Client: client, Log: s.log}
-				n.Publish(ctx, title, text, clickURL)
-				return nil
-			})
-		}()
-	}
+// BucketManifest is the root-pinned format-2 activation manifest
+// (seal_active.manifest; its SHA-256 is config seal.manifest_sha256). The
+// scopes and buckets are those at activation: both change later (new
+// organisations, new sets, rekey), so boot checks only the fixed fields.
+type BucketManifest struct {
+	Format       int              `json:"seal_format"`
+	Installation seal.ID          `json:"installation"`
+	Recipient    string           `json:"offline_recipient"`
+	SSHCA        string           `json:"ssh_ca"`
+	InternalCA   string           `json:"internal_ca"`
+	Config       string           `json:"public_config_digest"`
+	Scopes       []ManifestScope  `json:"scopes"`
+	Buckets      []ManifestBucket `json:"buckets"`
+	Passkeys     []ManifestWrap   `json:"passkeys,omitempty"`
+	ApproveOnly  []string         `json:"approve_only,omitempty"`
 }
-func (s *Server) afterUnlock() {
-	if at := s.seal.delayed.Swap(0); at > 0 {
-		s.notify.Send("aqmas: delayed notifications", "Activity while locked since "+time.UnixMilli(at).UTC().Format(time.RFC3339)+"; review the queue and original activity times.", s.cfg.PublicBaseURL+"/")
-	}
-	s.publishLockStatus("unlocked")
+type ManifestScope struct {
+	Scope  string `json:"scope"`
+	Public string `json:"public_key"`
 }
+type ManifestBucket struct {
+	ID     string `json:"id"`
+	Scope  string `json:"scope"`
+	Kind   string `json:"kind"`
+	Ref    string `json:"ref"`
+	Public string `json:"public_key"`
+}
+type ManifestWrap struct {
+	Credential string `json:"credential_id"`
+	Scope      string `json:"scope"`
+	Salt       string `json:"salt"`
+	WrapSHA256 string `json:"wrap_sha256"`
+}
+
+func migrationErr() *apiErr {
+	return &apiErr{423, "locked", "migration required: this store is still sealed in format 1; move it to per-credential buckets in Admin → Setup"}
+}
+
+// bucketsReady is nil when buckets can be used at all (format 2 serving).
+func (s *Server) bucketsReady() error {
+	switch {
+	case s.seal == nil:
+		return errNotFound()
+	case s.seal.mode == modeMigration:
+		return migrationErr()
+	case s.seal.mode != modeBuckets:
+		return errConflict("staging in progress")
+	}
+	return nil
+}
+func (s *Server) sealServing() bool { return s.seal != nil && s.seal.mode == modeBuckets }
+
+// setupSealedNotices points approval notices at the topic in notice_channel:
+// readable with every bucket closed (docs/BUCKETS.md §9).
+func (s *Server) setupSealedNotices() error {
+	if s.seal.mode != modeBuckets {
+		return nil
+	}
+	topic, err := s.store.Q().NoticeTopic(context.Background())
+	if err != nil {
+		return err
+	}
+	s.notify.TopicURL = topic
+	return nil
+}
+
+// publishLockStatus tells the separate lock-alert service that this process
+// started with everything closed. Format 2 never publishes "unlocked".
 func (s *Server) publishLockStatus(state string) {
 	dir := os.Getenv("RUNTIME_DIRECTORY")
 	if dir == "" {
 		return
 	}
-	epoch := s.seal.attempts.Epoch()
+	epoch := s.seal.opens.Epoch()
 	f, err := os.CreateTemp(dir, ".status-*")
 	if err == nil {
 		defer os.Remove(f.Name())
@@ -104,37 +146,48 @@ func (s *Server) publishLockStatus(state string) {
 	}
 }
 
-func sealBoot(cfg *config.Config, st *store.Store, setup bool) (sealed bool, err error) {
-	var v, n int
-	if err = st.DB().QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
-		return
+// sealBoot decides the seal mode from the pin, the schema and the activation
+// marker before anything else is loaded: "" (unsealed), modeBuckets,
+// modeMigration or modeSetup.
+func sealBoot(cfg *config.Config, st *store.Store, setup bool) (string, error) {
+	var v, active, wraps, buckets int
+	db := st.DB()
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return "", err
 	}
-	if err = st.DB().QueryRow(`SELECT count(*) FROM sqlite_schema WHERE name IN ('seal_active','seal_wraps')`).Scan(&n); err != nil {
-		return
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE name='seal_active'`).Scan(&active); err != nil {
+		return "", err
 	}
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE name='seal_wraps'`).Scan(&wraps); err != nil {
+		return "", err
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE name='bucket_scopes'`).Scan(&buckets); err != nil {
+		return "", err
+	}
+	pinned := cfg.Seal.Required && len(cfg.Seal.Manifest) == 64 && cfg.Ntfy.TopicURL == ""
 	switch {
-	case setup && cfg.Seal.Required && v >= 6 && v <= 7 && n == 0:
-		return false, nil
-	case !setup && cfg.Seal.Required && len(cfg.Seal.Manifest) == 64 && v == 8 && n == 2 && cfg.Ntfy.TopicURL == "":
-		return true, nil
-	case !setup && !cfg.Seal.Required && v <= 7 && n == 0:
-		return false, nil
+	case setup && cfg.Seal.Required && v >= 6 && v <= 7 && active+wraps+buckets == 0:
+		return modeSetup, nil
+	case !setup && pinned && v == store.SchemaBuckets && active == 1 && buckets == 1 && wraps == 0:
+		return modeBuckets, nil
+	case !setup && pinned && v == 8 && active == 1 && wraps == 1 && buckets == 0:
+		return modeMigration, nil
+	case !setup && !cfg.Seal.Required && v <= 7 && active+wraps+buckets == 0:
+		return "", nil
 	}
-	return false, errors.New("seal pin, schema and activation marker disagree; supervised maintenance required")
+	return "", errors.New("seal pin, schema and activation marker disagree; supervised maintenance required")
 }
 
-func (s *Server) loadSeal() error {
+func (s *Server) retiredSources() error {
 	// Refuse to call an installation sealed while retired files or imported
 	// systemd credential copies remain. Never open a private CA to check this.
 	paths := []string{filepath.Join(CADir(s.cfg.DataDir), pki.ClientCAKeyFile), filepath.Join(CADir(s.cfg.DataDir), pki.SSHCAKeyFile)}
 	cf := s.cfg.Cloudflare
-	{
-		paths = append(paths, cf.ProxyTokenFile, cf.MinterTokenFile)
-		if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
-			for _, name := range []string{cf.ProxyTokenCredential, cf.MinterTokenCredential} {
-				if name != "" {
-					paths = append(paths, filepath.Join(dir, name))
-				}
+	paths = append(paths, cf.ProxyTokenFile, cf.MinterTokenFile)
+	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
+		for _, name := range []string{cf.ProxyTokenCredential, cf.MinterTokenCredential} {
+			if name != "" {
+				paths = append(paths, filepath.Join(dir, name))
 			}
 		}
 	}
@@ -145,73 +198,72 @@ func (s *Server) loadSeal() error {
 			}
 		}
 	}
-	var mText string
-	var b []byte
-	if err := s.store.DB().QueryRow(`SELECT manifest, inventory FROM seal_active WHERE singleton=1 AND length(manifest)<=32768 AND length(inventory)<=524288`).Scan(&mText, &b); err != nil {
+	return nil
+}
+
+func (s *Server) pinnedManifest() (string, error) {
+	var m string
+	if err := s.store.DB().QueryRow(`SELECT manifest FROM seal_active WHERE singleton=1 AND length(manifest)<=1048576`).Scan(&m); err != nil {
+		return "", err
+	}
+	if seal.Digest([]byte(m)) != s.cfg.Seal.Manifest {
+		return "", errors.New("seal: public activation pin mismatch")
+	}
+	return m, nil
+}
+
+func newSealRuntime(s *Server, mode string, installation seal.ID) *sealRuntime {
+	z := &sealRuntime{mode: mode, installation: installation, recipient: s.cfg.Seal.Recipient, opens: seal.NewOpenAttempts(s.now), pool: newBucketPool(s.now), stop: make(chan struct{})}
+	z.pool.onChange = func() { s.bcast.notify() }
+	return z
+}
+
+// loadSeal starts a pinned format-2 store, or a format-1 store in
+// migration-required mode (sign-in, queueing, deny/revoke and Setup only).
+func (s *Server) loadSeal(mode string) error {
+	if err := s.retiredSources(); err != nil {
 		return err
 	}
-	var m seal.Manifest
-	var i seal.Inventory
-	if seal.Digest([]byte(mText)) != s.cfg.Seal.Manifest || json.Unmarshal([]byte(mText), &m) != nil || m.Format != 1 || m.InventoryDigest != seal.Digest(b) || json.Unmarshal(b, &i) != nil || m.Generation != i.Generation || m.Recipient != s.cfg.Seal.Recipient || i.Recipient != m.Recipient || i.SSHCA != s.sshPin() || i.InternalCA != s.pki.CAPin() || i.ConfigHash != s.profileRevision {
-		return errors.New("seal: public activation pin mismatch")
-	}
-	g, err := seal.NewGate(i.Generation, i.Check)
+	text, err := s.pinnedManifest()
 	if err != nil {
 		return err
 	}
-	s.seal = &sealRuntime{inv: i, gate: g, attempts: seal.NewAttempts(s.now), stop: make(chan struct{})}
-	if err = s.store.InitWindows(context.Background()); err != nil {
-		return err
-	}
-	if err = s.store.InitEnv(context.Background()); err != nil {
-		return err
-	}
-	return s.store.InitVault(context.Background())
-}
-func (s *Server) isLocked() bool {
-	if s.seal == nil {
-		return false
-	}
-	if s.seal.stage != nil {
-		return true
-	}
-	ok, _ := s.seal.gate.Status()
-	return !ok
-}
-func (s *Server) stopSealed() { s.seal.once.Do(func() { close(s.seal.stop); s.bcast.notify() }) }
-
-type leaseKey struct{}
-
-// All secret-backed operations use a lease from the outer handler; a
-// long-poll obtains it only AFTER waiting. Re-entering never extends a lease.
-func (s *Server) withLease(ctx context.Context, op func(context.Context) error) error {
-	if s.seal == nil {
-		return op(ctx)
-	}
-	if s.seal.stage != nil {
-		return lockedErr()
-	}
-	return s.seal.gate.WithKey(ctx, func(ctx context.Context, mk *seal.Key) error { return op(context.WithValue(ctx, leaseKey{}, mk)) })
-}
-func lockedErr() *apiErr {
-	return &apiErr{423, "locked", "waiting for owner unlock; retry within the original deadline"}
-}
-func (s *Server) secret(ctx context.Context, role string) ([]byte, error) {
-	k, _ := ctx.Value(leaseKey{}).(*seal.Key)
-	if k == nil || ctx.Err() != nil {
-		return nil, lockedErr()
-	}
-	r, err := s.seal.inv.Record(role)
-	if err == nil {
-		var b []byte
-		b, err = r.Decrypt(s.seal.inv.Generation, k, r.Envelope)
-		if err == nil {
-			return b, nil
+	ctx := context.Background()
+	if mode == modeMigration {
+		var m seal.Manifest
+		if json.Unmarshal([]byte(text), &m) != nil || m.Format != 1 || m.Recipient != s.cfg.Seal.Recipient || m.SSHCA != s.sshPin() || m.InternalCA != s.pki.CAPin() || m.Installation == (seal.ID{}) {
+			return errors.New("seal: public activation pin mismatch")
 		}
+		s.seal = newSealRuntime(s, modeMigration, m.Installation)
+		// v0.4.1 created these; IF NOT EXISTS leaves its tables as they are.
+		for _, init := range []func(context.Context) error{s.store.InitWindows, s.store.InitEnv, s.store.InitVault} {
+			if err := init(ctx); err != nil {
+				return err
+			}
+		}
+		s.log.Warn("format-1 sealed store: migration required; only sign-in, queueing, deny/revoke and Setup are served")
+		return nil
 	}
-	s.stopSealed()
-	return nil, errors.New("sealed record failed authentication; broker restarting locked")
+	var m BucketManifest
+	if json.Unmarshal([]byte(text), &m) != nil || m.Format != 2 || m.Installation == (seal.ID{}) || m.Recipient != s.cfg.Seal.Recipient || m.SSHCA != s.sshPin() || m.InternalCA != s.pki.CAPin() || m.Config != s.profileRevision {
+		return errors.New("seal: public activation pin mismatch")
+	}
+	// Freed pages must not keep old wraps (§7). The signer-key trigger of
+	// format 1 also froze payload and wrap, which rekey re-encrypts.
+	if _, err = s.store.DB().ExecContext(ctx, `PRAGMA secure_delete=ON;`+store.BucketDDL+`DROP TRIGGER IF EXISTS signer_key_immutable;`); err != nil {
+		return err
+	}
+	s.seal = newSealRuntime(s, modeBuckets, m.Installation)
+	if err = s.store.InitWindows(ctx); err != nil {
+		return err
+	}
+	if err = s.store.InitEnv(ctx); err != nil {
+		return err
+	}
+	return s.store.InitVault(ctx)
 }
+
+func (s *Server) stopSealed() { s.seal.once.Do(func() { close(s.seal.stop); s.bcast.notify() }) }
 
 func encodeID(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 func strictB64(s string, max int) ([]byte, error) {
@@ -224,23 +276,8 @@ func strictB64(s string, max int) ([]byte, error) {
 	}
 	return b, nil
 }
-func (s *Server) loadWrap(ctx context.Context, pk *storedPasskey) (seal.WrappedCredential, error) {
-	w := seal.WrappedCredential{Credential: seal.Credential{Generation: s.seal.inv.Generation, RPID: s.rpID, RawID: pk.CredentialID}, Passkey: pk.ID}
-	var salt []byte
-	err := s.store.DB().QueryRowContext(ctx, `SELECT salt,wrap FROM seal_wraps WHERE passkey=? AND generation=?`, pk.ID, w.Version).Scan(&salt, &w.Wrapped)
-	if errors.Is(err, sql.ErrNoRows) {
-		return w, errNotFound()
-	}
-	if err != nil {
-		return w, err
-	}
-	if len(salt) != 32 {
-		return w, errors.New("invalid seal salt")
-	}
-	copy(w.Salt[:], salt)
-	w.Tested = true
-	return w, nil
-}
+func sha256Bytes(s string) []byte { h := sha256.Sum256([]byte(s)); return h[:] }
+func sha256Hex(b []byte) string   { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 
 // writeExclusive never overwrites an old operator artifact. No secret may
 // be passed here: only sealed recovery bundles and public transition pins.
@@ -260,139 +297,21 @@ func writeExclusive(path string, b []byte) error {
 	return err
 }
 
-type sealStage struct {
-	mu            sync.Mutex
-	mk            *seal.Key
-	dir           string
-	session       string
-	wrap          seal.WrappedCredential
-	registration  string
-	salts         map[int64]seal.ID
-	activated     bool
-	expectedProof [32]byte
-	drill         hpke.PrivateKey // receives the recovery identity for the on-box drill
-	drilled       bool
+// errStage marks what the staging build stage still has to provide.
+func errStage(what string) error {
+	return fmt.Errorf("%s is not implemented in this build stage", what)
 }
 
-func (s *Server) newStage() error {
-	if s.cfg.Seal.Manifest != "" {
-		return errors.New("begin staging with an empty manifest pin")
-	}
-	g := seal.Generation{Installation: seal.RandomID(), Version: 1}
-	mk, err := seal.RandomKey()
-	if err != nil {
-		return err
-	}
-	success := false
-	defer func() {
-		if !success {
-			mk.Destroy()
-		}
-	}()
-	i := seal.Inventory{Generation: g, Recipient: s.cfg.Seal.Recipient, ConfigHash: s.profileRevision, SSHCA: s.sshPin(), InternalCA: s.pki.CAPin()}
-	if i.Check, err = g.CheckRecord(mk); err != nil {
-		return err
-	}
-	if i.Recovery, err = g.RecoveryPacket(i.Recipient, mk); err != nil {
-		return err
-	}
-	if err = s.importSources(func(o seal.Object, b []byte) error { o.Blob = seal.RandomID(); return i.Add(mk, o, b) }); err != nil {
-		return err
-	}
-	proof, err := i.DrillProof(mk)
-	if err != nil {
-		return err
-	}
-	dir, err := os.MkdirTemp(s.cfg.DataDir, "seal-stage-")
-	if err != nil {
-		return err
-	}
-	b, err := json.Marshal(i)
-	if err != nil {
-		return err
-	}
-	if err = writeExclusive(filepath.Join(dir, "inventory.json"), b); err != nil {
-		return err
-	}
-	drill, err := maint.NewKey()
-	if err != nil {
-		return err
-	}
-	s.seal = &sealRuntime{inv: i, attempts: seal.NewAttempts(s.now), stop: make(chan struct{}), stage: &sealStage{mk: mk, dir: dir, expectedProof: sha256.Sum256([]byte(proof)), drill: drill}}
-	s.log.Info("sealed import fenced; compare bundle digest and recipient off-host and perform offline drill", "directory", dir, "inventory_sha256", seal.Digest(b), "installation", encodeID(g.Installation[:]), "recipient", i.Recipient)
-	success = true
-	return nil
-}
+// STAGE-AGENT: seal-import and bucket-migrate staging (docs/BUCKETS.md §8,
+// contract "Stage"). The format-1 staging (one MK, one wrap) was removed.
+type sealStage struct{}
 
-func (s *Server) importSources(visit func(seal.Object, []byte) error) error {
-	for _, it := range []struct{ role, file string }{{"ssh-ca", pki.SSHCAKeyFile}, {"internal-ca", pki.ClientCAKeyFile}} {
-		b, err := readSecretFile(filepath.Join(CADir(s.cfg.DataDir), it.file), true)
-		if err != nil {
-			return err
-		}
-		err = s.pki.CheckPrivate(it.role, b)
-		if err == nil {
-			err = visit(seal.Object{Role: it.role, Global: it.role, Revision: 1}, b)
-		}
-		clear(b)
-		if err != nil {
-			return err
-		}
-	}
-	if v := s.cfg.Ntfy.TopicURL; v != "" {
-		b := []byte(v)
-		err := visit(seal.Object{Role: "ntfy-topic", Global: "approval-notices", Revision: 1}, b)
-		clear(b)
-		if err != nil {
-			return err
-		}
-	}
-	cf := s.cfg.Cloudflare
-	if cf.Enabled {
-		var proxyHash [32]byte
-		for _, parent := range []struct{ role, kind, cred, file string }{{"cf-proxy", "cloudflare-proxy", cf.ProxyTokenCredential, cf.ProxyTokenFile}, {"cf-minter", "cloudflare-mint", cf.MinterTokenCredential, cf.MinterTokenFile}} {
-			if parent.cred == "" && parent.file == "" {
-				continue
-			}
-			o := seal.Object{Role: parent.role, Revision: 1, Issuer: cf.APIBase, Account: cf.AccountID, ParentVersion: 1}
-			if o.Issuer == "" {
-				o.Issuer = "https://api.cloudflare.com/client/v4"
-			}
-			if err := s.store.DB().QueryRow(`SELECT c.org_id,v.id,t.id FROM personal_cutover c JOIN services v ON v.org_id=c.org_id JOIN credential_sets t ON t.service_id=v.id WHERE t.kind=? AND v.slug='dns-cdn'`, parent.kind).Scan(&o.Org, &o.Service, &o.Set); err != nil {
-				return err
-			}
-			tok, err := loadParentToken(parent.role, parent.cred, parent.file)
-			if err != nil {
-				return err
-			}
-			b := []byte(tok)
-			digest := sha256.Sum256(b)
-			if parent.role == "cf-proxy" {
-				proxyHash = digest
-			} else if digest == proxyHash {
-				clear(b)
-				return errors.New("proxy and minter must have distinct parent credentials")
-			}
-			err = visit(o, b)
-			clear(b)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
+// STAGE-AGENT: build the format-2 stage (scope keys, buckets, records,
+// recovery wraps in memory) from the plaintext sources or the format-1 store.
+func (s *Server) newStage() error { return errStage("seal-import staging") }
 
-// RecoveryDrill is local-only: authenticate the separately recorded bundle
-// digest before attempting decryption. Its output only acknowledges the drill.
+// RecoveryDrill was the format-1 offline drill over an inventory bundle.
+// STAGE-AGENT: replace with `aqmasd seal-drill BACKUP.db RECIPIENT` (§10).
 func RecoveryDrill(b []byte, digest, recipient string, identity []byte) (string, error) {
-	h := sha256.Sum256(b)
-	if hex.EncodeToString(h[:]) != digest {
-		return "", errors.New("recovery bundle digest differs from owner record")
-	}
-	var inv seal.Inventory
-	if json.Unmarshal(b, &inv) != nil || inv.Recipient != recipient {
-		return "", fmt.Errorf("invalid recovery context")
-	}
-	return inv.OfflineProof(identity)
+	return "", errStage("the offline recovery drill")
 }

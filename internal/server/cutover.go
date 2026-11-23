@@ -17,6 +17,7 @@ import (
 	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
 	"github.com/aquarat/agent-quartermaster/internal/server/organisations"
+	"github.com/aquarat/agent-quartermaster/internal/server/store"
 )
 
 // Maintenance is an exclusive daemon mode, not a second process racing the
@@ -38,13 +39,13 @@ func (s *Server) lockService() (*os.File, error) {
 		return nil, errors.New("another broker holds the data directory; stop and drain it first")
 	}
 	var v int
-	if err := s.store.DB().QueryRow("PRAGMA user_version").Scan(&v); err != nil || v < 5 || v > 8 || (v == 8) != (s.seal != nil) || (v >= 6) != s.store.Q().Scoped() {
+	if err := s.store.DB().QueryRow("PRAGMA user_version").Scan(&v); err != nil || v < 5 || v > store.SchemaBuckets || (v >= 8) != (s.seal != nil && s.seal.mode != modeSetup) || (v >= 6) != s.store.Q().Scoped() {
 		f.Close()
 		return nil, errors.New("database changed during startup; restart the broker")
 	}
-	if v == 8 {
+	if v >= 8 {
 		var m string
-		if err := s.store.DB().QueryRow(`SELECT manifest FROM seal_active WHERE singleton=1 AND length(manifest)<=32768`).Scan(&m); err != nil || fmt.Sprintf("%x", sha256.Sum256([]byte(m))) != s.cfg.Seal.Manifest {
+		if err := s.store.DB().QueryRow(`SELECT manifest FROM seal_active WHERE singleton=1 AND length(manifest)<=1048576`).Scan(&m); err != nil || fmt.Sprintf("%x", sha256.Sum256([]byte(m))) != s.cfg.Seal.Manifest {
 			f.Close()
 			return nil, errors.New("activation pin changed during startup")
 		}

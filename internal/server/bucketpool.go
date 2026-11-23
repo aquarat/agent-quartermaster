@@ -26,8 +26,8 @@ type openBucket struct {
 	key     *seal.Key
 	users   int
 	closing bool // no holds left: no new use; wiped when the last use ends
-	holds  map[string]bucketHold
-	opened time.Time
+	holds   map[string]bucketHold
+	opened  time.Time
 }
 
 // bucketHold is one reason to keep a bucket open. Ref is "<kind>:<id>" and
@@ -115,12 +115,42 @@ func (p *bucketPool) use(id seal.ID, fn func(*seal.Key) error) error {
 		p.mu.Lock()
 		ob.users--
 		closed := p.reap(id, ob)
+		if p.open[id] != ob && ob.users == 0 && ob.key != nil {
+			ob.key.Destroy() // evicted while in use
+			ob.key = nil
+		}
 		p.mu.Unlock()
 		if closed {
 			p.changed()
 		}
 	}()
 	return fn(ob.key)
+}
+
+// evict closes these buckets at once, whatever their holds (rekey replaced
+// their keys). A use in flight keeps its key until it ends, then it is wiped;
+// a later open installs the new key.
+func (p *bucketPool) evict(ids ...seal.ID) {
+	p.mu.Lock()
+	closed := false
+	for _, id := range ids {
+		ob := p.open[id]
+		if ob == nil {
+			continue
+		}
+		delete(p.open, id)
+		clear(ob.holds)
+		ob.closing = true
+		if ob.users == 0 {
+			ob.key.Destroy()
+			ob.key = nil
+		}
+		closed = true
+	}
+	p.mu.Unlock()
+	if closed {
+		p.changed()
+	}
 }
 
 // reap wipes an idle bucket with no holds. Caller holds mu.

@@ -259,10 +259,11 @@ func (s *Server) windowPolicyFinish(ctx context.Context, r *http.Request, sess s
 	if err := decode(r, &in); err != nil {
 		return nil, err
 	}
-	c, pk, err := s.takeReview(ctx, sess, "window-policy", in)
+	c, pk, settle, err := s.takeReview(ctx, sess, "window-policy", in)
 	if err != nil {
 		return nil, err
 	}
+	settle(false)
 	var m struct{ ID, Old, New string }
 	if json.Unmarshal([]byte(c.Canonical), &m) != nil {
 		return nil, errBad("invalid policy")
@@ -341,7 +342,39 @@ func (s *Server) windowOpenBegin(ctx context.Context, r *http.Request, sess stri
 	m := s.reviewFields("window", "open", t.ID)
 	m["terms"], _ = reviewJSON(t)
 	text, _ := reviewJSON(m)
-	return s.beginReview(ctx, sess, "window", "open", text, pk)
+	needs, err := s.windowNeeds(ctx, s.store.Q(), t)
+	if err != nil {
+		return nil, err
+	}
+	return s.beginTap(ctx, sess, "window", "open", text, needs, pk)
+}
+
+// windowNeeds: the SSH CA if the window's sets include SSH, the org's
+// Cloudflare proxy parent if they include Cloudflare, held for the window's life.
+func (s *Server) windowNeeds(ctx context.Context, q *store.Q, t windowTerms) ([]bucketNeed, error) {
+	until := s.now().Add(secs(t.Duration))
+	hold := windowHold(t.ID, until)
+	var needs []bucketNeed
+	for _, r := range t.Rules {
+		var row store.BucketRow
+		var err error
+		switch r.Kind {
+		case "ssh-ca":
+			row, err = s.caRow(ctx, q, "ssh-ca")
+		case "cloudflare-proxy":
+			row, err = q.BucketByRef(ctx, "cf-proxy", r.Set)
+			if err != nil {
+				err = errConflict("the Cloudflare proxy parent has no bucket")
+			}
+		default:
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		needs = append(needs, bucketNeed{Bucket: row, Holds: []bucketHold{hold}})
+	}
+	return needs, nil
 }
 
 // stageWindow runs INSIDE the issuing transaction; publication is under the
@@ -392,13 +425,14 @@ func (s *Server) windowOpenFinish(ctx context.Context, r *http.Request, sess str
 	if err := decode(r, &in); err != nil {
 		return nil, err
 	}
-	c, pk, err := s.takeReview(ctx, sess, "window", in)
+	c, pk, settle, err := s.takeReview(ctx, sess, "window", in)
 	if err != nil {
 		return nil, err
 	}
 	var m struct{ Terms string }
 	var t windowTerms
 	if json.Unmarshal([]byte(c.Canonical), &m) != nil || json.Unmarshal([]byte(m.Terms), &t) != nil {
+		settle(false)
 		return nil, errBad("invalid window")
 	}
 	pool := &s.seal.windows
@@ -411,10 +445,25 @@ func (s *Server) windowOpenFinish(ctx context.Context, r *http.Request, sess str
 		return err
 	})
 	if err != nil {
+		settle(false)
 		return nil, err
 	}
 	pool.publish(w)
+	settle(true)
+	if s.seal.pool != nil {
+		// The hold ends with the window: never later than its own deadline.
+		for _, n := range mustNeeds(s.windowNeeds(ctx, s.store.Q(), t)) {
+			s.seal.pool.hold(bucketSealID(n.Bucket), windowHold(t.ID, w.absolute))
+		}
+	}
 	return rec, nil
+}
+
+func mustNeeds(n []bucketNeed, err error) []bucketNeed {
+	if err != nil {
+		return nil
+	}
+	return n
 }
 
 type windowClick struct {
@@ -497,6 +546,7 @@ func (s *Server) windowConfirm(ctx context.Context, r *http.Request, sess string
 	defer p.Unlock()
 	var who string
 	var applied *window
+	var approved canon.Action
 	err := s.store.Tx(ctx, func(q *store.Q) error {
 		w, err := s.liveWindow(ctx, q, sess, in)
 		if err != nil {
@@ -508,7 +558,7 @@ func (s *Server) windowConfirm(ctx context.Context, r *http.Request, sess string
 			return errConflict("stale proposal; review again")
 		}
 		sig, err := strictB64(in.Proof, 64)
-		hash := sha256.Sum256(windowMessage(s.seal.inv.Installation[:], in.ID, in.Proposal, canon.Challenge(v.canonical)))
+		hash := sha256.Sum256(windowMessage(s.seal.installation[:], in.ID, in.Proposal, canon.Challenge(v.canonical)))
 		if err != nil || len(sig) != 64 || !ecdsa.Verify(w.tab, hash[:], new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:])) {
 			return errForbidden("invalid tab proof")
 		}
@@ -523,12 +573,14 @@ func (s *Server) windowConfirm(ctx context.Context, r *http.Request, sess string
 		if !w.live(s.now()) {
 			return errConflict("window expired")
 		}
-		applied = w
+		applied, approved = w, sg.Action
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	// Approvals under a window add their own holds (a Cloudflare grant's).
+	s.addDecisionHolds(ctx, approved)
 	applied.idle = s.now().Add(secs(applied.terms.Idle))
 	s.bcast.notify()
 	s.notify.Send("aqmas: window decision", who, s.cfg.PublicBaseURL+"/")
@@ -566,7 +618,8 @@ func (s *Server) windowClose(ctx context.Context, r *http.Request, sess string) 
 	}
 	p := &s.seal.windows
 	p.Lock()
-	defer p.Unlock()
 	delete(p.active, in.ID)
+	p.Unlock()
+	s.seal.pool.release("window:" + in.ID)
 	return api.OK{OK: true}, q.Audit(ctx, s.now(), "owner", "window_close", "window:"+in.ID, "")
 }

@@ -301,7 +301,7 @@ func (e *Env) Sign(ctx context.Context, o SignOptions) error {
 			var ae *APIError
 			if errors.As(err, &ae) && ae.HTTPStatus == 423 && ae.Code == "locked" {
 				if !notice {
-					e.logf("waiting for owner unlock")
+					e.logf("%s", lockedNotice(ae))
 					notice = true
 				}
 				continue
