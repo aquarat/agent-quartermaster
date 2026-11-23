@@ -8,14 +8,16 @@ carries the task out. After the runner is installed there is nothing left to do 
 | Task | What it does | Your part | Reversible |
 |---|---|---|---|
 | **Switch to organisations** | Backup, fenced review mode, the signed cutover, restart ([ORGANISATIONS.md](ORGANISATIONS.md)) | Tap **Run**; review the plan; tap **Activate** | Cancel any time before activating. An unhealthy broker afterwards restores the backup. |
-| **Seal the store** | Backup, seal import, recovery drill, activation pin, deletion of plaintext keys and old backups, lock alert, restart locked ([SEALED.md](SEALED.md)) | Save the recovery key; tap **Run**; create and test the wrap (two taps); paste the recovery key; tap **Activate**; tap **Unlock** | Cancel any time before activating. Not after. |
+| **Seal the store** | Backup, seal import into per-credential buckets (seal format 2), recovery drill, activation pin, deletion of plaintext keys and old backups, restart alert, restart with every bucket closed ([BUCKETS.md](BUCKETS.md)) | Save the recovery key; tap **Run**; create and test your passkey's scope keys (one tap per two scopes for each); paste the recovery key; tap **Activate**. Nothing to unlock afterwards: each approval opens what it needs | Cancel any time before activating. Not after. |
+| **Move to per-credential buckets** | Only for a store sealed by v0.4.1 (format 1): backup, migration mode, the format-1 store opened once and staged in buckets, recovery drill, activation pin, restart, deletion of format-1 backups if `purge_backups` ([SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)) | Tap **Run**; tap **Open the old store** with a format-1 unlock passkey; create and test the remaining scope keys (one tap per two scopes); paste the recovery key; tap **Activate**; afterwards enable your other passkeys | No — one-way; before activation the backup restores everything |
 | **Enable self-update** | Build tools, pinned toolchains, build user, deploy key, forge host key, release tokens, release cache, `[updates]` | Register the deploy key on the forge; paste the token(s); tap **Run** | Configuration is restored if the release check or restart fails. |
 | **Sync maintenance passkeys** | Replaces the runner's pinned passkeys with the listed ones | Tap **Run** with an already pinned passkey | Run again. |
 | **Upgrade aqmas** | Rebuild in a sandbox, compare with both releases, install, restart ([UPDATES.md](UPDATES.md)) | Review the diff; tap **Approve** | The previous binary is restored if the new one is unhealthy. |
 
 A task refuses to start when its prerequisite is missing (sealing needs organisations; an
-upgrade needs self-update), when another task is running, or when the broker is locked. Every
-task can be run again after a failure.
+upgrade needs self-update; the move to buckets needs a format-1 store) or when another task is
+running. While a format-1 store waits for the move, upgrades are refused. Every task can be
+run again after a failure.
 
 ## Install the runner (once, as root)
 
@@ -62,7 +64,7 @@ The spool is writable by the broker, so the runner treats every byte in it as ho
   deletes a single key file, the runner verifies that a pinned passkey signed the activation
   and that the signed manifest is the one in the database and names the recovery key of the
   signed task. The database merely saying "sealed" is not enough. (That the store really
-  opens is what the drill and your first unlock show.)
+  opens is what the drill and your first approval show.)
 * **Pasted secrets are sealed to the runner.** The browser encrypts them (HPKE, P-256 /
   HKDF-SHA256 / AES-128-GCM) to the runner's public key; the signed text binds the SHA-256 of
   that packet. The broker's log, audit trail and spool hold only ciphertext.
@@ -110,7 +112,7 @@ The page offers to **generate the recovery key in the browser** (a native age X2
 identity, made with WebCrypto, never sent anywhere) or to take a public key you made with
 `age-keygen`. Save the secret half (`AGE-SECRET-KEY-1…`) in your password manager before you
 continue: with a backup of the database it decrypts everything, and it is the only way back if
-every unlock passkey is lost.
+every passkey is lost.
 
 Copying the key puts it on the clipboard and downloading it writes a plain file: move it into
 the password manager and clear both. The page cannot check that you really saved it; the
@@ -118,30 +120,41 @@ drill below is what proves the copy you kept works.
 
 The recovery drill runs **on the bastion** (an owner decision trading the isolated-machine
 drill of [SEAL-OPERATIONS.md](SEAL-OPERATIONS.md) for one you will actually do): you paste
-the secret half once; the browser seals it to the import process, which decrypts the staged
-recovery packet with it, authenticates every staged secret and keeps only the
-acknowledgement. The key is not written or logged, and the process exits at activation. This
+the secret half once; the browser seals it to the import process, which opens every staged
+scope key from its recovery wrap, then every bucket and record, and keeps only the
+result. The key is not written or logged, and the process exits at activation. This
 proves the key you saved works. It does not prove the bastion never saw it, so treat a
 bastion compromise during that window as exposure of the recovery key.
 
-After activation the runner pins the manifest digest in the root configuration, blanks
-`ntfy.topic_url`, deletes `ca/ssh_user_ca`, `ca/client_ca.key`, the Cloudflare parent token
-files and their `LoadCredential=` lines, keeps `inventory.json` and `manifest.json` (the
-encrypted recovery bundle) under `/var/lib/aqmas-backups/sealed-…/`, and, unless you untick
-it, deletes every older backup in `/var/lib/aqmas-backups` because those still hold the
-private keys. Deleting files does not erase old disk blocks or off-box copies; rotate what
+Before activation the page shows the manifest (scopes, buckets, CA pins); activation is a
+plain passkey signature over it, which the runner verifies against its pins. After
+activation the runner pins the manifest digest in the root configuration, blanks
+`ntfy.topic_url` (approval notices now use the copy in the database's unsealed
+`notice_channel`), deletes `ca/ssh_user_ca`, `ca/client_ca.key`, the Cloudflare parent token
+files and their `LoadCredential=` lines, keeps `manifest.json` (public) under
+`/var/lib/aqmas-backups/sealed-…/`, starts the broker with every bucket closed and, unless you
+untick it, deletes every older backup in `/var/lib/aqmas-backups` because those still hold the
+private keys. The Cloudflare minter parent is not imported: revoke it at Cloudflare. Deleting files does not erase old disk blocks or off-box copies; rotate what
 matters ([SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)).
 
-The optional lock alert takes a dedicated ntfy topic URL and a publish-only token. They are
-stored root-only in `/etc/aqmas-alert/` for the separate `aqmas-lock-alert.service`.
+The optional restart alert (`lock_alert`) takes a dedicated ntfy topic URL and a
+publish-only token. They are stored root-only in `/etc/aqmas-alert/` for the separate
+`aqmas-lock-alert.service`, which tells you when a restart has closed every bucket.
+
+**Moving a format-1 store** (sealed by v0.4.1) works the same way in `bucket-migrate` mode,
+with one more step first: a tap by a format-1 unlock passkey opens the old master key once,
+the broker stages every credential in its bucket in memory and wipes that key. The move is
+one-way; until you activate, cancelling or a failure restores the configuration and the
+format-1 broker. `purge_backups` then deletes the pre-migration and older backups, which still
+hold format-1 data ([SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)).
 
 ## Web API
 
-All under a signed-in session. `GET` works while locked and in the maintenance modes.
+All under a signed-in session. `GET` works in every mode, with every bucket closed.
 
 * `GET /api/ui/setup` →
   `{mode, runner_installed, runner_version, secrets_key, deploy_key, passkeys[], current?, refused?, tasks[], update_sources}`.
-  `mode` is `serve`, `cutover` or `seal-setup`. Each task is its fixed description (`id`,
+  `mode` is `serve`, `cutover`, `seal-setup` or `bucket-migrate`. Each task is its fixed description (`id`,
   `title`, `summary`, `steps[]`, `reversible`, `secrets[]`) plus `state` (`available`,
   `blocked`, `idle`, `running`, `waiting`, `done`, `failed`), `blocked_by`, `rerunnable` and
   `last` (the last run: `request`, `state`, `step`, `waiting_for`, `deadline`,
@@ -157,8 +170,9 @@ All under a signed-in session. `GET` works while locked and in the maintenance m
   now in the spool. A passkey that is not pinned is refused here with an explanation.
 * `POST /api/ui/setup/cancel {}`: ask a waiting task to give up. Unsigned on purpose: it can
   only return to the state before the task.
-* `POST /api/ui/seal/drill {packet}` (import mode): the sealed recovery identity. The seal
-  status gains `drill_key` and `drilled`.
+* `POST /api/ui/seal/drill {packet}` (seal import or bucket migration): the sealed recovery
+  identity. The seal status `stage` carries `drill_key` and `drilled`; the staging taps are in
+  [API.md](API.md#buckets).
 
 Canonical text of a setup approval (keys sorted, as for every object):
 
@@ -173,6 +187,7 @@ extra whitespace; `secrets_sha256` is the SHA-256 of the raw secrets packet, or 
 |---|---|---|
 | `cutover` | `{}` | none |
 | `seal` | `{"recipient","purge_backups","lock_alert"}` | `ntfy_token`, `ntfy_topic_url` when `lock_alert` |
+| `buckets` | `{"purge_backups"}` | none |
 | `enable-updates` | `{"repo","forgejo_api","github_api","known_hosts":[sorted lines],"forgejo_token":bool,"github_token":bool}` | `forgejo_token` and/or `github_token` as flagged |
 | `sync-passkeys` | `{"pins":[{"id","key_sha256"}]}` | none |
 

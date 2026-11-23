@@ -149,7 +149,7 @@ sign-approve), `/api/ui/seal/control/challenge` (renew-leaf, reopen, rekey). All
 The challenge response gains `open: {descriptor}`, canonical JSON with sorted keys:
 
     {"attempt_id","buckets":[{"hold","id","kind","label","scope","until"}…],"epoch",
-     "installation","object":"bucket-open","recipient","scopes":[s1(,s2)],"v":1}
+     "installation","object":"bucket-open","purpose":"approve","recipient","scopes":[s1(,s2)],"v":1}
 
 and the WebAuthn challenge becomes
 `SHA-256(T2("open-challenge", SHA-256(canonical), SHA-256(descriptor)))`. The page recomputes
@@ -240,8 +240,9 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
   approval page: the routine path is enabling from another passkey; the strict path is the
   offline drill and `seal-recover` (§10).
 * **New organisation:** it has no scope key until a passkey creates it: the first value
-  written in it is refused with "create the scope first" and Admin offers **Create** (one tap:
-  fresh `skS`, wrapped for that passkey and to the recovery key).
+  written in it is refused with "create the scope first" and Admin offers **Create** (an
+  enable of the signed-in passkey for that scope: one signing tap, then one enrol tap; fresh
+  `skS`, wrapped for that passkey and to the recovery key).
 * **Remove a passkey:** its wraps go with it (cascade). The broker refuses to remove the last
   passkey that can open any scope. Removal does not revoke copies of its wraps in old backups:
   for a lost or stolen passkey, **Rekey** its scopes.
@@ -303,7 +304,7 @@ config; then scope wraps (create, test), drill and activation as above.
 
 * **Drill (browser):** Admin → Recovery drill (§7).
 * **Drill (offline):** `aqmasd seal-drill BACKUP.db RECIPIENT <identity.txt` opens every scope
-  key and bucket of a standalone backup and prints only counts.
+  key and bucket of a standalone backup and prints only counts and the manifest digest.
 * **Lost one passkey:** remove it, rekey its scopes, enable a new passkey from another.
 * **Lost every passkey:** `aqmasd seal-recover DIRECTORY <identity.txt` in isolated
   maintenance ([SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)): it opens every scope key from its

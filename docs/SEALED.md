@@ -1,198 +1,316 @@
 # Sealed mode and fewer approval taps
 
-For the existing-installation sealed import and cold-start protocol on
-`feat/sealed`, see the [operator procedure](SEAL-OPERATIONS.md). The implemented
-batch, window and env delivery contracts are in [API.md](API.md).
+> **Format 1 is superseded.** The installation master key (MK), the **Unlock broker**
+> ceremony, **Lock now**, the combined unlock + window tap and the locked-route allowlist of
+> v0.4.1 are replaced by per-credential buckets (seal format 2): [BUCKETS.md](BUCKETS.md) is
+> the design, [API.md](API.md#buckets) the wire contract and
+> [SEAL-OPERATIONS.md](SEAL-OPERATIONS.md) the procedures. This page keeps what still holds:
+> batches, approval windows, transport encryption and the threat notes.
 
-**Design for owner review · 2026-11-21.** After a restart, the bastion can **receive requests but cannot satisfy them** until the owner unlocks it. A stolen disk should not be enough to become the SSH CA or obtain a Cloudflare parent token. The price is availability: an unattended restart, including a successful update, interrupts issuance. Keep the owner's independent emergency SSH access.
+**Design · 2026-11-21, revised for format 2 on 2026-11-23.** A stolen disk or backup should
+not be enough to become the SSH CA or obtain a Cloudflare parent token. After a restart the
+bastion **receives requests but cannot satisfy those that need a closed bucket** until an
+approval opens it. There is no global unlock: the tap that approves a decision also opens
+exactly the buckets that decision needs. The price is availability: a restart, including a
+successful update, pauses grants that need a bucket until the owner reopens them. Keep the
+owner's independent emergency SSH access.
 
-Three decisions that look similar in the UI have different meanings:
+Two decisions that look similar in the UI have different meanings:
 
 | Button | What one passkey assertion authorises |
 |---|---|
-| **Unlock broker** | Make one installation's keys usable by this process until lock or exit. Resume existing, still-valid authority; grant no pending request merely by unlocking. |
-| **Approve selected (3)** | Decide precisely the three requests shown with the choices shown. A fourth request arriving before the tap is not included. Recommended for a backlog. |
-| **Open approval window: personal, 10 min** | Delegate a bounded class of *future* decisions to this tab. Each still has a confirmation, but the server no longer has passkey evidence of the owner's intent for that decision. Off by default. |
+| **Approve selected (3)** | Decide precisely the three requests shown with the choices shown, and open the buckets those decisions need. A fourth request arriving before the tap is not included. Recommended for a backlog. |
+| **Open approval window: personal, 10 min** | Delegate a bounded class of *future* decisions to this tab, and keep the buckets they need open for the window's life. Each still has a confirmation, but the server no longer has passkey evidence of the owner's intent for that decision. |
 
-Sign-in remains separate from unlocking. A signed-in owner can inspect the queue and revoke while locked. Unlock is installation-wide; a window is never installation-wide. Signing out closes the window, not the broker. Admin offers a separate, freshly signed **Lock now**.
+Sign-in opens nothing. A signed-in owner can inspect the queue, deny and revoke with every
+bucket closed. A window is never installation-wide. Signing out closes the window. Admin →
+Buckets offers a separate, freshly signed **Close all** (BUCKETS.md §5).
 
-**Review path:** read through the threat table for the decisions; the appendices contain the wire bindings, locked-route list and device evidence. Roll out the seal only after the recovery drill. Ship batches before offering any approval window.
+This is a design record, not an operator command reference. [API.md](API.md) describes
+today's interface. It and [the organisation design](ORGANISATIONS.md) remain the authority on
+grants, admissions and durations.
 
-This is a proposal, not an operator command reference. [API.md](API.md) describes today's interface. It and [the organisation design](ORGANISATIONS.md) remain the authority on grants, admissions and durations. The phase-2 work reviewed at `feat/organisations` (`fd693ce`) fences personal cutover and binds legacy requests to the personal catalogue; it does not implement sealing. Reuse that fence and its scoped canonical fields. Activate sealing separately, after the personal mapping is known; do not assign schema numbers here. Phase-3 env drafts and revisions must use the seal from their first write.
+## What is sealed
 
-## What stays available on disk
+[BUCKETS.md](BUCKETS.md) §2 lists every sealed secret and §9 what stays readable without a
+tap, and why. Two deliberate exceptions carry over from format 1:
 
-Generate a random 256-bit installation master key (MK). Store only **wrapped** copies: one for each unlock-capable owner credential and one encrypted to the owner's offline recovery recipient. A wrap is ciphertext, not a verifier that the server can turn back into a key by itself. No MK in a file, environment variable, systemd credential, updater spool, OS keyring or restart handoff. A running daemon necessarily has access to the MK after unlock. No TPM is assumed.
+* **Agent TLS `server.key`** stays a service-readable 0600 leaf key in a 0700 directory, so
+  agents can connect while every bucket is closed. TLS 1.3, the pinned internal CA, SANs,
+  server-only EKU and live host-certificate checks still apply. Theft enables server
+  impersonation; the leaf cannot issue host identities. If it is missing, expired, mismatched
+  or invalid for the configured names, the agent listener is disabled and the web surface stays
+  reachable for **Renew leaf**. Never fall back to HTTP, a new CA or unchecked clients.
+* **The restart alert** (below) holds its own write-only ntfy credential.
 
-| Material | Decision and consequence |
-|---|---|
-| Ed25519 SSH user CA; internal P-256 CA private key | Seal separately under global signer IDs. Fleet sets reference the same SSH signer, never copies. Public SSH CA, internal CA certificate, leaf chain and fingerprints remain readable. |
-| Agent TLS `server.key` | Deliberate exception: protect as a service-readable 0600 leaf key in a 0700 directory. TLS 1.3, pinned internal CA, SAN, server-only EKU and live host-certificate checks still apply. Theft can enable server impersonation; the leaf cannot issue new host identities. Renew while unlocked with ample margin and alert on expiry. If missing, expired, mismatched or invalid for the configured names, disable the agent listener; keep web unlock/repair reachable. Never fall back to HTTP, a new CA or accepting unchecked clients. |
-| CF proxy and optional minter parent | Separate issuer-, service-, role- and version-bound encrypted blobs. Do not unseal an entire token catalogue to answer a read. Keep existing scope/guard checks. Never persist the value of a minted child. |
-| Normal ntfy credential | Seal the bearer **and** any capability-bearing topic URL. In current `notify/ntfy.go` the capability is `ntfy.topic_url` in config; there is no separate bearer loader. Treat it as a secret even on sites that call it a token. |
-| Env sets, edit drafts | Per immutable blob/revision data encryption key (DEK); encrypt before SQLite/WAL. Unwrap just for the authorised edit/collection, including `run` and checkout variants, and for a reveal the owner signs individually (re-encrypted to a key of the asking browser; [API.md](API.md#vault-web-form-reveal-and-signer-sets)). |
-| Signer keys | One sealed record per `signer` set (role `signer-key`), opened only to sign an approved request. Never delivered, revealed or exported ([SIGNING.md](SIGNING.md)). |
-| Other boot dependencies | Tunnel connector identity, Access config/public verifier keys, updater's repository-read credentials, OS/SSH host and TLS leaf keys are separate operational trust, **not** sealed by the MK. Restrict ownership and back them up independently. No new root-to-broker secret channel. |
+Metadata is not confidential: host inventory, policy, key and env value names, grants,
+audit, public passkey records, salts, scope and bucket public keys and wraps can be read in
+a DB copy. Redacted CF snapshots are still sensitive; protect the DB, snapshot directory and
+backups. Encryption does not authenticate policy rows or detect rollback of the whole DB.
 
-Metadata is not confidential under this scheme: host inventory, policy, key names, grants, audit, public passkey records, wraps and salts may be read in a DB copy. Redacted CF snapshots are still sensitive; protect the DB, snapshot directory and backups. Encryption of payloads does not authenticate all policy rows or detect rollback of the whole DB.
+**Restart alert without a circular dependency.** A separate service under its own uid
+(`aqmas-lock-alert.service`) watches a local, read-only status file the broker writes at
+every start (`locked <epoch>`). It alone holds a different, write-only ntfy credential for a
+dedicated alert topic and publishes fixed text once per epoch, with bounded retries: no
+inbound commands, request content or links from the daemon. It also reports the service
+being down. Its credential is a disclosed disk-theft exception: it can send nuisance alerts,
+not open buckets or publish approval notices. Ordinary approval notices use the unsealed
+`notice_channel` topic (BUCKETS.md §9).
 
-**Cold-lock notification without a circular dependency.** A separate service under its own uid watches local read-only lock status (boot/lock generation; also service-down). It alone holds a different, write-only ntfy credential for a dedicated alert topic. It publishes fixed text, e.g. “aqmas locked — open your bookmarked approval page”, once per generation, with bounded retries/backoff; no inbound commands, arbitrary messages, request content or configurable links from the daemon. It detects a cold start even if lock happened before it started. Test delivery at provisioning. Its credential is a disclosed disk-theft exception: it can be abused to send nuisance alerts, not to unlock or publish normal approval notices. Without this independent notifier there is **no immediate authenticated cold-start push**. Show notification failure locally; queue/coalesce ordinary notices and label delayed decisions with their original times on unlock. Never block lock or revocation on a push.
+## Opening buckets
 
-## Unlocking and managing passkeys
+Every approval that needs a bucket carries an **open descriptor**; the WebAuthn challenge is
+bound to it; the browser derives one key-encryption key (KEK) per scope from the passkey's
+PRF output and sends the KEKs HPKE-sealed to a fresh, single-use broker key
+([BUCKETS.md](BUCKETS.md) §4, [API.md](API.md#buckets)). The raw PRF output never leaves
+the page and never appears in `clientExtensionResults`. A passkey without PRF signs in and
+approves anything whose buckets are already open; it cannot open a closed one. Enabling,
+testing, removing passkeys and rekeying scopes are in BUCKETS.md §7.
 
-1. Sign in normally. The page says **Locked — unlock**; it lists credentials with tested wraps. Pick one. The server creates a two-minute, single-use challenge and a fresh in-memory HPKE recipient key for this attempt. It returns its public key, the exact `unlock` canonical and options allowing only the selected raw credential ID, requiring user verification (UV) and requesting PRF with its stored salt.
-2. The embedded UI verifies the canonical, options and the owner's choice before the tap (Appendix A). The authenticator signs the challenge and supplies a credential-specific 32-byte PRF result to this origin. The browser derives a key-encryption key (KEK) and encrypts **the KEK and assertion together** to this attempt's public key. It sends the encrypted finish, never the PRF result. No PRF request at sign-in, batch, update or ordinary approval.
-3. With a live owner session, the server consumes the attempt, opens the packet, verifies the assertion and exact credential, opens its wrap and checks the MK against the installation key-check record. Only after those checks and an epoch/state recheck does it publish the in-memory key handle, audit the unlock and wake waiters. Wrong key, missing output, damaged envelope or stale challenge never installs a partial key, creates another MK or falls back to a file. Rate-limit attempts. A bad passkey attempt does not destroy good wraps.
+**What the extra encryption buys.** HTTPS ends at Cloudflare; the tunnel is a second
+connection. Sending the KEKs in ordinary HTTPS JSON would give an edge observer reusable
+offline unwrapping keys. With honest code and an unmodified challenge response, a passive edge
+or HTTP body logger gets only a one-attempt ciphertext; deleting the attempt key also protects
+a recorded exchange against later disk theft. An active edge controls the origin: it can
+replace the page, substitute its own recipient *before* the tap, or ask for the same PRF salts
+on a misleading ceremony. Binding the recipient into the signed challenge stops substitution
+from succeeding **at the honest server**; it cannot stop a false page learning the KEKs. With
+a DB copy those KEKs open their scopes' buckets offline, at most two scopes per tap. CSP,
+Access, a pin shipped by that same page and a passkey prompt are not independent trusted
+displays. Keep the zone, tunnel and owner browser trusted; for protection from an active edge
+require independently installed client code and a separately authenticated channel, or move
+the approval origin off that edge. Prefer the offline recovery path over pasting the recovery
+key into the tunnel UI.
 
-**What the extra encryption buys.** HTTPS ends at Cloudflare; the tunnel is a second connection. Sending the KEK in ordinary HTTPS JSON would give an edge observer a reusable offline unwrapping key. With honest code and an unmodified begin response, a passive edge or HTTP body logger gets only a one-attempt ciphertext. Deleting the attempt private key also protects a recorded exchange against later disk theft. An active edge controls the origin: it can replace the page, substitute its own public key *before* the tap, or ask for the same PRF salt on a misleading ceremony. Binding the genuine key to the signed canonical prevents substitution from succeeding **at the honest server**; it cannot stop a false page learning the PRF/KEK. With the matching wrap, that disclosure can expose the MK offline long after sign-out. CSP, Access, a pin shipped by that same page and a passkey prompt are not independent trusted displays. Keep the zone/tunnel and owner browser trusted; for protection from an active edge require independently installed, verified client code and a separately authenticated bastion channel, or move the entire approval origin off that edge. Never enter recovery material in the tunnel UI.
-
-For the off-edge option the unlock credential must have a **distinct RP ID outside the edge-controlled origin's WebAuthn scope**, including parent-domain and related-origin arrangements. Bind it there from enrollment through recovery. A pinned client for normal unlock does not prevent a second, deceptive PRF ceremony at a still-authorised origin.
-
-**Adding a credential.** In normal operation require unlocked state and an existing owner's fresh `passkey add` assertion over nickname and intended capability. Keep registration single-use and bound to that approval, owner, session and epoch through finish. Request PRF at `create()`; do not equate `prf.enabled` with usable key material. For an unlock-capable addition stage the credential, then request UV `get()` naming **only the new ID** over a wrap-enrollment canonical (installation, new credential, approved registration ID, salt, MK version and fresh transport key). Use the same encrypted finish as unlock. Make its wrap with the live MK. Verify with an independent fresh `get()` and actual round-trip unwrap/key-check before activating it. Repeat for existing passkeys during migration; some older credentials need a new registration with PRF enabled. Never silently replace an existing passkey in its provider or downgrade a requested unlock key. If unsupported, offer an explicitly approved sign/approve-only registration. Admin shows **Can unlock · last tested [date]**, **Not tested**, or **Sign and approve only**; a failed probe affects that path, not all synced devices.
-
-**Removing one.** Fresh signed removal is local revocation: delete credential and all its wraps, revoke its login sessions, *and* every window it opened (possibly in a session logged in by another owner key), abort related in-flight ceremonies, audit atomically. Keep the existing last-login-key guard; also refuse routine removal of the last tested unlock credential for the active MK, checked inside the same transaction. Use isolated recovery for emergency replacement if it was stolen. Prefer two independently held unlock credentials, not two devices synced to the same vault. Removal blocks live use, not offline use of an old wrap with an old backup. Handle root update pins separately.
+For the off-edge option the passkeys that hold scope keys need a **distinct RP ID outside the
+edge-controlled origin's WebAuthn scope**, including parent-domain and related-origin
+arrangements, bound there from enrolment through recovery. A pinned client for normal
+approvals does not prevent a second, deceptive PRF ceremony at a still-authorised origin.
 
 ## Two ways to approve several requests
 
 ### Batch: fewer taps, same signed boundary
 
-Select known pending requests within one org, set approve/deny and each duration individually. Freeze the selection. Show **all** canonical descriptions, org/path, host and destination, Ref, scopes, TTL and standing consequences before the tap. Example: “Approve Ref A for 15 min; deny Ref B; approve Ref C for 5 min”. No “and 17 more”, blanket “approve queue”, expandable-only critical fields or signature over bare IDs. Reason is marked untrusted. Limit batches to ten entries and 32 KiB of canonical UTF-8; split larger selections explicitly. Start with ordinary scoped requests only; send anything requiring special confirmation (including the exclusions below) to its individual tap.
+Select known pending requests within one org, set approve/deny and each duration
+individually. Freeze the selection. Show **all** canonical descriptions, org/path, host and
+destination, Ref, scopes, TTL and standing consequences before the tap. Example: “Approve Ref
+A for 15 min; deny Ref B; approve Ref C for 5 min”. No “and 17 more”, blanket “approve
+queue”, expandable-only critical fields or signature over bare IDs. Reason is marked
+untrusted. Limit batches to ten entries and 32 KiB of canonical UTF-8; split larger
+selections explicitly. Start with ordinary scoped requests only; send anything requiring
+special confirmation (including the exclusions below) to its individual tap. The tap opens
+the union of the members' buckets, so a batch may need at most two scopes.
 
-Use one server-stored outer canonical committing to an ordered list of **complete** inner action canonicals (Appendix A). The browser compares membership and every field with its frozen cards, renders those bytes, then requests one UV assertion over the outer hash. Apply all or none: reparse every member, re-resolve identity, admission, policy, revisions, cap, grantability, deadline and lock state in one immediate transaction. A concurrent cancel, deny, policy edit or stale item returns conflict with **none applied**; refresh and review a new selection. No network side effects in the transaction. Stage SSH signatures privately; publish only on commit. Mint/collect later under normal delivery checks; queue notifications after commit. Audit one signed list plus each exact member, outcome and batch ID. The owner still signed every action's contents; a crowded screen makes omissions easier for a human, hence the limit.
+Use one server-stored outer canonical committing to an ordered list of **complete** inner
+action canonicals (Appendix A). The browser compares membership and every field with its
+frozen cards, renders those bytes, then requests one UV assertion over the bound challenge.
+Apply all or none: reparse every member, re-resolve identity, admission, policy, revisions,
+cap, grantability and deadline in one immediate transaction. A concurrent cancel, deny,
+policy edit or stale item returns conflict with **none applied** (and nothing stays open);
+refresh and review a new selection. No network side effects in the transaction. Stage SSH
+signatures privately; publish only on commit. Mint/collect later under normal delivery
+checks; queue notifications after commit. Audit one signed list plus each exact member,
+outcome and batch ID. The owner still signed every action's contents; a crowded screen makes
+omissions easier for a human, hence the limit.
 
 ### Window: delegate clicks, not signatures
 
-In **Admin → Organisation → Approvals**, a fresh signed policy change sets off (default) or an absolute maximum of 5–60 minutes and an idle limit (propose 2 minutes, never longer than the absolute limit). Enabling it does not open one. Owner chooses a duration up to that maximum and reviews **which org, sets and actions, for how long, with what exclusions**. A fresh UV assertion signs `window open` (Appendix A); show a persistent countdown, org and **End now**. Opening one never extends a grant or sets a standing rule. Only an applied decision counts as activity; reads, polling and heartbeats do not. Neither activity nor a new tab renews the absolute deadline.
+In **Admin → Organisation → Approvals**, a fresh signed policy change sets off or an absolute
+maximum of 5–60 minutes and an idle limit (never longer than the absolute limit). Enabling
+it does not open one. The owner chooses a duration up to that maximum and reviews **which
+org, sets and actions, for how long, with what exclusions**. A fresh UV assertion signs
+`window open` (Appendix A) and opens the buckets the window's sets need (the SSH CA, the
+organisation's Cloudflare proxy parent) with a window hold until it ends; show a persistent
+countdown, org and **End now**. Opening one never extends a grant or sets a standing rule.
+Only an applied decision counts as activity; reads, polling and heartbeats do not. Neither
+activity nor a new tab renews the absolute deadline.
 
-Use a positive server-side allowlist. Start with finite, normal-risk non-root SSH to explicitly eligible sets and low-risk CF proxy `cf.read`/`cf.cache.purge` where a decision is needed. Admit only `request approve` and `request deny`, standing duration zero. Do not infer eligibility from an org name, a client risk flag, or permission to auto-approve. Exclude enrollments/replacements, admissions, policy, passkey, organisation and catalogue changes, unlock/lock/recovery, updates, `cf.admin`, `cf.read.private`, high-risk targets, token mode, env releases, standing rules, indefinite and beyond-soft-cap durations (requested or selected). These always use a fresh individual tap, including denials where applicable. All client/club grants are excluded unless that org explicitly opts particular eligible sets into windows in its signed policy; no org can waive the hard exclusions. Unknown kinds and unmapped legacy routes fail closed. No window until scoped policy and host identity are available.
+Use a positive server-side allowlist. Start with finite, normal-risk non-root SSH to
+explicitly eligible sets and low-risk CF proxy `cf.read`/`cf.cache.purge` where a decision is
+needed. Admit only `request approve` and `request deny`, standing duration zero. Do not infer
+eligibility from an org name, a client risk flag, or permission to auto-approve. Exclude
+enrollments/replacements, admissions, policy, passkey, organisation and catalogue changes,
+seal control (reopen, rekey, close all), recovery, updates, `cf.admin`, `cf.read.private`,
+high-risk targets, token mode, env releases, vault actions, standing rules, indefinite and
+beyond-soft-cap durations (requested or selected). These always use a fresh individual tap,
+including denials where applicable. Client and club grants are excluded unless that org
+explicitly opts particular eligible sets into windows in its signed policy; no org can waive
+the hard exclusions. Unknown kinds and unmapped legacy routes fail closed.
 
-**Confirming a click.** Use a distinct prepare/confirm route. Server builds the same complete canonical action as for a tap, stores it one-use for at most two minutes and never beyond the window deadline, binds it to session/window/tab. UI compares against the selected card and renders it before confirm. Server accepts only its stored proposal ID and a proof from that tab over window ID and proposal hash (Appendix A), never mutable fields from the click. Under the same decision fence/transaction, recheck session, opener credential, window generation, deadline, membership, admission, policy, eligibility and exact target fields before apply. A stale proposal needs new review; no automatic fallback to a click on a passkey route. Attribute each action as e.g. **Approved under window opened by passkey X at T**, with exact canonical, opener assertion reference, org, Ref, time and result. Applied-action pushes distinguish window, batch and direct tap. Never describe a window click as a WebAuthn signature.
+**Confirming a click.** Use a distinct prepare/confirm route. The server builds the same
+complete canonical action as for a tap, stores it one-use for at most two minutes and never
+beyond the window deadline, binds it to session/window/tab. The UI compares against the
+selected card and renders it before confirm. The server accepts only its stored proposal ID
+and a proof from that tab over window ID and proposal hash (Appendix A), never mutable fields
+from the click. Under the same decision fence/transaction, recheck session, opener
+credential, window generation, deadline, membership, admission, policy, eligibility and exact
+target fields before apply. A stale proposal needs new review; no automatic fallback to a
+click on a passkey route. Attribute each action as e.g. **Approved under window opened by
+passkey X at T**, with exact canonical, opener assertion reference, org, Ref, time and
+result. Applied-action pushes distinguish window, batch and direct tap. Never describe a
+window click as a WebAuthn signature.
 
-**What the owner gives up.** Malicious page code can confirm eligible requests (or deny them) with no click and no further tap. A hostile edge can serve such code. The tab key prevents simple bearer replay from a copied HTTP transcript; it cannot tell a human click from a script using the live tab. The server can attest to scope, expiry and what it applied, not that the owner saw the card. Multiple ordinary grants can accumulate, SSH access can expose other credentials on the host, and grants may survive the window, logout and lock. Closing the window prevents *new* approvals, not use of existing grants. This is more authority than caching sign-in, less than silently allowing every request. Choose batch if per-action intent matters.
+**What the owner gives up.** Malicious page code can confirm eligible requests (or deny them)
+with no click and no further tap. A hostile edge can serve such code. The tab key prevents
+simple bearer replay from a copied HTTP transcript; it cannot tell a human click from a script
+using the live tab. The server can attest to scope, expiry and what it applied, not that the
+owner saw the card. Multiple ordinary grants can accumulate, SSH access can expose other
+credentials on the host, and grants may survive the window, logout and **Close all** (a
+Cloudflare grant then pauses until reopened; an issued SSH certificate stays valid). Closing
+the window prevents *new* approvals, not use of existing grants. Choose batch if per-action
+intent matters.
 
-For example, distinguish **“You may approve for the next 10 minutes”** from **“Each SSH grant can last up to 30 minutes.”** Sign and display the maximum resulting TTL per eligible set/scope. The server can verify control of the opening key, not attest that the browser generated it as non-exportable: hostile code present at opening can nominate a remote key and copy the capability and session material. In that case automated confirmations and heartbeats can continue after tab close, until server revocation or expiry. Absolute time and the server allowlist, not the close event, bound that exposure.
+For example, distinguish **“You may approve for the next 10 minutes”** from **“Each SSH grant
+can last up to 30 minutes.”** Sign and display the maximum resulting TTL per eligible
+set/scope. The server can verify control of the opening key, not attest that the browser
+generated it as non-exportable: hostile code present at opening can nominate a remote key and
+copy the capability and session material. In that case automated confirmations and
+heartbeats can continue after tab close, until server revocation or expiry. Absolute time and
+the server allowlist, not the close event, bound that exposure.
 
-**Combine only by choice.** Offer an unchecked “Also open a window for [org]” on unlock. Sign a distinct combined canonical with the full unlock **and** window terms and tab key. Both become effective together only after successful verification, unwrap and policy recheck. A plain unlock or login assertion is never exchangeable for a window.
+A plain sign-in assertion is never exchangeable for a window, and a window open is never
+exchangeable for anything else.
 
 ## Operations and recovery
 
-**First provisioning / signed import.** This is a supervised maintenance cutover, not something `serve` does because files are missing. Start from a known-good host with a consistent, independently encrypted pre-cutover backup. On a fresh installation the local one-time enroll-code bootstrap registers the first owner only in isolated setup; generate CAs directly into staging, never into plaintext files. With an existing installation keep the existing RP, owner handle, trust pins, host identities and SSH serial high-water mark.
+Sealing, the one-way move from format 1, drills, lost passkeys and lost-everything recovery
+are in [SEAL-OPERATIONS.md](SEAL-OPERATIONS.md) and BUCKETS.md §8 and §10.
 
-1. Stop legacy issuance, fence and drain poll/mint/proxy/sweeper work. Disable automatic updater activation during migration. Run isolated setup under operator control, with no agent service. Create installation ID and MK in memory. Provision an offline recovery recipient and prove it can decrypt (below). Stage trusted, fixed-source imports under per-role DEKs; no arbitrary file reader in the UI. Verify file ownership/mode, bounded regular files, no symlinks or path substitution. Match CA public keys and certificate chains to independently recorded trust pins. Bind proxy/minter to the known service/account and correct issuer, ntfy to its intended destination. Stage env DEKs if already provisioned; no plaintext staging DB. If interrupted before activation, serving remains fenced.
-2. Build a manifest with installation and MK IDs, source/config generation, public fingerprints, service/issuer IDs, roles, encrypted blob IDs and ciphertext digests, TLS leaf exception, recovery recipient fingerprint and exact passkey wrap IDs. Show meaningful labels, counts and effects, not secret bytes or guessable plaintext hashes. Compare the manifest Ref/digest and recipient with the local operator view. Test unwrap/decrypt and CA key matches from staged blobs, obtain a verified PRF wrap and complete an offline recovery drill. A fresh owner `seal activate` signature commits to this full manifest. Recheck frozen inputs against staged bytes before switching. Commit wraps, blobs, signed manifest, audit and active marker atomically. Pin installation ID and a seal-required minimum format outside the service-writable DB in root-owned config; install this fail-closed gate *before* allowing a restart. Any marker mismatch means maintenance, never unsealed startup. Do not run a legacy binary on this state.
-3. Cold start locked, test unlock, signing, delivery, cleanup and notifications. Remove retired CA private files, ntfy config secret, both CF source files and `LoadCredential` mappings, including imported systemd copies via service restart. Restrict old backup handling immediately. Unlinking, overwriting or vacuuming cannot reliably erase CoW snapshots, SSDs, WAL, copied configs or old backups. Apply backup retention and crypto-erasure where possible. Rotate the normal ntfy capability and CF parents at their issuers; drain or verify deletion authority for outstanding children **before** retiring the original minter. Plan SSH CA replacement: distribute new public CA alongside old on every SSH/forge target, test new signer, stop old issuance then remove old trust everywhere (accelerate on compromise). Internal CA change also needs independently delivered CA pins, server leaf and reissued client identities/admissions; stage and test via emergency access, never silently accept a new pin. Rewrap alone does not revoke old credentials.
+**Recovery key: a dedicated native age X25519 identity.** Generate it on a trusted owner
+device; keep the private identity offline and independently accessible even if the passkey
+manager or account is lost. Only the public recipient goes on the bastion. Do not repurpose
+the emergency SSH signing key or depend on a memorable password. The owner can keep an
+independently protected second copy. Every scope key has a wrap to this recipient, so the
+identity plus a sealed backup reads **all** its secrets without a passkey. See the
+[age v1 specification](https://age-encryption.org/v1).
 
-**Setup and rotation commit invariant:** in the activation transaction require a successful second UV unwrap/key-check for at least one credential of the **target** MK generation, plus verified recovery for that generation. This holds for bootstrap, replacement and disaster recovery too. In isolated setup an approve-only first key may sign the addition of a staged PRF credential while the staged MK is in RAM. If that fails, retry in setup; do not remove a working credential, open the agent listener, or bootstrap over a missing active MK.
+**Updates.** A fresh individual update assertion and root-pinned public keys remain exactly
+as in [UPDATES.md](UPDATES.md). No PRF, window or bucket in the proof. Warn before approval:
+“Restart closes every bucket; paused grants wait for a Reopen.” `/healthz` tests process/DB
+health and seal readiness; a healthy restart with everything closed is success, not cause to
+roll back. Rollback also restarts closed. Only compatible sealed binaries may be
+auto-updated or rolled back; format changes are supervised (the move to buckets is a Setup
+task).
 
-**Recovery key choice: dedicated native age X25519 identity.** Generate on a trusted owner device; keep its private identity offline, independently accessible even if the passkey manager/account is lost. Only the public recipient goes on the bastion. Do not repurpose the emergency SSH signing key or depend on a human-memorable password. The owner can keep an independently protected second copy. This implements the earlier “offline copy” decision as an owner-only way to decrypt a wrapped MK; no usable MK needs to sit in a backup. See the [age v1 specification](https://age-encryption.org/v1). A recovery identity plus the sealed backup is sufficient to read **all** its secrets without a passkey.
-
-Keep an owner-controlled record off-host of installation ID, MK generation, recipient fingerprint and digest of the signed activation/rotation manifest. The root-owned seal-required config pins these too. For a switch, fence serving, stage the next root record locally after independent comparison, commit the signed DB transition, then atomically replace and sync the root record before reopening. If interrupted, mismatch means maintenance: complete only the matching reviewed transition, never choose the newer record by timestamp. The pinned digest identifies the transition, not every subsequent database write. Keep a separately authenticated, dated inventory for each backup. Restore against that backup's owner record; neither a matching key-check nor a recipient string in the restored DB establishes provenance.
-
-**Drill and disaster restore.** Back up with SQLite online backup: active metadata/IDs, public credential records and salts, all sealed blobs/DEK wraps, credential and recovery wraps and key-check per retained MK generation. Include compatible binary/format, RP/origin, root-owned config and public pins, protected leaf/chain and any retained snapshots. Encrypt the entire backup independently, record its digest/version/inventory outside the bastion, and store recovery identities separately. Periodically restore on an isolated trusted system with no agent listener, updater or issuer egress. Decrypt the recovery packet locally; verify installation, version and recipient, prove the key-check and authenticate every live blob against expected inventory. Test at least one passkey unlock on its real RP path without redirecting production traffic (or test in maintenance on the live broker); success signing in is insufficient. Record date and versions, never keys.
-
-For actual recovery, verify host integrity/rebuild first. Operator initiates a local-only maintenance session with network issuance fenced. Owner decrypts on a trusted device and transfers the MK/context **only** to the local recovery process via protected stdin over a verified, host-key-pinned owner SSH connection or trusted console; never argv, files, terminals with session recording, browser or logs. A root-restricted local IPC handoff may hold it in locked memory until maintenance exits. Recovery permits inventory verification and binding replacement credentials; it is not an approval session. With no working sign-in, require both the operator's local one-use enrollment ticket and successful recovery unwrap/key-check, register a new owner credential in isolated maintenance, then require its UV signature on the displayed replacement plan and test its new wrap. No ordinary public enroll code, DB reset, updater pin or remaining non-PRF signature decrypts anything. Revoke lost keys, expire sessions/challenges/windows/rules/grants, reconcile hosts, issuer children, admissions and audit against independent post-backup records, preserve serial high-water marks (rotate CA if not provable). Do not expose a restored stale allow-list. Cold start and unlock normally. Loss of every working wrap **and** its recovery path is permanent data loss: rebuild trust and replace upstream secrets.
-
-**Rotation.** Changing credentials need not re-encrypt payloads. For MK rotation take a consistent backup, fence writes and delivery, stage a new random MK/version, key-check and recovery packet. Re-evaluate each retained unlock credential (no cached KEKs); produce new wraps bound to the new version and verify each by a fresh evaluation. If a credential is absent, postpone or explicitly sign its downgrade to approve-only; never count an old wrap for the new MK. Unwrap every live DEK with the old MK and stage a new DEK wrap under the new MK; payload and its AAD stay unchanged. Verify complete inventory and recoverability before a fresh signed atomic active-generation switch; discard staged generations on abort, restart locked against last committed generation. Maintenance may restart from scratch rather than persist a plaintext bridge. Retire old online wraps after verification; retain matching offline identities for retained backups. For a recovery recipient change, sign both fingerprints, encrypt to the new public key, prove offline decrypt and switch; no silent change from a DB/config edit. If an MK, KEK or recovery identity may have leaked, replace MK, affected DEKs **and the underlying upstream credentials/CAs**. Old snapshots remain decryptable by holders of old material.
-
-**Updates.** A fresh individual update assertion and root-pinned public keys remain exactly as in [UPDATES.md](UPDATES.md). No PRF, combined action, window or MK in the proof. Warn before approval: “Restart interrupts issuance; you will need an unlock passkey afterwards.” `/healthz` tests process/DB health and seal format readiness; healthy **locked** is a successful restart, not cause to roll back. Updates card reconnects, shows installed identity or rollback result, then prompts for a distinct unlock. Rollback also restarts locked. If unattended, requests wait/expire. Root verifier needs no wrapped or unwrapped secret; update pin addition/removal is a separate out-of-band root operation, never synced from Admin or inferred from PRF capability. Only compatible sealed binaries may be auto-updated/rolled back; breaking format changes are supervised.
-
-**Memory on the bastion.** Hold the MK and transient KEKs/DEKs in bounded dedicated, locked pages (`mlock`, `MADV_DONTDUMP`); preflight the actual service uid's memlock limit and syscall filter, fail secret operations closed if locking fails. Decrypt per operation; fence/drain work then wipe buffers before unlocking/freeing pages. Minimise lifetime of signers, HTTP auth headers and response buffers. Preserve unprivileged service, `NoNewPrivileges`, empty capability set, private temp/devices and narrow writable paths; set a bounded `LimitMEMLOCK`, `LimitCORE=0`, non-dumpable process and disable system/kernel crash dumps, hibernation, memory snapshots and profiling/body tracing. Disable swap or require encrypted swap with nonpersistent boot keys; restrict ptrace and `/proc` to prevent same-uid inspection, isolate helpers. Go stacks, immutable strings, library signers, TLS/HTTP buffers, JS/WebCrypto and GC copies defeat promises of perfect wiping. Do not claim mlock covers the Go heap; use process exit for explicit relock after draining. None of this protects against live root.
+**Memory on the bastion.** Scope keys, bucket keys and KEKs live in dedicated locked pages
+(`mlock`, `MADV_DONTDUMP`); preflight the service uid's memlock limit and fail secret
+operations closed if locking fails. Scope keys and KEKs are wiped at the end of the tap; a
+bucket key is wiped when its last hold ends and no operation uses it. Preserve the
+unprivileged service, `NoNewPrivileges`, empty capability set, private temp/devices and
+narrow writable paths; set a bounded `LimitMEMLOCK`, `LimitCORE=0`, a non-dumpable process,
+and disable crash dumps, hibernation, memory snapshots and body tracing. Disable swap or
+encrypt it with nonpersistent boot keys; restrict ptrace and `/proc`. Go stacks, immutable
+strings, library signers, TLS/HTTP buffers, JS/WebCrypto and GC copies defeat perfect
+wiping. None of this protects against live root.
 
 ## Threats: what changes
 
+BUCKETS.md §1 compares format 1 and format 2 event by event. These notes still apply:
+
 | Event | Result and response |
 |---|---|
-| DB or backup copied | Sealed blobs require a PRF-derived KEK or recovery identity; metadata and any separately backed-up leaf/snapshots remain sensitive. Pre-import backups may contain plaintext. No rollback detection from AEAD alone. |
-| Powered-off disk stolen, no TPM | No usable MK after correct migration. Leaf, connector, lock notifier and update-read keys may be usable; rotate them. Assumes no plaintext swap, dumps, earlier files or VM RAM snapshot. |
-| Root on locked bastion | Can steal those exceptions, alter DB, policy, code, audit and page, disrupt service and trap the **next** unlock. Cannot decrypt today's sealed blobs just from the clean cold disk. Never unlock a suspect host; rebuild from trusted media. |
-| Root/daemon compromise while unlocked | Can read the MK, use signers, release across all orgs, copy parents and forge broker activity. Locking afterwards cannot unsteal anything. Replace broker trust and upstream keys. |
-| Compromised Access/edge | Access bypass alone is not a WebAuthn signature. Edge sees session traffic; active origin control can mislead the owner, harvest PRF on a tap or drive an open window. Tunnel TLS does not make the page independent of Cloudflare. |
-| Compromised approval page/browser | Can request or misdescribe genuine ceremonies, exfiltrate reusable key material and click repeatedly within an open window. Even a direct passkey tap is not a trusted display. Check CLI Refs/applied pushes; suspend the origin and rotate on exposure. |
-| Lost/stolen passkey | Device UV and provider recovery matter. Use second independent credential or offline recovery. Remove key, wraps, sessions, windows and root pin if applicable; consider old wraps and synced copies compromised. |
-| Lost/stolen recovery identity | If destroyed, use a working PRF path to replace recipient and verify a new backup. If theft is possible, assume any old packet exposes that MK: rotate MK, DEKs and protected credentials as above. Losing both kinds of unlock path cannot be fixed by root. |
-| Lock while grants exist | Proxy stops locally; cached SSH certs and sessions, provider-valid children and copied env values are not recalled. Revoke at issuer/target where necessary. |
+| DB or backup copied | Buckets need a PRF-derived KEK or the recovery identity; metadata and any separately backed-up leaf or snapshots remain sensitive. Pre-import backups may contain plaintext. No rollback detection. |
+| Powered-off disk stolen, no TPM | No usable scope or bucket key after a correct import. Leaf, connector, restart-alert and update-read keys may be usable; rotate them. Assumes no plaintext swap, dumps, earlier files or VM RAM snapshot. |
+| Root on the bastion with everything closed | Can steal those exceptions, alter DB, policy, code, audit and page, disrupt service and trap the **next** tap. Cannot decrypt today's buckets from the clean cold disk. Never approve on a suspect host; rebuild from trusted media. |
+| Root/daemon compromise while buckets are open | Can use every open bucket and every scope a later tap yields, release values and forge broker activity. **Close all** afterwards cannot unsteal anything. Replace broker trust and upstream keys. |
+| Compromised Access/edge | Access bypass alone is not a WebAuthn signature. The edge sees session traffic; active origin control can mislead the owner, harvest KEKs on a tap or drive an open window. Tunnel TLS does not make the page independent of Cloudflare. |
+| Compromised approval page/browser | Can request or misdescribe genuine ceremonies, exfiltrate KEKs for up to two scopes per tap and click repeatedly within an open window. Even a direct passkey tap is not a trusted display. Check CLI Refs and applied pushes; suspend the origin and rotate on exposure. |
+| Lost/stolen passkey | Remove it, **rekey** its scopes and enable a replacement from another passkey (BUCKETS.md §7); old backups hold its wraps until the rekey. |
+| Lost/stolen recovery identity | Format 2 offers no recipient change yet: if it is destroyed, keep two independently held passkeys enabled for every scope. If theft is possible, assume every backup it covers is exposed and rotate the protected credentials at their issuers (a rekey keeps wrapping to the same recipient). Losing every passkey and the identity cannot be fixed by root. |
+| Close all or restart while grants exist | The proxy, env releases and signing pause locally; issued SSH certificates, provider-valid children and copied env values are not recalled. Revoke at the issuer or target where necessary. |
 
 ## Appendix A · Formats and checks at the boundaries
 
-**At rest (suite 1).** Use OS CSPRNG for all keys, salts, IDs and nonces. Context tuples below have fixed field order per role; frame each component as a uint32 big-endian length followed by bytes, strings UTF-8, counters uint64 big-endian, raw binary IDs/keys never display nicknames/short Refs. Start each tuple with `aqmas-seal`, version and a distinct role label. Bound lengths and reject noncanonical encodings, unknown suites, trailing fields, duplicate role/ID/version tuples. Reconstruct expected fields from the authorised object, root-pinned installation/recipient and live manifest, **not just the envelope header**.
+Format-2 constructions (context strings `T2`, scope and bucket wraps, records, KEK
+derivation, descriptor, packet) are in BUCKETS.md §3–4 and API.md#buckets. Format 1's
+suite-1 at-rest records, `mk-*` tuples and `hpke-finish` packet are kept only for the
+one-way migration.
 
-* **Passkey → MK:** persist random 32-byte salt per credential wrap (stable for its lifetime, new for replacement); `prf.eval.first` receives those exact bytes, not an encoded string, a login challenge or a hash. WebAuthn handles its own domain prefix ([PRF specification](https://www.w3.org/TR/webauthn-3/#prf-extension)). Browser derives 32-byte KEK via HKDF-SHA-256 Extract+Expand, IKM = 32-byte UV PRF output, salt = installation ID (random 32 bytes), info = tuple `mk-kek`, installation, RP ID, full raw credential ID, MK version, PRF salt. AEAD = XChaCha20-Poly1305 under KEK, plaintext = MK, AAD = corresponding `mk-wrap` tuple with the same fields. Store suite, bindings, salt, nonce and ciphertext/tag only. New random 24-byte nonce **on every encryption** including retry/rewrap; never derive it from a row ID or reuse the challenge nonce. Same PRF input must recur on unlock; the AEAD nonce is not the PRF input.
-* **MK → DEK → blob:** each immutable payload has a new 32-byte DEK and blob ID. Payload XChaCha AAD = `payload`, installation, global/scoped namespace, immutable org/service/set or global signer ID, role/kind, revision, blob ID. For CF parents append the authoritative issuer ID, account ID and parent credential version to that tuple. An independent XChaCha encryption wraps DEK under MK with AAD `dek-wrap`, same bindings plus MK version. Separate fresh 24-byte nonces. Key-check = AEAD under MK of fixed format marker with its own fresh nonce and `mk-check`, installation and version AAD. Never use MK as a transport key. Unknown/missing data or failed authentication of a required blob blocks serving that authority and triggers lock/investigation. No skip-bad-records restore.
-* **Offline wrap:** one standard age v1 file to the single pinned X25519 recipient, no plugins or passphrase mode. Authenticated file plaintext is the framed tuple `mk-recovery`, installation, MK version, recipient public key and MK. Verify against independently recorded expected context **and** the MK key-check (anyone with the public recipient can encrypt a file). No user-selected KDF parameters or offline password guessing surface. Verify the actual recovery copy, not merely that encryption to a public key succeeded.
+**In transit.** RFC 9180 HPKE base mode on both ends: DHKEM(P-256, HKDF-SHA256),
+HKDF-SHA256, AES-128-GCM, one encapsulation and one message per fresh attempt key. No
+caller-chosen HPKE nonce. Validate encoded public keys; domain-separate `info` by protocol,
+installation and purpose; bind attempt ID, boot epoch, the bound challenge and the signing
+credential in the AAD. The server keeps the ephemeral private key only in a bounded,
+expiring attempt map bound to session and purpose; it is evicted on use, failure, timeout
+and **Close all**. Strip PRF extension results from WebAuthn serialization on **both**
+create and get; send only allowlisted public extension outputs. Do not modify signed
+authenticator data. No telemetry, exception dumps, caches or intermediary body capture.
+Treat client extension output as key material, **not signed proof**: proof is a valid bound
+assertion plus a successful unwrap whose scalar matches the stored public key. Uncompressed
+SEC1 P-256 public keys (65 bytes), unpadded base64url. Do not put decrypted packets,
+transient extension data or ciphertext that might carry a secret into passkey records or
+audit.
 
-**In transit.** Use a reviewed [RFC 9180 HPKE](https://www.rfc-editor.org/rfc/rfc9180) base-mode library on both ends: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, one encapsulation and one message per fresh attempt. No caller-chosen HPKE nonce. Pin suite/version, validate encoded public keys, domain-separate `info` by protocol, installation and purpose. AAD = framed attempt ID, boot/lock epoch and SHA-256 of canonical. Server stores ephemeral private key only in a bounded, expiring attempt map with the session hash, purpose, expected raw credential and canonical; evict on use/failure/timeout/lock. Strip PRF extension results from generic WebAuthn serialization on **both** create/get; send only allowlisted public extension outputs. Do not modify signed authenticator data; encapsulate the entire signed response when evaluating PRF, even during setup. No telemetry, exception dumps, caches or intermediary body capture. Treat client extension output as key material, **not signed proof**: proof requires a valid bound assertion plus successful unwrap/key-check. During enrollment the trust in the browser furnishing a real KEK is explicit.
-
-Use uncompressed SEC1 P-256 public keys (65 bytes), unpadded base64url in canonical fields. Frame HPKE `info` as `hpke-finish`, installation, purpose (`unlock`, `unlock-window` or `wrap-enroll`); use distinct attempt keys even across two steps of enrollment. Publish per-role byte vectors including exact `info`, AAD and key encoding. Registration requests enable PRF without evaluating the production salt on `create`; for a standalone PRF setup/test use a signed setup challenge with its own attempt key. Do not put decrypted packets, transient extension data or ciphertext that might carry a secret into passkey records or audit.
-
-**Canonical profiles (proposed; publish exact schemas and Go/TS vectors in API.md before rollout).** Preserve [API.md's rules](API.md#approval-challenge-the-security-boundary): sorted ASCII keys, exact scalar types, UTF-8 JSON, byte-identical reserialization, 32-byte random nonce, issuance time, SHA-256 over exact bytes, strict endpoint/object/verb/session binding. Dispatch new object/version explicitly; unknown fields fail, no v1 fallback. UI compares each option, signed field and digest with selected action; display from canonical only, with escaping/bidi isolation and full scope descriptions. Server consumes its own stored challenge once and checks RP ID, origin, type, UP, UV, actual signer and counter policy, owner authority, expiry and current state on apply.
+**Canonical profiles.** Preserve [API.md's rules](API.md#approval-challenge-the-security-boundary):
+sorted ASCII keys, exact scalar types, UTF-8 JSON, byte-identical reserialization, 32-byte
+random nonce, issuance time, SHA-256 over exact bytes, strict endpoint/object/verb/session
+binding. Dispatch new object/version explicitly; unknown fields fail, no fallback. The UI
+compares each option, signed field and digest with the selected action; display from
+canonical only, with escaping/bidi isolation and full scope descriptions. The server
+consumes its own stored challenge once and checks RP ID, origin, type, UP, UV, actual signer
+and counter policy, owner authority, expiry and current state on apply.
 
 | Profile | Fields committed beyond the common action/object/id/time/nonce/version |
 |---|---|
-| Unlock / wrap enrollment | Installation ID, RP ID, MK generation, boot/lock epoch, raw credential ID (unpadded base64url), PRF salt, suite, attempt ID and exact ephemeral recipient public key. Enrollment adds approved registration ID. Options' salt, sole allowed ID and recipient bytes must match. Combined unlock includes all window terms; plain unlock has none. |
-| Batch decide | Installation, org ID/label, epoch, count and a scalar `items` string: canonical JSON array of strings, each string one complete independently parseable scoped request canonical, in bytewise request-ID order. Use the same JSON string escaping as the outer canonical; require exact round trip in both languages. No duplicate IDs, nested batches, mixed orgs, unknown item versions or reusable inner challenge records. Only the outer hash is a challenge. |
-| Window open | Installation, org ID/label, policy/eligibility version, explicit eligible set IDs, allowed kinds/scopes/verbs, per-grant TTL ceilings and exclusions, absolute duration, idle limit, session-bound public attempt ID, actual opener credential ID (restrict allow list), lock epoch and tab public key. Show the delegation, not just “verify identity”. Server times start at successful apply, capped by session expiry. |
+| Batch decide | Installation, org ID/label, epoch, count and a scalar `items` string: canonical JSON array of strings, each string one complete independently parseable scoped request canonical, in bytewise request-ID order. Same JSON string escaping as the outer canonical; exact round trip in both languages. No duplicate IDs, nested batches, mixed orgs, unknown item versions or reusable inner challenge records. Only the outer hash is a challenge. |
+| Window open | Installation, epoch and the terms: org ID/label, policy version, explicit eligible set IDs, allowed kinds/scopes/verbs, per-grant TTL ceilings and exclusions, absolute duration, idle limit, public window ID, the opener credential ID (sole allowed credential) and tab public key. Show the delegation, not just “verify identity”. Server times start at successful apply, capped by session expiry. |
 
-**Window capability.** On open the tab generates an ephemeral non-exportable WebCrypto P-256 signing key; server returns a random 32-byte opaque token once. Keep private key/token in this document's memory only (no cookies for the window, storage, service workers, URL or “restore tab”); store only token hash plus a revocable in-memory record with signed terms, opener key/person, live login session hash and Access subject, tab public key, deadlines, policy revision and lock epoch. Use current strict `__Host-aqmas_session` cookie/POST guards too; require verified Access subject for windows. Confirm requires token plus ECDSA-SHA256 tab signature over framed `window-confirm`, installation, window ID, one-use proposal ID and canonical hash. A tab signature is a software capability, not user verification. Never accept it at an assertion endpoint. Revoke immediately on end/logout, key or session loss, admission/policy/membership changes, lock, restart, expiry; invalidate pending proposals too. One active window per session; opening another closes the old one. Show active windows in Admin and allow closing from another authenticated owner session.
+**Window capability.** On open the tab generates an ephemeral non-exportable WebCrypto P-256
+signing key; the server returns a random 32-byte opaque token once. Keep private key and
+token in this document's memory only (no cookies for the window, storage, service workers,
+URL or “restore tab”); the server stores only the token hash plus a revocable in-memory
+record with signed terms, opener key/person, live login session hash and Access subject, tab
+public key, deadlines, policy revision and epoch. Use the strict `__Host-aqmas_session`
+cookie/POST guards too; require a verified Access subject for windows. Confirm requires token
+plus an ECDSA-SHA256 tab signature over framed `window-confirm`, installation, window ID,
+one-use proposal ID and canonical hash. A tab signature is a software capability, not user
+verification; it is never accepted at an assertion endpoint. Revoke immediately on
+end/logout, key or session loss, admission/policy/membership changes, **Close all**, restart
+and expiry; invalidate pending proposals too. One active window per session; opening another
+closes the old one. Admin shows active windows and can close them from another authenticated
+owner session.
 
-On pagehide/close/reload discard tab secrets and best-effort notify the server to close; never resume from back-forward cache. Server cannot *observe tab close reliably*. Use a short presence lease (e.g. heartbeat every 10 s, expire after 30 s, never extend idle/absolute deadline); loss of tab key prevents new confirms even if close message was lost. Suspended tabs may need a fresh tap. A hostile or still-running page can keep the lease alive within the signed limits. Use monotonic server deadlines within the process and serialize close vs commit; revoke wins for any not-yet-authorised decision.
+On pagehide/close/reload discard tab secrets and best-effort notify the server to close;
+never resume from back-forward cache. The server cannot *observe tab close reliably*: a
+presence lease (heartbeat every 10 s, expiry after 30 s, never extending idle or absolute
+deadlines) and loss of the tab key prevent new confirms even if the close message was lost.
+A hostile or still-running page can keep the lease alive within the signed limits. Use
+monotonic server deadlines and serialize close against commit; revoke wins for any
+not-yet-authorised decision.
 
-## Appendix B · Lock state machine and route allowlist
+## Appendix B · Which passkeys can hold scope keys?
 
-**Startup → locked.** `server.New` today calls `pki.Load(..., true)` before opening SQLite; it can create both CAs or reissue a leaf. `setupCloudflare` builds long-lived proxy/minter objects with token strings. Replace those paths with public trust/leaf loading, catalogue metadata, and gated secret handles. Public print/fingerprint commands must not use `LoadCAs` to read private keys. `web.go`/`passkeys.go`, `actions.go`/`canon`, `store` and `web/src/{flows,canonical,webauthn}.ts` already separate sign-in, stored challenges and canonical verification. Today assertion options drop extensions and the serializer forwards client extension results: add narrow PRF input decoding and output filtering, not generic pass-through. Keep the root updater's original update parser separate.
-
-**Locked → unlocking → unlocked** only for the verified attempt in the current epoch. Concurrent attempts cannot publish multiple handles. **Unlocked → draining → locked:** close the gate to new secret operations, revoke windows/attempts and stale action challenges, cancel bounded workers and wait for active leases through response/delivery. No secret starts to leave after the fence; bytes already sent or upstream calls already dispatched cannot be recalled. Record uncertain mints with issuer-bound durable intent/cleanup. Finish explicit lock by restarting and reporting locked only after drain/termination. Hard kill or crash starts a fresh epoch; never restore unlocked state, window tokens or ephemeral transport keys. Local expiry clocks continue through lock. On unlock drain verified issuer jobs, wake polls and recheck live grants/host, admission, policy and deadlines. Pending work queued while locked stays for explicit decision, not a surprise burst of automatic grants.
-
-**Locked allowlist** (proposed; everything else unavailable). Preserve normal ownership, Access, mTLS, poll-token, admission, visibility/404, anti-CSRF, quota and rate checks *before* returning lock information about an object. Use `423 locked` with retry guidance for an otherwise authorised but gated operation; CF proxy uses its existing error shape. New CLI shows “waiting for owner unlock” without resetting deadlines. Long polls recheck the gate on wake and just before issuing/consuming or writing any grant payload.
-
-| Listener / allowed operations while locked | Restrictions |
-|---|---|
-| Web static UI, `GET /healthz`, `GET /api/ui/session`, `POST /api/ui/login/{begin,finish}`, `POST /api/ui/logout` | Health is not authority. Anonymous status is minimal; login remains UV. No enroll-code registration on a sealed installation. |
-| Session-only `GET /api/ui/{state,hosts,help,updates}`, `GET /api/ui/{requests,enrollments}/{id}`, proposed `GET /api/ui/seal/status` | Metadata only, including non-secret queue/cleanup status and unlock readiness; update status cached, no discovery required while locked. |
-| Session-only `POST /api/ui/seal/unlock/{challenge,finish}`; `POST /api/ui/{requests,enrollments}/{id}/{challenge,decide}` **deny only** | Fresh canonical tap even for denial. No approve, batch, window open/confirm, register, update approval, secret edit, stage or import. Maintenance/bootstrap is separate from this public state. |
-| Session-only `POST /api/ui/{grants,standing,hosts}/{id}/{challenge,revoke}`; `POST /api/ui/passkeys/{id}/{challenge,remove}` (remove only); local `aqmasd revoke-host` | Apply local effects and audit immediately, including dependent revocations. Last-key guards apply. Do not claim upstream deletion. Queue durable issuer/service/parent-version/child-ID jobs in same transaction. Show “revoked here; upstream cleanup pending” until confirmed with the right issuer, or report provider expiry separately. |
-| Agent `POST /v1/enroll`, `GET /v1/enroll/{id}`, `POST /v1/requests`, `GET /v1/requests/{id}`, `POST /v1/requests/{id}/cancel` | Enrollment routes keep existing no-client-cert exception and poll token. Valid new submissions queue only, including policy-auto and standing matches. Pending, cancelled, denied, revoked, expired polls give metadata only. For an approved poll that would normally deliver, return locked; do **not** claim one-shot delivery, sign, mint or hand out existing certs. Preserve pending caps and normal expiry (defaults 10 min requests, 1 h enrollments). |
-| Agent mTLS `GET /v1/{grants,ssh-ca,ssh-target,cf/catalogue}`, `GET /v1/releases/latest`, `GET /v1/releases/{version}/{asset}` | Metadata, public trust and already-installed root-managed CLI assets only. Same scoped resolution on personal aliases. Future v2 allow only admitted catalogue, request create, status/list (metadata) and cancel equivalents; never collection/checkout/check-out renewal. |
-| Local workers | Expire rows, sweep stale sessions/challenges, maintain non-secret deletion intents; notifier described above. No CF proxy (even synthetic), snapshots API, orphan listing, issuer deletes, child mint, secret-backed ntfy, TLS CA issuance or standing/auto issuance. No “GET is safe” shortcut. |
-
-## Appendix C · Which passkeys are likely to unlock?
-
-Evidence reviewed **21 November 2026**; these are published results, not tests of the owner's devices. “PRF works” means a *provider* returns a stable PRF result on UV `get()` for the same credential and salt. Browser API support, successful sign-in, a vendor using PRF to unlock its **own** vault, and a credential created on another device are four different claims. A synced credential may also share a single recovery/failure domain.
+Evidence reviewed **21 November 2026**; these are published results, not tests of the owner's
+devices. “PRF works” means a *provider* returns a stable PRF result on UV `get()` for the
+same credential and salt. Browser API support, successful sign-in, a vendor using PRF to
+unlock its **own** vault, and a credential created on another device are four different
+claims. A synced credential may also share a single recovery/failure domain. Admin's
+**Test** proves a passkey's wraps on the device in hand.
 
 | Provider / authenticator | Evidence and deployment expectation |
 |---|---|
-| iCloud Keychain / Apple Passwords | **Yes on current platform paths.** [WebKit, Safari 18](https://webkit.org/blog/15865/webkit-features-in-safari-18-0/) introduced passkey PRF; [provider measurements](https://www.corbado.com/blog/passkeys-prf-webauthn) distinguish macOS 15+/iOS 18+ platform use from early iOS hybrid/QR inconsistencies. Test same-device and synced-device unlock separately on patched OS versions. |
-| Bitwarden-stored passkey | **Uncertain/mixed; provision as approval-only until tested.** [Bitwarden's vault unlock documentation](https://bitwarden.com/help/login-with-passkeys/) describes Bitwarden as RP. Its [provider feature request](https://community.bitwarden.com/t/support-for-storing-prf-capable-passkeys-in-bitwarden-vault/82239) and [2026 cross-platform tests](https://www.corbado.com/blog/passkeys-prf-webauthn) do not establish general provider support: no output on tested macOS/Chrome; some community successes elsewhere. |
+| iCloud Keychain / Apple Passwords | **Yes on current platform paths.** [WebKit, Safari 18](https://webkit.org/blog/15865/webkit-features-in-safari-18-0/) introduced passkey PRF; [provider measurements](https://www.corbado.com/blog/passkeys-prf-webauthn) distinguish macOS 15+/iOS 18+ platform use from early iOS hybrid/QR inconsistencies. Test same-device and synced-device use separately on patched OS versions. |
+| Bitwarden-stored passkey | **Uncertain/mixed; provision as approve-only until tested.** [Bitwarden's vault unlock documentation](https://bitwarden.com/help/login-with-passkeys/) describes Bitwarden as RP. Its [provider feature request](https://community.bitwarden.com/t/support-for-storing-prf-capable-passkeys-in-bitwarden-vault/82239) and [2026 cross-platform tests](https://www.corbado.com/blog/passkeys-prf-webauthn) do not establish general provider support: no output on tested macOS/Chrome; some community successes elsewhere. |
 | 1Password | **Yes on supported browser-extension paths.** [Vendor support and extension fix](https://www.1password.community/1password-at-home-31/passkeys-don-t-work-on-filekey-app-21994) identifies 8.10.82+ for a specific interop fix. [Provider guidance](https://www.1password.community/developers-69/1password-prf-support-in-macos-applications-25946) says request PRF at creation. Don't extrapolate to old entries, every mobile provider or hybrid transport. |
 | Google Password Manager | **Yes reported on Android/Chrome and desktop Chrome using GPM** ([PRF tests](https://www.corbado.com/blog/passkeys-prf-webauthn)). [Google's environment guide](https://developers.google.com/identity/passkeys/supported-environments) distinguishes GPM from a local Chrome profile or another OS provider. Choosing Chrome alone proves nothing. Test sync and QR separately. |
 | Windows Hello | **Conditional yes**, not the old blanket “no”. [Patched Windows 11 reports](https://community.bitwarden.com/t/encryption-prf-via-windows-hello-passkey/94236) and [Bitwarden's November Hello support note](https://bitwarden.com/blog/use-windows-hello-or-apple-touch-id-to-log-into-bitwarden/) support recent Hello with Chromium. Reports for 24H2/25H2 with Feb 2026 update or later vary for `create()` vs `get()`; do not rely on older Windows or mistake an external key/Edge password manager for Hello. |
 | YubiKey 5 series | **Yes with supported FIDO2 credential, firmware, UV/PIN and browser transport.** [Yubico's PRF guide](https://developers.yubico.com/WebAuthn/Concepts/PRF_Extension/Developers_Guide_to_PRF.html) describes assertion-time `hmac-secret`; [firmware guide](https://developers.yubico.com/Passkeys/Passkey_concepts/Security_key_capabilities/Pseudo-Random_Function_PRF_Support.html) distinguishes newer 5.8 creation-time support. Use `get()` regardless. U2F-only mode is insufficient. |
 | Security Key NFC series | **Yes on documented FIDO2 units; NFC end-to-end is conditional.** [Device info from a 5.4.3 Security Key NFC](https://github.com/Yubico/yubikey-manager/issues/594) lists `hmac-secret`. Test actual model/firmware over USB and separately on phone/NFC. [Safari 26.4](https://webkit.org/blog/17862/webkit-features-for-safari-26-4/) added roaming-key PRF; [interop issue 311099](https://bugs.webkit.org/show_bug.cgi?id=311099) documents mismatching results and a preview fix. Platform-key success is no proof for roaming keys. |
 
-**Release gates.** Round-trip a test wrap twice with independent UV assertions per supported device/browser/transport. Include cancellation, missing PRF on `create` and `get`, differing results across sync, lost last PRF key and recovery without *any* login key. Run Go/TS vectors for context encoding, wrong salts, swapped wraps/roles/versions, tampered HPKE public key/packets, check failures, stale epochs and replay. Test crash at each cutover/rotation boundary, locked update/rollback, expired TLS leaf, cold lock push, no private-key reads on boot, no raw PRF in either ceremony JSON, logs or DB/WAL. Race lock against auto/standing, proxy, sweep, mint and one-shot delivery. Race batch vs cancel and window vs close, logout, idle, policy revision, opener removal and excluded actions on legacy and scoped routes. Verify every denied path leaves authority unchanged.
+## Owner decisions (2026-11-21, as they stand under format 2)
 
-## Owner decisions (2026-11-21)
-
-1. **Any single enrolled, unlock-capable passkey unlocks** — Apple, a password-manager passkey or
-   a hardware authenticator; no two-person or two-device rule ("we don't need an extreme level of
-   security"). A passkey is unlock-capable only if its provider returns a stable PRF result
-   (tested at enrollment, shown on the Admin passkey list); a passkey without PRF still signs in
-   and approves. Recovery: a dedicated offline recovery key held by the owner. Before sealing goes
-   live, a drill: unlock with one tested passkey and recover with the recovery key alone.
-2. **Unlocking through the Cloudflare-served approval page is acceptable**, with the per-attempt
-   encryption described above. An off-edge unlock origin is optional later work.
+1. **Any single enabled passkey opens what it holds** — Apple, a password-manager passkey or a
+   hardware authenticator; no two-person or two-device rule. A passkey holds scope keys only if
+   its provider returns a stable PRF result (tested when enabled, shown in Admin); a passkey
+   without PRF still signs in and approves. Recovery: a dedicated offline recovery key held by
+   the owner, proven by a drill before activation.
+2. **Approving through the Cloudflare-served page is acceptable**, with the per-attempt
+   encryption above. An off-edge origin is optional later work.
 3. **Accepted exceptions:** the agent-API TLS leaf key stays a protected service-readable file,
-   and a separate lock-alert publisher keeps its own ntfy credential.
-4. **Build and enable both now:** exact-action batches **and** approval windows. Windows are on by
-   default for the owner's own organisation with conservative defaults (configurable on the Admin
-   page: duration and idle timeout), with the always-tap exclusions in this document; client and
-   club organisations default to off but are configurable per organisation.
-5. **One tap may unlock and open a window, and that combination is on by default** (the unlock
-   screen shows the window that will open and lets the owner untick it).
-
-## Open questions for the owner (answered above, kept for the record)
-
-1. Which two independent credential/device paths should pass the first unlock drill? Is a dedicated offline age identity with a separately held spare acceptable?
-2. Is the Cloudflare-served unlock page acceptable given active-edge PRF theft, or is an independently trusted approval path a prerequisite?
-3. Accept the unsealed TLS leaf and separate lock-alert publisher so requests queue and ntfy works after a cold restart?
-4. Ship exact batches first and keep windows off everywhere? For a personal pilot, which sets, absolute duration and idle limit; should client/club windows stay disabled even as a policy option?
-5. Offer the explicit combined unlock/window tap, or keep the two decisions on separate prompts?
+   the restart-alert publisher keeps its own ntfy credential, and the approval-notice topic
+   stays unsealed (BUCKETS.md §9).
+4. **Batches and approval windows** are both built. Windows are on by default for the owner's
+   own organisation with conservative defaults (configurable in Admin); client and club
+   organisations default to off.
+5. *Superseded:* the combined unlock + window tap. A window-open tap opens what the window
+   needs; there is nothing else to unlock.

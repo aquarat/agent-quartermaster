@@ -7,7 +7,8 @@ web UI mirrors them in `web/src/types.ts`. This file describes them.
 Errors: non-2xx with `api.Error` `{"error": "<code>", "message": "<human text>"}`. Codes
 (`api.Err*`): `bad_request` (400), `unauthenticated` (401), `forbidden` (403), `not_found`
 (404), `conflict` (409: already decided, challenge already used, state changed),
-`expired` (410), `rate_limited` (429), `denied`, `internal` (500).
+`expired` (410), `locked` (423: a sealed bucket is closed, [Buckets](#buckets)),
+`rate_limited` (429), `denied`, `internal` (500).
 
 Statuses (`api.Status*`): `pending`, `approved`, `denied`, `expired`, `revoked`, `cancelled`.
 
@@ -159,8 +160,8 @@ lives on the server, keyed by `challenge_id` (no state in cookies).
 | `GET /api/ui/help` | session | `{agent_api_url,cli_download_base_url,ca_pin,owner_max_seconds}`; no secrets, no inferred URLs from request headers |
 | `POST /api/ui/hosts/{id}/challenge` / `revoke` | `{action:"revoke"}` / `DecideRequest` | `ChallengeResponse` / `RevokeResult`; expires pending requests, revokes the host and standing/CF access, audits `host_revoke` |
 | `GET /api/ui/requests/{id}`, `GET /api/ui/enrollments/{id}` | | `PendingItem` plus `status` |
-| `POST /api/ui/requests/{id}/challenge` | `ChallengeRequest {action: approve\|deny, ttl_seconds?, standing_hours?}` | `ChallengeResponse {challenge_id, canonical, public_key}` |
-| `POST /api/ui/requests/{id}/decide` | `DecideRequest {challenge_id, assertion}` | `RequestStatus` **without** `grant` (browsers never get certificates) |
+| `POST /api/ui/requests/{id}/challenge` | `ChallengeRequest {action: approve\|deny, ttl_seconds?, standing_hours?}` | `ChallengeResponse {challenge_id, canonical, public_key, open?}` (`open`: [Buckets](#buckets)) |
+| `POST /api/ui/requests/{id}/decide` | `DecideRequest {challenge_id, assertion, open?}` | `RequestStatus` **without** `grant` (browsers never get certificates) |
 | `POST /api/ui/enrollments/{id}/challenge` / `decide` | `{action: approve\|deny}` / `DecideRequest` | `ChallengeResponse` / `EnrollStatus` without the certificate |
 | `POST /api/ui/standing/{id}/challenge` / `revoke` | `{action: "revoke"}` / `DecideRequest` | `ChallengeResponse` / `RevokeResult {ok, id, status}` |
 | `POST /api/ui/grants/{id}/challenge` / `revoke` | `{action: "revoke"}` / `DecideRequest` | `ChallengeResponse` / `RevokeResult` |
@@ -221,7 +222,9 @@ lives on the server, keyed by `challenge_id` (no state in cookies).
 
 ### Approval challenge (the security boundary)
 
-The WebAuthn challenge for an action is `SHA-256(canonical)` (go-webauthn `WithChallenge`),
+The WebAuthn challenge for an action is `SHA-256(canonical)` (go-webauthn `WithChallenge`;
+on a sealed installation an action that opens buckets binds an open descriptor too, see
+[Buckets](#buckets)),
 where `canonical` is UTF-8 JSON with keys sorted (bytewise; all keys ASCII), no whitespace, no
 HTML escaping, values only strings, integers and booleans, and **exactly** this key set per
 object (a missing or extra key cannot be built by the server and is refused by the UI):
@@ -406,6 +409,12 @@ maintenance runner. As **root**: `aqmasd maint-init [--repin]` installs the runn
 `aqmasd maint-run` (started by `aqmas-maint.path`) runs one owner-approved request. The
 Setup web API and the canonical `setup` object are in [SETUP.md](SETUP.md).
 
+Sealed stores ([Buckets](#buckets), [SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)):
+`seal-import` and `bucket-migrate` are the staging modes the runner starts;
+`seal-drill BACKUP.db RECIPIENT <identity` opens every scope key, bucket and record of a
+standalone backup offline and prints only counts and the manifest digest;
+`seal-recover DIRECTORY <identity` is isolated recovery when every passkey is lost.
+
 ## 5. Cloudflare (milestone 2 contract)
 
 Design, scope catalogue, deny-list, guard rails, snapshots and config: `docs/CLOUDFLARE.md`.
@@ -568,65 +577,256 @@ On the agent API listener (`:8443`, mTLS client certificate required).
   `aqmas: approve cloudflare cf.dns.edit zone=example.com (proxy) for hosta, ttl 7200s, standing 0h [ref ABC123]`.
 - Audit entries for Cloudflare: `cf_auto_approve`, `cf_write`, `cf_refused`, `cf_token_mint`,
   `cf_token_delete`, `cf_token_orphan` (object `grant:<id>` or `request:<id>`).
-# Sealed ceremony profile (schema 8)
 
-See [the supervised procedure](SEAL-OPERATIONS.md). Session/CSRF/Access
-requirements are unchanged. `GET /api/ui/seal/status` returns the mode,
-boot/lock epoch, installation and session-visible unlock selections.
-`POST /api/ui/seal/unlock/challenge` takes `credential` (the public passkey
-row identifier) and, for supervised wrap setup, `registration_id`. The response
-is `{attempt_id,canonical,publicKey}`. For canonical `v=3,object="seal"` the
-exact sorted fields are `action,credential_id,epoch,id,installation,issued_at,
-mk_version,nonce,object,prf_salt,recipient,rp_id,suite,v` plus `registration_id`
-for `wrap-enroll` only. Binary fields are unpadded base64url, UTC time at
-second precision; generation, suite and version are integers. The selected
-raw credential and its salt must match the sole allowed ID and `prf.eval.first`.
-Never evaluate PRF for an ordinary assertion or send extension results.
+# Buckets
 
-Suite 1 uses Appendix A length-prefixed tuples with **version uint64(1)**.
-At-rest records are one suite byte `01` || 24-byte random nonce || XChaCha
-ciphertext and tag. The key-check marker is `aqmas installation master key
-check`. Recovery uses `filippo.io/age`, with the canonical `age1…` recipient
-string in the recovery tuple. For RFC 9180 base mode use SEC1 uncompressed
-P-256 / HKDF-SHA256 / AES-128-GCM. `info` role `hpke-finish`: installation,
-purpose; AAD role `hpke-aad`: raw attempt ID, epoch, SHA-256(canonical).
-Plaintext is u32be(32), KEK, u32be(assertion length), UTF-8 assertion JSON
-(≤16 KiB). Finish takes only `{attempt_id,enc,ciphertext}`; packet fields are
-unpadded base64url. An attempt is consumed before packet verification. An
-assertion is still required inside the packet; HPKE is not authentication.
+Seal format 2, schema 9 ([BUCKETS.md](BUCKETS.md); procedures in
+[SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)). Session, CSRF and Access requirements are
+unchanged. There is no unlock: format 1's `/api/ui/seal/unlock/*`, the `lock` control action
+and the combined `unlock-window` ceremony are gone. Binary values are unpadded base64url;
+`raw` below means the decoded bytes. Context strings:
 
-`POST /api/ui/seal/control/challenge` accepts `action=lock|activate`.
-`object="seal-control",v=3` fields are `action,epoch,id,issued_at,nonce,object,v`
-where id is installation. Activate additionally signs `manifest`, the complete
-public JSON transition manifest as a string. Finish (`control/finish`) takes
-the standard `challenge_id,assertion`. No PRF. There is no unsigned import or
-unlock on restart. Authorised but locked secret operations return 423 `locked`;
-request and enrollment polls may retry without resetting their deadlines.
-# Sealed passkey capabilities
+    T2(role, f1, …, fn) = F("aqmas-seal") ‖ F(u64be(2)) ‖ F(role) ‖ F(f1) ‖ … ‖ F(fn)
+    F(x) = u32be(len(x)) ‖ x
 
-Admin on an unlocked installation uses session-only POSTs under
-`/api/ui/seal/passkeys/`. `challenge` accepts `action` (`register`, `enable`,
-`disable`), `nickname`, `capability` (`unlock` or `approve-only`) and the
-full base64url `credential_id` (empty only for register). Canonical v3 object
-`passkey-capability` signs these four scalars, the new registration `id`,
-`installation`, `epoch`, `mk_version`, `nonce` and `issued_at`. `authorize`
-consumes only that challenge and a UV assertion. Registration `create`
-submits the attestation against this signed intent. For an unlock credential,
-`evaluate`/`finish` run two independent single-ID PRF gets and encrypted
-finishes: first wrap the live MK, then unwrap it and verify the key-check.
-Neither a new credential nor its wrap is active before the second test.
-There is no implicit downgrade on cancellation or provider failure. Repeat
-with an explicitly signed approve-only intent instead. Unfinished enrollment
-is bounded, session-bound, expires after five minutes and is lost on restart.
-Existing keys can be tested without re-registering them. `unlock_tested_at`
-is for this credential and MK, not a guarantee about every synced device.
+Routes under `/api/ui/seal/` answer 404 on an unsealed installation, 423 `locked` on a
+format-1 store awaiting migration, and 409 while a stage is in progress (except status,
+drill, stage and the `activate` control action). An operation that needs a closed bucket
+answers **423 with error code `locked`**: agents get "*label* is closed: waiting for the owner
+to reopen it" and keep their deadline; an approval that must open a bucket but carries no
+`open` gets "this approval must open *labels*". At most 60 open attempts a minute and 64
+pending (429 `rate_limited`).
+
+## Open descriptor and bound challenge
+
+A challenge whose action needs buckets returns `ChallengeResponse {challenge_id, canonical,
+public_key, open: {descriptor}}`; its finish takes `open` next to `challenge_id` and
+`assertion`:
+
+| Challenge | Actions that carry `open` | Finish |
+|---|---|---|
+| `POST /api/ui/requests/{id}/challenge` | `approve` (SSH; Cloudflare proxy mode) | `POST /api/ui/requests/{id}/decide` |
+| `POST /api/ui/enrollments/{id}/challenge` | `approve` | `POST /api/ui/enrollments/{id}/decide` |
+| `POST /api/ui/seal/batch/challenge` | a batch with an approval | `POST /api/ui/seal/batch/finish` |
+| `POST /api/ui/seal/windows/open/challenge` | sets with SSH or Cloudflare proxy | `POST /api/ui/seal/windows/open/finish` |
+| `POST /api/ui/seal/env/challenge` | `approve` | `POST /api/ui/seal/env/finish` |
+| `POST /api/ui/seal/vault/challenge` | `reveal`, `sign-approve` | `POST /api/ui/seal/vault/finish` |
+| `POST /api/ui/seal/control/challenge` | `renew-leaf`, `reopen`, `rekey` | `POST /api/ui/seal/control/finish` |
+| `POST /api/ui/seal/passkeys/challenge` | `register`, `enable` (scopes that already have a key) | `POST /api/ui/seal/passkeys/authorize` |
+
+Every other challenge keeps `challenge = SHA-256(canonical)`. The descriptor is canonical JSON
+(sorted keys, no whitespace, no HTML escaping) with exactly these keys:
+
+    {"attempt_id","buckets":[{"hold","id","kind","label","scope","until"}…],"epoch",
+     "installation","object":"bucket-open","purpose":"approve","recipient","scopes","v":1}
+
+* `attempt_id`, `epoch` (this boot), `installation`, each bucket `id`: 32 bytes.
+* `recipient`: a fresh 65-byte P-256 point (uncompressed SEC1) for this ceremony only: single
+  use, bound to the session and purpose, two minutes.
+* `scopes`: one or two, `installation` first, then organisation IDs sorted. An action needing
+  buckets of three scopes is refused (400): split it.
+* `buckets`: sorted by raw ID. `kind` is `ssh-ca`, `internal-ca`, `cf-proxy`, `env-set` or
+  `signer`; `label` the display path; `hold` the card text of what keeps it open afterwards
+  (`; `-joined); `until` the latest RFC 3339 end, or `""` for an event (revoke, collect,
+  restart). Every bucket's `scope` is in `scopes`. `buckets` is `[]` when the tap opens only
+  scope keys (passkey enable, rekey of an empty scope).
+
+The WebAuthn challenge is
+
+    SHA-256(T2("open-challenge", SHA-256(canonical), SHA-256(descriptor)))
+
+`public_key.extensions.prf.evalByCredential` maps each owner passkey that has wraps for
+**all** the descriptor's scopes to `{"first": salt(s1), "second": salt(s2)}` (32-byte salts,
+descriptor order; `second` only for two scopes), even when the buckets are open.
+`allowCredentials` lists those passkeys, plus every other owner passkey when every needed
+bucket is open at challenge time (a window open lists only its chosen credential). With no
+passkey able to open them the challenge is refused (423).
+
+The page parses the descriptor (exact key set, `v` 1, 32-byte IDs, 65-byte recipient starting
+`0x04`, one or two scopes), checks its re-serialisation equals the string, recomputes the
+bound challenge and compares it with the options, checks every `evalByCredential` entry has
+exactly one 32-byte salt per scope, and shows the buckets (label, hold, until) on the card.
+After the tap, with `getClientExtensionResults().prf.results.first` (and `.second` for two
+scopes), for each scope *i*:
+
+    KEK_i = HKDF-SHA256(ikm = PRF result_i, salt = raw installation,
+                        info = T2("scope-kek", raw installation, utf8(rpId),
+                                  raw credential ID, utf8(scope_i), raw salt_i), 32)
+
+and sends `open: {attempt_id, enc, ciphertext}`: RFC 9180 base mode,
+DHKEM(P-256, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM, to `recipient`, with
+
+    info      = T2("hpke-open", raw installation, utf8(purpose))
+    aad       = T2("open-aad", raw attempt ID, raw epoch, bound challenge (32 bytes), raw credential ID)
+    plaintext = F(KEK_1) ‖ F(KEK_2 or "")
+
+`enc` is 65 bytes. The page wipes PRF results and KEKs and never puts PRF results in the
+assertion's `clientExtensionResults` (the broker refuses extension output it does not
+expect). If the passkey returned no PRF results the page sends no `open`; the broker then
+succeeds only when every needed bucket is already open. An `open` on a challenge without a
+descriptor is refused (400); a packet sent while everything was open is consumed and
+discarded.
+
+The broker verifies the assertion over the bound challenge, consumes the attempt, opens the
+packet, unwraps the signing passkey's scope wraps (marking them tested), unwraps exactly the
+descriptor's closed buckets, wipes scope keys and KEKs, holds the buckets for the apply, then
+keeps the descriptor's holds (or releases them on failure). A failure anywhere opens and
+applies nothing.
+
+**Scope-enrol descriptors** (passkey enable and test, recovery enrolment, staging) have the
+same keys plus `credential_id` (the only allowed credential) and `salts` (one 32-byte salt per
+scope, aligned), with `object` `"scope-enrol"`, `buckets` `[]` and `purpose` `enrol`, `test`,
+`stage` or `migrate`. Their options carry `extensions.prf.eval {first, second?}` (not
+`evalByCredential`) and `allowCredentials` = that credential. The bound challenge, KEK and
+packet are as above with the descriptor's `purpose` in `info`. `migrate` adds
+`legacy {installation, mk_version, prf_salt}` and exactly one scope (`installation`): PRF
+`first` is `legacy.prf_salt`, `second` is `salts[0]`, and the packet's first slot carries the
+format-1 KEK (HKDF over the first PRF output, salt = raw legacy installation, info = the
+suite-1 tuple `mk-kek`, legacy installation, rpId, credential ID, `mk_version`, `prf_salt`),
+the second the scope KEK.
+
+## Seal status
+
+`GET /api/ui/seal/status` (session):
+
+    {"mode", "installation", "epoch",
+     "scopes":   [{"scope","title","buckets","has_key"}],
+     "buckets":  [{"id","kind","label","scope","scope_title","open","opened_at"?,
+                   "holds":[{"kind","ref","reason","until"?,"since"}],
+                   "paused":[{"kind","ref","reason"}]}],
+     "passkeys": [{"id","name","current","prf","scopes":[{"scope","tested"}],"opens","of","missing"}],
+     "active_windows"?, "profiles"?, "verified_access"?, "leaf_expires"?, "leaf_repair"?,
+     "stage"?}
+
+* `mode`: `unsealed` (only the empty lists), `buckets` (format 2 serving),
+  `migration-required` (a schema-8 format-1 store under this binary: sign-in, queueing,
+  deny/revoke and Setup only), `setup` (seal import or bucket migration staging) or
+  `activated` (staging committed, the process is about to exit). Scopes, buckets and passkeys
+  are filled in mode `buckets` for an owner session.
+* `scopes`: the installation and every organisation, with or without a scope key.
+* Hold `kind`: `instant`, `grant` (Cloudflare proxy grant), `env` (release until collected,
+  at most 10 minutes), `sign` (signing grant), `standing`, `auto` (Cloudflare auto-approval
+  until restart) or `window`. `paused` lists live users of the bucket (grants, env releases,
+  signing grants, standing rules) without a hold on it: they wait for a **Reopen**.
+* Per passkey: `id` as in `PasskeyInfo`; `prf` true when it holds any scope wrap; `opens` the
+  number of buckets in its scopes, `of` all buckets; `missing` the scopes it has no wrap for.
+* `stage` (mode `setup`, owner session): `{source: "unsealed"|"format-1", scopes:[{scope,
+  title, buckets, wrapped, tested}], drilled, drill_key, manifest?, legacy_unlocked,
+  dropped?, choices:[{id, name, credential_id, legacy?: {mk_version, prf_salt,
+  installation}}]}`. `manifest` appears once every scope is wrapped and tested and the drill
+  passed; `choices` are the passkeys that may take the next step (for `format-1`, before the
+  old store is open, only format-1 unlock passkeys).
+
+## Seal control
+
+`POST /api/ui/seal/control/challenge {action, buckets?, scope?}` → `ChallengeResponse`;
+`POST /api/ui/seal/control/finish {challenge_id, assertion, open?}` → `{ok}`.
+
+| `action` | Input | Signed fields | Opens | Effect |
+|---|---|---|---|---|
+| `close-all` | nothing | `open_buckets` (count) | nothing | Wipes every open bucket and hold, ends every window, drops pending attempts and capability stages |
+| `renew-leaf` | nothing | `repair` (JSON string: `ca_pin`, `configured_sans`, `effect`) | `internal-ca`, instant | Renews the agent TLS leaf; the broker then restarts (everything closes) |
+| `reopen` | `buckets`: 1–16 sorted, unique bucket IDs | `buckets` `[{id, label}]` | those buckets | Keeps each open with the holds of its live users |
+| `rekey` | `scope` (with a key) | `scope`, `scope_title`, `bucket_count` | every bucket of the scope (an empty scope: its key alone) | New scope key and bucket keys, records re-encrypted, drafts dropped, the scope's buckets closed, only the tapping passkey keeps a wrap. Requires `open`; returns `{ok, buckets}` |
+| `activate` | nothing (mode `setup`, stage ready) | `manifest` (the format-2 manifest JSON string) | nothing | Commits the stage; the process exits. A plain signature: challenge `SHA-256(canonical)`, `open` refused, a passkey not pinned by the runner refused |
+
+## Passkey capabilities
+
+Session routes under `/api/ui/seal/passkeys/` (BUCKETS.md §7):
+
+1. `challenge {action, nickname, capability, credential_id, scopes}`: `action` `register`,
+   `enable`, `disable` or `test`; `capability` `unlock` (one or two `scopes`, installation
+   first) or `approve-only` (none); `credential_id` the target's raw ID, `""` for register;
+   `nickname` the target's current nickname or the new one. Register/enable: the canonical
+   carries an open descriptor (purpose `approve`, `buckets` `[]`, the listed scopes that
+   already have a key), so the approving passkey must already open them; with none, a plain
+   challenge. Test: a scope-enrol descriptor (purpose `test`) at the target's own salts.
+   Disable: plain.
+2. `authorize {challenge_id, assertion, open?}` → register: `{registration_id, public_key}`
+   (creation options, PRF requested); enable: `{registration_id}`; disable: `{ok}` (deletes
+   the target's wraps for the listed scopes, or all; refused for the last passkey that opens a
+   scope); test: `{ok, scopes}` (marks the wraps tested).
+3. `create {registration_id, credential}` → `{ok}` (register only; an approve-only
+   registration is committed here).
+4. `evaluate {registration_id}` → `ChallengeResponse` with canonical object `passkey-enrol`
+   and a scope-enrol descriptor (purpose `enrol`, the target credential, fresh salts). A
+   listed scope without a key gets one now (fresh key pair and recovery wrap).
+5. `finish {registration_id, challenge_id, assertion, open}` → `{ok, scopes}`: the broker
+   wraps each open scope key under the target's KEKs and wipes it.
+
+Repeat from step 1 for further scopes, two per round. A stage is bound to the session,
+expires after five minutes and is lost on restart (at most 16 pending). Admin's **Create**
+for a new organisation's scope is `enable` of the signed-in passkey for that scope (two
+taps).
+
+## Recovery (Admin, rare path)
+
+1. `POST /api/ui/seal/recovery/key {}` → `{attempt_id, recipient}`: a fresh broker key (two
+   minutes, single use). The page seals the pasted identity text to it: HPKE base mode,
+   `info = T2("hpke-open", raw installation, "recovery")`,
+   `aad = T2("open-aad", raw attempt ID, raw epoch, "", "")`; `packet` =
+   base64url(`enc ‖ ciphertext`).
+2. `POST /api/ui/seal/recovery/challenge {mode, attempt_id, packet_sha256, credential_id?,
+   scopes?}`: `mode` `drill` (plain challenge) or `enrol` (target `credential_id`, one or two
+   `scopes` with a key; scope-enrol descriptor, purpose `enrol`, fresh salts, the target
+   taps). `packet_sha256` is the lowercase hex SHA-256 of the raw packet.
+3. `POST /api/ui/seal/recovery/finish {challenge_id, assertion, packet, open?}` →
+   `{ok, scopes, buckets}`: drill opens every scope key from its recovery wrap and every bucket
+   and record, then wipes them; enrol wraps the recovered scope keys for the target.
+
+`aqmasd seal-recover` serves its own steps on a private socket only (`POST /recovery/{step}`,
+header `X-Aqmas-Recovery`: the ticket for `begin`, then the session it returns): `begin
+{name}` → `{public_key, session, registration_id, installation, epoch, scopes}`; `create
+{credential}` → `{credential_id, scopes}`; `evaluate {}` → `{canonical, public_key, open}`
+(scope-enrol, purpose `enrol` until every scope is wrapped, then `test`); `finish {assertion,
+open}` → `{next: "evaluate"}` or `{next: "replace", canonical, public_key}`; `replace
+{assertion}` → `{ok}`.
+
+## Stage
+
+Seal import and bucket migration (status `mode` `setup`):
+
+* `POST /api/ui/seal/stage/challenge {step, credential, scopes}`: `step` `open-legacy`
+  (format-1 source, first step: exactly `["installation"]`, a format-1 unlock passkey),
+  `create` (scopes without a wrap; fresh salts) or `test` (wrapped, untested scopes; their
+  salts); `credential` the passkey's `id`; one or two scopes, installation first. The first
+  step fixes the passkey and session. → `ChallengeResponse` with a scope-enrol descriptor of
+  purpose `migrate`, `stage` or `test`.
+* `POST /api/ui/seal/stage/finish {challenge_id, assertion, open}` → `{ok}`. A passkey
+  without PRF results cannot be used.
+* `POST /api/ui/seal/drill {packet}` → `{ok, scopes, buckets}`: the recovery identity sealed
+  to `stage.drill_key` (HPKE base mode, empty AAD, info `aqmas-seal-drill-v1\0` followed by
+  the 32 raw installation bytes; see [SETUP.md](SETUP.md)). It opens every staged scope key,
+  bucket and record.
+* Then the `activate` control action.
+
+## Canonical key sets (v3)
+
+Common keys: `v` (3), `object`, `action`, `id`, `nonce`, `issued_at`; most objects also carry
+`installation` and `epoch` (this boot). Values may be strings, integers, booleans, arrays and
+nested objects as listed.
+
+| `object` | `action` | `id` | Further keys |
+|---|---|---|---|
+| `seal-control` | `close-all`, `renew-leaf`, `reopen`, `rekey`, `activate` | installation | `epoch` and the action's signed fields above (no `installation` key) |
+| `passkey-capability` | `register`, `enable`, `disable`, `test` | fresh registration ID | `installation, epoch, credential_id, nickname, capability, scopes` |
+| `passkey-enrol` | `enrol` | registration ID | `installation, epoch, credential_id, scopes` |
+| `recovery` | `drill`, `enrol` | attempt ID | `installation, epoch, packet_sha256`; enrol adds `credential_id, nickname, scopes` |
+| `recovery-enrol` (seal-recover) | `enrol`, `test` | registration ID | `installation, epoch, credential_id, nickname, scopes` |
+| `recovery` (seal-recover) | `replace` | registration ID | `installation, epoch, credential_id, nickname, scopes, effects, manifest_sha256, backup_sha256, serial_high_water` (decimal string), `retire_credentials` (comma-joined IDs); challenge `SHA-256(canonical)` |
+| `seal-stage` | `open-legacy`, `create`, `test` | installation | `epoch, credential, scopes` (no `installation` key) |
+
+The batch, window, env and vault objects below keep their key sets; their challenges are
+bound to a descriptor when they open buckets.
+
 # Batch and window profiles
 
 On a sealed installation, `/api/ui/seal/batch/{challenge,finish}` commits to
 1–10 complete scoped canonicals, max 32 KiB, same org, sorted by request ID.
 The flat v3 `batch/decide` profile adds `installation,epoch,org_id,org_title,
 count,items` to the common keys. `items` is a canonical JSON array of strings.
-Finish accepts only the challenge ID and UV assertion. Any stale member rolls
+The tap opens the union of the members' buckets (at most two scopes). Finish
+accepts only the challenge ID, the UV assertion and `open`. Any stale member rolls
 back all changes (including serials/signatures); the outer assertion and each
 member and outcome are linked in audit. Only ordinary finite SSH and low-risk
 proxy requests qualify. Individual taps remain available.
@@ -642,11 +842,9 @@ beyond-soft-cap decision. See [SEALED.md](SEALED.md#window-delegate-clicks-not-s
 
 Windows require verified Access. `windows/open/{challenge,finish}` uses
 `window/open`, `installation,epoch,terms` with a new public window ID. Only
-the chosen credential is offered. Combined `unlock-window` instead includes
-the complete `window` terms string in the HPKE-bound seal canonical and uses
-purpose `unlock-window`; finish includes `combined:true`. Neither mode can be
-exchanged for the other. The eligible personal combination is preselected.
-An open returns `{id,token,expires_at}`. The tab retains a non-extractable
+the chosen credential is offered. The tap opens the buckets the window's sets
+need (SSH CA, the org's Cloudflare proxy parent) with a window hold. An open
+returns `{id,token,expires_at}`. The tab retains a non-extractable
 P-256 key and token only in memory. `windows/prepare` re-resolves an ordinary
 decision and returns a one-use proposal; `windows/confirm` requires a raw
 P1363 ECDSA-SHA256 proof over the suite-1 tuple `window-confirm`, installation,
@@ -676,15 +874,17 @@ blob. SHA-256 commitment input is u32be-length-prefixed components: UTF-8
 `aqmas-env-edit-v1`, secret random 32-byte salt, org/service/set IDs, base
 revision as u64be, operation, then sorted triples of operation/name/exact
 value bytes. Commit recomputes the commitment and key changes before atomically
-publishing a fresh DEK-encrypted revision. SQLite free pages and earlier WAL
-or snapshots can retain recoverable old ciphertext and wraps.
+publishing a fresh revision: one record per entry, sealed to the set's bucket
+public key (nothing needs to be open). The store runs `secure_delete`; earlier
+WAL frames, snapshots and backups can still retain old ciphertext.
 
 Session-only `/api/ui/seal/env/{state,ticket,challenge,finish}`. V3 `env`
 signs `action,id,installation,epoch,issued_at,nonce,metadata,ttl_seconds` and
 the common `v,object`. Metadata is the complete reviewed draft or release
 record (immutable IDs, path/title, revisions, admission, identity, manifest,
 mode, address and policy limits); the untrusted free-form reason is blank
-in the signed release. Releases need a fresh individual tap, including
+in the signed release. Approving a release opens the set's bucket until the
+values are collected (10 minutes at most). Releases need a fresh individual tap, including
 denials. No window, batch, standing or automatic env approval. Rotation
 means replacing the value at its provider as well as importing the new set.
 
@@ -692,7 +892,7 @@ means replacing the value at its provider as well as importing the new set.
 `GET /v2/env/grants/{id}`, `POST .../{id}/checkin` return metadata only.
 `POST /v2/grants/{id}/collect` returns values **once**, after commit, only to
 the live issuing enrollment and peer with matching mode, revision, admission
-and policy. A locked 423 does not consume the grant. A response lost after
+and policy. A 423 `locked` (bucket closed) does not consume the grant. A response lost after
 commit requires a new release. TTL bounds collection, not upstream validity.
 
 * `aqmas run PATH --why REASON -- COMMAND ...` resolves COMMAND first and
@@ -718,7 +918,7 @@ destination variables (including unset-but-declared integer, nameref and
 readonly attributes) before the first export. Disable command tracing. Use
 `aqmas reap-checkouts` on login to remove RAM-file remnants from a killed
 holder; checkout runs the same reaper and waits for holder readiness before
-reporting success. Combined-window audit stores the exact opening canonical
+reporting success. Window-open audit stores the exact opening canonical
 and the public WebAuthn verification fields when signed authenticator data
 has no extensions. When it carries extensions, audit records that the opener
 was verified live; the assertion cannot later be independently reverified
@@ -735,7 +935,7 @@ section is the wire contract.
 
 Values and private keys cross the edge as one RFC 9180 HPKE base-mode message
 per fresh key pair: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, the
-suite of the unlock finish. Public keys are uncompressed SEC1 points (65
+suite of the bucket-open packet ([Buckets](#buckets)). Public keys are uncompressed SEC1 points (65
 bytes); binary fields are unpadded base64url. `T(role, f...)` is the sealed
 store's framed tuple (`aqmas-seal`, uint64 1, role, then each field, every
 component prefixed with its uint32 big-endian length).
@@ -746,30 +946,30 @@ component prefixed with its uint32 big-endian length).
 | Broker → browser (reveal) | Browser's, generated for this reveal and named in the signed canonical | `T("hpke-vault", installation, "reveal")` | `T("hpke-vault-aad", SHA-256 of the canonical, epoch, set ID as UTF-8)` |
 
 The edge and any HTTP body logger see ciphertext only. The broker's upload
-key is named in the signed metadata (`recipient`), as the unlock recipient is:
+key is named in the signed metadata (`recipient`), as an open recipient is:
 the page signs for the key it sealed to, so a packet opened and re-sealed on
-the way is refused by the page before the tap. As with unlock
+the way is refused by the page before the tap. As with opening buckets
 ([SEALED.md](SEALED.md)), none of this defends against an edge that serves a
 different page: such a page can read what is typed into it. An upload attempt
 and a generated key awaiting its tap are dropped after five minutes, at
 logout, and when their challenge is refused or finished.
-A packet for one set, attempt, lock epoch or purpose does not open as another.
+A packet for one set, attempt, boot epoch or purpose does not open as another.
 The reveal AAD contains the canonical's digest, and so its nonce: a recorded
 response cannot be replayed into a later ceremony. Vectors:
 `test/vectors/vault.json` (Go and TypeScript each open what the other sealed).
 
 ## Routes
 
-* `GET state` → `{unlocked, schemes, organisations:[{id,slug,title,allow_reveal}], sets, requests}`.
+* `GET state` → `{schemes, organisations:[{id,slug,title,allow_reveal}], sets, requests}`.
   A set carries `org_id, org_slug, org_title, service_id, service_slug,
   service_title, set_id, set_slug, set_title, kind ("env-set" | "signer"),
   revision, names, allow_reveal` and, for a signer, `scheme, origin, created_at,
   signatures, public_key, public_hex, public_pem, fingerprint` (SHA-256 of the
   raw public key). `requests` are pending signing requests and live signing
-  grants (below). Metadata only; works while locked.
-* `POST attempt` `{}` → `{attempt_id, recipient, expires_at}`. Unlocked only.
-* `POST challenge` with a choice (below) → `{canonical, challenge_id, public_key, facts}`.
-* `POST finish` `{challenge_id, assertion}` → the action's result.
+  grants (below). Metadata only; needs no open bucket.
+* `POST attempt` `{}` → `{attempt_id, recipient, expires_at}`.
+* `POST challenge` with a choice (below) → `{canonical, challenge_id, public_key, facts, open?}`.
+* `POST finish` `{challenge_id, assertion, open?}` → the action's result.
 
 Every action is a v3 review canonical: sorted keys `action, epoch, id,
 installation, issued_at, metadata, nonce, object ("vault"), v (3)`.
@@ -778,7 +978,8 @@ insignificant space, `/`, `<`, `>` and `&` unescaped, U+2028/U+2029 as
 ` `/` `. The page builds the expected metadata from what the owner
 chose and what `state` showed, and refuses a canonical that differs by one
 byte. `finish` consumes the stored challenge, verifies a fresh user-verified
-assertion over its SHA-256, rebuilds the metadata from current rows and
+assertion over its SHA-256 (bound to the descriptor for `reveal` and
+`sign-approve`, which open the set's bucket), rebuilds the metadata from current rows and
 applies only if it is byte-identical. No vault action can be confirmed under
 an approval window or in a batch. *Target fields* below are `org_id, org_slug,
 org_title, service_id, service_slug, service_title, set_id, set_slug,
@@ -812,15 +1013,16 @@ as LF and refuses an imported value that contains a carriage return (a text
 box cannot keep one); `aqmas set import` stores such a value exactly.
 
 **Reveal.** Refused for a signer (always), when the organisation's
-`allow_reveal` is off, and while locked. The plaintext is
+`allow_reveal` is off. The tap opens the set's bucket for an instant. The plaintext is
 `{"entries":[{"name","value"}]}` for exactly the signed names. The audit row
 names the set, revision and key names. A new organisation allows reveal;
-`policy` turns it off or on (turning it on needs an unlocked broker).
+`policy` turns it off or on.
 
 **Signer.** The private key is generated by the broker, or parsed from the
 sealed import packet `{"private_key": text}` (hex seed or scalar; PKCS#8, SEC1
-or OpenSSH PEM, unencrypted). It is sealed under role `signer-key` and opened
-only to sign. No route returns it; there is no export.
+or OpenSSH PEM, unencrypted). It is sealed to the signer's own bucket under
+role `signer-key`; `sign-approve` opens that bucket until the grant is used up,
+expires or is revoked. No route returns it; there is no export.
 
 **Dotenv import** (browser and `aqmas set import`): `NAME=value` lines, blank
 lines and `#` comment lines. A value is bare (no quote, backslash, `$`,
@@ -849,7 +1051,8 @@ read as LF. Errors name the line, never its content. Vectors:
 * `GET /v2/sign/requests/{id}`, `POST .../{id}/cancel`, `GET /v2/sign/grants/{id}`,
   `POST /v2/sign/grants/{id}/end`: metadata, cancel, end early.
 * `POST /v2/sign/grants/{id}/sign` `{items}` → `{request, signatures:[{name, sha256, signature}]}`.
-  423 while locked. Same host and address as the request. Each signature is
+  423 `locked` while the signer's bucket is closed (after a restart:
+  **Reopen**). Same host and address as the request. Each signature is
   verified against the public key and audited (path, scheme, digests, size,
   name, enrollment, address) in the transaction that spends the grant.
 
