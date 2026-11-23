@@ -2,7 +2,7 @@
 // /mock/login), at phone, tablet and desktop widths. Not part of the build or the tests.
 //
 //   cd web && bun run build && bun screenshots/capture.ts [path/to/headless_shell]
-//   SHOTS=vault bun screenshots/capture.ts     only the Credential sets pictures (vault-*.png)
+//   SHOTS=vault bun screenshots/capture.ts     only the Vault pictures (vault-*.png)
 //
 // Uses Chromium's DevTools protocol directly (no extra dependencies). Default browser: the
 // Playwright headless shell under ~/.cache/ms-playwright.
@@ -12,7 +12,8 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { startMock } from "../mock/server";
 
-const outDir = import.meta.dir;
+// OUT=/some/dir writes the pictures there instead of next to this file.
+const outDir = process.env.OUT ?? import.meta.dir;
 const dist = join(import.meta.dir, "..", "dist");
 
 function findBrowser(): string {
@@ -139,10 +140,11 @@ const FAKE_PASSKEY = `navigator.credentials.get = async (o) => {
 
 const ENV_FILE = "# staging\nAPP_SECRET=mock-rotated-secret\nAPP_TOKEN=mock-new-token\nTLS_KEY=\"-----BEGIN PRIVATE KEY-----\nTU9DSyBLRVkgTUFURVJJQUwgUk9UQVRFRA==\n-----END PRIVATE KEY-----\n\"\n";
 
-/** Vault and the signing cards, against the mock's made-up organisations. */
+/** The Vault tab and the signing cards, against the mock's made-up organisations. */
 async function vaultShots(w: number) {
   const m = startMock({ port: 0, distDir: dist, vault: true });
   const origin = `http://localhost:${m.server.port}`;
+  const id = (slug: string) => m.store.vault.sets.find((x) => x.set_slug === slug)!.set_id;
   try {
     await open(w, false, origin);
     await until(`document.querySelectorAll("#sec-signing .sign-card").length >= 2`);
@@ -150,39 +152,24 @@ async function vaultShots(w: number) {
     await shootEl(`vault-sign-single-${w}.png`, "#sec-signing .sign-card:nth-of-type(1)", w);
     await shootEl(`vault-sign-timed-${w}.png`, "#sec-signing .sign-card:nth-of-type(2)", w);
     await evaluate(FAKE_PASSKEY);
-    await evaluate(`location.hash = "#/admin"`);
-    await until(`!!document.querySelector("#sec-vault .vault-pick select")`);
+    await evaluate(`location.hash = "#/vault"`);
+    await until(`document.querySelectorAll("#sec-vault .vault-item").length > 3`);
+    await shoot(`vault-list-${w}.png`, w, true);
     // The write-only form with a .env import waiting to be saved.
-    await pick("#vault-org", "client-a");
+    await evaluate(`location.hash = "#/vault/${id("staging")}"`);
     await until(`!!document.querySelector("#sec-vault .vault-editor .vault-keys li")`);
     await evaluate(`(() => { const dt = new DataTransfer(); dt.items.add(new File([${JSON.stringify(ENV_FILE)}], "staging.env")); const i = document.querySelector("#vault-file"); i.files = dt.files; i.dispatchEvent(new Event("change")); })()`);
     await until(`document.querySelectorAll("#sec-vault .vault-changes li").length === 3`);
     await click("#sec-vault .vault-keys li:nth-child(3) .btn", "Remove");
     await sleep(200);
     await shootEl(`vault-form-${w}.png`, "#sec-vault .vault-editor", w);
-    // Reveal: values on the page, with the countdown.
-    await evaluate(`[...document.querySelectorAll("#sec-vault .kv-row .btn")].forEach((b) => b.click())`);
-    await click("#sec-vault .vault-editor .btn", "Reveal all…");
-    await until(`!!document.querySelector("#sec-vault .vault-confirm .confirm")`);
-    await click("#sec-vault .vault-confirm .confirm");
-    await until(`document.querySelectorAll("#sec-vault .revealed-item").length === 4`);
-    await sleep(200);
-    await shootEl(`vault-reveal-${w}.png`, "#sec-vault .vault-editor", w);
-    await click("#sec-vault .revealed-head .btn", "Hide now");
-    // A new signing key: the public key before the tap, then what verifiers need.
-    await pick("#vault-org", "personal");
+    await evaluate(`location.hash = "#/vault/new"`);
+    await until(`!!document.querySelector("#sec-vault .vault-add-form")`);
+    await shootEl(`vault-add-${w}.png`, "#sec-vault .vault-add-form", w);
+    await evaluate(`location.hash = "#/vault/${id("release-key")}"`);
     await until(`!!document.querySelector("#sec-vault .vault-signer")`);
-    await evaluate(`document.querySelector("#sec-vault .vault-new-signer").open = true`);
-    await type("#ns-slug", "ota-key");
-    await type("#ns-title", "OTA key");
-    await click("#sec-vault .vault-new-signer .btn", "Review…");
-    await until(`!!document.querySelector("#sec-vault .vault-new-signer .vault-confirm .vault-key")`);
-    await sleep(200);
-    await shootEl(`vault-signer-${w}.png`, "#sec-vault .vault-new-signer", w);
-    await click("#sec-vault .vault-new-signer .vault-confirm .confirm");
-    await until(`!!document.querySelector("#sec-vault .vault-signer .vault-done")`);
-    await sleep(600);
-    await shootEl(`vault-signer-created-${w}.png`, "#sec-vault .vault-signer", w);
+    await sleep(300);
+    await shoot(`vault-signer-${w}.png`, w, true);
   } finally {
     m.stop();
   }
@@ -201,9 +188,15 @@ try {
   await shoot("main-1280-dark.png", 1280, true);
   await open(375, true);
   await shoot("main-375-dark.png", 375, true);
+  const page = async (w: number, hash: string, ready: string) => {
+    await open(w, false);
+    await evaluate(`location.hash = ${JSON.stringify(hash)}`);
+    await until(ready);
+    await sleep(300);
+  };
 
   // Rename sheet on a phone: type a name, continue to the canonical confirmation.
-  await open(375, false);
+  await page(375, "#/security", `document.querySelectorAll("#sec-passkeys article").length >= 3`);
   await evaluate(`[...document.querySelectorAll("#sec-passkeys article")][2].querySelector("button").click()`);
   await until(`!!document.querySelector("dialog input#pk-rename")`);
   await evaluate(`(() => { const i = document.querySelector("dialog input#pk-rename"); i.value = "YubiKey C (desk)"; [...document.querySelectorAll("dialog button")].find(b => b.textContent === "Continue").click(); })()`);
@@ -213,7 +206,7 @@ try {
   await shoot("sheet-rename-375.png", 375, false);
 
   // Removing the passkey this session signed in with: warning first, then confirmation.
-  await open(375, false);
+  await page(375, "#/security", `!!document.querySelector("#sec-passkeys article.current button.deny")`);
   await evaluate(`document.querySelector("#sec-passkeys article.current button.deny").click()`);
   await until(`[...document.querySelectorAll("dialog button")].some(b => b.textContent === "Continue")`);
   await sleep(200);
@@ -224,7 +217,7 @@ try {
   await shoot("sheet-remove-confirm-375.png", 375, false);
 
   // Activity with a row expanded and the Passkeys filter, desktop.
-  await open(1280, false);
+  await page(1280, "#/activity", `!!document.querySelector("#sec-recent .ev-toggle")`);
   await evaluate(`document.querySelector('.filters [data-filter="passkeys"]').click()`);
   await sleep(200);
   await evaluate(`document.querySelector("#sec-recent .ev-toggle").click()`);

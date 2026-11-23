@@ -32,7 +32,7 @@ Buckets protect **snapshots** (a disk, a backup, a memory dump, a brief root), n
 attacker who stays. A window keeps the SSH CA open for its duration; what it may approve is
 limited by policy, not by cryptography. A Cloudflare set with auto-approval or indefinite
 grants keeps its proxy parent open from the first approval after a restart until the next
-restart (§5): that is the convenience the owner chose, and it is shown in Admin.
+restart (§5): that is the convenience the owner chose, and it is shown under Security.
 
 ## 2. What is sealed, and what is not
 
@@ -141,7 +141,7 @@ Derived from the stored request and the signed choice, never from the page:
 | Approve signing (`aqmas sign`) | the signer | signing hold until used up, expired or revoked |
 | Open approval window | `ssh-ca` if its sets include SSH, the org's `cf-proxy` if they include Cloudflare | window hold until it ends |
 | Batch | union of its items | per item |
-| Reopen (Admin, after a restart or Close all) | the named buckets | the holds of their live users |
+| Reopen (Security, after a restart or Close all) | the named buckets | the holds of their live users |
 | Rekey scope | every bucket of the scope | instant |
 | Deny, revoke, policy, form commit, env commit, signer create/import, catalogue, passkey add/rename/remove, updates, setup, Close all | none | — |
 
@@ -223,10 +223,10 @@ bucket is open (423 otherwise), as v0.4.1 served them only while unlocked.
 
 **Restart.** Everything is closed; nothing is restored. Grants that need a bucket (proxy
 grants, uncollected env releases, signing grants, standing rules, auto policies) are
-**paused**; Admin lists them per bucket with **Reopen** (one tap per two scopes). The agent
+**paused**; Security → Buckets lists them per bucket with **Reopen** (one tap per two scopes). The agent
 sees `423 locked` "… is closed: waiting for the owner to reopen it" and keeps its deadline.
 
-**Close all** (Admin, one signed tap) wipes every key and hold and ends every window. It
+**Close all** (Security → Buckets or the header's tray, one signed tap) wipes every key and hold and ends every window. It
 replaces format 1's **Lock now** and needs no restart. Format 1's lock state, unlock
 ceremony, combined unlock+window and lock-protected route allowlist are gone; sign-in never
 opened anything and still does not.
@@ -238,7 +238,17 @@ at every start, so the owner hears that a restart paused grants.
 holds; `closeAll()` wipes them. A future "SSH to the bastion" approval calls both before the
 session starts and shows the list on its red card.
 
-## 6. Admin
+## 6. Security tab
+
+**The header**, on every page, has a pill with the number of open buckets. It opens a tray: the
+open buckets and their holds, what is waiting, and **Close all**.
+
+**Security opens with one sentence**: "2 of 4 passkeys can open your credentials", each passkey's
+state, and **Enable the other N…**, which runs the enable-then-test sequence of §7 for one passkey
+after the other (the signed-in passkey approves, the passkey being enabled taps to create its keys
+and to test them; a passkey that is not at hand can be skipped). The status's `prf` field only
+says that a passkey has a wrap already, so every passkey that opens too little is offered; an
+authenticator without PRF fails at its own tap and says so.
 
 **Security → Buckets** lists every bucket (kind, path, scope), whether it is open, each hold (why,
 ref, until), paused users with **Reopen**, per-scope **Rekey**, and **Close all**. Per passkey:
@@ -254,14 +264,14 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
   1's flow) and, in the same tap, opens the scope keys (PRF, ≤ two scopes); the new passkey
   then taps once with fresh salts for those scopes; the broker wraps each open scope key under
   the new KEKs and wipes it. Repeat per two scopes. The new wraps are marked tested the first
-  time they open something; **Enable** in Admin ends with that test round (so "enable B,
+  time they open something; **Enable** (Security → Passkeys, or the guided sequence above) ends with that test round (so "enable B,
   then remove A" needs no separate step) and **Test** does it on demand. A **tested** wrap is
   never replaced (the KEKs come from the page): the page skips scopes the passkey already
   opens tested, the broker refuses an enable naming one, and the store refuses the write. An
   untested wrap may be replaced by an enable or a recovery enrol. A stage holds the opened scope keys between the
   two taps; it is wiped when it finishes, at its five-minute deadline (its own timer and the
   15 s reconcile pass) and by Close all.
-* **Enrol with the recovery key** (when no passkey can open a scope any more): Admin, paste
+* **Enrol with the recovery key** (when no passkey can open a scope any more): Security → Recovery key, paste
   the identity; the page seals it to a fresh broker key; one tap by the target passkey signs
   `recovery enrol` with the packet digest and evaluates PRF for up to two scopes. The broker
   opens those scope keys from their recovery wraps, wraps them for the passkey, wipes them.
@@ -269,7 +279,7 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
   approval page: the routine path is enabling from another passkey; the strict path is the
   offline drill and `seal-recover` (§10).
 * **New organisation:** it has no scope key until a passkey creates it: the first value
-  written in it is refused with "create the scope first" and Admin offers **Create** (an
+  written in it is refused with "create the scope first" and Security → Buckets offers **Create** (Vault → Add item runs the same step for a new organisation) (an
   enable of the signed-in passkey for that scope: one signing tap, then one enrol tap; fresh
   `skS`, wrapped for that passkey and to the recovery key). That wrap is untested, so until a
   passkey has opened the new scope once (**Test**: a third tap) no bucket is created in it: the
@@ -289,7 +299,7 @@ passkeys[], active_windows[]}` ([API.md](API.md#buckets)).
   So a KEK of the old salt (one malicious-page tap before the rekey) plus a later DB copy does
   not open `skS'`. The broker cannot check the fresh KEK before it is used, so the new wrap is
   **untested** until it next opens: the page chains a **Test** tap of the same passkey right
-  after the rekey, and Admin shows the scope as **Untested after rekey** until a test passes.
+  after the rekey, and Security → Buckets shows the scope as **Untested after rekey** until a test passes.
   If it fails, the way back in is the recovery key: recovery enrol may replace an untested
   wrap (never a tested one), so it can re-wrap the rekeying passkey itself.
 * The store runs with `PRAGMA secure_delete=ON` and checkpoints the WAL after removals,

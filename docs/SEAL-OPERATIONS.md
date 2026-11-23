@@ -75,7 +75,7 @@ run `seal-preflight.py CONFIG SOURCES.json` as root, before starting the unit. T
 unit requires root-protected config ancestors; use `-require-root-config` for maintenance
 commands too.
 
-In Security → Passkeys, **Enable** a second, independently held passkey for every scope (one
+On the Security tab, **Enable the other N…** (or **Enable** on one passkey under Passkeys) gives a second, independently held passkey every scope (one
 tap by a passkey that already opens them, then one by the new passkey per two scopes) and
 **Test** it. Watch the agent TLS leaf expiry on the broker card and sign **Renew leaf**
 (it opens the internal CA for an instant, then the broker restarts) well before expiry.
@@ -151,7 +151,7 @@ Prove the recovery identity opens a real backup. Do both from time to time.
    (the same tap's second evaluation). Copies of the old wraps in backups then expose only
    values as they were at the copy.
 3. **Test** the rekeying passkey: the page asks for this tap right after the rekey (later:
-   Security → Passkeys → **Test**). Its new wrap is untested until it opens once, Admin shows the
+   Security → Passkeys → **Test**). Its new wrap is untested until it opens once, Security → Buckets shows the
    scope as **Untested after rekey**, and new sets in the scope wait for that. If the test
    fails, use the recovery key (Security → Recovery key: enrol that passkey for the scope; it may
    replace the untested wrap). Then **enable** your other passkeys again from it (Enable ends

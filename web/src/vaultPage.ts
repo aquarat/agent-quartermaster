@@ -336,11 +336,11 @@ export class VaultForms {
         next ? "Allow reveal with passkey" : "Turn reveal off with passkey",
         next ? "approve" : "deny",
         () => vaultPolicy(this.host.api, this.seal!, org, next, location.hostname),
-        () => [h("p", null, "Values of ", h("bdi", null, vt(org.title)), next ? " can be shown on this page again, each time after a passkey tap." : " can no longer be shown on this page. Delivery to hosts (aqmas run) is unchanged.")],
+        () => [h("p", null, "Values of ", h("bdi", null, vt(org.title)), next ? " can be shown in the Vault again, each time after a passkey tap." : " can no longer be shown in the Vault. Delivery to hosts (aqmas run) is unchanged.")],
         () => this.host.changed(),
       ),
     );
-    return h("div", { class: "vault-policy-box" }, h("p", { class: "vault-policy" }, h("span", null, "Reveal on this page for ", h("bdi", null, vt(org.title)), ": ", h("strong", null, org.allow_reveal ? "allowed" : "off"), ". "), b), slot);
+    return h("div", { class: "vault-policy-box" }, h("p", { class: "vault-policy" }, h("span", null, "Reveal in the Vault for ", h("bdi", null, vt(org.title)), ": ", h("strong", null, org.allow_reveal ? "allowed" : "off"), ". "), b), slot);
   }
 
   // ---- env set: write-only form and reveal ----

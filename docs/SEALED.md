@@ -23,7 +23,7 @@ Two decisions that look similar in the UI have different meanings:
 | **Open approval window: personal, 10 min** | Delegate a bounded class of *future* decisions to this tab, and keep the buckets they need open for the window's life. Each still has a confirmation, but the server no longer has passkey evidence of the owner's intent for that decision. |
 
 Sign-in opens nothing. A signed-in owner can inspect the queue, deny and revoke with every
-bucket closed. A window is never installation-wide. Signing out closes the window. Admin →
+bucket closed. A window is never installation-wide. Signing out closes the window. Security →
 Buckets offers a separate, freshly signed **Close all** (BUCKETS.md §5).
 
 This is a design record, not an operator command reference. [API.md](API.md) describes
@@ -115,7 +115,7 @@ omissions easier for a human, hence the limit.
 
 ### Window: delegate clicks, not signatures
 
-In **Admin → Organisation → Approvals**, a fresh signed policy change sets off or an absolute
+In **Security → Buckets → approval windows** (per organisation), a fresh signed policy change sets off or an absolute
 maximum of 5–60 minutes and an idle limit (never longer than the absolute limit). Enabling
 it does not open one. The owner chooses a duration up to that maximum and reviews **which
 org, sets and actions, for how long, with what exclusions**. A fresh UV assertion signs
@@ -267,7 +267,7 @@ one-use proposal ID and canonical hash. A tab signature is a software capability
 verification; it is never accepted at an assertion endpoint. Revoke immediately on
 end/logout, key or session loss, admission/policy/membership changes, **Close all**, restart
 and expiry; invalidate pending proposals too. One active window per session; opening another
-closes the old one. Admin shows active windows and can close them from another authenticated
+closes the old one. Security → Buckets shows active windows and can close them from another authenticated
 owner session.
 
 On pagehide/close/reload discard tab secrets and best-effort notify the server to close;
@@ -284,7 +284,7 @@ Evidence reviewed **21 November 2026**; these are published results, not tests o
 devices. “PRF works” means a *provider* returns a stable PRF result on UV `get()` for the
 same credential and salt. Browser API support, successful sign-in, a vendor using PRF to
 unlock its **own** vault, and a credential created on another device are four different
-claims. A synced credential may also share a single recovery/failure domain. Admin's
+claims. A synced credential may also share a single recovery/failure domain. Security → Passkeys →
 **Test** proves a passkey's wraps on the device in hand.
 
 | Provider / authenticator | Evidence and deployment expectation |
@@ -301,7 +301,7 @@ claims. A synced credential may also share a single recovery/failure domain. Adm
 
 1. **Any single enabled passkey opens what it holds** — Apple, a password-manager passkey or a
    hardware authenticator; no two-person or two-device rule. A passkey holds scope keys only if
-   its provider returns a stable PRF result (tested when enabled, shown in Admin); a passkey
+   its provider returns a stable PRF result (tested when enabled, shown under Security); a passkey
    without PRF still signs in and approves. Recovery: a dedicated offline recovery key held by
    the owner, proven by a drill before activation.
 2. **Approving through the Cloudflare-served page is acceptable**, with the per-attempt
@@ -310,7 +310,7 @@ claims. A synced credential may also share a single recovery/failure domain. Adm
    the restart-alert publisher keeps its own ntfy credential, and the approval-notice topic
    stays unsealed (BUCKETS.md §9).
 4. **Batches and approval windows** are both built. Windows are on by default for the owner's
-   own organisation with conservative defaults (configurable in Admin); client and club
+   own organisation with conservative defaults (configurable under Security); client and club
    organisations default to off.
 5. *Superseded:* the combined unlock + window tap. A window-open tap opens what the window
    needs; there is nothing else to unlock.
