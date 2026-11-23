@@ -1,0 +1,352 @@
+# Per-credential buckets (seal format 2)
+
+**Design · 2026-11-23 · status: implemented on `feat/sealed-buckets`.** Replaces the single
+installation master key (MK) of [SEALED.md](SEALED.md) format 1 (v0.4.1). The owner asked:
+*store individual credentials in encrypted buckets; when the browser approves, decrypt only
+that bucket; hold as few decrypted credentials as possible at any one time.*
+
+In one paragraph: every secret the broker holds lives in a **bucket** with its own P-256 key
+pair. The public half is stored in the clear, so writing a value needs nothing open. The
+private half is wrapped to each passkey's **opener key** for the bucket's **scope** (the
+installation, or one organisation) and to the offline age recovery key. The approval tap
+that signs a decision also evaluates the passkey's PRF for at most two scopes; the browser
+sends the resulting key-encryption keys to the broker sealed with HPKE; the broker opens
+exactly the buckets the signed card lists, keeps them only as long as the card says (an
+instant, a grant, a window), and drops the opener keys at once. There is no global unlock:
+after a restart nothing is open, and nothing needs to be until it is used.
+
+## 1. Threat model
+
+| Event | Format 1 (v0.4.1) | Format 2 (this design) |
+|---|---|---|
+| Stolen disk, DB copy or backup | Nothing without a PRF tap or the recovery key | Same |
+| Memory dump / brief root while running | Everything (MK in memory while unlocked) | Only the buckets open at that instant (§5); opener keys are never kept |
+| Malicious approval page (compromised edge or browser) during one tap | PRF-derived KEK; with a DB copy, the MK: everything | KEKs for **at most two scopes** (§4.4); with a DB copy, the buckets of those scopes. Without a DB copy, nothing: wraps never leave the broker |
+| Persistent root on the bastion | Everything once unlocked | Every bucket as it is used, plus any scope whose KEK a tap yields. Buckets do **not** defend against persistent root |
+| DB writer (tampering) | Payload AEAD under the MK detected forged records | Records are public-key encrypted: a DB writer can substitute ciphertexts or a bucket's public key. Substituted public keys are detected when the bucket is next opened (§3.3). DB integrity was never a goal ([SEALED.md](SEALED.md)); this is stated, not fixed |
+
+Buckets protect **snapshots**: a disk, a backup, a memory dump, a brief root. They are not a
+defence against an attacker who stays: root can alter the served page and collect the keys
+of every bucket the owner opens from then on.
+
+## 2. What is sealed, and what is not
+
+Enumerated from v0.4.1 (`seal.Object` roles, `env_revisions`, `env_drafts`, `signer_keys`):
+
+| Secret | v0.4.1 | Format 2 | Scope |
+|---|---|---|---|
+| SSH user CA private key | MK record `ssh-ca` | bucket kind `ssh-ca` | installation |
+| Internal (client TLS) CA private key | MK record `internal-ca` | bucket kind `internal-ca` | installation |
+| Cloudflare proxy parent token | MK record `cf-proxy` | bucket kind `cf-proxy` | its organisation |
+| Cloudflare minter parent token | MK record `cf-minter` | bucket kind `cf-minter` (stored; token mode is off under organisations) | its organisation |
+| Env set values (current revision) | MK-DEK record per revision | one bucket per env set, one record per entry | the set's organisation |
+| Env drafts (CLI upload) | MK-DEK record | entries sealed to the set's bucket at upload | the set's organisation |
+| Signer private key | MK-DEK record per signer | one bucket per signer set | the set's organisation |
+| Approval-notice ntfy topic URL | MK record `ntfy-topic` | **not sealed** (§9): plain row `notice_channel` | — |
+
+Nothing remains under an always-open key. The exceptions that must work while every bucket
+is closed are in §9.
+
+## 3. Construction
+
+Primitives (all from the existing suite): P-256 keys; HPKE base mode RFC 9180
+DHKEM(P-256, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM (Go `crypto/hpke`, browser
+`@hpke/core`); XChaCha20-Poly1305 with a fresh random 24-byte nonce; HKDF-SHA256; age v1
+X25519. Every context string is
+
+    T2(role, f1, …, fn) = F("aqmas-seal") ‖ F(u64be(2)) ‖ F(role) ‖ F(f1) ‖ … ‖ F(fn)
+    F(x) = u32be(len(x)) ‖ x
+
+`installation` is the random 32-byte installation ID, `rp` the WebAuthn RP ID, `cred` the
+raw credential ID, `scope` the UTF-8 string `installation` or an organisation ID, `B` a
+bucket ID (32 random bytes), `pkX` an uncompressed SEC1 point (65 bytes). Format 2's version
+number 2 separates every label from format 1.
+
+### 3.1 Opener keys (per passkey, per scope)
+
+For each passkey that can open buckets and each scope it is enabled for, the broker stores
+`(passkey, scope, salt, pkO, wrapO)`:
+
+* `salt`: 32 random bytes, the PRF input, fixed for the opener's life.
+* `KEK = HKDF-SHA256(ikm = PRF(salt), salt = installation, info = T2("opener-kek", installation, rp, cred, scope, salt), 32)`,
+  computed **in the browser**; the raw PRF output never leaves the page.
+* `skO`: a random P-256 scalar generated by the broker when the opener is created; `pkO` its
+  public key.
+* `wrapO = 0x01 ‖ nonce24 ‖ XChaCha20-Poly1305(KEK, nonce, skO, aad = T2("opener-wrap", installation, rp, cred, scope, salt, pkO))`
+  (73 bytes, the format-1 record layout).
+
+Opening an opener checks that the unwrapped scalar's public key equals `pkO`.
+
+### 3.2 Buckets
+
+A bucket is `(B, scope, kind, ref, pkB)` plus wraps. `skB` is a random P-256 scalar generated
+by the broker when the bucket is created; it is wrapped and then wiped.
+
+* **Wrap to an opener:** HPKE to `pkO`, `info = T2("bucket-wrap", installation, B, scope, kind, pkB, pkO)`,
+  empty AAD, plaintext `skB` (32 bytes). Stored `enc(65) ‖ ct(48)`.
+* **Recovery wrap:** one age v1 file to the pinned X25519 recipient with plaintext
+  `T2("bucket-recovery", installation, B, scope, kind, pkB, recipient) ‖ F(skB)`.
+  Anyone holding the public recipient can produce such a file, so a recovery open also
+  checks `skB → pkB`.
+* Opening any wrap checks the scalar is in range and `skB·G = pkB`.
+
+### 3.3 Records
+
+Every secret value is HPKE-encrypted to `pkB` (single-shot), stored `enc ‖ ct`:
+
+| Role | `info = T2("bucket-record", installation, B, role, …)` | plaintext |
+|---|---|---|
+| `ssh-ca`, `internal-ca` | (none) | PEM private key |
+| `cf-proxy`, `cf-minter` | org, service, set, issuer, account | token |
+| `env-entry` | set, entry ID (32 random), entry name | value |
+| `signer-key` | set, scheme, public key | `{"scheme","private"}` JSON |
+
+AAD is `T2("record-aad", B)`. A record cannot be moved between buckets, sets, names or roles.
+An env revision is a list of entry references; an unchanged entry keeps its ciphertext from
+revision to revision, which is what lets a merge or an unset happen with the bucket closed.
+Because `pkB` is public, a DB writer can encrypt a forged record or replace `pkB`; the
+broker refuses a bucket whose opened scalar does not match `pkB` (`pkB` is also part of every
+wrap's `info`), so a swapped public key is caught at the next open, but values written to it
+in between were readable by whoever swapped it.
+
+### 3.4 Why opener keys per scope, not per bucket or per passkey
+
+* **A PRF salt per bucket** would let one tap yield at most two buckets, but wrapping a new
+  bucket to a passkey would need that passkey's PRF for the new salt: every passkey would
+  have to tap for every new bucket, and "any single passkey works" would fail for buckets
+  created with another passkey.
+* **One opener key per passkey** makes wrapping tapless but lets one malicious-page tap (plus
+  a DB copy) open everything, as format 1 does.
+* **One opener per (passkey, scope)** keeps wrapping tapless (`pkO` is public) and bounds a
+  tap to two scopes: WebAuthn evaluates at most two PRF inputs per assertion, and every
+  action needs at most two scopes (installation and one organisation: batches and windows
+  are single-organisation). The price is enabling a passkey: one PRF evaluation per scope,
+  two per tap (one or two taps for a typical installation), and one tap per passkey when an
+  organisation is added (§7).
+
+## 4. The approval tap
+
+### 4.1 Which buckets an action needs
+
+The broker derives the needs of an action from the stored request and the signed choice,
+never from the page:
+
+| Action | Bucket | Hold (§5) |
+|---|---|---|
+| Approve SSH request | `ssh-ca` | instant (the certificate is signed in the decision transaction) |
+| … with a standing rule, or matching a live rule | `ssh-ca` | + standing hold until the rule expires |
+| Approve Cloudflare proxy request | `cf-proxy` | grant hold until the grant ends (indefinite: until revoked) |
+| … auto-approvable scope, or with/matching a standing rule | `cf-proxy` | + auto hold (until restart or the policy changes) / standing hold |
+| Approve enrollment (client certificate) | `internal-ca` | instant |
+| Renew agent TLS leaf | `internal-ca` | instant |
+| Approve env release (`aqmas run`, checkout) | the set | env hold until collected, expired or revoked |
+| Reveal (vault) | the set | instant |
+| Approve signing (`aqmas sign`) | the signer | signing hold until used up, expired or revoked |
+| Open approval window | `ssh-ca` if the window's sets include SSH; the org's `cf-proxy` if they include Cloudflare | window hold until the window ends |
+| Batch | the union of its items | per item |
+| Reopen (Admin, after a restart) | the named buckets | the holds of their live users |
+| Everything else: deny, revoke, policy, form commit, env commit, signer create, catalogue, passkeys, updates, setup | none | — |
+
+Writes are tapless with respect to buckets: the web form, `aqmas env put/import/unset` and
+signer create/import encrypt to `pkB` and need only the signature they already needed.
+
+### 4.2 The descriptor and the bound challenge
+
+When an action needs buckets the challenge response carries an **open descriptor**, canonical
+JSON with sorted keys:
+
+    {"attempt_id","buckets":[{"hold","id","kind","label","scope","until"}…],"epoch",
+     "installation","object":"bucket-open","recipient","scopes":[s1(,s2)],"v":1}
+
+and the WebAuthn challenge becomes
+
+    challenge = SHA-256( T2("open-challenge", SHA-256(canonical), SHA-256(descriptor)) )
+
+instead of `SHA-256(canonical)`. The page recomputes it, refuses options whose challenge
+differs, and shows the descriptor's buckets and holds on the card ("Opens: SSH CA (instant);
+personal/dns-cdn proxy parent (until 14:05)"). `recipient` is a fresh HPKE key of this
+attempt (single use, session- and challenge-bound, two minutes), so a substituted recipient
+fails at the honest broker.
+
+The options carry `extensions.prf.evalByCredential`: for each passkey with openers for **all**
+the descriptor's scopes, `{first: salt(scope1), second: salt(scope2)}` in descriptor order.
+`allowCredentials` is restricted to those passkeys unless every needed bucket is already
+open (then any owner passkey may sign).
+
+### 4.3 Finish
+
+The page derives `KEK(scope_i)` for the credential that answered and sends, next to the
+normal assertion,
+
+    open = {attempt_id, enc, ciphertext}: HPKE to recipient,
+      info = T2("hpke-open", installation, "approve"),
+      aad  = T2("open-aad", attempt_id, epoch, challenge, cred),
+      plaintext = F(KEK1) ‖ F(KEK2 or empty)
+
+The broker verifies the assertion over the bound challenge, consumes the attempt, opens the
+packet, unwraps the signing passkey's opener for each scope, unwraps exactly the descriptor's
+buckets, wipes the KEKs and opener scalars, registers the holds and applies the decision.
+A failure anywhere opens nothing and applies nothing. The PRF results are never put into
+`clientExtensionResults` sent to the broker.
+
+### 4.4 Per-tap limits and passkeys without PRF
+
+* A genuine page asks for exactly the descriptor's scopes. A malicious page can ask the
+  authenticator for any two salts it knows, so one tap yields at most **two scopes'** KEKs,
+  useful only together with the wraps (a DB copy). The broker opens only what the card lists.
+* A passkey without PRF ("sign and approve only") still signs in, denies, revokes, commits
+  values and approves anything whose buckets are already open (for example inside a
+  window). It cannot open a closed bucket: the card says "needs a passkey that can open
+  …". This matches format 1, where such a passkey could not unlock.
+
+## 5. Holds: how long a bucket stays open
+
+The broker keeps open buckets in one in-memory table: `B → (skB in a locked page, holds)`.
+A hold is `(kind, ref, until)`; `until` zero means "until an event". The key is wiped when
+the last hold goes. Kinds:
+
+* **instant:** for the length of one operation (signature, reveal, delivery).
+* **grant:** a Cloudflare proxy grant, until `not_after` or revocation.
+* **env:** an approved env release, until collected (one-shot), expired or revoked.
+* **sign:** a signing grant, until its signatures are used, it expires or is revoked.
+* **standing:** a standing rule, until it expires or is revoked.
+* **auto:** an organisation's auto-approve policy for a Cloudflare set, until restart, the
+  policy changes, or **Close all**.
+* **window:** an approval window, until it ends (end, idle, absolute, sign-out, close).
+
+Holds are released on the event (revoke, collect, last signature, window end) and by a
+reconcile pass every 15 s that drops holds whose grant, rule or window is no longer live.
+Approvals under a window add their own holds (a Cloudflare grant outlives the window).
+
+**Standing rules and auto-approval (the renewal decision).** SSH certificates are signed for
+the full approved TTL, so a grant needs no renewal; repeat access comes from standing rules.
+A standing rule or auto policy issues without a tap only while its bucket is open. Approving
+a request that has or matches one keeps the bucket open for the rule's life (auto: until
+restart). After a restart the first matching request waits for one tap, whose card says
+"re-arms standing rule … until …". This is the convenient behaviour the owner asked for: one
+tap per restart per rule, none in between; turn the rule off to have the bucket closed when
+idle.
+
+**Restart.** Everything is closed; no state is restored. Grants survive but those that need a
+bucket (proxy grants, uncollected env releases, signing grants, standing rules, auto
+policies) are **paused**. Admin lists them per bucket with **Reopen** (one tap per two
+scopes). The agent sees `423 locked` with "waiting for the owner to reopen" and keeps its
+original deadline.
+
+**Close all** (Admin, one signed tap) wipes every key and hold and ends every window. Its
+replacement of format 1's **Lock now** needs no restart. Format 1's lock state, unlock
+ceremony, combined unlock+window and lock-protected route allowlist are gone: sign-in never
+opened anything and still does not.
+
+**Lock alert.** The separate alert service is unchanged; the broker writes `locked <epoch>`
+at every start, so the owner is told when a restart has paused grants.
+
+**Hook for the planned bastion-SSH feature.** `buckets.Open()` lists open buckets with their
+holds; `buckets.CloseAll(reason)` wipes them and ends windows. A future "SSH to the bastion"
+grant calls both before the session starts and shows the list on its red card.
+
+## 6. Admin
+
+**Admin → Buckets** shows every bucket (kind, organisation/path, scope), whether it is open,
+each hold (why, ref, until), paused users after a restart with **Reopen**, and **Close all**.
+`GET /api/ui/seal/status` returns `{mode, installation, epoch, scopes[], buckets[],
+passkeys[], active_windows[]}`; see [API.md](API.md#buckets).
+
+Per passkey: **Opens N of M buckets** (buckets wrapped to its openers), scopes enabled, and
+**Not enabled for …** when an organisation is missing.
+
+## 7. Passkeys
+
+* **Enable** (new passkey, or an approve-only one): a signed capability by an existing passkey
+  (format 1's flow), then one PRF tap per two scopes by the new passkey; each creates openers.
+  Then every bucket that is open at that moment is wrapped to the new openers at once; other
+  buckets pick the passkey up the next time they are open (any open wraps to every opener of
+  its scope that lacks a wrap).
+* **Enrol everywhere** (Admin, browser): paste the recovery identity; the page seals it to a
+  fresh broker key (HPKE, as the drill), one tap signs `recovery enrol` naming the target
+  passkeys and the packet digest. The broker opens every bucket from its recovery wrap one at
+  a time, wraps it to every opener lacking a wrap, wipes it. Nothing stays open. The same
+  ceremony without writing is the **recovery drill**.
+* **New organisation:** no passkey has an opener for it yet; Admin shows "Not enabled for
+  club" per passkey (one tap each). A bucket can only be created in a scope where at least
+  one opener exists; otherwise the write is refused with that hint.
+* **Remove** a passkey: deleting its row cascades to its openers and their wraps. The broker
+  refuses to remove the last passkey that has openers (the recovery key still opens
+  everything, but routine use would stop).
+
+## 8. Migration and sealing (one-way)
+
+**From v0.4.1 sealed (schema 8): Admin → Setup → "Move to per-credential buckets".** One way:
+no rollback, no v0.4.1 readability afterwards; the pre-migration backup is the only way back.
+
+1. Run (tap): the runner stops the broker, takes its backup (DB, config, keys), starts the
+   broker in `bucket-migrate` mode (no agent listener).
+2. Tap 1: PRF `first` = the passkey's format-1 salt (opens the MK), `second` = a new
+   installation opener salt. The broker opens the MK, decrypts every format-1 record, signer
+   key and current env revision, builds all buckets in memory (keys, records, recovery
+   wraps), then wipes the MK. Older env revisions and open drafts are dropped (they were
+   unreachable or short-lived).
+3. Taps 2…: openers for the remaining scopes, two per tap.
+4. Recovery drill: paste the recovery key; the broker opens every staged bucket from its
+   recovery wrap.
+5. Tap **Activate**: a plain signature over the format-2 manifest (installation, recipient,
+   every bucket's ID/scope/kind/public key, every opener public key). One SQLite transaction
+   writes buckets, wraps, openers, re-encrypted records, the plain ntfy row, drops format-1
+   tables and sets schema 9. The runner verifies the signature against its pins, re-pins
+   `manifest_sha256`, restarts serve.
+
+An interruption before step 5 commits nothing (all staging is in memory); the runner restores
+config and restarts; the task can be run again. A crash after the commit is finished forward.
+The new binary started in serve mode on a schema-8 DB serves only sign-in, queueing and the
+Setup page ("migration required").
+
+**From an unsealed store (schema 6/7): "Seal the store"** now produces format 2 directly with
+the same stage: sources are the plaintext CA files, Cloudflare parent files and the ntfy
+config; then openers, drill, activation as above.
+
+## 9. What stays readable without a tap, and why
+
+| Item | Why it cannot be in a bucket |
+|---|---|
+| Approval-notice ntfy topic URL (`notice_channel`) | Notices tell the owner a request is waiting, i.e. when every bucket is closed. Theft lets an attacker read or send notices. |
+| Agent TLS leaf `server.key` (0600) | Agents connect while everything is closed (format-1 exception, unchanged). |
+| Lock-alert credential (root, `/etc/aqmas-alert`) | Unchanged. |
+| Updater read tokens, tunnel connector, OS keys | Unchanged; separate operational trust. |
+| Public material: bucket and opener public keys, salts, wraps, records, names | Ciphertext or public by design. Env value **names** stay in the clear, as in format 1. |
+
+## 10. Recovery
+
+* **Drill (browser):** Admin → Recovery drill; proves the saved identity opens every bucket.
+* **Drill (offline):** `aqmasd seal-drill BACKUP.db RECIPIENT <identity.txt` on a standalone
+  backup copy opens every bucket and prints only counts.
+* **Lost one passkey:** remove it; enable a new one; enrol everywhere.
+* **Lost every passkey:** `aqmasd seal-recover DIRECTORY <identity.txt` in isolated
+  maintenance (format-1 procedure, [SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)): it opens every
+  bucket from its recovery wrap, registers a replacement passkey with openers for every
+  scope, wraps every bucket to them and retires the old passkeys. `seal-transfer` is gone:
+  there is no MK to transfer, so the identity itself is piped to the recovery process.
+
+## 11. Formats (schema 9)
+
+    buckets(id BLOB32 PK, scope, kind, ref, label, public_key BLOB65, recovery BLOB, payload BLOB NULL, created)
+    opener_keys(id PK, passkey → passkeys ON DELETE CASCADE, scope, salt BLOB32 UNIQUE, public_key BLOB65, wrapped BLOB73, created, tested_at NULL, UNIQUE(passkey, scope))
+    bucket_wraps(bucket → buckets ON DELETE CASCADE, opener → opener_keys ON DELETE CASCADE, wrap BLOB113, PK(bucket, opener))
+    env_revisions.payload = JSON [{"n":name,"i":entry-id,"c":record}…]; .wrap = bucket ID
+    env_drafts.payload    = same entries (unset: names only); signer_keys.payload = record; .wrap = bucket ID
+    seal_active(manifest = format-2 manifest, inventory = '{}', canonical, assertion)  -- the root-pinned activation
+    notice_channel(singleton, topic_url)
+
+**Downgrade fence:** v0.4.1 refuses schema 9 (its boot check requires schema 8 and the
+format-1 tables). The new binary on schema 8 only offers the migration. There is no path back
+except the pre-migration backup.
+
+## 12. Test plan (summary)
+
+Go/TS vectors for `T2`, KEK derivation, the bound challenge and the open packet; Go
+round-trips of opener, bucket, recovery wraps and every record role with tamper cases; each
+action opens only its buckets (other buckets absent from the open table, their operations
+refused without a tap); windows open only their scope and close on expiry; restart leaves
+nothing open; migration round trip and re-run after a simulated failure; recovery open of
+every bucket; passkey enable/remove; sentinel scans of logs, DB, WAL and output; canonical
+binding of every new action. Interop: migrate a v0.4.1-format store, then SSH grant,
+`aqmas run`, Reveal, `aqmas sign`, a window, restart, recovery drill.
