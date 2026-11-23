@@ -362,7 +362,7 @@ func TestSSHCancel(t *testing.T) {
 	f.requestPending = 1 << 30
 	e := newTestEnv(t)
 	enroll(t, f, e)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := f.waitingCtx(t)
 	defer cancel()
 	_, err := e.EnsureSSHCert(ctx, sshOpts("x"))
 	if ExitCode(err) != ExitCancelled {

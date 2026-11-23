@@ -148,7 +148,7 @@ func TestCFRequestPendingAndDecisions(t *testing.T) {
 func TestCFRequestCancel(t *testing.T) {
 	f, e := cfEnv(t)
 	f.requestPending = 1 << 30
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := f.waitingCtx(t)
 	defer cancel()
 	spec, _ := ParseCFSpec("cf.tunnel.config", []string{"tunnel=home"})
 	err := e.CFRequestCmd(ctx, spec, 0, "x", false)
@@ -165,7 +165,7 @@ func TestCFRequestCancel(t *testing.T) {
 func TestCFEnvRequestsAllBeforeWaiting(t *testing.T) {
 	f, e := cfEnv(t)
 	f.requestPending = 1 << 30
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := f.waitingCtx(t)
 	defer cancel()
 	a, _ := ParseCFSpec("cf.dns.edit", []string{"zone=example.com"})
 	b, _ := ParseCFSpec("cf.pages", []string{"project=site"})

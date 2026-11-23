@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -484,4 +485,31 @@ func newTestEnv(t *testing.T) *testEnv {
 		PollMin: time.Millisecond,
 	}
 	return &testEnv{Env: e, stdout: out, stderr: errb}
+}
+
+// waitingCtx returns a context that is cancelled once the client has polled a request it
+// created (so it is in its waiting loop), instead of after a fixed time: a slow machine
+// can spend a fixed deadline before the request even exists.
+func (f *fakeServer) waitingCtx(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	go func() {
+		for ctx.Err() == nil {
+			time.Sleep(10 * time.Millisecond)
+			f.mu.Lock()
+			polled := false
+			for _, r := range f.requests {
+				polled = polled || r.polls > 0
+			}
+			for _, r := range f.bastion.reqs {
+				polled = polled || r.polls > 0
+			}
+			f.mu.Unlock()
+			if polled {
+				cancel()
+				return
+			}
+		}
+	}()
+	return ctx, cancel
 }

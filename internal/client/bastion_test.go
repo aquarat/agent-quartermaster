@@ -549,7 +549,7 @@ func TestBastionRootFailuresLeaveNothing(t *testing.T) {
 	t.Run("cancelled while waiting", func(t *testing.T) {
 		f, e := bastionSetup(t)
 		f.bastion.rootAllowed, f.bastion.pending = true, 1<<30
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := f.waitingCtx(t)
 		defer cancel()
 		_, err := e.BastionRoot(ctx, BastionOptions{Host: "bastion", Why: "x"}, never)
 		if ExitCode(err) != ExitCancelled {
@@ -597,7 +597,7 @@ func newEd25519(t *testing.T) (ssh.PublicKey, ssh.Signer, error) {
 func TestBastionInspectCancel(t *testing.T) {
 	f, e := bastionSetup(t)
 	f.bastion.pending = 1 << 30
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := f.waitingCtx(t)
 	defer cancel()
 	_, err := e.EnsureBastionInspect(ctx, BastionOptions{Host: "bastion", Why: "x"})
 	if ExitCode(err) != ExitCancelled {
