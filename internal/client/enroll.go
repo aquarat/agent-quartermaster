@@ -40,6 +40,10 @@ func DefaultHostName(hostname func() (string, error)) (string, error) {
 	if !hostNameRE.MatchString(name) {
 		return "", &UsageError{Msg: fmt.Sprintf("this machine's hostname %q does not give a usable host name (lowercase letters, digits and '-', at most 63 characters); pass --name HOST", sanitize(h))}
 	}
+	// Not a name for this machine: every unconfigured machine has it.
+	if name == "localhost" || strings.HasPrefix(name, "localhost-") {
+		return "", &UsageError{Msg: fmt.Sprintf("this machine's hostname %q names no machine in particular; pass --name HOST", sanitize(h))}
+	}
 	return name, nil
 }
 
@@ -81,13 +85,18 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 		}
 	}
 	if fromHostname {
-		// A configuration copied from another machine keeps that machine's name; --force
-		// without --name takes this machine's, and says what it replaces.
-		replacing := ""
-		if o.Force && old != nil && old.HostName != "" && old.HostName != o.Name {
-			replacing = fmt.Sprintf(", replacing the enrolment as %q", sanitize(old.HostName))
+		// aqmasd replaces by name: a derived name that differs from the enrolment already
+		// here would add a second host and leave that one valid. Which was meant (replace
+		// it, or enrol this machine as a new host) is the user's to say.
+		if old != nil && old.HostName != "" && old.HostName != o.Name {
+			was := sanitize(old.HostName)
+			return &UsageError{Msg: fmt.Sprintf("this configuration is enrolled as %q but this machine's hostname gives %q. "+
+				"Pass --name %s to replace the enrolment %q (approving it revokes that certificate), or --name %s to enrol this machine as a new host "+
+				"(if this configuration was copied from another machine, that machine's key is here too: revoke %q under Hosts in the web UI and re-enrol it)",
+				was, o.Name, was, was, o.Name, was)}
 		}
-		e.logf("enrolling as %q (from this machine's hostname%s; use --name to choose another)", o.Name, replacing)
+		e.logf("enrolling as %q (from this machine's hostname; use --name to choose another). "+
+			"If the approval card says it replaces an enrolment, approving it revokes that other machine's access", o.Name)
 	}
 	server := o.Server
 	if server == "" {

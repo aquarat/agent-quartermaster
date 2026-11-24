@@ -128,9 +128,9 @@ func (s Sources) Names() []string {
 // agree. A configured source that cannot be reached, or disagrees, is an error: there is no
 // fallback to fewer sources, or making one unreachable would downgrade the check.
 //
-// ExtraSums is filled the same way, except that a release may have none (one from before
-// 0.9.3): then Extra stays nil. Where one source has the file and another does not, or they
-// differ, that is a disagreement like any other.
+// ExtraSums is filled the same way. A release before 0.9.3 has none (Extra stays nil); from
+// 0.9.3 on a source without it is refused. Where one source has the file and another does
+// not, or they differ, that is a disagreement like any other.
 func (s Sources) Fill(ctx context.Context, m *Metadata) error {
 	var e error
 	m.Second, m.Extra = nil, nil
@@ -139,6 +139,9 @@ func (s Sources) Fill(ctx context.Context, m *Metadata) error {
 	}
 	if m.Extra, e = s.GitHub.ExtraHashes(ctx, m.Version, true); e != nil {
 		return fmt.Errorf("GitHub: %w", e)
+	}
+	if m.Extra == nil && NeedsExtra(m.Version) {
+		return errors.New("GitHub: release " + m.Version + " has no " + ExtraSums + " (every release from " + ExtraSince + " publishes one)")
 	}
 	if s.HasSecond() {
 		if m.Second, e = s.Second.Hashes(ctx, m.Version, false); e != nil {

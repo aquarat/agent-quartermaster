@@ -79,11 +79,13 @@ in `SHA256SUMS.extra` instead (from 0.9.3: `aqmas-darwin-amd64`, the macOS x86-6
 the same format. Older versions never fetch it.
 
 Current versions fetch `SHA256SUMS.extra` from every configured source next to
-`SHA256SUMS`. A release without one (0.9.2 and earlier) has no extra builds; a source that
-publishes it while another does not, or a different one, is a disagreement and refuses the
-check like any other. The agreed digests are recorded in `latest.json` under `extra`, which
-older readers ignore. The installer rebuilds `aqmas-darwin-amd64` too and requires the
-recorded digest. The owner's update approval names the four `SHA256SUMS` digests as before;
+`SHA256SUMS`. A release before 0.9.3 has none and no extra builds; from 0.9.3 on it is
+required, so a source that leaves it out is refused rather than read as "no extra builds".
+A source that publishes it while another does not, or a different one, is a disagreement
+and refuses the check like any other. The agreed digests are recorded in `latest.json` under
+`extra`, which older readers ignore. The installer rebuilds `aqmas-darwin-amd64` too and
+requires the recorded digest; a rebuilt tree that produces `SHA256SUMS.extra` while the
+approved metadata has no `extra`, or a different one, is refused. The owner's update approval names the four `SHA256SUMS` digests as before;
 the extra build is covered by the source comparison and the bastion's own rebuild.
 
 A bastion upgraded from 0.9.2 was installed by 0.9.2's installer, which records no `extra`.
@@ -103,7 +105,7 @@ Its last job, `compare`, checks the published manifest against a second source *
 |---|---|
 | `SECOND_SOURCE_RELEASES_URL` | The second source's release-download base, e.g. `https://forge.example.com/OWNER/NAME/releases/download`. The job fetches `<base>/<tag>/SHA256SUMS` and `<base>/<tag>/SHA256SUMS.extra`, following the forge's redirect to the attachment (https only). |
 
-It is read from a **secret only**: GitHub prints repository *variables* in the job log, which is public for a public repository, while secrets are masked. The job prints nothing but the final HTTP status. A second source the runner cannot reach (private network, an access policy) is a notice, not a failure: the checks at install time are what count. A manifest that was served and differs fails the job.
+It is read from a **secret only**: GitHub prints repository *variables* in the job log, which is public for a public repository, while secrets are masked. The job prints nothing but the final HTTP status. A second source the runner cannot reach (private network, an access policy) is a notice, not a failure: the checks at install time are what count. A manifest that was served and differs fails the job, and so does a second source that serves `SHA256SUMS` but answers 404 for `SHA256SUMS.extra` (releases from 0.9.3).
 
 **A second builder** (`.forgejo/workflows/release.yml`, optional): the generic workflow for a Forgejo/Gitea instance that hosts a copy of the repository. It names no host (it uses the instance it runs on). Its `linux-arm64` Docker job runs tests on a `VERSION` change on main, skips an existing tag, then creates the tag/release for the event commit and uploads the assets. Use the repository job token with `contents: write`. If release creation is denied, use the `RELEASE_TOKEN` Actions secret restricted to **this repository** with `write:repository`, and expire/rotate it. A failed upload leaves a draft; inspect it, verify the tag and assets, then complete it manually. Do not move a published tag.
 

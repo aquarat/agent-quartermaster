@@ -152,13 +152,21 @@ export function setupCommand(o: SetupOptions) {
     'cd /',
     `later=${quote(enrollCommand(o.server, o.pin ?? ""))}`,
     `if ! (: </dev/tty) 2>/dev/null; then printf '%s\\n' "No terminal to ask on. To enroll this machine, run: $later"; exit 0; fi`,
-    "printf 'Enroll this machine now? [Y/n] '",
-    "read -r ok </dev/tty || ok=n",
-    `case "$ok" in [nN]*) printf '%s\\n' "Not enrolled. To enroll later, run: $later"; exit 0 ;; esac`,
+    "while :; do",
+    "  printf 'Enroll this machine now? [Y/n] '",
+    "  read -r ok </dev/tty || ok=n",
+    `  case "$ok" in ""|[yY]|[yY][eE][sS]) break ;; [nN]|[nN][oO]) printf '%s\\n' "Not enrolled. To enroll later, run: $later"; exit 0 ;; *) echo "Please answer y or n." ;; esac`,
+    "done",
     `n=$(hostname 2>/dev/null || uname -n); n=$(printf '%s' "\${n%%.*}" | tr '[:upper:]' '[:lower:]')`,
-    `printf 'Host name [%s]: ' "$n"`,
-    "read -r name </dev/tty || name=",
-    `if [ -z "$name" ] || [ "$name" = "$n" ]; then ${enroll}; else ${enroll} --name "$name"; fi)`,
+    'case "$n" in localhost|localhost-*) n= ;; esac',
+    "echo 'The broker knows this machine by its host name. If the approval card says it replaces an enrolment, approving it revokes the access of that other machine.'",
+    "name=",
+    'while [ -z "$name" ]; do',
+    `  if [ -n "$n" ]; then printf 'Host name [%s]: ' "$n"; else printf 'Host name: '; fi`,
+    '  read -r name </dev/tty || { echo; echo "No answer; not enrolled. To enroll later, run: $later"; exit 1; }',
+    '  if [ -z "$name" ]; then name=$n; fi',
+    "done",
+    `${enroll} --name "$name")`,
   );
   return lines.join("\n");
 }
@@ -174,7 +182,7 @@ function installCard(c: HelpConfig, card: (title: string, ...children: Child[]) 
     ? [p("Already have aqmas? Enroll only:"), command(enrollCommand(c.agent_api_url, c.ca_pin))]
     : [p("Enrolment needs the broker's agent API address, which is not configured: ask the operator to set agent_api_url to show the enrolment command.")];
   const about = [
-    p("Cross-check the CA pin once against an independently recorded copy: a faked help page could point a new host at another server. The machine is enrolled under its hostname (up to the first dot, lowercased) unless you answer with another name, or add --name <name> to the enrol command. --server is the agent API address, not the address of this web page: the CLI cannot enroll through the web UI. If the machine already has an enrollment (for example a configuration copied from another machine, or an expired certificate), run the enrol command with --force to replace it."),
+    p("Cross-check the CA pin once against an independently recorded copy: a faked help page could point a new host at another server. The machine is enrolled under its hostname (up to the first dot, lowercased) unless you answer with another name, or add --name <name> to the enrol command. --server is the agent API address, not the address of this web page: the CLI cannot enroll through the web UI. If aqmas says the machine is already enrolled: to renew the same machine (an expired certificate, for example), add --force --name <its enrolled name> (aqmas status shows it); approving the card marked “replaces” revokes the old certificate. A configuration copied from another machine carries that machine's name and key: enrol this one under its own name with --force --name <name>, then revoke the other machine's entry under Hosts and re-enrol that machine."),
     p("Enrolment prints a Ref and waits. Under Approvals, match the Ref and client key to the terminal, confirm its connecting address and class, and check “replaces”: approving a replacement revokes the old identity."),
     p("An approved host can ask for nothing until it is admitted to an organisation. The approval card offers that in the same go (“Let it join…”); later it is Admit under Hosts."),
   ];
@@ -370,7 +378,7 @@ export function helpPage(c: HelpConfig) {
     card(
       "Troubleshooting",
       p(
-        "5 — Server unreachable or TLS failed: check the agent API URL, route and certificate validity. On a pin mismatch, stop and verify the CA independently; do not bypass the check. For an expired client certificate, verify the pin and re-enroll with --force; review the replacement card.",
+        "5 — Server unreachable or TLS failed: check the agent API URL, route and certificate validity. On a pin mismatch, stop and verify the CA independently; do not bypass the check. For an expired client certificate, verify the pin and re-enroll with --force --name <its enrolled name> (aqmas status shows it); review the replacement card.",
       ),
       p(
         "3 — Denied or revoked: review the decision before requesting again. 4 — Expired: submit a new request. 130 — Cancelled. 2 — Usage. 1 — Other error. 0 — Success; SSH, mosh and wrapped commands return their own exit status.",

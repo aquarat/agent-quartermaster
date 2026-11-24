@@ -3,10 +3,8 @@ package release
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/fs"
 	"maps"
-	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -41,22 +39,12 @@ func testSums(c string) Sums {
 	return s
 }
 
-// fakeSource serves one release in GitHub's API shape or in the Forgejo/Gitea shape.
+// fakeSource serves release 1.0.0 in GitHub's API shape or in the Forgejo/Gitea shape, with
+// a fixed SHA256SUMS.extra (fakeExtraSource varies that).
 func fakeSource(t *testing.T, github bool, sums func() string) *httptest.Server {
 	t.Helper()
-	const id = "00000000-0000-0000-0000-000000000001"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/releases/tags/v1.0.0"):
-			fmt.Fprintf(w, `{"tag_name":"v1.0.0","assets":[{"name":"SHA256SUMS","id":1,"uuid":%q}]}`, id)
-		case github && strings.HasSuffix(r.URL.Path, "/releases/assets/1"), !github && r.URL.Path == "/attachments/"+id:
-			fmt.Fprint(w, sums())
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(srv.Close)
-	return srv
+	extra := testExtra("e").ExtraText()
+	return fakeExtraSource(t, github, sums, func() string { return extra })
 }
 
 func TestSourcesFill(t *testing.T) {

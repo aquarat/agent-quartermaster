@@ -68,7 +68,14 @@ describe("Help: install the aqmas CLI", () => {
     expect(text).toContain("read -r ok </dev/tty");
     expect(text).toContain("read -r name </dev/tty");
     expect(text).toContain("if ! (: </dev/tty) 2>/dev/null; then");
-    expect(text).toContain(`"$HOME/.local/bin/aqmas" enroll --server 'https://agent.example.com:8443' --ca-pin '${pin}'; else "$HOME/.local/bin/aqmas" enroll --server 'https://agent.example.com:8443' --ca-pin '${pin}' --name "$name"; fi)`);
+    // The name asked for is always passed: aqmasd replaces by name, so it is never left to guess.
+    expect(text).toContain(`"$HOME/.local/bin/aqmas" enroll --server 'https://agent.example.com:8443' --ca-pin '${pin}' --name "$name")`);
+    // y, yes or Enter is yes; n or no is no; anything else asks again.
+    expect(text).toContain(`case "$ok" in ""|[yY]|[yY][eE][sS]) break ;; [nN]|[nN][oO]) `);
+    expect(text).toContain(`*) echo "Please answer y or n." ;; esac\ndone`);
+    // localhost is no default; a card marked "replaces" is explained before the name is asked.
+    expect(text).toContain('case "$n" in localhost|localhost-*) n= ;; esac');
+    expect(text.indexOf("approving it revokes the access of that other machine")).toBeLessThan(text.indexOf("Host name"));
     // Pasted into interactive zsh: no comments, no bash-only syntax.
     for (const l of text.split("\n")) expect(l.trimStart().startsWith("#")).toBe(false);
     expect(text).not.toContain("[[");
@@ -90,7 +97,7 @@ describe("Help: install the aqmas CLI", () => {
     // Enrolment is in the same card, for a machine that already has aqmas too.
     expect([...page.querySelectorAll("section.card h2")].map((e) => e.textContent)).not.toContain("Enroll a machine");
     expect([...card.querySelectorAll(".command pre")].map((e) => e.textContent)).toContain(`aqmas enroll --server 'https://agent.example.com:8443' --ca-pin '${pin}'`);
-    for (const s of ["enrolled under its hostname", "--name <name>", "not the address of this web page", "--force", "admitted to an organisation", "Cross-check the CA pin"]) expect(card.textContent).toContain(s);
+    for (const s of ["enrolled under its hostname", "--name <name>", "not the address of this web page", "--force --name <its enrolled name>", "enrol this one under its own name with --force --name <name>", "admitted to an organisation", "Cross-check the CA pin"]) expect(card.textContent).toContain(s);
     // Every command on the page keeps its copy button.
     expect(page.querySelectorAll("pre").length).toBe(page.querySelectorAll(".command button").length);
   });
@@ -201,7 +208,7 @@ describe("Help: install the aqmas CLI", () => {
     expect(installCommand("https://example.com/it's", "aqmas-linux-arm64", "b".repeat(64))).toContain(`-- 'https://example.com/it'\\''s/aqmas-linux-arm64'`);
     const t = setupCommand({ base: "https://example.com/it's", hashes: { "aqmas-linux-arm64": "b".repeat(64) }, version: "1.2.3'; x", server: "https://a.example.com/'$(id)", pin: "sha256:'x" });
     expect(t).toContain(`-o "$a" -- 'https://example.com/it'\\''s/'"$a"`);
-    expect(t).toContain(`enroll --server 'https://a.example.com/'\\''$(id)' --ca-pin 'sha256:'\\''x';`);
+    expect(t).toContain(`enroll --server 'https://a.example.com/'\\''$(id)' --ca-pin 'sha256:'\\''x' --name "$name")`);
     expect(t).toContain(`'aqmas 1.2.3'\\''; x' "$a"`);
   });
 });

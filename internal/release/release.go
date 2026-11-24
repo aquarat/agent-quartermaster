@@ -30,6 +30,14 @@ var ExtraAssets = [...]string{DarwinAMD}
 // ExtraSums is the name of the second checksum file. A release before 0.9.3 has none.
 const ExtraSums = "SHA256SUMS.extra"
 
+// ExtraSince is the first release that publishes ExtraSums. From it on the file is
+// required: a source that leaves it out is refused, so it cannot be stripped to push the
+// builds it lists back onto an unrecorded check.
+const ExtraSince = "0.9.3"
+
+// NeedsExtra reports whether a release of version v must publish ExtraSums.
+func NeedsExtra(v string) bool { return ValidVersion(v) && !Newer(ExtraSince, v) }
+
 // CLIAssets are every CLI build a release may carry.
 var CLIAssets = [...]string{"aqmas-darwin-arm64", DarwinAMD, "aqmas-linux-amd64", "aqmas-linux-arm64"}
 var versionRE = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)

@@ -187,9 +187,12 @@ bun -e 'const [v,commit,...ports]=process.argv.slice(1);const get=async(p,n)=>{c
 const parse=t=>Object.fromEntries(t.trim().split("\n").map(l=>l.split("  ").reverse()));const sums=[],extra=[];for(const p of ports){sums.push(await get(p,"SHA256SUMS"));extra.push(await get(p,"SHA256SUMS.extra"))}
 if(sums[0]!==sums[1]||extra[0]!==extra[1])process.exit(1);const m=parse(sums[0]);console.log(JSON.stringify({version:v,commit,github:m,second:m,extra:parse(extra[0]),sources:2}))' "$v" "$(git -C "$ROOT" rev-parse HEAD)" "$PF" "$PG" > "$T/releases/latest-two.json"
 # Brokers and CLIs of 0.9.2 read this release's SHA256SUMS and the bastion's record of it
-# (with its new "extra" member) with their own, strict parser: the one from the v0.9.2 tag.
-OLD_TAG=v0.9.2
-if git -C "$ROOT" rev-parse -q --verify "$OLD_TAG^{commit}" >/dev/null; then
+# (with its new "extra" member) with their own, strict parser: the one from the 0.9.2 commit.
+# v0.9.2, by commit: the test must not depend on a tag existing. Missing history is a failure.
+OLD_TAG=0ba281b29076898ba5f117ae7b0b5f4754724d10
+git -C "$ROOT" cat-file -e "$OLD_TAG^{commit}" 2>/dev/null || fail "0.9.2 ($OLD_TAG) is not in this clone; fetch the full history (git fetch --unshallow)"
+[[ $(git -C "$ROOT" show "$OLD_TAG:VERSION") == 0.9.2 ]] || fail "$OLD_TAG is not 0.9.2"
+{
   mkdir "$T/old-release"
   git -C "$ROOT" show "$OLD_TAG:internal/release/release.go" > "$T/old-release/release.go"
   printf 'module oldrelease\n\ngo 1.24\n' > "$T/old-release/go.mod"
@@ -219,11 +222,9 @@ func TestNewReleaseReadsAsOld(t *testing.T) {
 	}
 }
 GO
-  (cd "$T/old-release" && SUMS="$T/releases/$v/SHA256SUMS" LATEST="$T/releases/latest-two.json" GOFLAGS=-mod=mod GOTOOLCHAIN=local go test -count=1 . >"$T/old-release/out" 2>&1) || fail "$OLD_TAG parser: $(cat "$T/old-release/out")"
-  ok "$OLD_TAG's parser accepts this release's SHA256SUMS and the record with SHA256SUMS.extra"
-else
-  echo "interop: $OLD_TAG is not in this clone; the 0.9.2 compatibility checks are skipped" >&2
-fi
+  (cd "$T/old-release" && SUMS="$T/releases/$v/SHA256SUMS" LATEST="$T/releases/latest-two.json" GOFLAGS=-mod=mod GOTOOLCHAIN=local go test -count=1 . >"$T/old-release/out" 2>&1) || fail "0.9.2 parser: $(cat "$T/old-release/out")"
+  ok "0.9.2's parser accepts this release's SHA256SUMS and the record with SHA256SUMS.extra"
+}
 bun -e 'const m=await Bun.file(process.argv[1]).json();delete m.second;m.sources=1;console.log(JSON.stringify(m))' "$T/releases/latest-two.json" > "$T/releases/latest.json"
 (cd "$ROOT" && CGO_ENABLED=0 go build -tags interop -trimpath -buildvcs=false -ldflags '-X github.com/aquarat/agent-quartermaster/internal/client.Version=0.0.0' -o "$T/upgrade/aqmas" ./cmd/aqmas)
 printf '\n[github]\napi = "http://127.0.0.1:%s"\n' "$PG" >> "$AQMAS_CONFIG_DIR/config.toml"
@@ -261,17 +262,17 @@ fi
 "$T/upgrade/aqmas" version | grep -F "aqmas $v " >/dev/null
 "$T/upgrade/aqmas.prev" version | grep -F 'aqmas 0.0.0 ' >/dev/null
 ok 'old CLI verified the release (bastion with one source, then two) against GitHub, replaced itself and retained runnable previous version'
-# A real 0.9.2 CLI (built from its tag) upgrades from this bastion: the record now has an
+# A real 0.9.2 CLI (built from its commit) upgrades from this bastion: the record now has an
 # "extra" member and the release a SHA256SUMS.extra, neither of which it knows.
-if [[ -d $T/old-release ]]; then
+{
   git -C "$ROOT" worktree add --detach "$T/wt-old" "$OLD_TAG" >/dev/null 2>&1 || fail "git worktree add $OLD_TAG"
   mkdir "$T/upgrade-old"
-  (cd "$T/wt-old" && CGO_ENABLED=0 go build -tags interop -trimpath -buildvcs=false -ldflags '-X github.com/aquarat/agent-quartermaster/internal/client.Version=0.0.0' -o "$T/upgrade-old/aqmas" ./cmd/aqmas) || fail "build $OLD_TAG CLI"
-  "$T/upgrade-old/aqmas" upgrade --yes --expect-sha256 "$want" </dev/null 2>"$T/upgrade-old/err" || fail "$OLD_TAG CLI upgrade: $(cat "$T/upgrade-old/err")"
-  "$T/upgrade-old/aqmas" version | grep -F "aqmas $v " >/dev/null || fail "$OLD_TAG CLI did not install $v"
+  (cd "$T/wt-old" && CGO_ENABLED=0 go build -tags interop -trimpath -buildvcs=false -ldflags '-X github.com/aquarat/agent-quartermaster/internal/client.Version=0.0.0' -o "$T/upgrade-old/aqmas" ./cmd/aqmas) || fail "build 0.9.2 CLI"
+  "$T/upgrade-old/aqmas" upgrade --yes --expect-sha256 "$want" </dev/null 2>"$T/upgrade-old/err" || fail "0.9.2 CLI upgrade: $(cat "$T/upgrade-old/err")"
+  "$T/upgrade-old/aqmas" version | grep -F "aqmas $v " >/dev/null || fail "0.9.2 CLI did not install $v"
   git -C "$ROOT" worktree remove --force "$T/wt-old"
-  ok "$OLD_TAG CLI upgraded itself to $v from a bastion whose record has SHA256SUMS.extra"
-fi
+  ok "0.9.2 CLI upgraded itself to $v from a bastion whose record has SHA256SUMS.extra"
+}
 
 # --- ssh: first request, approved for 10 min ---
 "$AQMAS" ssh 127.0.0.1 --ttl 15m --why "interop first login" -- echo ok </dev/null >"$T/ssh1.out" 2>"$T/ssh1.err" &

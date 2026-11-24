@@ -12,19 +12,20 @@ import (
 	"testing"
 )
 
-// fakeExtraSource serves release 1.0.0 with SHA256SUMS and, when extra() is not "", a
+// fakeExtraSource serves any release version with SHA256SUMS and, when extra() is not "", a
 // SHA256SUMS.extra, in GitHub's API shape or the Forgejo/Gitea one.
 func fakeExtraSource(t *testing.T, github bool, sums, extra func() string) *httptest.Server {
 	t.Helper()
 	const id1, id2 = "00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/releases/tags/v1.0.0"):
+		case strings.Contains(r.URL.Path, "/releases/tags/v"):
+			_, tag, _ := strings.Cut(r.URL.Path, "/releases/tags/")
 			assets := fmt.Sprintf(`{"name":"SHA256SUMS","id":1,"uuid":%q}`, id1)
 			if extra() != "" {
 				assets += fmt.Sprintf(`,{"name":%q,"id":2,"uuid":%q}`, ExtraSums, id2)
 			}
-			fmt.Fprintf(w, `{"tag_name":"v1.0.0","assets":[%s]}`, assets)
+			fmt.Fprintf(w, `{"tag_name":%q,"assets":[%s]}`, tag, assets)
 		case github && strings.HasSuffix(r.URL.Path, "/releases/assets/1"), !github && r.URL.Path == "/attachments/"+id1:
 			fmt.Fprint(w, sums())
 		case github && strings.HasSuffix(r.URL.Path, "/releases/assets/2"), !github && r.URL.Path == "/attachments/"+id2:
@@ -102,15 +103,28 @@ func TestSourcesFillExtra(t *testing.T) {
 	if err := both.Fill(t.Context(), &m); err != nil || !m.Valid() || m.Compared() != 2 || m.Hash(DarwinAMD) == "" {
 		t.Fatalf("two agreeing sources: %v %+v", err, m)
 	}
-	// A release without the file (one from before 0.9.3), at every source: no extra hashes.
+	// A release before 0.9.3 has no such file at any source: no extra hashes.
 	ghExtra, secondExtra = "", ""
-	if err := both.Fill(t.Context(), &m); err != nil || !m.Valid() || m.Extra != nil || m.Hash(DarwinAMD) != "" {
-		t.Fatalf("no SHA256SUMS.extra: %v %+v", err, m)
+	for _, v := range []string{"0.9.2", "0.8.10"} {
+		old := Metadata{Version: v, Commit: m.Commit}
+		if err := both.Fill(t.Context(), &old); err != nil || !old.Valid() || old.Extra != nil || old.Hash(DarwinAMD) != "" {
+			t.Fatalf("%s without SHA256SUMS.extra: %v %+v", v, err, old)
+		}
+	}
+	// From 0.9.3 on the file is required: stripping it is refused, not read as "no extras".
+	for _, v := range []string{"0.9.3", "0.10.0", "1.0.0"} {
+		if !NeedsExtra(v) {
+			t.Fatalf("NeedsExtra(%s) = false", v)
+		}
+		stripped := Metadata{Version: v, Commit: m.Commit}
+		if err := both.Fill(t.Context(), &stripped); err == nil || !strings.Contains(err.Error(), "has no SHA256SUMS.extra") {
+			t.Fatalf("%s without SHA256SUMS.extra accepted: %v", v, err)
+		}
 	}
 	// One source has it and the other not, or they differ: a disagreement.
 	for _, c := range [][2]string{{testExtra("e").ExtraText(), ""}, {"", testExtra("e").ExtraText()}, {testExtra("e").ExtraText(), testExtra("f").ExtraText()}} {
 		ghExtra, secondExtra = c[0], c[1]
-		if err := both.Fill(t.Context(), &m); err == nil || !strings.Contains(err.Error(), "disagree") {
+		if err := both.Fill(t.Context(), &m); err == nil || !strings.Contains(err.Error(), "disagree") && !strings.Contains(err.Error(), "GitHub: release 1.0.0 has no") {
 			t.Fatalf("%q vs %q accepted: %v", c[0], c[1], err)
 		}
 	}

@@ -92,21 +92,35 @@ status "Fetched $v. Downloading dependencies, then testing and building offline.
 
 # Do not follow paths in a builder-owned directory as root. Copy only the known
 # filenames out via the offline sandbox, then hash the root-owned copies.
+dist=/work/src/dist
+# BEGIN check-assets (updater_test.go runs this block on its own)
 # SHA256SUMS lists exactly these four; a later build (macOS x86-64) is in SHA256SUMS.extra,
 # whose digests the metadata carries under "extra" when the release has that file.
 sums=(aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64)
 extra=()
 if jq -e 'has("extra")' "$out/metadata" >/dev/null; then extra=(aqmas-darwin-amd64); fi
+# A tree that builds SHA256SUMS.extra must come with approved digests for it: metadata
+# without "extra" for such a release means the file was left out somewhere on the way.
+if (( ${#extra[@]} == 0 )) && "${box[@]}" /usr/bin/test -e "$dist/SHA256SUMS.extra"; then
+  echo "the release builds SHA256SUMS.extra but the verified metadata has no extra digests" >&2; exit 1
+fi
 status "Built $v. Checking all $(( ${#sums[@]} + ${#extra[@]} )) binaries against the approved digests."
 mkdir "$out/assets"
 for a in "${sums[@]}" ${extra[@]+"${extra[@]}"}; do
   key=github; [[ $a == aqmas-darwin-amd64 ]] && key=extra
-  "${box[@]}" /usr/bin/timeout 30 /usr/bin/head -c 134217729 "/work/src/dist/$a" > "$out/assets/$a"
+  "${box[@]}" /usr/bin/timeout 30 /usr/bin/head -c 134217729 "$dist/$a" > "$out/assets/$a"
   [[ $(wc -c < "$out/assets/$a") -le 134217728 ]]
   [[ $(sha256sum "$out/assets/$a"|cut -d' ' -f1) == "$(jq -er --arg k "$key" --arg a "$a" '.[$k][$a]' "$out/metadata")" ]]
 done
 (cd "$out/assets" && sha256sum "${sums[@]}" > SHA256SUMS)
-if (( ${#extra[@]} )); then (cd "$out/assets" && sha256sum "${extra[@]}" > SHA256SUMS.extra); fi
+if (( ${#extra[@]} )); then
+  (cd "$out/assets" && sha256sum "${extra[@]}" > SHA256SUMS.extra)
+  # The rebuilt tree's own SHA256SUMS.extra must list exactly what was approved.
+  "${box[@]}" /usr/bin/timeout 30 /usr/bin/head -c 4097 "$dist/SHA256SUMS.extra" > "$out/built.extra"
+  cmp -s "$out/built.extra" "$out/assets/SHA256SUMS.extra" || { echo "the rebuilt SHA256SUMS.extra differs from the approved digests" >&2; exit 1; }
+  rm -- "$out/built.extra"
+fi
+# END check-assets
 install -m 0755 "$out/assets/aqmasd-linux-arm64" "$installstage/new"; rm "$out/assets/aqmasd-linux-arm64"
 chmod 0755 "$out/assets"; chmod 0644 "$out/assets/"* "$out/metadata"
 # After an earlier automatic rollback the running binary and .prev are one file already

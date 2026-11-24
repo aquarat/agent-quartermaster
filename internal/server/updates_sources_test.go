@@ -83,7 +83,8 @@ func newUpdateLab(t *testing.T) *updateLab {
 		l.sums[a] = strings.Repeat("a", 64)
 	}
 	l.secondSums = maps.Clone(l.sums)
-	const id = "00000000-0000-0000-0000-000000000001"
+	const id, id2 = "00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"
+	extra := release.Sums{release.DarwinAMD: strings.Repeat("e", 64)}.ExtraText()
 	serve := func(github bool, sums func() release.Sums) *httptest.Server {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Header.Get("Authorization") != "" {
@@ -91,9 +92,11 @@ func newUpdateLab(t *testing.T) *updateLab {
 			}
 			switch {
 			case strings.HasSuffix(r.URL.Path, "/releases/tags/v1.0.1"):
-				fmt.Fprintf(w, `{"tag_name":"v1.0.1","assets":[{"name":"SHA256SUMS","id":1,"uuid":%q}]}`, id)
+				fmt.Fprintf(w, `{"tag_name":"v1.0.1","assets":[{"name":"SHA256SUMS","id":1,"uuid":%q},{"name":"SHA256SUMS.extra","id":2,"uuid":%q}]}`, id, id2)
 			case github && strings.HasSuffix(r.URL.Path, "/releases/assets/1"), !github && r.URL.Path == "/attachments/"+id:
 				fmt.Fprint(w, sums().Text())
+			case github && strings.HasSuffix(r.URL.Path, "/releases/assets/2"), !github && r.URL.Path == "/attachments/"+id2:
+				fmt.Fprint(w, extra)
 			default:
 				http.NotFound(w, r)
 			}

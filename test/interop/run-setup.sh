@@ -233,6 +233,7 @@ cp "$AQMASD" "$T/rel-good/aqmasd-linux-arm64"
 # A build listed in SHA256SUMS.extra (0.9.3 on) is seeded the same way.
 echo "cli aqmas-darwin-amd64" >"$T/rel-good/aqmas-darwin-amd64"
 (cd "$T/rel-good" && sha256sum aqmas-darwin-amd64 >SHA256SUMS.extra)
+cp "$T/rel-good/SHA256SUMS.extra" "$T/rel-bad/SHA256SUMS.extra"
 sed "s/^[0-9a-f]\{64\}  aqmasd-linux-arm64/$(printf 'f%.0s' {1..64})  aqmasd-linux-arm64/" "$T/rel-good/SHA256SUMS" >"$T/rel-bad/SHA256SUMS"
 serve_release() { # GITHUB_DIR [SECOND_DIR]: what GitHub ($PG) and the second source ($PF) publish
 	for p in "${REL_PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null || true; done

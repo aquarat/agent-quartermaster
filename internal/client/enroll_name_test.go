@@ -24,6 +24,10 @@ func TestDefaultHostName(t *testing.T) {
 		{host: ".local", errHas: `".local"`},
 		{host: long, errHas: long},
 		{host: "bad\x1b[31m", errHas: `"bad?[31m"`},
+		{host: "localhost", errHas: `"localhost" names no machine`},
+		{host: "LocalHost.localdomain", errHas: `"LocalHost.localdomain" names no machine`},
+		{host: "localhost-live", errHas: "names no machine"},
+		{host: "localhostess", want: "localhostess"},
 	} {
 		got, err := DefaultHostName(func() (string, error) { return tc.host, nil })
 		if tc.errHas == "" {
@@ -54,7 +58,7 @@ func TestEnrollDefaultsToHostname(t *testing.T) {
 	if err != nil || cfg.HostName != "agent-host" {
 		t.Fatalf("config %+v, %v", cfg, err)
 	}
-	msg := `aqmas: enrolling as "agent-host" (from this machine's hostname; use --name to choose another)`
+	msg := `aqmas: enrolling as "agent-host" (from this machine's hostname; use --name to choose another). If the approval card says it replaces an enrolment, approving it revokes that other machine's access`
 	if !strings.Contains(e.stderr.String(), msg) {
 		t.Fatalf("stderr lacks %q:\n%s", msg, e.stderr)
 	}
@@ -71,31 +75,37 @@ func TestEnrollDefaultsToHostname(t *testing.T) {
 	}
 }
 
-// --force on a configuration copied from another machine takes this machine's hostname,
-// not the old enrolment's name, and says which enrolment it replaces.
-func TestEnrollForceDefaultsToHostnameAndNamesTheOld(t *testing.T) {
+// aqmasd replaces by name, so --force without --name goes ahead only when the hostname gives
+// the name already enrolled here; otherwise the user chooses between the two.
+func TestEnrollForceWithoutNameNeedsTheSameName(t *testing.T) {
 	f := newFakeServer(t)
 	e := newTestEnv(t)
 	enroll(t, f, e) // enrolled as "agenthost"
+	posts := f.enrollPosts
 	e.Hostname = func() (string, error) { return "newhost", nil }
-	e.stderr.Reset()
-	if err := e.Enroll(context.Background(), EnrollOptions{Force: true}); err != nil {
-		t.Fatalf("enroll --force: %v\nstderr: %s", err, e.stderr)
+	err := e.Enroll(context.Background(), EnrollOptions{Force: true})
+	for _, s := range []string{`enrolled as "agenthost"`, `gives "newhost"`, "--name agenthost to replace", "--name newhost to enrol this machine as a new host", `revoke "agenthost" under Hosts`} {
+		if err == nil || !strings.Contains(err.Error(), s) {
+			t.Fatalf("error lacks %q: %v", s, err)
+		}
 	}
-	msg := `aqmas: enrolling as "newhost" (from this machine's hostname, replacing the enrolment as "agenthost"; use --name to choose another)`
-	if !strings.Contains(e.stderr.String(), msg) {
-		t.Fatalf("stderr lacks %q:\n%s", msg, e.stderr)
+	if f.enrollPosts != posts {
+		t.Fatal("a request was sent")
 	}
-	if cfg, err := LoadConfig(e.Paths); err != nil || cfg.HostName != "newhost" {
-		t.Fatalf("config %+v, %v", cfg, err)
+	if cfg, err := LoadConfig(e.Paths); err != nil || cfg.HostName != "agenthost" {
+		t.Fatalf("config changed: %+v, %v", cfg, err)
 	}
 
-	// Same name: nothing to mention.
+	// Either explicit choice goes ahead.
+	if err := e.Enroll(context.Background(), EnrollOptions{Force: true, Name: "newhost"}); err != nil {
+		t.Fatalf("--force --name newhost: %v", err)
+	}
+	// Now the hostname gives the enrolled name: --force alone replaces it.
 	e.stderr.Reset()
 	if err := e.Enroll(context.Background(), EnrollOptions{Force: true}); err != nil {
-		t.Fatalf("enroll --force again: %v", err)
+		t.Fatalf("enroll --force with the same name: %v", err)
 	}
-	if strings.Contains(e.stderr.String(), "replacing") || !strings.Contains(e.stderr.String(), `enrolling as "newhost" (from this machine's hostname; use`) {
+	if !strings.Contains(e.stderr.String(), `enrolling as "newhost" (from this machine's hostname; use`) || !strings.Contains(e.stderr.String(), "revokes that other machine's access") {
 		t.Fatalf("stderr:\n%s", e.stderr)
 	}
 

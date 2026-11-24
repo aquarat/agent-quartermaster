@@ -392,8 +392,11 @@ proxy choice and does not make the grants it issues indefinite.
   without `--name` the host name is the machine's hostname up to its first dot, lowercased
   (`Web-1.example.com` → `web-1`), and the CLI prints it before sending anything; a hostname
   that is not then a valid name (lowercase letters, digits, `-`, at most 63) is refused with
-  a request for `--name`, never rewritten. `--force` without `--name` also uses the hostname
-  (not the old enrolment's name) and names the enrolment it replaces. Creates the client key
+  a request for `--name`, never rewritten; so is `localhost` (and `localhost-*`). aqmasd
+  replaces an enrolment by name, so where this configuration is already enrolled under
+  another name (a configuration copied from another machine, say) the CLI refuses and offers
+  `--name OLD` (replace that enrolment) or `--name NEW` (enrol this machine as a new host).
+Creates the client key
   + CSR, prints the approve URL and Ref, waits. Without `--ca-pin`, the
   CA is trusted only after the user confirms its fingerprint at a terminal. `--server` is the
   agent API (`https://HOST:8443`), not the web UI's address; the web UI's Help page shows the
