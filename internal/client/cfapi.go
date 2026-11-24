@@ -116,8 +116,7 @@ func cfErrorMessage(body []byte) string {
 func (c *APIClient) CFCatalogue(ctx context.Context) (*api.CFCatalogue, error) {
 	var out api.CFCatalogue
 	if err := c.do(ctx, http.MethodGet, "/v1/cf/catalogue", nil, &out); err != nil {
-		var ae *APIError
-		if errors.As(err, &ae) && ae.HTTPStatus == http.StatusNotFound {
+		if plainNotFound(err) {
 			return nil, fmt.Errorf("Cloudflare access is not enabled on aqmasd (%w)", err)
 		}
 		return nil, err

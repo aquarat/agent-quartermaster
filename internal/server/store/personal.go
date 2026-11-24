@@ -21,6 +21,14 @@ func (q *Q) PersonalAdmission(ctx context.Context, hostID int64, now time.Time) 
 	return notFound(err)
 }
 
+// Admitted reports whether the host holds an active admission to any organisation that is
+// not archived. It says nothing about what that organisation contains.
+func (q *Q) Admitted(ctx context.Context, hostID int64) (bool, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, `SELECT count(*) FROM org_hosts a JOIN organisations o ON o.id=a.org_id WHERE a.host_id=? AND a.active=1 AND o.archived=0`, hostID).Scan(&n)
+	return n > 0, err
+}
+
 func (q *Q) PersonalResource(ctx context.Context, host int64, kind, alias string, now time.Time) (organisations.Resource, error) {
 	r, err := organisations.PersonalAlias(ctx, q.q, host, kind, alias, now)
 	return r, notFound(err)

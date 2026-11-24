@@ -31,6 +31,9 @@ const (
 	ErrUnauthenticated = "unauthenticated"
 	ErrForbidden       = "forbidden"
 	ErrNotFound        = "not_found"
+	// ErrNotAdmitted (HTTP 404, like not_found): the calling host is enrolled but holds no
+	// active admission to any organisation. Sent in place of not_found for that host only.
+	ErrNotAdmitted = "not_admitted"
 	ErrConflict        = "conflict"
 	ErrExpired         = "expired"
 	ErrDenied          = "denied"

@@ -78,11 +78,33 @@ func (s *Server) AgentHandler() http.Handler {
 func (s *Server) requirePersonal(next func(http.ResponseWriter, *http.Request, *store.Host)) http.Handler {
 	return s.requireHost(func(w http.ResponseWriter, r *http.Request, h *store.Host) {
 		if err := s.store.Q().PersonalAdmission(r.Context(), h.ID, s.now()); err != nil {
-			s.writeErr(w, r, mapNotFound(err))
+			s.writeErr(w, r, s.hostNotFound(r.Context(), h, err))
 			return
 		}
 		next(w, r, h)
 	})
+}
+
+// hostNotFound is mapNotFound for an authenticated host's own calls. What other
+// organisations hold stays hidden: a host that is admitted somewhere hears the same
+// "not found" for everything it cannot see. A host with no active admission at all is told
+// so instead, for every such answer alike, so the reply depends on its own state only and
+// never on whether the thing it named exists.
+func (s *Server) hostNotFound(ctx context.Context, h *store.Host, err error) error {
+	var ae *apiErr
+	if !errors.Is(err, store.ErrNotFound) && !(errors.As(err, &ae) && ae.code == "not_found") {
+		return err
+	}
+	q := s.store.Q()
+	if !q.Scoped() {
+		return errNotFound()
+	}
+	if ok, e := q.Admitted(ctx, h.ID); e != nil {
+		return e
+	} else if !ok {
+		return errNotAdmitted()
+	}
+	return errNotFound()
 }
 
 // requireHost authenticates the caller by its verified client certificate: issued by the

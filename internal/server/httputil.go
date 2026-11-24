@@ -25,6 +25,13 @@ func errBad(msg string) *apiErr       { return &apiErr{http.StatusBadRequest, "b
 func errUnauth(msg string) *apiErr    { return &apiErr{http.StatusUnauthorized, "unauthenticated", msg} }
 func errForbidden(msg string) *apiErr { return &apiErr{http.StatusForbidden, "forbidden", msg} }
 func errNotFound() *apiErr            { return &apiErr{http.StatusNotFound, "not_found", "not found"} }
+
+// errNotAdmitted tells an authenticated host about its own state only: it is enrolled and
+// holds no active admission to any organisation. The status stays 404 so that clients
+// written before the code existed take the path they always took for "nothing here".
+func errNotAdmitted() *apiErr {
+	return &apiErr{http.StatusNotFound, api.ErrNotAdmitted, "this host is enrolled but not admitted to an organisation yet; the owner admits it under the organisation's Hosts"}
+}
 func errConflict(msg string) *apiErr  { return &apiErr{http.StatusConflict, "conflict", msg} }
 func errExpired(msg string) *apiErr   { return &apiErr{http.StatusGone, "expired", msg} }
 func errInternal() *apiErr {

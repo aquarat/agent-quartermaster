@@ -933,7 +933,7 @@ func (s *Server) requireHostCF(next func(http.ResponseWriter, *http.Request, *st
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h, err := s.hostFromTLS(r)
 		if err == nil {
-			err = mapNotFound(s.store.Q().PersonalAdmission(r.Context(), h.ID, s.now()))
+			err = s.hostNotFound(r.Context(), h, s.store.Q().PersonalAdmission(r.Context(), h.ID, s.now()))
 		}
 		if err == nil && s.store.Q().Scoped() {
 			_, err = s.store.Q().PersonalResource(r.Context(), h.ID, "cloudflare-proxy", "proxy", s.now())

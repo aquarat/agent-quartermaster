@@ -119,7 +119,7 @@ func (e *Env) IsBastion(ctx context.Context, host string) bool {
 // the cue to ask whether the name is the bastion's.
 func NotATarget(err error) bool {
 	var ae *APIError
-	return errors.As(err, &ae) && (ae.HTTPStatus == 404 || ae.HTTPStatus == 400)
+	return errors.As(err, &ae) && (ae.HTTPStatus == 404 || ae.HTTPStatus == 400) && !NotAdmitted(err)
 }
 
 func bastionLevel(o BastionOptions) (string, error) {
@@ -145,8 +145,7 @@ func (e *Env) bastionStart(ctx context.Context, o BastionOptions) (level, why st
 		return
 	}
 	if info, err = c.BastionInfo(ctx); err != nil {
-		var ae *APIError
-		if errors.As(err, &ae) && ae.HTTPStatus == 404 {
+		if plainNotFound(err) {
 			err = errors.New("access to the bastion is not installed on this aqmasd (the owner installs it under Settings → Bastion access)")
 		}
 		return
@@ -463,8 +462,7 @@ func (e *Env) BastionShow(ctx context.Context) error {
 	}
 	info, err := c.BastionInfo(ctx)
 	if err != nil {
-		var ae *APIError
-		if errors.As(err, &ae) && ae.HTTPStatus == 404 {
+		if plainNotFound(err) {
 			fmt.Fprintln(e.Stdout, "bastion      access to the bastion is not installed on this aqmasd")
 			fmt.Fprintf(e.Stdout, "tasks        %s (aqmas bastion task NAME --why \"...\")\n", strings.Join(BastionTasks, " "))
 			return nil

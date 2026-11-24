@@ -51,7 +51,24 @@ func lockedNotice(e *APIError) string {
 	return "waiting for the owner to reopen the credential's bucket"
 }
 
+// NotAdmitted reports the server's "enrolled, but not admitted to an organisation" answer.
+func NotAdmitted(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.Code == api.ErrNotAdmitted
+}
+
+// plainNotFound is a 404 that means "nothing of that name here", not "this host is not
+// admitted": the cue for the callers that turn a 404 into "feature not installed".
+func plainNotFound(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.HTTPStatus == http.StatusNotFound && ae.Code != api.ErrNotAdmitted
+}
+
 func (e *APIError) Error() string {
+	if e.Code == api.ErrNotAdmitted {
+		return "this host is enrolled but not admitted to an organisation yet, so the broker shows it nothing. " +
+			"Ask the owner to admit it in the web UI (the organisation's Hosts page: Admit), then run the command again"
+	}
 	msg := e.Message
 	if msg == "" {
 		msg = http.StatusText(e.HTTPStatus)

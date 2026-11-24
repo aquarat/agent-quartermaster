@@ -10,6 +10,14 @@ Errors: non-2xx with `api.Error` `{"error": "<code>", "message": "<human text>"}
 `expired` (410), `locked` (423: a sealed bucket is closed, [Buckets](#buckets)),
 `rate_limited` (429), `denied`, `internal` (500).
 
+`not_admitted` (404) replaces `not_found` on the agent API for one case only: the calling
+host is enrolled but has no active admission to any organisation (the owner admits it under
+the organisation's Hosts, or together with the enrolment approval). It describes the
+caller's own state and is sent for every "not found" answer to that host alike, so it does
+not reveal whether the thing asked for exists. A host that is admitted somewhere and asks
+for something it cannot see still gets `not_found`, indistinguishable from a missing object.
+The status is 404 so that clients older than the code behave as before and print it.
+
 Statuses (`api.Status*`): `pending`, `approved`, `denied`, `expired`, `revoked`, `cancelled`.
 
 The short **Ref** of an item is the last 6 characters of its id, upper-cased. The UI shows it

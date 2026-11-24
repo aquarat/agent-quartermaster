@@ -22,7 +22,7 @@ func (s *Server) envAgentRoutes(m *http.ServeMux) {
 	route := func(pattern string, secret bool, f func(context.Context, *store.Q, *http.Request, *store.Host) (any, error)) {
 		m.Handle(pattern, s.requireHost(func(w http.ResponseWriter, r *http.Request, h *store.Host) {
 			if err := s.bucketsReady(); err != nil {
-				s.writeErr(w, r, err)
+				s.writeErr(w, r, s.hostNotFound(r.Context(), h, err))
 				return
 			}
 			// No network read inside BEGIN IMMEDIATE.
@@ -50,7 +50,7 @@ func (s *Server) envAgentRoutes(m *http.ServeMux) {
 				return err
 			})
 			if err != nil {
-				s.writeErr(w, r, mapNotFound(err))
+				s.writeErr(w, r, s.hostNotFound(ctx, h, err))
 				return
 			}
 			if call.after != nil {
