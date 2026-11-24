@@ -654,7 +654,9 @@ describe("Setup through the App and the mock", () => {
     expect(JSON.stringify(f.log.slice(start).map((x) => x.body)).includes("READONLYTOKEN")).toBe(false);
     expect(m.store.setup.received.at(-1)!.secrets).toEqual({ github_token: "ghp_READONLYTOKEN_0123456789" });
     // The form is back for another run with empty token fields.
-    await until(() => card("enable-updates").querySelectorAll('input[type="password"]').length === 2);
+    // The old form also has two token fields: wait for the re-rendered one, whose fields are empty.
+    const tokens = () => [...card("enable-updates").querySelectorAll<HTMLInputElement>('input[type="password"]')].map((i) => i.value);
+    await until(() => tokens().length === 2 && tokens().every((v) => v === ""), 8000);
     expect([...card("enable-updates").querySelectorAll<HTMLInputElement>('input[type="password"]')].map((i) => i.value)).toEqual(["", ""]);
   }, 30000);
 
