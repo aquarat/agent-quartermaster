@@ -290,10 +290,11 @@ func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) (release.M
 		return m, err
 	}
 	defer os.RemoveAll(stage)
-	for _, name := range release.Assets {
-		if name == release.Daemon {
-			continue
-		}
+	names := slices.DeleteFunc(slices.Clone(release.Assets[:]), func(n string) bool { return n == release.Daemon })
+	if m.Extra != nil {
+		names = append(names, release.ExtraAssets[:]...)
+	}
+	for _, name := range names {
 		// Whichever source delivers it: the bytes are checked against the agreed digest.
 		b, err := src.GitHub.Asset(ctx, m.Version, name, true, 128<<20)
 		if err != nil && src.HasSecond() {
@@ -303,7 +304,7 @@ func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) (release.M
 			return m, errors.New("could not download " + name)
 		}
 		sum := sha256.Sum256(b)
-		if hex.EncodeToString(sum[:]) != m.GitHub[name] {
+		if hex.EncodeToString(sum[:]) != m.Hash(name) {
 			return m, errors.New(name + " does not match the published digest")
 		}
 		// Explicit modes: the runner's umask is 077 and the broker serves these files.
@@ -313,6 +314,11 @@ func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) (release.M
 	}
 	if err = writeOwned(filepath.Join(stage, "SHA256SUMS"), []byte(m.GitHub.Text()), 0, 0, 0644); err != nil {
 		return m, err
+	}
+	if m.Extra != nil {
+		if err = writeOwned(filepath.Join(stage, release.ExtraSums), []byte(m.Extra.ExtraText()), 0, 0, 0644); err != nil {
+			return m, err
+		}
 	}
 	if err = os.Chmod(stage, 0755); err != nil {
 		return m, err

@@ -36,6 +36,8 @@ type Env struct {
 	PollMin time.Duration
 	// RetryDelay is the backoff unit for transient failures while waiting (default 2 s).
 	RetryDelay time.Duration
+	// goos/goarch stand in for runtime.GOOS/GOARCH in tests of `upgrade` ("": the real ones).
+	goos, goarch string
 }
 
 func (e *Env) retryBase() time.Duration {

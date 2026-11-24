@@ -63,7 +63,7 @@ jobs:
             make release
           ' bash "$work"
           mkdir dist
-          for f in aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64 SHA256SUMS; do
+          for f in aqmas-darwin-arm64 aqmas-darwin-amd64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64 SHA256SUMS SHA256SUMS.extra; do
             test -f "$work/src/dist/$f" && test ! -L "$work/src/dist/$f"
             runuser -u node -- cat "$work/src/dist/$f" > "dist/$f"
           done
@@ -97,11 +97,15 @@ jobs:
           [[ $TAG =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           cd dist
           files=(aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64)
-          for f in "${files[@]}" SHA256SUMS; do [[ -f $f && ! -L $f ]]; done
+          # SHA256SUMS keeps its four names (brokers 0.9.0-0.9.2 refuse any other line);
+          # builds added since are listed in SHA256SUMS.extra.
+          extra=(aqmas-darwin-amd64)
+          for f in "${files[@]}" "${extra[@]}" SHA256SUMS SHA256SUMS.extra; do [[ -f $f && ! -L $f ]]; done
           sha256sum "${files[@]}" | cmp - SHA256SUMS
+          sha256sum "${extra[@]}" | cmp - SHA256SUMS.extra
           api() { curl --fail-with-body -sS -H "Authorization: token $RELEASE_TOKEN" "$@"; }
           body=$(jq -nc --arg t "$TAG" --arg sha "$GITHUB_SHA" '{tag_name:$t,target_commitish:$sha,name:$t,draft:true}')
           id=$(api -H 'Content-Type: application/json' -d "$body" "$API/releases" | jq -er '.id | numbers')
-          for f in "${files[@]}" SHA256SUMS; do api -F "attachment=@$f" "$API/releases/$id/assets?name=$f" >/dev/null; done
+          for f in "${files[@]}" "${extra[@]}" SHA256SUMS SHA256SUMS.extra; do api -F "attachment=@$f" "$API/releases/$id/assets?name=$f" >/dev/null; done
           api -X PATCH -H 'Content-Type: application/json' -d '{"draft":false}' "$API/releases/$id" >/dev/null
           api -X POST "$API/push_mirrors-sync" >/dev/null || echo 'Check push mirror status (sync-on-commit and interval still enabled).'

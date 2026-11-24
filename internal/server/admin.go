@@ -32,9 +32,12 @@ func (s *Server) handleHelp(w http.ResponseWriter, _ *http.Request, _ string) {
 		v.ReleaseVersion = release.Version
 		if m := maint.ReadInstalled(s.cfg.Updates.Cache()); m != nil && m.Version == release.Version && m.Commit == release.Commit {
 			v.CLISHA256, v.CLISHA256Sources = map[string]string{}, m.Compared()
-			for _, a := range release.Assets {
-				if a != release.Daemon {
-					v.CLISHA256[a] = m.GitHub[a]
+			// A record made before this broker knew ExtraSums (an upgrade from 0.9.2 is
+			// installed by 0.9.2's installer) has no macOS x86-64 hash: that one is left
+			// out, and the page checks it against the published file instead.
+			for _, a := range release.CLIAssets {
+				if h := m.Hash(a); h != "" {
+					v.CLISHA256[a] = h
 				}
 			}
 		}

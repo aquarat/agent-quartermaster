@@ -70,6 +70,16 @@ func TestHelpInstallFields(t *testing.T) {
 		}
 	}
 
+	// A record with SHA256SUMS.extra adds the macOS x86-64 hash; one without leaves it out
+	// (the page checks that build against the published file).
+	extra := strings.Repeat("e", 64)
+	if v := help(`{"version":"1.2.3","commit":"` + commit + `","github":` + string(text) + `,"extra":{"aqmas-darwin-amd64":"` + extra + `"},"sources":1}`); len(v.CLISHA256) != 4 || v.CLISHA256[release.DarwinAMD] != extra {
+		t.Fatalf("record with extra: %+v", v)
+	}
+	if _, ok := help(record("1.2.3", commit)).CLISHA256[release.DarwinAMD]; ok {
+		t.Fatal("a record without extra gave a macOS x86-64 hash")
+	}
+
 	for name, latest := range map[string]string{
 		"no record":         "",
 		"another version":   record("1.2.4", commit),

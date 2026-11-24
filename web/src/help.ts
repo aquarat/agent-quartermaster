@@ -34,35 +34,44 @@ function command(text: string) {
 
 /** The CLI builds, in the words of the page and of `uname -sm` on such a machine. */
 export const PLATFORMS = [
-  { asset: "aqmas-linux-arm64", title: "Linux arm64", uname: "Linux aarch64" },
-  { asset: "aqmas-linux-amd64", title: "Linux x86-64", uname: "Linux x86_64" },
-  { asset: "aqmas-darwin-arm64", title: "macOS (Apple Silicon)", uname: "Darwin arm64" },
+  { asset: "aqmas-linux-arm64", title: "Linux arm64", uname: "Linux aarch64", cases: ["Linux/aarch64", "Linux/arm64"] },
+  { asset: "aqmas-linux-amd64", title: "Linux x86-64", uname: "Linux x86_64", cases: ["Linux/x86_64", "Linux/amd64"] },
+  { asset: "aqmas-darwin-arm64", title: "macOS (Apple Silicon)", uname: "Darwin arm64", cases: ["Darwin/arm64"] },
+  { asset: "aqmas-darwin-amd64", title: "macOS (Intel)", uname: "Darwin x86_64", cases: ["Darwin/x86_64"] },
 ] as const;
+
+/** The published checksum file that lists an asset. aqmas-darwin-amd64 came after the
+ * four-line SHA256SUMS that brokers of 0.9.2 and earlier parse strictly, so it has its own. */
+export const sumsFile = (asset: string) => (asset === "aqmas-darwin-amd64" ? "SHA256SUMS.extra" : "SHA256SUMS");
 
 const sha256 = /^[0-9a-f]{64}$/;
 
-/** The broker's hashes, only when it gave a well-formed one for every CLI build. */
-export function cliHashes(c: HelpConfig): Record<string, string> | undefined {
-  const sums = c.cli_sha256;
-  return sums && PLATFORMS.every((p) => sha256.test(sums[p.asset] ?? "")) ? sums : undefined;
+/** The broker's well-formed hash for each CLI build it gave one for; the others are left out. */
+export function cliHashes(c: HelpConfig): Record<string, string> {
+  const sums = c.cli_sha256 ?? {};
+  const out: Record<string, string> = {};
+  for (const p of PLATFORMS) if (sha256.test(sums[p.asset] ?? "")) out[p.asset] = sums[p.asset]!;
+  return out;
 }
+
+const curl = "curl -fLsS --proto '=https' --proto-redir '=https'";
 
 /**
  * One paste for bash or zsh: download into a fresh temporary directory, verify, install as
  * ~/.local/bin/aqmas, print the version. The subshell keeps `set -e` and the directory change
  * out of the user's shell, and any failing step ends it before the install.
  * With `hash` the download is checked against that value, which the broker supplied. Without
- * it the only reference left is the SHA256SUMS published beside the download.
+ * it the only reference left is the published checksum file beside the download.
  * The file goes in beside the old one and is renamed over it, so a running or half-written
  * aqmas is never what the name points at. Last, a copy elsewhere that comes first on PATH
  * (an older system-wide install) is named, because it is what typing "aqmas" would still run.
  */
 export function installCommand(base: string, asset: string, hash?: string) {
   const check = asset.startsWith("aqmas-darwin-") ? "shasum -a 256" : "sha256sum";
-  const curl = "curl -fLsS --proto '=https' --proto-redir '=https'";
+  const file = sumsFile(asset);
   const verify = hash
     ? [`echo ${quote(`${hash}  ${asset}`)} | ${check} -c -`]
-    : [`${curl} -o SHA256SUMS -- ${quote(base + "/SHA256SUMS")}`, `grep ${quote(`  ${asset}$`)} SHA256SUMS > expected`, `${check} -c expected`];
+    : [`${curl} -o ${file} -- ${quote(base + "/" + file)}`, `grep ${quote(`  ${asset}$`)} ${file} > expected`, `${check} -c expected`];
   return [
     "(set -e",
     'd=$(mktemp -d); trap \'rm -rf "$d"\' EXIT; cd "$d"',
@@ -77,12 +86,98 @@ export function installCommand(base: string, asset: string, hash?: string) {
   ].join("\n");
 }
 
+/** The enrolment command for a machine that already has aqmas. */
+export const enrollCommand = (server: string, pin: string) => `aqmas enroll --server ${quote(server)} --ca-pin ${quote(pin)}`;
+
+export interface SetupOptions {
+  base: string;
+  /** Broker hashes per asset; an asset without one is checked against the published file. */
+  hashes: Record<string, string>;
+  version?: string;
+  /** Agent API and CA pin; without a server the command installs only. */
+  server?: string;
+  pin?: string;
+}
+
+/**
+ * The one command for every platform: pick the build from `uname -s`/`uname -m` (an arm64
+ * Mac running the shell under Rosetta reports x86_64, so hw.optional.arm64 decides there),
+ * say what will happen, download into a temporary directory, check, install as
+ * ~/.local/bin/aqmas, then ask on the terminal (/dev/tty, since a paste's stdin is the rest
+ * of the paste) whether to enroll and under which name, and enroll with the agent API and pin
+ * written into the command. The default name is the hostname, which the CLI derives the same
+ * way when --name is left out, so --name is passed only for another answer.
+ * POSIX sh that bash and zsh both run as pasted: no comments (interactive zsh rejects them by
+ * default), no arrays or [[ ]], no unquoted expansions that zsh would not split, no "!" in
+ * strings (history expansion).
+ */
+export function setupCommand(o: SetupOptions) {
+  const bin = '"$HOME/.local/bin/aqmas"';
+  const what = o.version ? `aqmas ${o.version}` : "aqmas";
+  const cases = PLATFORMS.map((p) => {
+    const h = o.hashes[p.asset];
+    const pick = h && sha256.test(h) ? `h=${h}; s=` : `h=; s=${sumsFile(p.asset)}`;
+    return `  ${p.cases.join("|")}) a=${p.asset}; ${pick} ;;`;
+  });
+  const lines = [
+    "(set -e",
+    'os=$(uname -s); arch=$(uname -m)',
+    'if [ "$os" = Darwin ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then arch=arm64; fi',
+    'case "$os/$arch" in',
+    ...cases,
+    `  *) echo "aqmas: there is no build for $os $arch. Builds exist for ${PLATFORMS.map((p) => p.uname).join(", ")}." >&2; exit 1 ;;`,
+    "esac",
+    'check256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }',
+    o.server
+      ? `printf 'This downloads %s (%s), checks its SHA-256, installs it as ~/.local/bin/aqmas, then asks whether to enroll this machine with %s.\\n' ${quote(what)} "$a" ${quote(o.server)}`
+      : `printf 'This downloads %s (%s), checks its SHA-256 and installs it as ~/.local/bin/aqmas.\\n' ${quote(what)} "$a"`,
+    'd=$(mktemp -d); trap \'rm -rf "$d"\' EXIT; cd "$d"',
+    `${curl} -o "$a" -- ${quote(o.base + "/")}"$a"`,
+    `if [ -n "$h" ]; then printf '%s  %s\\n' "$h" "$a" > expected; else ${curl} -o sums -- ${quote(o.base + "/")}"$s"; grep "  $a\\$" sums > expected; fi`,
+    `check256 -c expected || { echo "aqmas: the download does not match its SHA-256; nothing was installed." >&2; exit 1; }`,
+    'mkdir -p "$HOME/.local/bin"',
+    `install -m 755 "$a" "$HOME/.local/bin/aqmas.new"`,
+    `mv -f "$HOME/.local/bin/aqmas.new" ${bin}`,
+    `${bin} version`,
+    'p=$(command -v aqmas || true)',
+    'if [ -n "$p" ] && ! [ "$p" -ef "$HOME/.local/bin/aqmas" ]; then echo "Note: $p comes first on PATH and is what \\"aqmas\\" runs; remove it or put ~/.local/bin first."; fi',
+  ];
+  if (!o.server) {
+    lines.push(`echo "Enrolment needs the broker's agent API address: ask the operator to set agent_api_url, then use the enrolment command on the Help page.")`);
+    return lines.join("\n");
+  }
+  const enroll = `${bin} enroll --server ${quote(o.server)} --ca-pin ${quote(o.pin ?? "")}`;
+
+  lines.push(
+    'cd /',
+    `later=${quote(enrollCommand(o.server, o.pin ?? ""))}`,
+    `if ! (: </dev/tty) 2>/dev/null; then printf '%s\\n' "No terminal to ask on. To enroll this machine, run: $later"; exit 0; fi`,
+    "printf 'Enroll this machine now? [Y/n] '",
+    "read -r ok </dev/tty || ok=n",
+    `case "$ok" in [nN]*) printf '%s\\n' "Not enrolled. To enroll later, run: $later"; exit 0 ;; esac`,
+    `n=$(hostname 2>/dev/null || uname -n); n=$(printf '%s' "\${n%%.*}" | tr '[:upper:]' '[:lower:]')`,
+    `printf 'Host name [%s]: ' "$n"`,
+    "read -r name </dev/tty || name=",
+    `if [ -z "$name" ] || [ "$name" = "$n" ]; then ${enroll}; else ${enroll} --name "$name"; fi)`,
+  );
+  return lines.join("\n");
+}
+
 function installCard(c: HelpConfig, card: (title: string, ...children: Child[]) => HTMLElement) {
   const p = (...s: Child[]) => h("p", null, s);
   const code = (s: string) => h("code", null, s);
   const base = c.cli_download_base_url.replace(/\/+$/, "");
   const hashes = cliHashes(c);
   const version = c.release_version ? `aqmas ${c.release_version}` : "aqmas";
+  const title = "Install aqmas and enroll a machine";
+  const enrollOnly = c.agent_api_url
+    ? [p("Already have aqmas? Enroll only:"), command(enrollCommand(c.agent_api_url, c.ca_pin))]
+    : [p("Enrolment needs the broker's agent API address, which is not configured: ask the operator to set agent_api_url to show the enrolment command.")];
+  const about = [
+    p("Cross-check the CA pin once against an independently recorded copy: a faked help page could point a new host at another server. The machine is enrolled under its hostname (up to the first dot, lowercased) unless you answer with another name, or add --name <name> to the enrol command. --server is the agent API address, not the address of this web page: the CLI cannot enroll through the web UI. If the machine already has an enrollment (for example a configuration copied from another machine, or an expired certificate), run the enrol command with --force to replace it."),
+    p("Enrolment prints a Ref and waits. Under Approvals, match the Ref and client key to the terminal, confirm its connecting address and class, and check “replaces”: approving a replacement revokes the old identity."),
+    p("An approved host can ask for nothing until it is admitted to an organisation. The approval card offers that in the same go (“Let it join…”); later it is Admit under Hosts."),
+  ];
   const after = [
     p("If the shell then answers “command not found” for aqmas, ", code("~/.local/bin"), " is not on its PATH. Add it once and open a new terminal: zsh (the macOS default) reads ", code("~/.zshrc"), ", bash reads ", code("~/.bashrc"), "."),
     command(`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`),
@@ -93,40 +188,63 @@ function installCard(c: HelpConfig, card: (title: string, ...children: Child[]) 
   ];
   if (!base)
     return card(
-      "Install the aqmas CLI",
+      title,
       p("This broker knows no download address for its release. Copy the aqmas binary for this machine from the operator’s build, then install it where your user can replace it:"),
       command('mkdir -p "$HOME/.local/bin" && install -m 755 aqmas "$HOME/.local/bin/aqmas.new" && mv -f "$HOME/.local/bin/aqmas.new" "$HOME/.local/bin/aqmas" && "$HOME/.local/bin/aqmas" version'),
+      enrollOnly,
+      about,
       after,
     );
   const from = c.cli_download_source === "github" ? "GitHub" : "the address the operator configured";
+  const github = c.cli_download_source === "github";
+  const hashed = PLATFORMS.filter((pl) => hashes[pl.asset]);
+  const unhashed = PLATFORMS.filter((pl) => !hashes[pl.asset]);
+  const published = (pls: readonly (typeof PLATFORMS)[number][]) => [...new Set(pls.map((pl) => sumsFile(pl.asset)))].join(" or ");
+  const check = hashed.length
+    ? h(
+        "p",
+        { class: "install-check", "data-check": unhashed.length ? "mixed" : "broker" },
+        `It downloads ${version} from ${from} into a temporary directory and checks it against the SHA-256 this broker recorded when it verified the release it runs. `,
+        c.cli_sha256_sources === 2
+          ? "GitHub and a second, independent source published the same hashes then. "
+          : "That record was made from GitHub’s published checksums alone, so it is GitHub’s word as it stood then, not a second opinion. ",
+        "The hashes are in the command itself: a file that differs from the recorded release stops it and nothing is installed. ",
+        unhashed.length
+          ? `This broker's record has no hash for ${unhashed.map((pl) => pl.title).join(", ")} (that build is newer than the installer that made the record; the bastion's next update records it), so on ${unhashed.length === 1 ? "that platform" : "those platforms"} the command checks the download against the ${published(unhashed)} file published beside it instead: ` +
+              (github ? "a check against GitHub only, which catches a damaged download, not a replaced release. " : "that shows the download arrived whole and nothing more. ")
+          : "",
+      )
+    : h(
+        "p",
+        { class: "install-check", "data-check": "published" },
+        github
+          ? `This broker holds no verified record of the release it runs (self-update is not set up yet, or its record is of another version), so the command checks ${version} against the SHA256SUMS file GitHub publishes beside it. That is a check against GitHub only: it catches a damaged download, not a replaced release. `
+          : `This broker holds no verified record of the release it runs, so the command checks ${version} against the SHA256SUMS file at the same address the operator configured. That shows the download arrived whole and nothing more: compare the SHA-256 of the installed file with an independently trusted release digest before relying on it. `,
+        "A failed check stops it and installs nothing.",
+      );
   return card(
-    "Install the aqmas CLI",
-    p("On the machine that needs aqmas, find out which build it takes, then paste the block under that heading into its terminal (bash or zsh)."),
-    command("uname -sm"),
-    h("dl", { class: "facts" }, ...PLATFORMS.map((pl) => [h("dt", null, pl.uname), h("dd", null, pl.title)])),
-    hashes
-      ? h(
-          "p",
-          { class: "install-check", "data-check": "broker" },
-          `Each block downloads ${version} from ${from} into a temporary directory and checks it against the SHA-256 this broker recorded when it verified the release it runs. `,
-          c.cli_sha256_sources === 2
-            ? "GitHub and a second, independent source published the same hashes then. "
-            : "That record was made from GitHub’s published checksums alone, so it is GitHub’s word as it stood then, not a second opinion. ",
-          "The hash is in the command itself: a file that differs from the recorded release stops the block and nothing is installed. Otherwise it installs ",
-          code("~/.local/bin/aqmas"),
-          " and prints its version. If another aqmas comes first on PATH, the block says so.",
-        )
-      : h(
-          "p",
-          { class: "install-check", "data-check": "published" },
-          c.cli_download_source === "github"
-            ? `This broker holds no verified record of the release it runs (self-update is not set up yet, or its record is of another version), so each block checks ${version} against the SHA256SUMS file GitHub publishes beside it. That is a check against GitHub only: it catches a damaged download, not a replaced release. `
-            : `This broker holds no verified record of the release it runs, so each block checks ${version} against the SHA256SUMS file at the same address the operator configured. That shows the download arrived whole and nothing more: compare the SHA-256 of the installed file with an independently trusted release digest before relying on it. `,
-          "A failed check stops the block and installs nothing; otherwise it installs ",
-          code("~/.local/bin/aqmas"),
-          " and prints its version.",
-        ),
-    ...PLATFORMS.map((pl) => [h("h3", null, pl.title), h("div", { "data-platform": pl.asset }, command(installCommand(base, pl.asset, hashes?.[pl.asset])))]),
+    title,
+    p(
+      "On the machine that needs aqmas, paste this into a terminal (bash or zsh, Linux or macOS, arm64 or x86-64). It picks the build for the machine, says what it is about to do, installs ",
+      code("~/.local/bin/aqmas"),
+      " and prints its version; if another aqmas comes first on PATH it says so. ",
+      c.agent_api_url
+        ? "Then it asks whether to enroll the machine with this broker and under which name (the hostname unless you type another), and runs the enrolment with this broker's agent API address and CA pin."
+        : "It does not enroll: this broker has no agent API address configured (agent_api_url), so ask the operator to set it.",
+    ),
+    h("div", { "data-setup": "" }, command(setupCommand({ base, hashes, version: c.release_version, server: c.agent_api_url || undefined, pin: c.ca_pin }))),
+    check,
+    enrollOnly,
+    about,
+    h(
+      "details",
+      { class: "manual-install" },
+      h("summary", null, "Manual steps, one platform at a time"),
+      p("Find out which build the machine takes, then paste the block under that heading; each block installs only."),
+      command("uname -sm"),
+      h("dl", { class: "facts" }, ...PLATFORMS.map((pl) => [h("dt", null, pl.uname), h("dd", null, pl.title)])),
+      ...PLATFORMS.map((pl) => [h("h3", null, pl.title), h("div", { "data-platform": pl.asset }, command(installCommand(base, pl.asset, hashes[pl.asset])))]),
+    ),
     after,
   );
 }
@@ -163,20 +281,6 @@ export function helpPage(c: HelpConfig) {
       p("There is no rename, move or delete of a whole item yet: remove its keys instead (an empty set delivers nothing), and ask before reusing a slug."),
     ),
     installCard(c, card),
-    card(
-      "Enroll a machine",
-      p("With aqmas installed (above), enroll the machine with this broker. Cross-check the CA pin once against an independently recorded copy. A faked help page could point a new host at another server."),
-      c.agent_api_url
-        ? command(`aqmas enroll --server ${quote(c.agent_api_url)} --ca-pin ${quote(c.ca_pin)}`)
-        : p("Ask the operator to set agent_api_url to show the enrollment command."),
-      p(
-        "The machine is enrolled under its hostname (up to the first dot, lowercased); add --name <name> to choose another. --server is the agent API address shown here, not the address of this web page: the CLI cannot enroll through the web UI. If the machine already has an enrollment (for example a configuration copied from another machine, or an expired certificate), add --force to replace it.",
-      ),
-      p(
-        "The command prints a Ref and waits. Under Approvals, match the Ref and client key to the terminal, confirm its connecting address and class, and check “replaces”: approving a replacement revokes the old identity.",
-      ),
-      p("An approved host can ask for nothing until it is admitted to an organisation. The approval card offers that in the same go (“Let it join…”); later it is Admit under Hosts."),
-    ),
     card(
       "CLI quick reference",
       p("SSH selectors accept a target name, alias, or address. Specify host:port (or [IPv6]:port) when services share an address."),

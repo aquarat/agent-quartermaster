@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,9 @@ const GitHubAPI = "https://api.github.com/repos/aquarat/agent-quartermaster"
 const GitHubRepo = "https://github.com/aquarat/agent-quartermaster.git"
 
 var ErrOffline = errors.New("release source unreachable")
+
+// ErrNoAsset is a release that has no attachment of the name asked for.
+var ErrNoAsset = errors.New("missing release checksum asset")
 var attachmentID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 type Source struct {
@@ -123,10 +127,17 @@ func (s Sources) Names() []string {
 // Fill fetches the manifest of m.Version from every configured source and requires them to
 // agree. A configured source that cannot be reached, or disagrees, is an error: there is no
 // fallback to fewer sources, or making one unreachable would downgrade the check.
+//
+// ExtraSums is filled the same way, except that a release may have none (one from before
+// 0.9.3): then Extra stays nil. Where one source has the file and another does not, or they
+// differ, that is a disagreement like any other.
 func (s Sources) Fill(ctx context.Context, m *Metadata) error {
 	var e error
-	m.Second = nil
+	m.Second, m.Extra = nil, nil
 	if m.GitHub, e = s.GitHub.Hashes(ctx, m.Version, true); e != nil {
+		return fmt.Errorf("GitHub: %w", e)
+	}
+	if m.Extra, e = s.GitHub.ExtraHashes(ctx, m.Version, true); e != nil {
 		return fmt.Errorf("GitHub: %w", e)
 	}
 	if s.HasSecond() {
@@ -135,6 +146,13 @@ func (s Sources) Fill(ctx context.Context, m *Metadata) error {
 		}
 		if !m.Second.Agrees(m.GitHub) {
 			return errors.New("release hashes disagree between GitHub and the second source (" + s.Second.Host() + ")")
+		}
+		extra, e := s.Second.ExtraHashes(ctx, m.Version, false)
+		if e != nil {
+			return fmt.Errorf("second source (%s): %w", s.Second.Host(), e)
+		}
+		if (extra == nil) != (m.Extra == nil) || extra != nil && !maps.Equal(extra, m.Extra) {
+			return errors.New("release hashes (" + ExtraSums + ") disagree between GitHub and the second source (" + s.Second.Host() + ")")
 		}
 	}
 	return nil
@@ -161,6 +179,18 @@ func (s Source) Hashes(ctx context.Context, version string, github bool) (Sums, 
 		return nil, e
 	}
 	return Parse(b)
+}
+
+// ExtraHashes is the release's ExtraSums manifest, or nil for a release that has none.
+func (s Source) ExtraHashes(ctx context.Context, version string, github bool) (Sums, error) {
+	b, e := s.Asset(ctx, version, ExtraSums, github, 4096)
+	if errors.Is(e, ErrNoAsset) {
+		return nil, nil
+	}
+	if e != nil {
+		return nil, e
+	}
+	return ParseExtra(b)
 }
 
 // Asset downloads one named release attachment (bounded). The caller verifies its digest.
@@ -263,7 +293,7 @@ func (s Source) Asset(ctx context.Context, version, name string, github bool, li
 		}
 	}
 	if target == "" {
-		return nil, errors.New("missing release checksum asset")
+		return nil, ErrNoAsset
 	}
 	return get(target, "application/octet-stream", limit)
 }

@@ -92,14 +92,21 @@ status "Fetched $v. Downloading dependencies, then testing and building offline.
 
 # Do not follow paths in a builder-owned directory as root. Copy only the known
 # filenames out via the offline sandbox, then hash the root-owned copies.
-status "Built $v. Checking all four binaries against the approved digests."
+# SHA256SUMS lists exactly these four; a later build (macOS x86-64) is in SHA256SUMS.extra,
+# whose digests the metadata carries under "extra" when the release has that file.
+sums=(aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64)
+extra=()
+if jq -e 'has("extra")' "$out/metadata" >/dev/null; then extra=(aqmas-darwin-amd64); fi
+status "Built $v. Checking all $(( ${#sums[@]} + ${#extra[@]} )) binaries against the approved digests."
 mkdir "$out/assets"
-for a in aqmasd-linux-arm64 aqmas-linux-arm64 aqmas-linux-amd64 aqmas-darwin-arm64; do
+for a in "${sums[@]}" ${extra[@]+"${extra[@]}"}; do
+  key=github; [[ $a == aqmas-darwin-amd64 ]] && key=extra
   "${box[@]}" /usr/bin/timeout 30 /usr/bin/head -c 134217729 "/work/src/dist/$a" > "$out/assets/$a"
   [[ $(wc -c < "$out/assets/$a") -le 134217728 ]]
-  [[ $(sha256sum "$out/assets/$a"|cut -d' ' -f1) == "$(jq -er --arg a "$a" '.github[$a]' "$out/metadata")" ]]
+  [[ $(sha256sum "$out/assets/$a"|cut -d' ' -f1) == "$(jq -er --arg k "$key" --arg a "$a" '.[$k][$a]' "$out/metadata")" ]]
 done
-(cd "$out/assets" && sha256sum aqmas-* aqmasd-linux-arm64 > SHA256SUMS)
+(cd "$out/assets" && sha256sum "${sums[@]}" > SHA256SUMS)
+if (( ${#extra[@]} )); then (cd "$out/assets" && sha256sum "${extra[@]}" > SHA256SUMS.extra); fi
 install -m 0755 "$out/assets/aqmasd-linux-arm64" "$installstage/new"; rm "$out/assets/aqmasd-linux-arm64"
 chmod 0755 "$out/assets"; chmod 0644 "$out/assets/"* "$out/metadata"
 # After an earlier automatic rollback the running binary and .prev are one file already

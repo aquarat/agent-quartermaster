@@ -30,6 +30,8 @@ type HelpConfig struct {
 	ReleaseVersion string `json:"release_version,omitempty"`
 	// CLISHA256 maps each CLI asset name to the SHA-256 in the verified record of the
 	// installed release. Absent unless that record exists and is of the running release.
+	// aqmas-darwin-amd64 (listed in SHA256SUMS.extra) is present only when the record has
+	// that file's digests: not in a record written by a 0.9.2 broker's installer.
 	CLISHA256 map[string]string `json:"cli_sha256,omitempty"`
 	// CLISHA256Sources is how many published sources that record holds agreeing manifests
 	// of (1: GitHub alone, 2: GitHub and a second source); absent with CLISHA256.

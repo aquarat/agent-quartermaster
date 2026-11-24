@@ -831,7 +831,12 @@ func (b *lab) releases(versions ...string) {
 		assets[name], b.sums[name] = body, hex.EncodeToString(sum[:])
 	}
 	assets["SHA256SUMS"] = []byte(b.sums.Text())
-	names := []string{"SHA256SUMS", "aqmas-darwin-arm64", "aqmas-linux-amd64", "aqmas-linux-arm64"}
+	// A build listed in SHA256SUMS.extra (0.9.3 on) is seeded too.
+	extraBody := []byte("binary " + release.DarwinAMD)
+	extraSum := sha256.Sum256(extraBody)
+	assets[release.DarwinAMD] = extraBody
+	assets[release.ExtraSums] = []byte(release.Sums{release.DarwinAMD: hex.EncodeToString(extraSum[:])}.ExtraText())
+	names := []string{"SHA256SUMS", "aqmas-darwin-arm64", "aqmas-linux-amd64", "aqmas-linux-arm64", release.ExtraSums, release.DarwinAMD}
 	b.forge = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		want := map[string]string{"/api/v1/repos/example/aqmas": secretForge, "/gh/repos/example/aqmas": secretHub}
 		second := strings.HasPrefix(r.URL.Path, "/api/v1/") || strings.HasPrefix(r.URL.Path, "/attachments/")
@@ -958,6 +963,8 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 		t.Fatal("host key not trusted")
 	case b.read("releases", "0.3.0", "aqmas-linux-amd64") != "binary aqmas-linux-amd64" || !strings.Contains(b.read("releases", "latest.json"), `"version":"0.3.0"`):
 		t.Fatal("release cache not seeded")
+	case b.read("releases", "0.3.0", release.DarwinAMD) != "binary "+release.DarwinAMD || b.read("releases", "0.3.0", release.ExtraSums) == "" || !strings.Contains(b.read("releases", "latest.json"), `"extra":{"aqmas-darwin-amd64":`):
+		t.Fatal("SHA256SUMS.extra build not seeded or recorded")
 	}
 	for path, want := range map[string]os.FileMode{b.path("releases", "0.3.0"): 0755, b.path("releases", "0.3.0", "aqmas-linux-amd64"): 0644, b.path("releases", "0.3.0", "SHA256SUMS"): 0644,
 		b.path("releases", "latest.json"): 0644, b.l.status(): 0644, b.path("etc", "known_hosts"): 0644, b.path("etc", "github-read-token"): 0440, b.path("etc", "repo-key"): 0440, b.l.pins(): 0600, b.l.key(): 0600} {

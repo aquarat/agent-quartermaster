@@ -25,11 +25,15 @@ pins:
 release: pins
 	$(MAKE) build WEB_INSTALL='--production --offline --ignore-scripts'
 	mkdir -p dist
-	cp bin/aqmasd-linux-arm64 bin/aqmas-linux-arm64 bin/aqmas-linux-amd64 bin/aqmas-darwin-arm64 dist/
+	cp bin/aqmasd-linux-arm64 bin/aqmas-linux-arm64 bin/aqmas-linux-amd64 bin/aqmas-darwin-arm64 bin/aqmas-darwin-amd64 dist/
+	# SHA256SUMS keeps exactly its four names: brokers 0.9.0-0.9.2 refuse any other line.
+	# Builds added since are listed in SHA256SUMS.extra (internal/release ExtraSums).
 	cd dist && sha256sum aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64 > SHA256SUMS
+	cd dist && sha256sum aqmas-darwin-amd64 > SHA256SUMS.extra
 
 verify-release:
 	@set -e; expected=$$(mktemp); trap 'rm -f "$$expected"' EXIT; cp '$(SUMS)' "$$expected"; $(MAKE) release; cmp "$$expected" dist/SHA256SUMS
+	@if [ -f '$(SUMS).extra' ]; then cmp '$(SUMS).extra' dist/SHA256SUMS.extra; fi
 
 build: aqmasd aqmas
 
@@ -40,6 +44,7 @@ aqmas:
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o bin/aqmas-linux-arm64 ./cmd/aqmas
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o bin/aqmas-linux-amd64 ./cmd/aqmas
 	GOOS=darwin GOARCH=arm64 $(GOBUILD) -o bin/aqmas-darwin-arm64 ./cmd/aqmas
+	GOOS=darwin GOARCH=amd64 $(GOBUILD) -o bin/aqmas-darwin-amd64 ./cmd/aqmas
 
 # Build the TypeScript UI into web/dist (embedded into aqmasd by the webui target).
 web:

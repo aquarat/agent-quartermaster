@@ -48,6 +48,7 @@ PIDS=()
 cleanup() {
 	for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
 	wait 2>/dev/null || true
+	[[ -d $T/wt-old ]] && { git -C "$ROOT" worktree remove --force "$T/wt-old" 2>/dev/null || true; }
 	if [[ ${KEEP:-0} == 1 ]]; then echo "interop: kept $T"; else rm -rf "$T"; fi
 }
 trap cleanup EXIT
@@ -176,14 +177,53 @@ ok "enrolled interop-host (Ref ${EID: -6})"
 v=$(cat "$ROOT/VERSION")
 make -C "$ROOT" release >/dev/null
 mkdir -p "$T/releases/$v" "$T/upgrade"
-cp "$ROOT/dist/"aqmas-* "$ROOT/dist/SHA256SUMS" "$T/releases/$v/"
+cp "$ROOT/dist/"aqmas-* "$ROOT/dist/SHA256SUMS" "$ROOT/dist/SHA256SUMS.extra" "$T/releases/$v/"
 for port in "$PF" "$PG"; do
   bun "$ROOT/test/interop/release-source.ts" "$port" "$v" "$T/releases/$v/SHA256SUMS" & PIDS+=($!)
   for _ in {1..50}; do curl -fsS "http://127.0.0.1:$port/releases/tags/v$v" >/dev/null 2>&1 && break; sleep 0.1; done
 done
 # Both sources must serve the same manifest before it becomes the cached release identity.
-bun -e 'const [v,commit,...ports]=process.argv.slice(1);const sums=[];for(const p of ports){const r=await (await fetch(`http://127.0.0.1:${p}/releases/tags/v${v}`)).json();const a=r.assets.find(a=>a.name==="SHA256SUMS");sums.push(await (await fetch(`http://127.0.0.1:${p}/releases/assets/${a.id}`)).text())}
-if(sums[0]!==sums[1])process.exit(1);const m=Object.fromEntries(sums[0].trim().split("\n").map(l=>l.split("  ").reverse()));console.log(JSON.stringify({version:v,commit,github:m,second:m,sources:2}))' "$v" "$(git -C "$ROOT" rev-parse HEAD)" "$PF" "$PG" > "$T/releases/latest-two.json"
+bun -e 'const [v,commit,...ports]=process.argv.slice(1);const get=async(p,n)=>{const r=await (await fetch(`http://127.0.0.1:${p}/releases/tags/v${v}`)).json();const a=r.assets.find(a=>a.name===n);return await (await fetch(`http://127.0.0.1:${p}/releases/assets/${a.id}`)).text()};
+const parse=t=>Object.fromEntries(t.trim().split("\n").map(l=>l.split("  ").reverse()));const sums=[],extra=[];for(const p of ports){sums.push(await get(p,"SHA256SUMS"));extra.push(await get(p,"SHA256SUMS.extra"))}
+if(sums[0]!==sums[1]||extra[0]!==extra[1])process.exit(1);const m=parse(sums[0]);console.log(JSON.stringify({version:v,commit,github:m,second:m,extra:parse(extra[0]),sources:2}))' "$v" "$(git -C "$ROOT" rev-parse HEAD)" "$PF" "$PG" > "$T/releases/latest-two.json"
+# Brokers and CLIs of 0.9.2 read this release's SHA256SUMS and the bastion's record of it
+# (with its new "extra" member) with their own, strict parser: the one from the v0.9.2 tag.
+OLD_TAG=v0.9.2
+if git -C "$ROOT" rev-parse -q --verify "$OLD_TAG^{commit}" >/dev/null; then
+  mkdir "$T/old-release"
+  git -C "$ROOT" show "$OLD_TAG:internal/release/release.go" > "$T/old-release/release.go"
+  printf 'module oldrelease\n\ngo 1.24\n' > "$T/old-release/go.mod"
+  cat > "$T/old-release/compat_test.go" <<'GO'
+package release
+
+import (
+	"encoding/json"
+	"os"
+	"testing"
+)
+
+func TestNewReleaseReadsAsOld(t *testing.T) {
+	b, err := os.ReadFile(os.Getenv("SUMS"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse(b); err != nil {
+		t.Fatalf("0.9.2 parser refuses the new SHA256SUMS: %v", err)
+	}
+	if b, err = os.ReadFile(os.Getenv("LATEST")); err != nil {
+		t.Fatal(err)
+	}
+	var m Metadata
+	if err := json.Unmarshal(b, &m); err != nil || !m.Valid() {
+		t.Fatalf("0.9.2 refuses the new release record: %v", err)
+	}
+}
+GO
+  (cd "$T/old-release" && SUMS="$T/releases/$v/SHA256SUMS" LATEST="$T/releases/latest-two.json" GOFLAGS=-mod=mod GOTOOLCHAIN=local go test -count=1 . >"$T/old-release/out" 2>&1) || fail "$OLD_TAG parser: $(cat "$T/old-release/out")"
+  ok "$OLD_TAG's parser accepts this release's SHA256SUMS and the record with SHA256SUMS.extra"
+else
+  echo "interop: $OLD_TAG is not in this clone; the 0.9.2 compatibility checks are skipped" >&2
+fi
 bun -e 'const m=await Bun.file(process.argv[1]).json();delete m.second;m.sources=1;console.log(JSON.stringify(m))' "$T/releases/latest-two.json" > "$T/releases/latest.json"
 (cd "$ROOT" && CGO_ENABLED=0 go build -tags interop -trimpath -buildvcs=false -ldflags '-X github.com/aquarat/agent-quartermaster/internal/client.Version=0.0.0' -o "$T/upgrade/aqmas" ./cmd/aqmas)
 printf '\n[github]\napi = "http://127.0.0.1:%s"\n' "$PG" >> "$AQMAS_CONFIG_DIR/config.toml"
@@ -221,6 +261,17 @@ fi
 "$T/upgrade/aqmas" version | grep -F "aqmas $v " >/dev/null
 "$T/upgrade/aqmas.prev" version | grep -F 'aqmas 0.0.0 ' >/dev/null
 ok 'old CLI verified the release (bastion with one source, then two) against GitHub, replaced itself and retained runnable previous version'
+# A real 0.9.2 CLI (built from its tag) upgrades from this bastion: the record now has an
+# "extra" member and the release a SHA256SUMS.extra, neither of which it knows.
+if [[ -d $T/old-release ]]; then
+  git -C "$ROOT" worktree add --detach "$T/wt-old" "$OLD_TAG" >/dev/null 2>&1 || fail "git worktree add $OLD_TAG"
+  mkdir "$T/upgrade-old"
+  (cd "$T/wt-old" && CGO_ENABLED=0 go build -tags interop -trimpath -buildvcs=false -ldflags '-X github.com/aquarat/agent-quartermaster/internal/client.Version=0.0.0' -o "$T/upgrade-old/aqmas" ./cmd/aqmas) || fail "build $OLD_TAG CLI"
+  "$T/upgrade-old/aqmas" upgrade --yes --expect-sha256 "$want" </dev/null 2>"$T/upgrade-old/err" || fail "$OLD_TAG CLI upgrade: $(cat "$T/upgrade-old/err")"
+  "$T/upgrade-old/aqmas" version | grep -F "aqmas $v " >/dev/null || fail "$OLD_TAG CLI did not install $v"
+  git -C "$ROOT" worktree remove --force "$T/wt-old"
+  ok "$OLD_TAG CLI upgraded itself to $v from a bastion whose record has SHA256SUMS.extra"
+fi
 
 # --- ssh: first request, approved for 10 min ---
 "$AQMAS" ssh 127.0.0.1 --ttl 15m --why "interop first login" -- echo ok </dev/null >"$T/ssh1.out" 2>"$T/ssh1.err" &

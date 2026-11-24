@@ -279,7 +279,7 @@ func (s *Server) latestRelease(w http.ResponseWriter, r *http.Request, _ *store.
 }
 func (s *Server) releaseAsset(w http.ResponseWriter, r *http.Request, _ *store.Host) {
 	v, a := r.PathValue("version"), r.PathValue("asset")
-	if !release.ValidVersion(v) || a != "SHA256SUMS" && (a == release.Daemon || !slices.Contains(release.Assets[:], a)) {
+	if !release.ValidVersion(v) || a != "SHA256SUMS" && a != release.ExtraSums && !slices.Contains(release.CLIAssets[:], a) {
 		http.NotFound(w, r)
 		return
 	}

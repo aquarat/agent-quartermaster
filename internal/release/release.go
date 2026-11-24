@@ -16,7 +16,22 @@ var Commit = "unknown"
 
 const Daemon = "aqmasd-linux-arm64"
 
+// Assets are the files SHA256SUMS lists, exactly. Brokers of 0.9.0 to 0.9.2 parse that file
+// strictly (these four names, nothing else), so it never gains a line: a build added later
+// is listed in ExtraSums instead, which those brokers never fetch.
 var Assets = [...]string{"aqmas-darwin-arm64", "aqmas-linux-amd64", "aqmas-linux-arm64", Daemon}
+
+// DarwinAMD is the macOS x86-64 CLI, published from 0.9.3 on.
+const DarwinAMD = "aqmas-darwin-amd64"
+
+// ExtraAssets are the builds listed in ExtraSums (SHA256SUMS.extra) rather than SHA256SUMS.
+var ExtraAssets = [...]string{DarwinAMD}
+
+// ExtraSums is the name of the second checksum file. A release before 0.9.3 has none.
+const ExtraSums = "SHA256SUMS.extra"
+
+// CLIAssets are every CLI build a release may carry.
+var CLIAssets = [...]string{"aqmas-darwin-arm64", DarwinAMD, "aqmas-linux-amd64", "aqmas-linux-arm64"}
 var versionRE = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 var commitRE = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var digestRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -76,15 +91,68 @@ func (s Sums) Text() string {
 	return b.String()
 }
 
+// ValidExtra reports whether s is a complete ExtraSums manifest.
+func (s Sums) ValidExtra() bool {
+	if len(s) != len(ExtraAssets) {
+		return false
+	}
+	for _, a := range ExtraAssets {
+		if !ValidHash(s[a]) {
+			return false
+		}
+	}
+	return true
+}
+
+// ParseExtra parses ExtraSums as strictly as Parse parses SHA256SUMS.
+func ParseExtra(b []byte) (Sums, error) {
+	s := Sums{}
+	for _, line := range strings.Split(strings.TrimSuffix(string(b), "\n"), "\n") {
+		hash, name, ok := strings.Cut(line, "  ")
+		if !ok || !slices.Contains(ExtraAssets[:], name) || s[name] != "" || !ValidHash(hash) {
+			return nil, errors.New("invalid or duplicate " + ExtraSums + " entry")
+		}
+		s[name] = hash
+	}
+	if !s.ValidExtra() {
+		return nil, errors.New("incomplete " + ExtraSums)
+	}
+	return s, nil
+}
+
+// ExtraText is ExtraSums as published.
+func (s Sums) ExtraText() string {
+	var b strings.Builder
+	for _, name := range ExtraAssets {
+		fmt.Fprintf(&b, "%s  %s\n", s[name], name)
+	}
+	return b.String()
+}
+
 // Metadata is a verified release identity: what the bastion caches as latest.json, hands to
 // its installer and serves to fleet CLIs. GitHub is the manifest every installation checks.
 // Second is the manifest of the configured second source and is absent without one; when
 // present it must be identical.
+//
+// Extra holds the ExtraSums digests (absent for a release without that file). Every
+// configured source must publish the same ExtraSums, or none: Fill refuses anything else, so
+// a record with Second and Extra means both sources agreed on Extra too. It is a member of
+// its own because CLIs and brokers of 0.9.2 and earlier require GitHub to hold exactly the
+// four SHA256SUMS names, and ignore a member they do not know.
 type Metadata struct {
 	Version string `json:"version"`
 	Commit  string `json:"commit"`
 	GitHub  Sums   `json:"github"`
 	Second  Sums   `json:"second,omitempty"`
+	Extra   Sums   `json:"extra,omitempty"`
+}
+
+// Hash is the verified digest of any asset of the release ("" when it has none).
+func (m Metadata) Hash(asset string) string {
+	if slices.Contains(ExtraAssets[:], asset) {
+		return m.Extra[asset]
+	}
+	return m.GitHub[asset]
 }
 
 // record is Metadata on disk and on the wire. Sources (1 or 2) marks a record written by
@@ -95,12 +163,13 @@ type record struct {
 	Commit  string `json:"commit"`
 	GitHub  Sums   `json:"github"`
 	Second  Sums   `json:"second,omitempty"`
+	Extra   Sums   `json:"extra,omitempty"`
 	Sources int    `json:"sources,omitempty"`
 	Legacy  Sums   `json:"forgejo,omitempty"`
 }
 
 func (m Metadata) MarshalJSON() ([]byte, error) {
-	return json.Marshal(record{Version: m.Version, Commit: m.Commit, GitHub: m.GitHub, Second: m.Second, Sources: m.Compared()})
+	return json.Marshal(record{Version: m.Version, Commit: m.Commit, GitHub: m.GitHub, Second: m.Second, Extra: m.Extra, Sources: m.Compared()})
 }
 
 // LegacyJSON is the record with the verified digests repeated under "forgejo", where a CLI
@@ -113,7 +182,7 @@ func (m Metadata) MarshalJSON() ([]byte, error) {
 // still upgrade themselves. It does not weaken their own check: the old CLI still fetches
 // GitHub's manifest itself and refuses a mismatch.
 func (m Metadata) LegacyJSON() ([]byte, error) {
-	return json.Marshal(record{Version: m.Version, Commit: m.Commit, GitHub: m.GitHub, Second: m.Second, Sources: m.Compared(), Legacy: m.GitHub})
+	return json.Marshal(record{Version: m.Version, Commit: m.Commit, GitHub: m.GitHub, Second: m.Second, Extra: m.Extra, Sources: m.Compared(), Legacy: m.GitHub})
 }
 
 func (m *Metadata) UnmarshalJSON(b []byte) error {
@@ -128,12 +197,12 @@ func (m *Metadata) UnmarshalJSON(b []byte) error {
 	default:
 		return errors.New("release metadata does not hold the sources it counts")
 	}
-	*m = Metadata{Version: v.Version, Commit: v.Commit, GitHub: v.GitHub, Second: v.Second}
+	*m = Metadata{Version: v.Version, Commit: v.Commit, GitHub: v.GitHub, Second: v.Second, Extra: v.Extra}
 	return nil
 }
 
 func (m Metadata) Valid() bool {
-	return ValidVersion(m.Version) && ValidCommit(m.Commit) && m.GitHub.Valid() && (m.Second == nil || m.Second.Agrees(m.GitHub))
+	return ValidVersion(m.Version) && ValidCommit(m.Commit) && m.GitHub.Valid() && (m.Second == nil || m.Second.Agrees(m.GitHub)) && (m.Extra == nil || m.Extra.ValidExtra())
 }
 
 // Compared is how many published sources the record holds agreeing manifests of.

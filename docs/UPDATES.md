@@ -67,17 +67,41 @@ make release
 make verify-release VERSION=0.1.0 SUMS=/path/to/downloaded/SHA256SUMS
 ```
 
-`dist/` contains `aqmasd-linux-arm64`, `aqmas-linux-{amd64,arm64}`, `aqmas-darwin-arm64` and the sorted `SHA256SUMS`. To check reproducibility, build two fresh checkouts in different directories; compare `web/dist` recursively and compare the manifests. GitHub builds on AMD64; a second builder may build on another architecture (the Forgejo workflow builds natively on ARM64) and must produce the same bytes. A mismatch, including web bundler or toolchain drift, makes the release unusable. Do not repair a mismatch by copying the good manifest to the other host.
+`dist/` contains `aqmasd-linux-arm64`, `aqmas-linux-{amd64,arm64}`, `aqmas-darwin-{arm64,amd64}`, the sorted `SHA256SUMS` (all but `aqmas-darwin-amd64`) and `SHA256SUMS.extra` (that one; see [Checksum files](#checksum-files)). `verify-release` also compares `SUMS.extra` when that file exists beside `SUMS`. To check reproducibility, build two fresh checkouts in different directories; compare `web/dist` recursively and compare the manifests. GitHub builds on AMD64; a second builder may build on another architecture (the Forgejo workflow builds natively on ARM64) and must produce the same bytes. A mismatch, including web bundler or toolchain drift, makes the release unusable. Do not repair a mismatch by copying the good manifest to the other host.
+
+## Checksum files
+
+A release publishes two manifests. `SHA256SUMS` lists exactly `aqmas-darwin-arm64`,
+`aqmas-linux-amd64`, `aqmas-linux-arm64` and `aqmasd-linux-arm64`, and never changes shape:
+brokers and CLIs of 0.9.0 to 0.9.2 parse it strictly and refuse an unknown or missing name,
+so one more line would stop every older bastion's self-update. Builds added since are listed
+in `SHA256SUMS.extra` instead (from 0.9.3: `aqmas-darwin-amd64`, the macOS x86-64 CLI), in
+the same format. Older versions never fetch it.
+
+Current versions fetch `SHA256SUMS.extra` from every configured source next to
+`SHA256SUMS`. A release without one (0.9.2 and earlier) has no extra builds; a source that
+publishes it while another does not, or a different one, is a disagreement and refuses the
+check like any other. The agreed digests are recorded in `latest.json` under `extra`, which
+older readers ignore. The installer rebuilds `aqmas-darwin-amd64` too and requires the
+recorded digest. The owner's update approval names the four `SHA256SUMS` digests as before;
+the extra build is covered by the source comparison and the bastion's own rebuild.
+
+A bastion upgraded from 0.9.2 was installed by 0.9.2's installer, which records no `extra`.
+Until its next update (or “Enable self-update” run again), its Help page has no recorded hash
+for macOS x86-64 and checks that one build against the published `SHA256SUMS.extra`, and
+`aqmas upgrade` on such a Mac says the bastion has no record of it yet. A macOS x86-64 CLI
+compares the bastion's `extra` with GitHub's `SHA256SUMS.extra` as other CLIs compare
+`SHA256SUMS`.
 
 ## CI
 
-**GitHub** (`.github/workflows/release.yml`): on a `v*` tag it tests, builds and publishes the four binaries and `SHA256SUMS` as a GitHub release. Protect `main`, restrict who can push release tags and require review of workflow changes.
+**GitHub** (`.github/workflows/release.yml`): on a `v*` tag it tests, builds and publishes the five binaries, `SHA256SUMS` and `SHA256SUMS.extra` as a GitHub release. Protect `main`, restrict who can push release tags and require review of workflow changes.
 
 Its last job, `compare`, checks the published manifest against a second source **when one is configured for the repository**, and passes with a notice when none is:
 
 | Actions secret | Value |
 |---|---|
-| `SECOND_SOURCE_RELEASES_URL` | The second source's release-download base, e.g. `https://forge.example.com/OWNER/NAME/releases/download`. The job fetches `<base>/<tag>/SHA256SUMS`, following the forge's redirect to the attachment (https only). |
+| `SECOND_SOURCE_RELEASES_URL` | The second source's release-download base, e.g. `https://forge.example.com/OWNER/NAME/releases/download`. The job fetches `<base>/<tag>/SHA256SUMS` and `<base>/<tag>/SHA256SUMS.extra`, following the forge's redirect to the attachment (https only). |
 
 It is read from a **secret only**: GitHub prints repository *variables* in the job log, which is public for a public repository, while secrets are masked. The job prints nothing but the final HTTP status. A second source the runner cannot reach (private network, an access policy) is a notice, not a failure: the checks at install time are what count. A manifest that was served and differs fails the job.
 
@@ -129,7 +153,8 @@ nothing taken from the request but the values you see and sign:
 4. **Seeds the installed identity.** Downloads `SHA256SUMS` of the running version from
    every configured source (GitHub; the second source too when there is one), requires
    them to agree and to match the SHA-256 of the installed `/usr/local/bin/aqmasd`,
-   downloads the three CLI binaries, checks each against the manifest, and fills
+   downloads the CLI binaries (with `SHA256SUMS.extra` when the release has one), checks
+   each against the manifest, and fills
    `/var/lib/aqmas-releases/VERSION/` and `latest.json`. A broker that is not the published
    binary is refused: self-update never starts from a PR build.
 5. Writes `[updates]` into `/etc/aqmas/config.toml` (the tables above; `[updates.second]`
@@ -232,7 +257,7 @@ Ordinary installation/restart alone does not advance the version.
 
 ## Upgrade a fleet CLI
 
-Install `aqmas` with the block for the machine's platform under Help → “Install the aqmas CLI” on the approval page (it installs `~/.local/bin/aqmas`, which upgrades without sudo), or system-wide at `/usr/local/bin/aqmas`. Use `aqmas upgrade --check`; `aqmas upgrade` (alias `update`) displays the version and digest, downloads and verifies the executable over mTLS, then prompts. For a deliberate non-interactive install supply **both** `--yes` and `--expect-sha256 HEX`. For a system-wide install (the executable in a root-owned directory such as `/usr/local/bin`) run `sudo aqmas upgrade`: plain `aqmas upgrade` says so before it downloads anything. Under sudo the CLI takes the identity of the user who ran sudo (from `SUDO_UID`/`SUDO_GID`, with none of root's groups) for everything except the last step: it reads that user's enrolment in `~/.config/aqmas` with the usual ownership and permission checks, talks to the bastion and to GitHub, and reads a configured token file as that user. It takes root back only to replace the executable, which still requires the install directory and all its parents to be root-controlled: owned by root and writable by nobody else. A group-writable directory such as a `root:staff` mode-2775 `/usr/local/bin` is refused with that reason; install `aqmas` in `~/.local/bin` there and upgrade it without sudo. Root therefore never reads a file on the configuration's say-so, and never writes or re-owns anything in the user's directories. If the user's configuration lives elsewhere, name it: `sudo AQMAS_CONFIG_DIR=/path/to/aqmas aqmas upgrade` (sudo passes a variable given on its command line only where the sudoers rule allows it, `SETENV` or a full `ALL` rule; where it does not, keep the configuration in `~/.config/aqmas`). If that user has no enrolment at all, root's own enrolled configuration is used as before, found from root's account entry and not from `HOME` (which sudo may have kept); an enrolment directory owned by anyone other than the invoking user is refused. What this accepts: whoever may run sudo decides, through their own enrolment, what root installs, as they could with sudo anyway. Do not give a narrowly scoped sudo rule for `aqmas upgrade` to an account you would not give root. GitHub uses a separate system-CA HTTPS client, never the mTLS client identity. The CLI's `[github]` table (in the host's `~/.config/aqmas/config.toml`) accepts the same optional `api` and `token_file` settings as `[updates.github]` above; without it the CLI asks the public repository. The CLI never talks to a second source and no credential for one goes on fleet hosts: the bastion has already compared it (the CLI prints whether the bastion compared one published source or two), and the CLI then checks the bastion's digests against GitHub itself.
+Install `aqmas` with the single command under Help → “Install aqmas and enroll a machine” on the approval page (it picks the build for the machine; per-platform blocks are under “Manual steps”) (it installs `~/.local/bin/aqmas`, which upgrades without sudo), or system-wide at `/usr/local/bin/aqmas`. Use `aqmas upgrade --check`; `aqmas upgrade` (alias `update`) displays the version and digest, downloads and verifies the executable over mTLS, then prompts. For a deliberate non-interactive install supply **both** `--yes` and `--expect-sha256 HEX`. For a system-wide install (the executable in a root-owned directory such as `/usr/local/bin`) run `sudo aqmas upgrade`: plain `aqmas upgrade` says so before it downloads anything. Under sudo the CLI takes the identity of the user who ran sudo (from `SUDO_UID`/`SUDO_GID`, with none of root's groups) for everything except the last step: it reads that user's enrolment in `~/.config/aqmas` with the usual ownership and permission checks, talks to the bastion and to GitHub, and reads a configured token file as that user. It takes root back only to replace the executable, which still requires the install directory and all its parents to be root-controlled: owned by root and writable by nobody else. A group-writable directory such as a `root:staff` mode-2775 `/usr/local/bin` is refused with that reason; install `aqmas` in `~/.local/bin` there and upgrade it without sudo. Root therefore never reads a file on the configuration's say-so, and never writes or re-owns anything in the user's directories. If the user's configuration lives elsewhere, name it: `sudo AQMAS_CONFIG_DIR=/path/to/aqmas aqmas upgrade` (sudo passes a variable given on its command line only where the sudoers rule allows it, `SETENV` or a full `ALL` rule; where it does not, keep the configuration in `~/.config/aqmas`). If that user has no enrolment at all, root's own enrolled configuration is used as before, found from root's account entry and not from `HOME` (which sudo may have kept); an enrolment directory owned by anyone other than the invoking user is refused. What this accepts: whoever may run sudo decides, through their own enrolment, what root installs, as they could with sudo anyway. Do not give a narrowly scoped sudo rule for `aqmas upgrade` to an account you would not give root. GitHub uses a separate system-CA HTTPS client, never the mTLS client identity. The CLI's `[github]` table (in the host's `~/.config/aqmas/config.toml`) accepts the same optional `api` and `token_file` settings as `[updates.github]` above; without it the CLI asks the public repository. The CLI never talks to a second source and no credential for one goes on fleet hosts: the bastion has already compared it (the CLI prints whether the bastion compared one published source or two), and the CLI then checks the bastion's digests against GitHub itself.
 
 The only degraded mode is an explicit `--allow-single-source` when GitHub is unreachable from that host; it warns loudly and trusts the previously verified cache on the broker alone. It never overrides a malformed manifest or a mismatch. Without that exception, failure to verify is fatal. Interactive runs check the enrolled API for a one-line notice at most daily; no implicit install or prompt. **CLI and bastion of different versions** keep working in both directions: a bastion of this version repeats its verified digests under the key a 0.8.1 CLI reads (`forgejo`), and a CLI of this version reads a 0.8.1 bastion's two-source record. That repeat is GitHub's digests even when the bastion compared GitHub alone, so a 0.8.1 CLI believes two sources agreed where there was one plus the bastion's rebuild; it still fetches GitHub's manifest itself and refuses a mismatch. Roll back with a rename of `aqmas.prev` over `aqmas` in the install directory. On macOS Go's arm64 linker already ad-hoc signs release binaries. The installer clears quarantine on its staged file if present and checks the signature. Invalid signatures require a corrected release; re-signing bytes locally after verification would invalidate the approved digest.
 **Vault tables (web form, reveal policy, signers):** additive tables and triggers created on a

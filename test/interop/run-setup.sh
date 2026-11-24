@@ -230,6 +230,9 @@ mkdir -p "$T/rel-good" "$T/rel-bad"
 for n in aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64; do echo "cli $n" >"$T/rel-good/$n"; done
 cp "$AQMASD" "$T/rel-good/aqmasd-linux-arm64"
 (cd "$T/rel-good" && sha256sum aqmas-darwin-arm64 aqmas-linux-amd64 aqmas-linux-arm64 aqmasd-linux-arm64 >SHA256SUMS)
+# A build listed in SHA256SUMS.extra (0.9.3 on) is seeded the same way.
+echo "cli aqmas-darwin-amd64" >"$T/rel-good/aqmas-darwin-amd64"
+(cd "$T/rel-good" && sha256sum aqmas-darwin-amd64 >SHA256SUMS.extra)
 sed "s/^[0-9a-f]\{64\}  aqmasd-linux-arm64/$(printf 'f%.0s' {1..64})  aqmasd-linux-arm64/" "$T/rel-good/SHA256SUMS" >"$T/rel-bad/SHA256SUMS"
 serve_release() { # GITHUB_DIR [SECOND_DIR]: what GitHub ($PG) and the second source ($PF) publish
 	for p in "${REL_PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null || true; done
@@ -276,7 +279,8 @@ grep -q "^repo = \"$HTTP_REPO\"" "$L/etc/config.toml" && grep -q '^cache_dir' "$
 ! grep -qE '^deploy_key|^\[updates\.(second|forgejo)\]|^token_file' "$L/etc/config.toml" || fail "GitHub-only configuration has a key, a second source or a token"
 [[ ! -e $L/etc/repo-key && ! -e $L/etc/github-read-token && ! -e $L/etc/second-read-token && ! -s $L/etc/known_hosts ]] || fail "GitHub-only setup left a key, a token or a host key"
 grep -q '"sources":1' "$L/releases/latest.json" && ! grep -q '"second"' "$L/releases/latest.json" && grep -q "\"commit\":\"$COMMIT\"" "$L/releases/latest.json" || fail "GitHub-only release identity: $(cat "$L/releases/latest.json")"
-[[ $(cat "$L/releases/$VERSION/aqmas-linux-amd64") == "cli aqmas-linux-amd64" ]] || fail "release cache not seeded"
+[[ $(cat "$L/releases/$VERSION/aqmas-linux-amd64") == "cli aqmas-linux-amd64" && $(cat "$L/releases/$VERSION/aqmas-darwin-amd64") == "cli aqmas-darwin-amd64" ]] || fail "release cache not seeded"
+cmp -s "$T/rel-good/SHA256SUMS.extra" "$L/releases/$VERSION/SHA256SUMS.extra" && grep -q '"extra":{"aqmas-darwin-amd64"' "$L/releases/latest.json" || fail "SHA256SUMS.extra not recorded: $(cat "$L/releases/latest.json")"
 owner login >/dev/null
 # Nothing serves the repository, so the check for a new release cannot succeed: the upgrade
 # task says so (first check pending, or failed) and never reads "idle" (shown as "Up to date").

@@ -1,9 +1,10 @@
 // Loopback release API, including GitHub's authenticated asset API shape. Serves SHA256SUMS
-// and, when they exist beside it, the binaries it lists.
+// and, when they exist beside it, SHA256SUMS.extra and the binaries both list.
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
 const [port,version,file]=process.argv.slice(2);
-const names=['SHA256SUMS','aqmas-darwin-arm64','aqmas-linux-amd64','aqmas-linux-arm64'];
+// SHA256SUMS.extra and the build it lists (macOS x86-64) are served only where they exist.
+const names=['SHA256SUMS','aqmas-darwin-arm64','aqmas-linux-amd64','aqmas-linux-arm64','SHA256SUMS.extra','aqmas-darwin-amd64'];
 const uuid=(i:number)=>`00000000-0000-0000-0000-00000000000${i+1}`;
 const path=(n:string)=>n==='SHA256SUMS'?file!:join(dirname(file!),n);
 Bun.serve({hostname:'127.0.0.1',port:Number(port), fetch(req){

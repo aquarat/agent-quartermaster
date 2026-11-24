@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -118,7 +120,19 @@ func (e *Env) upgrade(ctx context.Context, c *APIClient, source release.Source, 
 	if m.Second != nil {
 		compared = "GitHub and a second source"
 	}
+	asset := "aqmas-" + runtime.GOOS + "-" + runtime.GOARCH
+	if e.goos != "" {
+		asset = "aqmas-" + e.goos + "-" + e.goarch
+	}
 	gh, err := source.Hashes(ctx, m.Version, true)
+	// A build listed in SHA256SUMS.extra (macOS x86-64) is checked against GitHub's copy of
+	// that file as well, the same way.
+	if err == nil && slices.Contains(release.ExtraAssets[:], asset) {
+		var extra release.Sums
+		if extra, err = source.ExtraHashes(ctx, m.Version, true); err == nil && !maps.Equal(extra, m.Extra) {
+			return errors.New("the bastion's verified release and GitHub's " + release.ExtraSums + " disagree (or the bastion has no record of " + asset + " for this release yet)")
+		}
+	}
 	switch {
 	case single && errors.Is(err, release.ErrOffline):
 		e.logf("WARNING: SINGLE SOURCE — GitHub unreachable; trusting only the bastion")
@@ -129,9 +143,11 @@ func (e *Env) upgrade(ctx context.Context, c *APIClient, source release.Source, 
 	default:
 		e.logf("bastion verified %s against %s and its own rebuild; GitHub agrees", m.Version, compared)
 	}
-	asset := "aqmas-" + runtime.GOOS + "-" + runtime.GOARCH
-	want := m.GitHub[asset]
+	want := m.Hash(asset)
 	if want == "" {
+		if slices.Contains(release.ExtraAssets[:], asset) {
+			return fmt.Errorf("the bastion has no verified record of %s for %s (it is recorded from the bastion's next update on); install that release by hand from the Help page", asset, m.Version)
+		}
 		return errors.New("unsupported platform")
 	}
 	e.logf("%s version %s SHA-256 %s", asset, m.Version, want)

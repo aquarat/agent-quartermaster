@@ -25,19 +25,25 @@ server’s URL and CA pin. The review behind this layout is [docs/UI-REVIEW.md](
 
 ## Install the CLI on a machine
 
-Open **Help** on your broker's approval page. "Install the aqmas CLI" has one copy-paste block
-each for Linux arm64, Linux x86-64 and macOS on Apple Silicon (`uname -sm` on the machine tells
-you which). A block downloads the CLI of the release the broker runs from this repository's
-GitHub release, checks it against the SHA-256 the broker recorded when it verified that release
-(the hash is in the command; on a broker that compares GitHub alone it is GitHub's published
-hash as it stood then, with a second source it is what both agreed on), stops on a mismatch,
-installs `~/.local/bin/aqmas` and prints its version. It works in bash and zsh and
-needs no configuration on the broker. A broker without a verified record of its release yet
-(before self-update is set up) shows the same blocks checking against GitHub's published
-`SHA256SUMS`, and says that this is a check against GitHub only.
+Open **Help** on your broker's approval page. "Install aqmas and enroll a machine" has one
+copy-paste command for every supported machine: Linux arm64 and x86-64, macOS on Apple Silicon
+and on Intel, in bash or zsh. It picks the build from `uname -sm` (an Apple Silicon Mac whose
+shell runs under Rosetta still gets the arm64 build), says what it is about to do, downloads the
+CLI of the release the broker runs from this repository's GitHub release, checks it against the
+SHA-256 the broker recorded when it verified that release (the hashes are in the command; on a
+broker that compares GitHub alone they are GitHub's published hashes as they stood then, with a
+second source they are what both agreed on), stops on a mismatch, installs `~/.local/bin/aqmas`
+and prints its version. It then asks on the terminal whether to enroll the machine and under
+which name (the hostname, up to the first dot and lowercased, unless you type another) and runs
+`aqmas enroll` with the broker's agent API address and CA pin. It needs no configuration on the
+broker; without `agent_api_url` it installs only and says so. A broker without a verified record
+of its release yet (before self-update is set up) checks against GitHub's published `SHA256SUMS`
+instead, and says that this is a check against GitHub only. The macOS Intel build
+(`aqmas-darwin-amd64`) is listed in its own `SHA256SUMS.extra`; a broker whose record predates
+it checks that one build against the published file and says so. Per-platform install blocks
+and the enroll-only command are on the same card for doing it by hand.
 
-"Enroll a machine" on the same page then gives the `aqmas enroll` command with the agent API
-address and CA pin. Later, `aqmas upgrade` upgrades the CLI from the broker
+Later, `aqmas upgrade` upgrades the CLI from the broker
 ([docs/UPDATES.md](docs/UPDATES.md)); installed in `~/.local/bin` it needs no sudo.
 
 - Design and milestone 1 scope: [docs/DESIGN.md](docs/DESIGN.md)
