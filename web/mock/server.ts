@@ -835,6 +835,8 @@ export function startMock(opts: MockOptions = {}) {
       const signed = `signed by passkey 1 nonce=${String(c.nonce).slice(0, 8)}`;
       if (c.object === "enrollment") {
         store.audit("owner", c.action === "approve" ? "enroll_approve" : "enroll_deny", `enrollment:${id}`, `hostname=${c.requesting_host} ${signed}`);
+        // As aqmasd: an approved enrolment is a host, admitted to no organisation yet.
+        if (c.action === "approve" && store.vault.enabled) store.vault.enrolled(id, p.requesting_host, p.enrollment?.class ?? "agent", p.requesting_address ?? "");
         return { id, status: c.action === "approve" ? "approved" : "denied" };
       }
       if (c.action === "deny") {

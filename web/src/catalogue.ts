@@ -128,18 +128,34 @@ export function policyForm(cat: Catalogue, o: Org, sign: Sign): HTMLElement {
   );
 }
 
+/** The signed catalogue change that admits a host to an organisation, or removes it: the
+ * target and choice for the confirmation sheet. The plan is exactly the catalogue's rows. */
+export function admissionProposal(cat: Catalogue, o: Org, host: CatHost): { target: ActionTarget; choice: ActionChoice } {
+  const proposal = {
+    organisation: node(o),
+    host,
+    result_revision: host.generation + 1,
+    auto_access: host.active ? [] : o.auto_access,
+    admitted_services: o.services,
+  };
+  return { target: { object: "org_host", id: host.enrollment, facts: { plan: planString({ owner_id: cat.owner_id, ...proposal }) } }, choice: { action: host.active ? "remove" : "admit" } };
+}
+
 /** Hosts: admit a host to an organisation, or remove it. */
 export function admissionButton(cat: Catalogue, o: Org, host: CatHost, sign: Sign): HTMLButtonElement {
   return btn(
     host.active ? "Remove…" : "Admit…",
-    () =>
-      propose(cat, sign, "org_host", host.active ? "remove" : "admit", host.enrollment, {
-        organisation: node(o),
-        host,
-        result_revision: host.generation + 1,
-        auto_access: host.active ? [] : o.auto_access,
-        admitted_services: o.services,
-      }),
+    () => {
+      const p = admissionProposal(cat, o, host);
+      sign(p.target, p.choice);
+    },
     host.active ? "btn small deny" : "btn small approve",
   );
+}
+
+/** What the enrolment approval offers: no organisation (nothing to offer), exactly one
+ * (admitting is preselected) or several (the owner chooses one, or "not now"). */
+export function admitOffer(cat: Catalogue | null | undefined): { orgs: Org[]; preselected: string | null } {
+  const orgs = cat?.organisations ?? [];
+  return { orgs, preselected: orgs.length === 1 ? orgs[0]!.id : null };
 }

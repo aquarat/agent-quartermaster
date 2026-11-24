@@ -54,7 +54,7 @@ import { hostCard, type HostInfo } from './admin';
 import { SetupPage, setupSummary } from './setupPage';
 import type { SetupView } from './setup';
 import { helpPage, type HelpConfig } from './help';
-import { admissionButton, policyForm, type Catalogue } from './catalogue';
+import { admissionButton, admissionProposal, admitOffer, policyForm, type Catalogue } from './catalogue';
 import { bucketsPanel, sealBanner, serving, type SealView } from './sealPanel';
 import { capabilityForm, createScope, howItOpens, testAfterRekey, type BrowserContext } from './capabilities';
 import { BrowserKeys } from './browserKey';
@@ -235,6 +235,18 @@ export class App {
       this.refreshing = false;
       if(requested!==route().page) void this.refresh();
     }
+  }
+
+  /** True once organisations are in use: a host then needs an admission to ask for anything. */
+  organised(): boolean {
+    return this.state?.catalogue_enabled === true;
+  }
+
+  /** The catalogue as it is now (null before the switch to organisations). */
+  async freshCatalogue(): Promise<Catalogue | null> {
+    const cat = this.organised() ? ((await this.api.catalogue?.()) ?? null) : null;
+    this.catalogue = cat;
+    return cat;
   }
 
   /** Hosts and the catalogue for the global search, whatever page is open (at most every 30 s). */
@@ -661,6 +673,12 @@ export class App {
       const card = hostCard(host, (t) => this.sheet.openRevoke(t));
       if (cat && !host.revoked_at) {
         const rows = cat.organisations.map((o) => ({ o, x: o.hosts.find((x) => x.enrollment === host.id) })).filter((r) => r.x);
+        if (!rows.some((r) => r.x!.active)) {
+          // Enrolled, admitted nowhere: say so where the host is listed, next to the way out.
+          card.classList.add("unadmitted");
+          card.querySelector("h3")!.append(" ", h("span", { class: "badge not-admitted" }, "Not admitted"));
+          card.insertBefore(h("p", { class: "warn not-admitted-note" }, "This host is enrolled but not admitted to any organisation, so it can ask for nothing. ", rows.length ? "Admit it to one below." : "Create an organisation first (Vault → Add item)."), card.querySelector("dl.facts"));
+        }
         card.insertBefore(
           h(
             "div",
@@ -1147,6 +1165,7 @@ export class App {
       e?.replaces_existing ? h("p", { class: "warn" }, "A host with this name is already enrolled. Approving revokes its certificate.") : null,
       enrollFacts(p),
       agentSays(p),
+      this.organised() ? h("p", { class: "muted admit-hint" }, "Joining alone lets it ask for nothing: “Let it join…” also offers to admit it to an organisation, as a second confirmation straight after.") : null,
       h(
         "div",
         { class: "actions" },
@@ -1444,9 +1463,37 @@ function nicknameField(id: string, value: string, placeholder: string) {
   return { input, error, field };
 }
 
+/** What an admission admits to what, read from the text the passkey signs (never from the
+ * page's own state): the host, the organisation and the services it may then ask for. */
+function admissionSummary(plan: string | undefined): HTMLElement | null {
+  let p: { organisation?: { title?: unknown; slug?: unknown }; host?: { name?: unknown; class?: unknown; fingerprint?: unknown; enrollment?: unknown }; admitted_services?: { title?: unknown; sets?: unknown[] }[]; auto_access?: unknown[] };
+  try {
+    p = JSON.parse(plan ?? "");
+  } catch {
+    return null;
+  }
+  const text = (v: unknown) => vt(typeof v === "string" ? v : "?");
+  const services = Array.isArray(p.admitted_services) ? p.admitted_services : [];
+  const auto = Array.isArray(p.auto_access) ? p.auto_access.length : 0;
+  return h(
+    "dl",
+    { class: "facts admission-summary" },
+    fact("Host", h("bdi", { class: "host-name" }, text(p.host?.name))),
+    fact("Class", h("bdi", null, text(p.host?.class))),
+    fact("Client certificate", h("bdi", { class: "mono" }, text(p.host?.fingerprint))),
+    fact("Enrollment", h("bdi", { class: "mono" }, text(p.host?.enrollment))),
+    fact("Admitted to", h("span", null, h("bdi", null, text(p.organisation?.title)), " ", h("span", { class: "mono muted" }, text(p.organisation?.slug)))),
+    fact("May then ask for", services.length ? h("span", null, services.map((v, i) => [i ? ", " : "", h("bdi", null, text(v.title)), ` (${Array.isArray(v.sets) ? v.sets.length : 0})`])) : "nothing yet: the organisation has no services"),
+    fact("Granted without asking", auto ? `${auto} automatic scope${auto === 1 ? "" : "s"} (listed in the signed text below)` : "nothing"),
+  );
+}
+
 // ---- the decision sheet ----
 
 type Step = "choose" | "working" | "confirm" | "signing" | "create" | "done" | "error";
+/** An admission that follows an enrolment approval: which host (its enrolment id and the name
+ * the card showed) and which organisation. */
+type AdmitAfter = { enrollment: string; host: string; org: { id: string; title: string } };
 
 class Sheet {
   private dlg: HTMLDialogElement;
@@ -1457,6 +1504,11 @@ class Sheet {
   /** Nickname chosen for a passkey being added ("" = let the server name it). */
   private goneNote: HTMLElement | null = null;
   private retry: (() => void) | null = null;
+  /** Chosen with an enrolment approval: the organisation to admit the host to right after. */
+  private admitAfter: AdmitAfter | null = null;
+  /** Set while that admission (the second confirmation) is in the sheet: the enrolment has
+   * already been approved, which every later screen of the flow says. */
+  private chain: AdmitAfter | null = null;
   /** Bumped whenever a flow starts or the sheet closes; async results for an older flow are
    * dropped so they can never draw over (or act in) a different flow. */
   private seq = 0;
@@ -1474,6 +1526,7 @@ class Sheet {
       this.prepared = null;
       this.target = null;
       this.retry = null;
+      this.admitAfter = this.chain = null;
     });
     document.body.appendChild(this.dlg);
   }
@@ -1489,11 +1542,13 @@ class Sheet {
   }
 
   /** Start a new flow: returns its sequence number. */
-  private begin(target: ActionTarget): number {
+  private begin(target: ActionTarget, chained = false): number {
     this.seq++;
     this.target = target;
     this.prepared = null;
     this.retry = null;
+    this.admitAfter = null;
+    if (!chained) this.chain = null;
     if (!this.dlg.open) {
       this.render();
       this.dlg.showModal();
@@ -1583,14 +1638,7 @@ class Sheet {
     const again = () => this.openApprove(p);
     this.step = "choose";
     if (p.kind === "enrollment") {
-      const go = h("button", { class: "btn approve", type: "button", "data-autofocus": "" }, "Continue");
-      go.addEventListener("click", () => void this.prepare(seq, target, { action: "approve" }, again));
-      this.render(
-        h("h2", { id: "sheet-title" }, "Let this host join?"),
-        this.summary(p),
-        h("p", null, "It gets a client certificate and can ask for access. Configured automatic scopes and matching standing approvals may grant access without another prompt."),
-        h("div", { class: "actions" }, this.cancelButton(), go),
-      );
+      this.chooseEnrollment(seq, p, target, again);
       return;
     }
     if (p.kind === "bastion") {
@@ -1636,6 +1684,112 @@ class Sheet {
       void this.prepare(seq, target, { action: "approve", ttl_seconds: Math.max(0,ttl), standing_hours: Math.max(0,standing),standing_seconds:selected==='default'?standard:0,indefinite:ttl===-1,standing_indefinite:standing===-1 }, again);
     });
     this.render(h("h2", { id: "sheet-title" }, cf?.scope === "cf.admin" ? "Approve break-glass access" : "Approve access"), this.summary(p), ttlSet, standSet, h("div", { class: "actions" }, this.cancelButton(), go));
+  }
+
+  /** Letting a host join, and (once organisations are in use) admitting it in the same go.
+   * The admission is the ordinary signed catalogue change, proposed straight after the
+   * enrolment approval: two confirmations, each over its own unchanged text. */
+  private chooseEnrollment(seq: number, p: PendingItem, target: ActionTarget, again: () => void): void {
+    const draw = (cat: Catalogue | null, failed: boolean) => {
+      if (!this.current(seq)) return;
+      this.step = "choose";
+      const offer = admitOffer(cat);
+      const name = () => h("bdi", null, vt(p.requesting_host));
+      const error = h("p", { class: "error", role: "alert" });
+      let read: () => string | null | undefined = () => null; // an org id, null = not now, undefined = not chosen yet
+      let fieldset: HTMLElement | null = null;
+      if (offer.orgs.length === 1) {
+        const o = offer.orgs[0]!;
+        const box = h("input", { type: "checkbox", name: "admit", value: o.id, checked: true });
+        read = () => (box.checked ? o.id : null);
+        fieldset = h("fieldset", { class: "admit-choice" }, h("legend", null, "Admission"), h("label", { class: "check" }, box, " Also admit ", name(), " to ", h("bdi", null, vt(o.title))));
+      } else if (offer.orgs.length > 1) {
+        const radio = (value: string, ...label: Child[]) => h("label", { class: "check" }, h("input", { type: "radio", name: "admit", value }), " ", ...label);
+        fieldset = h(
+          "fieldset",
+          { class: "admit-choice" },
+          h("legend", null, "Also admit ", name(), " to an organisation?"),
+          offer.orgs.map((o) => radio(o.id, h("bdi", null, vt(o.title)), " ", h("span", { class: "mono muted" }, vt(o.slug)))),
+          radio("", "Not now"),
+        );
+        const set = fieldset;
+        read = () => {
+          const v = set.querySelector<HTMLInputElement>("input:checked")?.value;
+          return v === undefined ? undefined : v || null;
+        };
+        set.addEventListener("change", () => (error.textContent = ""));
+      }
+      const go = h("button", { class: "btn approve", type: "button", "data-autofocus": "" }, "Continue");
+      go.addEventListener("click", () => {
+        const chosen = read();
+        if (chosen === undefined) {
+          error.textContent = "Choose an organisation to admit it to, or “Not now”.";
+          return;
+        }
+        const org = offer.orgs.find((o) => o.id === chosen);
+        void this.prepare(seq, target, { action: "approve" }, again, org ? { enrollment: p.id, host: p.requesting_host, org: { id: org.id, title: org.title } } : null);
+      });
+      this.render(
+        h("h2", { id: "sheet-title" }, "Let this host join?"),
+        this.summary(p),
+        this.app.organised()
+          ? h("p", null, "Joining gives it a client certificate. It can ask for an organisation's credentials only once it is admitted to that organisation; configured automatic scopes and matching standing approvals may then grant access without another prompt.")
+          : h("p", null, "It gets a client certificate and can ask for access. Configured automatic scopes and matching standing approvals may grant access without another prompt."),
+        fieldset,
+        fieldset ? h("p", { class: "hint muted" }, "Admitting is a second passkey confirmation, shown right after this one with exactly what is admitted to what. You can also do it later under Hosts.") : null,
+        failed ? h("p", { class: "warn" }, "The organisations could not be loaded, so admitting is not offered here. After it has joined, admit it under Hosts.") : null,
+        this.app.organised() && !failed && !offer.orgs.length ? h("p", { class: "warn" }, "There is no organisation to admit it to yet. After it has joined, it can ask for nothing until you create one and admit it under Hosts.") : null,
+        error,
+        h("div", { class: "actions" }, this.cancelButton(), go),
+      );
+    };
+    if (!this.app.organised()) {
+      draw(null, false);
+      return;
+    }
+    this.working("Let this host join?");
+    this.app.freshCatalogue().then(
+      (cat) => draw(cat, false),
+      () => draw(null, true),
+    );
+  }
+
+  /** The second half of "let it join and admit it": the enrolment is approved, now the
+   * admission is proposed from the catalogue as it is after that approval. */
+  private admitNext(a: AdmitAfter): void {
+    const seq = ++this.seq;
+    this.target = null;
+    this.prepared = null;
+    this.admitAfter = null;
+    this.chain = a;
+    this.retry = () => this.admitNext(a);
+    this.step = "working";
+    this.render(
+      h("h2", { id: "sheet-title", class: "ok" }, "Joined. Next: the admission"),
+      this.chainNote(a),
+      h("p", { class: "spinner", role: "status" }, "Preparing the admission…"),
+      h("div", { class: "actions" }, this.cancelButton()),
+    );
+    this.app.freshCatalogue().then(
+      (cat) => {
+        if (!this.current(seq)) return;
+        const o = cat?.organisations.find((x) => x.id === a.org.id);
+        const host = o?.hosts.find((x) => x.enrollment === a.enrollment);
+        if (!cat || !o) return this.showError(new FlowError("That organisation is no longer in the catalogue."));
+        if (!host) return this.showError(new FlowError("The catalogue does not list the new host yet."));
+        if (host.active) return this.showError(new FlowError("It is already admitted there."));
+        const { target, choice } = admissionProposal(cat, o, host);
+        void this.prepare(this.begin(target, true), target, choice, () => this.admitNext(a));
+      },
+      (e) => {
+        if (this.current(seq)) this.showError(e);
+      },
+    );
+  }
+
+  /** Shown on every screen of the admission that follows an enrolment approval. */
+  private chainNote(a: AdmitAfter): HTMLElement {
+    return h("p", { class: "chain-note", role: "status" }, "Step 1 of 2 is done: ", h("bdi", null, vt(a.host)), " has joined. Step 2 of 2: admit it to ", h("bdi", null, vt(a.org.title)), ". Until that is confirmed it can ask for nothing.");
   }
 
   /** A bastion session (bastion.ts): the card is read again before the challenge, so the
@@ -1759,9 +1913,10 @@ class Sheet {
     this.render(h("h2", { id: "sheet-title" }, text), h("p", { class: "spinner", role: "status" }, "Working…"), h("div", { class: "actions" }, this.cancelButton()));
   }
 
-  private async prepare(seq: number, target: ActionTarget, choice: ActionChoice, retry?: () => void): Promise<void> {
+  private async prepare(seq: number, target: ActionTarget, choice: ActionChoice, retry?: () => void, admitAfter: AdmitAfter | null = null): Promise<void> {
     if (!this.current(seq)) return;
     this.retry = retry ?? (() => void this.prepare(this.begin(target), target, choice));
+    this.admitAfter = admitAfter;
     this.working("Preparing confirmation");
     try {
       const p = await prepareAction(this.app.api, target, choice);
@@ -1790,6 +1945,8 @@ class Sheet {
     const rootActive = !!p.open && this.app.rootUntil() > 0;
     this.render(
       h("h2", { id: "sheet-title" }, rootFacts ? "Root on the bastion: check, then confirm" : loud ? "Break-glass: check, then confirm" : "Check, then confirm"),
+      this.chain && p.canonical.object === "org_host" ? [this.chainNote(this.chain), admissionSummary(typeof p.canonical.plan === "string" ? p.canonical.plan : undefined)] : null,
+      this.admitAfter && p.canonical.object === "enrollment" ? h("p", { class: "chain-note" }, "Step 1 of 2: let it join. Step 2 follows as its own confirmation: admit ", h("bdi", null, vt(this.admitAfter.host)), " to ", h("bdi", null, vt(this.admitAfter.org.title)), ".") : null,
       rootBlock,
       d.risk ? h("p", { class: "card-top" }, h("span", { class: "kind" }, "Cloudflare"), riskBadge(d.risk)) : null,
       h("p", { class: `headline ${negative ? "neg" : "pos"}${loud || rootFacts ? " loud" : ""}` }, renderParts(d.headlineParts)),
@@ -1900,7 +2057,11 @@ class Sheet {
       );
       return;
     }
-    const words: Record<string, string> = { approve: "Approved", deny: "Denied", revoke: "Revoked", rename: "Renamed", remove: "Removed" };
+    if (c.object === "enrollment" && c.action === "approve" && this.admitAfter) {
+      this.admitNext(this.admitAfter);
+      return;
+    }
+    const words: Record<string, string> = { approve: "Approved", deny: "Denied", revoke: "Revoked", rename: "Renamed", remove: "Removed", admit: "Admitted" };
     const lines: Child[] = [];
     if (c.object === "grant" && c.kind === "cloudflare")
       lines.push(
@@ -1929,7 +2090,15 @@ class Sheet {
     else if (c.object === "request" && c.action === "approve" && c.kind === "bastion") lines.push(...decisionLines(c, r as Record<string, unknown>));
     else if (c.object === "standing") lines.push("Matching requests need your approval again.");
     else if (c.object === "passkey" && c.action === "remove") lines.push("It can no longer sign in or approve anything here. Delete it from its password manager or key too if you no longer need it.");
+    else if (c.object === "enrollment" && c.action === "approve" && this.app.organised()) {
+      const hosts = nav("Open Hosts", "#/hosts", "Hosts");
+      hosts.className = "btn approve";
+      hosts.addEventListener("click", () => this.close());
+      lines.push(h("p", { class: "warn not-admitted-note" }, h("bdi", null, vt(c.requesting_host ?? "The host")), " has joined but is not admitted to an organisation, so it can ask for nothing yet. Admit it under Hosts, where it is marked “Not admitted”."), h("p", null, hosts));
+    }
     else if (c.object === "enrollment" && c.action === "approve") lines.push(h("span", null, h("bdi", null, vt(c.requesting_host ?? "The host")), " can now ask for access."));
+    else if (c.object === "org_host" && c.action === "admit" && this.chain)
+      lines.push(h("span", null, h("bdi", null, vt(this.chain.host)), " has joined and is admitted to ", h("bdi", null, vt(this.chain.org.title)), ": it can now ask for that organisation's credentials."));
     else if (c.object === "request" && c.action === "approve") {
       const notAfter = typeof r.grant?.not_after === "string" ? new Date(r.grant.not_after) : null;
       lines.push(
@@ -1946,7 +2115,7 @@ class Sheet {
       );
     }
     this.render(
-      h("h2", { id: "sheet-title", class: c.action === "approve" || c.action === "rename" ? "ok" : "neg" }, words[c.action] ?? "Done"),
+      h("h2", { id: "sheet-title", class: c.action === "approve" || c.action === "rename" || c.action === "admit" ? "ok" : "neg" }, words[c.action] ?? "Done"),
       h("p", { class: "headline" }, renderParts(p.description.headlineParts)),
       lines.map((l) => (l instanceof HTMLElement && l.tagName === "P" ? l : h("p", null, l))),
       h("div", { class: "actions" }, done),
@@ -1957,6 +2126,22 @@ class Sheet {
     this.step = "error";
     const msg = explainError(e);
     const again = this.retry;
+    if (this.chain) {
+      // The enrolment approval went through; only the admission did not. Say both, and keep
+      // the way to try the admission again in the same place.
+      const a = this.chain;
+      const hosts = nav("Open Hosts", "#/hosts", "Hosts");
+      hosts.className = "btn";
+      hosts.addEventListener("click", () => this.close());
+      this.render(
+        h("h2", { id: "sheet-title", class: "neg" }, "Joined, but not admitted"),
+        h("p", { class: "chain-note" }, h("bdi", null, vt(a.host)), " has joined: that approval went through. Admitting it to ", h("bdi", null, vt(a.org.title)), " did not:"),
+        h("p", { class: "error", role: "alert" }, vt(msg)),
+        h("p", { class: "muted" }, nothingChanged(e) ? "The admission was not made, so it can ask for nothing yet. Try again here, or admit it later under Hosts, where it is marked “Not admitted”." : "The admission may or may not have gone through. Check Hosts, which shows whether it is admitted."),
+        h("div", { class: "actions" }, h("button", { class: "btn", type: "button", on: { click: () => this.close() } }, "Close"), hosts, again ? h("button", { class: "btn approve", type: "button", "data-autofocus": "", on: { click: () => again() } }, "Try the admission again") : null),
+      );
+      return;
+    }
     this.render(
       h("h2", { id: "sheet-title", class: "neg" }, e instanceof FlowError ? "Not signed" : "That didn't work"),
       h("p", { class: "error", role: "alert" }, vt(msg)),

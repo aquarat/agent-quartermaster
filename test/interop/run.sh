@@ -337,9 +337,28 @@ ok 'signed activation and personal SSH approval from the legacy CLI'
 owner catalogue create
 owner catalogue remove
 if "$AQMAS" list >"$T/foreign.out" 2>&1; then fail 'client-a admission conferred personal access'; fi
+# Admitted elsewhere: what it cannot see is a plain "not found", never a hint about its state.
+grep -q 'not_found' "$T/foreign.out" && ! grep -q 'not admitted' "$T/foreign.out" || fail "a host admitted elsewhere was told more than not_found: $(cat "$T/foreign.out")"
 owner catalogue readmit
 "$AQMAS" list --json | bun -e 'if((await Bun.stdin.json()).grants.length)process.exit(1)' || fail 're-admission revived grants'
 ok 'signed catalogue creation, identical sibling paths and remove/re-admit isolation'
+
+# A host enrolled after the cutover is admitted nowhere: it is told so (not a bare
+# "not found"), and the admission the page proposes right after the enrolment approval
+# is what lets it in.
+(
+  export AQMAS_CONFIG_DIR=$T/late/config AQMAS_CACHE_DIR=$T/late/cache
+  "$AQMAS" enroll --name late-host --server "https://127.0.0.1:$PA" --ca-pin "$PIN" --note "interop late host" </dev/null >"$T/late-enroll.out" 2>"$T/late-enroll.err" &
+  LPID=$!
+  LID=$(owner wait enrollment late-host 20)
+  owner approve "$LID" >/dev/null 2>"$T/late-owner.err" || fail "approving the late enrolment: $(cat "$T/late-owner.err")"
+  wait $LPID || { cat "$T/late-enroll.err"; fail "late enroll exited $?"; }
+  if "$AQMAS" ssh testhost --why "not admitted yet" -- echo ok </dev/null >"$T/late.out" 2>"$T/late.err"; then fail 'an unadmitted host got access'; fi
+  grep -q 'enrolled but not admitted to an organisation' "$T/late.err" && ! grep -q 'not_found' "$T/late.err" || fail "unadmitted host message: $(cat "$T/late.err")"
+  owner catalogue admit-host:personal:late-host || fail 'admitting the late host'
+  "$AQMAS" list >"$T/late-list.out" 2>&1 || fail "admitted late host still refused: $(cat "$T/late-list.out")"
+) || exit 1
+ok 'a host enrolled after the cutover hears "not admitted"; the admission proposed after its enrolment approval lets it in'
 
 source "$ROOT/test/interop/seal.sh"
 seal_cutover

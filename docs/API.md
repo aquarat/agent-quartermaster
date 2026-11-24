@@ -341,6 +341,20 @@ generation. `auto_access:[]` means **none**. Policy rules are sorted by `(set_id
 they bind policy-auto, standing eligibility, and explicit proxy-duration relaxation.
 A policy replacement expires pending work and ends active grants/standing in that org.
 Removal does so for that enrollment only. Re-admission never resurrects old bindings.
+
+**Admitting with the enrolment approval (web UI).** Approving an enrolment and admitting the
+new host stay two signed actions with unchanged canonical texts: `enrollment:approve`, then
+`org_host:admit`. The page joins them into one flow. "Let it join…" offers "Also admit to
+ORGANISATION": preselected when the catalogue holds exactly one organisation, a choice (or
+"Not now") when it holds several. After the enrolment approval is applied, the page reads the
+catalogue again, proposes the `org_host:admit` plan for the new host row and shows its own
+confirmation (host, class, certificate fingerprint, organisation, the services it may then
+ask for and what is granted without asking, all read from the text to be signed). Both need
+an individual passkey confirmation: neither enrolment nor admission is eligible for an
+approval window. If the admission fails or is cancelled, the enrolment stays approved; the
+sheet says "Joined, but not admitted" with the reason and "Try the admission again", and
+Hosts marks the host "Not admitted" with Admit next to each organisation. Until it is
+admitted the host's CLI is told `not_admitted` (above).
 See `test/interop/catalogue.ts` for cross-language vectors including a stale signed replace.
 
 Scoped access canonicals also carry `soft_cap,hard_cap,standing_soft_cap,standing_default`

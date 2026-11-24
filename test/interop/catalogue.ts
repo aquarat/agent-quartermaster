@@ -1,5 +1,5 @@
 // Real owner-side catalogue ceremonies, using exactly the browser's verifier.
-import { planString, type Catalogue } from "../../web/src/catalogue";
+import { admissionProposal, planString, type Catalogue } from "../../web/src/catalogue";
 import type { Api } from "../../web/src/api";
 import type { Authenticator } from "../../web/src/webauthn";
 import { completeAction, prepareAction, type ActionChoice, type ActionTarget } from "../../web/src/flows";
@@ -50,6 +50,18 @@ export async function exerciseCatalogue(api: Api, auth: Authenticator, mode: str
       kind: "env-set",
       result_revision: 0,
     });
+    return;
+  }
+  if (mode.startsWith("admit-host:")) {
+    // admit-host:ORG:NAME: what the page proposes right after it approved NAME's enrolment
+    // ("Also admit to ORG"), built by the page's own function.
+    const [o, name] = mode.slice(11).split(":");
+    const now = await read(),
+      parent = now.organisations.find((x) => x.slug === o)!,
+      host = parent.hosts.find((h) => h.name === name);
+    if (!host || host.active) throw Error("host is not listed as unadmitted");
+    const p = admissionProposal(now, parent, host);
+    await completeAction(api, auth, await prepareAction(api, p.target, p.choice));
     return;
   }
   if (mode === "remove" || mode === "readmit") {

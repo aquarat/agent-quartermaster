@@ -3,7 +3,7 @@
 // passkeys" sequence end to end.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Window } from "happy-dom";
-import { createApi } from "../src/api";
+import { ApiError, createApi } from "../src/api";
 import { decode, encode } from "../src/b64url";
 import { startMock } from "../mock/server";
 import { TABS } from "../src/nav";
@@ -182,6 +182,140 @@ describe("navigation", () => {
     await until(() => m.store.vault.catalogue().organisations.find((o) => o.slug === "client-a")!.hosts.find((x) => x.name === "web-1")!.active);
     button(dlg, /^Done$|^Close$/)?.click();
     expect(web.querySelector("button.deny")).toBeTruthy(); // Revoke host is still here
+  });
+
+  // Generous: these wait for the page to follow the mock through several round trips.
+  const soon = (cond: () => boolean) => until(cond, 30_000);
+  const sheet = () => doc.querySelector<HTMLDialogElement>("dialog.sheet")!;
+  const catHost = (org: string, name: string) => m.store.vault.catalogue().organisations.find((o) => o.slug === org)!.hosts.find((x) => x.name === name);
+  const joinCard = async (name: string) => {
+    go("#/");
+    await soon(() => [...root.querySelectorAll("article.card.enroll")].some((c) => c.querySelector("h3")!.textContent === name));
+    return [...root.querySelectorAll<HTMLElement>("article.card.enroll")].find((c) => c.querySelector("h3")!.textContent === name)!;
+  };
+
+  test("letting a host join offers to admit it: two confirmations, a failed admission is shown and can be retried", async () => {
+    const card = await joinCard("kiosk-3");
+    expect(card.querySelector(".admit-hint")!.textContent).toContain("also offers to admit it to an organisation");
+    button(card, /^Let it join…$/)!.click();
+    const dlg = sheet();
+    await soon(() => !!dlg.querySelector("fieldset.admit-choice"));
+    // Several organisations: a choice, nothing preselected, and "Not now" is one of the answers.
+    const radios = [...dlg.querySelectorAll<HTMLInputElement>('fieldset.admit-choice input[type="radio"]')];
+    expect(radios.map((r) => r.closest("label")!.textContent!.trim())).toEqual(["Personal personal", "Client A client-a", "Club club", "Not now"]);
+    expect(radios.some((r) => r.checked)).toBe(false);
+    const before = me.gets.length;
+    button(dlg, /^Continue$/)!.click();
+    expect(dlg.querySelector('[role="alert"]')!.textContent).toContain("Choose an organisation");
+    expect(me.gets.length).toBe(before);
+    radios[1]!.checked = true;
+    radios[1]!.dispatchEvent(new win.Event("change", { bubbles: true }) as unknown as Event);
+    button(dlg, /^Continue$/)!.click();
+
+    // First confirmation: the enrolment, unchanged, saying what follows.
+    await soon(() => !!dlg.querySelector("button.confirm"));
+    expect(dlg.querySelector(".headline")!.textContent).toContain("kiosk-3");
+    expect(dlg.querySelector(".chain-note")!.textContent).toBe("Step 1 of 2: let it join. Step 2 follows as its own confirmation: admit kiosk-3 to Client A.");
+    dlg.querySelector<HTMLButtonElement>("button.confirm")!.click();
+
+    // Second confirmation: the ordinary org_host admit, with exactly what is admitted to what.
+    await soon(() => dlg.querySelector(".headline")?.textContent === "Client A: admit org host." && !!dlg.querySelector("button.confirm"));
+    expect(m.store.pending.some((p) => p.id === "01JDEMO0ENROLL0KIOSK00003")).toBe(false);
+    expect(catHost("client-a", "kiosk-3")!.active).toBe(false);
+    expect(dlg.querySelector(".chain-note")!.textContent).toContain("kiosk-3 has joined. Step 2 of 2: admit it to Client A");
+    const summary = dlg.querySelector(".admission-summary")!.textContent!;
+    for (const part of ["kiosk-3", "agent", "01JDEMO0ENROLL0KIOSK00003", "Client A", "client-a", "PaaS (2)"]) expect(summary).toContain(part);
+
+    // The admission fails (the organisation changed under it): the sheet says the host joined,
+    // that the admission did not happen, and offers it again.
+    const apply = api.apply;
+    api.apply = async () => {
+      api.apply = apply;
+      throw new ApiError(409, "conflict", "catalogue or admission changed; reload and review again");
+    };
+    dlg.querySelector<HTMLButtonElement>("button.confirm")!.click();
+    await soon(() => dlg.querySelector("#sheet-title")?.textContent === "Joined, but not admitted");
+    expect(dlg.querySelector(".chain-note")!.textContent).toContain("kiosk-3 has joined: that approval went through. Admitting it to Client A did not");
+    expect(dlg.querySelector('[role="alert"]')!.textContent).not.toBe("");
+    expect(dlg.textContent).toContain("The admission was not made");
+    expect(catHost("client-a", "kiosk-3")!.active).toBe(false);
+    button(dlg, /^Try the admission again$/)!.click();
+    await soon(() => dlg.querySelector(".headline")?.textContent === "Client A: admit org host." && !!dlg.querySelector("button.confirm"));
+    dlg.querySelector<HTMLButtonElement>("button.confirm")!.click();
+    await soon(() => dlg.querySelector("#sheet-title")?.textContent === "Admitted");
+    expect(catHost("client-a", "kiosk-3")!.active).toBe(true);
+    expect(catHost("personal", "kiosk-3")!.active).toBe(false);
+    expect(dlg.textContent).toContain("kiosk-3 has joined and is admitted to Client A");
+    // The enrolment was signed as the existing action, once; the admission is the catalogue's own.
+    expect(m.store.applied.filter((a) => a.canonical["id"] === "01JDEMO0ENROLL0KIOSK00003").map((a) => a.object + ":" + a.action)).toEqual(["enrollment:approve"]);
+    button(dlg, /^Done$/)!.click();
+  });
+
+  test("one organisation: admitting is preselected and can be switched off; an unadmitted host is marked on Hosts", async () => {
+    m.store.pending.unshift({
+      id: "01JDEMO0ENROLL0KIOSK00004",
+      kind: "enrollment",
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+      expires_at: new Date(Date.now() + 25 * 60_000).toISOString(),
+      requesting_host: "kiosk-4",
+      requesting_address: "192.0.2.41",
+      requester: { tool: "owner-cli", user: "pi" },
+      reason: "Second lobby kiosk.",
+      enrollment: { replaces_id: "", max_ssh_seconds: 28800, max_standing_hours: 24, class: "agent", csr_fingerprint: "SHA256:" + "k".repeat(43), ssh_host_key_fingerprints: [] },
+      ttl_requested: 0,
+      ttl_max: 0,
+      risk: "normal",
+    } as unknown as (typeof m.store.pending)[number]);
+    const card = await joinCard("kiosk-4");
+    // As if the catalogue held one organisation only.
+    const real = api.catalogue!;
+    api.catalogue = async () => {
+      const cat = (await real())!;
+      return { ...cat, organisations: cat.organisations.filter((o) => o.slug === "personal") };
+    };
+    try {
+      button(card, /^Let it join…$/)!.click();
+      const dlg = sheet();
+      await soon(() => !!dlg.querySelector("fieldset.admit-choice"));
+      const box = dlg.querySelector<HTMLInputElement>('fieldset.admit-choice input[type="checkbox"]')!;
+      expect(box.checked).toBe(true);
+      expect(box.closest("label")!.textContent!.trim()).toBe("Also admit kiosk-4 to Personal");
+      expect(dlg.querySelectorAll('fieldset.admit-choice input[type="radio"]').length).toBe(0);
+      // Off is possible: then it is one confirmation, and the result says what is missing.
+      box.checked = false;
+      button(dlg, /^Continue$/)!.click();
+      await soon(() => !!dlg.querySelector("button.confirm"));
+      expect(dlg.querySelector(".chain-note")).toBeNull();
+      dlg.querySelector<HTMLButtonElement>("button.confirm")!.click();
+      await soon(() => dlg.querySelector("#sheet-title")?.textContent === "Approved");
+      expect(dlg.querySelector(".not-admitted-note")!.textContent).toContain("kiosk-4 has joined but is not admitted to an organisation, so it can ask for nothing yet");
+      const open = [...dlg.querySelectorAll<HTMLAnchorElement>("a")].find((a) => a.textContent === "Open Hosts")!;
+      expect(open.getAttribute("href")).toBe("#/hosts");
+      button(dlg, /^Done$/)!.click();
+    } finally {
+      api.catalogue = real;
+    }
+    go("#/hosts");
+    const cards = () => [...root.querySelectorAll<HTMLElement>("#sec-hosts article.card")];
+    await soon(() => cards().some((c) => c.querySelector("h3 bdi")?.textContent === "kiosk-4"));
+    const k4 = cards().find((c) => c.querySelector("h3 bdi")!.textContent === "kiosk-4")!;
+    expect(k4.classList.contains("unadmitted")).toBe(true);
+    expect(k4.querySelector("h3 .badge.not-admitted")!.textContent).toBe("Not admitted");
+    expect(k4.querySelector(".not-admitted-note")!.textContent).toContain("enrolled but not admitted to any organisation");
+    expect([...k4.querySelectorAll(".admission-list button")].map((b) => b.textContent)).toEqual(["Admit…", "Admit…", "Admit…"]);
+    // A host admitted somewhere carries no such mark.
+    const k3 = cards().find((c) => c.querySelector("h3 bdi")!.textContent === "kiosk-3")!;
+    expect(k3.querySelector(".badge.not-admitted")).toBeNull();
+    expect(k3.classList.contains("unadmitted")).toBe(false);
+    // Admitting from there is the same signed change, and the mark goes.
+    button(k4.querySelector(".admission-list li")!, /^Admit…$/)!.click();
+    const dlg = sheet();
+    await soon(() => dlg.querySelector(".headline")?.textContent === "Personal: admit org host." && !!dlg.querySelector("button.confirm"));
+    expect(dlg.querySelector(".chain-note")).toBeNull();
+    dlg.querySelector<HTMLButtonElement>("button.confirm")!.click();
+    await soon(() => catHost("personal", "kiosk-4")!.active);
+    button(dlg, /^Done$|^Close$/)?.click();
+    await soon(() => !cards().find((c) => c.querySelector("h3 bdi")?.textContent === "kiosk-4")?.querySelector(".badge.not-admitted"));
   });
 
   test("the tray: what is open and Close all, reviewed before its tap", async () => {

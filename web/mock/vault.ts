@@ -178,6 +178,10 @@ export class MockVault {
       })),
     };
   }
+  /** An approved enrolment becomes a host that no organisation has admitted. */
+  enrolled(enrollment: string, name: string, cls: string, address: string): void {
+    this.hosts.push({ row_id: this.hosts.length + 1, enrollment, name, fingerprint: "SHA256:" + b64url(sha256("mock host " + name)), class: cls, address, revoked_at: null, orgs: new Map() });
+  }
   hostList() {
     const day = 86_400_000;
     return this.hosts.map((x, i) => ({ id: x.enrollment, name: x.name, address: x.address, class: x.class, enrolled_at: new Date(Date.now() - (20 + i) * day).toISOString(), not_before: new Date(Date.now() - (20 + i) * day).toISOString(), not_after: new Date(Date.now() + 70 * day).toISOString(), last_request_at: i < 2 ? new Date(Date.now() - (i + 1) * 2_520_000).toISOString() : null, revoked_at: x.revoked_at }));

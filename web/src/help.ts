@@ -50,7 +50,7 @@ export function helpPage(c: HelpConfig) {
         ...[
           ["Approvals", "Everything waiting for you (access requests, signature requests, env releases, hosts asking to join), then who holds access now and your auto-approvals. The number on the tab counts what waits, on every page."],
           ["Vault", "Every credential the broker holds, as one searchable list: env sets, signing keys, the Cloudflare parent credential, the CAs and the access rules. Filter by type or organisation; open an item for its fields, who may ask for it and what happened to it. “Add item” creates a new one."],
-          ["Hosts", "Enrolled hosts, the organisations each may ask for (Admit, Remove) and Revoke."],
+          ["Hosts", "Enrolled hosts, the organisations each may ask for (Admit, Remove) and Revoke. A host that has joined but is admitted nowhere is marked “Not admitted” and can ask for nothing; “Let it join…” on Approvals offers the admission in the same go."],
           ["Activity", "The audit log, with filters."],
           ["Security", "Whether your passkeys can open your credentials (and Enable for the ones that cannot), passkeys, the buckets open right now with Reopen, Rekey and Close all, approval windows, and the recovery key."],
           ["Settings", "Setup and upgrades, and each organisation's policies."],
