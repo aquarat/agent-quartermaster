@@ -2,6 +2,7 @@
 package release
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -75,13 +76,64 @@ func (s Sums) Text() string {
 	return b.String()
 }
 
+// Metadata is a verified release identity: what the bastion caches as latest.json, hands to
+// its installer and serves to fleet CLIs. GitHub is the manifest every installation checks.
+// Second is the manifest of the configured second source and is absent without one; when
+// present it must be identical.
 type Metadata struct {
 	Version string `json:"version"`
 	Commit  string `json:"commit"`
-	Forgejo Sums   `json:"forgejo"`
 	GitHub  Sums   `json:"github"`
+	Second  Sums   `json:"second,omitempty"`
+}
+
+// record is Metadata on disk and on the wire. Sources (1 or 2) marks a record written by
+// this format. Records of 0.8.1 and earlier have no such field: they named the second
+// source "forgejo" and always had one.
+type record struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	GitHub  Sums   `json:"github"`
+	Second  Sums   `json:"second,omitempty"`
+	Sources int    `json:"sources,omitempty"`
+	Legacy  Sums   `json:"forgejo,omitempty"`
+}
+
+func (m Metadata) MarshalJSON() ([]byte, error) {
+	return json.Marshal(record{Version: m.Version, Commit: m.Commit, GitHub: m.GitHub, Second: m.Second, Sources: m.Compared()})
+}
+
+// LegacyJSON is the record with the verified digests repeated under "forgejo", where a CLI
+// of 0.8.1 or earlier looks for them (and refuses a reply without them). Current readers
+// ignore that key because the record says how many sources it holds.
+func (m Metadata) LegacyJSON() ([]byte, error) {
+	return json.Marshal(record{Version: m.Version, Commit: m.Commit, GitHub: m.GitHub, Second: m.Second, Sources: m.Compared(), Legacy: m.GitHub})
+}
+
+func (m *Metadata) UnmarshalJSON(b []byte) error {
+	var v record
+	if e := json.Unmarshal(b, &v); e != nil {
+		return e
+	}
+	switch {
+	case v.Sources == 0 && v.Second == nil:
+		v.Second = v.Legacy
+	case v.Sources == 1 && v.Second == nil, v.Sources == 2 && v.Second != nil:
+	default:
+		return errors.New("release metadata does not hold the sources it counts")
+	}
+	*m = Metadata{Version: v.Version, Commit: v.Commit, GitHub: v.GitHub, Second: v.Second}
+	return nil
 }
 
 func (m Metadata) Valid() bool {
-	return ValidVersion(m.Version) && ValidCommit(m.Commit) && m.Forgejo.Agrees(m.GitHub)
+	return ValidVersion(m.Version) && ValidCommit(m.Commit) && m.GitHub.Valid() && (m.Second == nil || m.Second.Agrees(m.GitHub))
+}
+
+// Compared is how many published sources the record holds agreeing manifests of.
+func (m Metadata) Compared() int {
+	if m.Second != nil {
+		return 2
+	}
+	return 1
 }

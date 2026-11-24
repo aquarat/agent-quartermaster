@@ -47,6 +47,14 @@ jobs:
           for f in "${files[@]}" SHA256SUMS; do [[ -f $f && ! -L $f ]]; done
           sha256sum "${files[@]}" | cmp - SHA256SUMS
           gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" "${files[@]}" SHA256SUMS --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+  # Optional: compare with the same release built independently by a second source (for
+  # example the Forgejo workflow in .forgejo/workflows/release.yml running on another forge).
+  # Where that is comes only from this repository's settings, never from the code:
+  #   SECOND_SOURCE_RELEASES_URL = https://forge.example.com/OWNER/NAME/releases/download
+  # Set it as an Actions *secret* if the host name should stay private: a repository
+  # variable works too, but GitHub prints variables in the (public) job log, while secrets
+  # are masked. With neither set the job says so and passes: GitHub is then the only
+  # published source, and installations still rebuild from source and compare.
   compare:
     needs: publish
     runs-on: ubuntu-24.04
@@ -55,13 +63,20 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
+          SECOND_SOURCE_RELEASES_URL: ${{ secrets.SECOND_SOURCE_RELEASES_URL || vars.SECOND_SOURCE_RELEASES_URL }}
         run: |
           set -eu
+          base=${SECOND_SOURCE_RELEASES_URL%/}
+          if [ -z "$base" ]; then
+            echo '::notice::No second release source is configured (SECOND_SOURCE_RELEASES_URL is unset); nothing to compare.'
+            exit 0
+          fi
+          case "$base" in https://*) ;; *) echo 'SECOND_SOURCE_RELEASES_URL must be an https URL'; exit 1 ;; esac
           gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -p SHA256SUMS
-          url="https://forge.example.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/SHA256SUMS"
-          code=$(curl --max-time 20 -sS -o forgejo.sums -w '%{http_code}' "$url") || code=000
+          # Quiet on purpose: curl's own messages would name the host in a public log.
+          code=$(curl --max-time 20 -s -o second.sums -w '%{http_code}' "$base/$GITHUB_REF_NAME/SHA256SUMS" 2>/dev/null) || code=000
           case "$code" in
-            200) cmp SHA256SUMS forgejo.sums ;;
-            000|302|401|403|404) echo '::notice::Forgejo release inaccessible from this runner; installation still requires matching manifests.' ;;
-            *) echo "Unexpected Forgejo response $code"; exit 1 ;;
+            200) cmp SHA256SUMS second.sums && echo 'The second source published the same SHA256SUMS.' ;;
+            000|302|401|403|404) echo '::notice::The second source is not reachable from this runner; an installation that configures it still requires matching manifests.' ;;
+            *) echo "Unexpected response $code from the second source"; exit 1 ;;
           esac

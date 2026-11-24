@@ -71,13 +71,29 @@ export interface SetupView {
   runner_version?: string;
   /** HPKE public key (base64url, P-256 uncompressed) pasted secrets are sealed to. */
   secrets_key?: string;
-  /** Public half of the read-only deploy key. */
+  /** Public half of the read-only deploy key (only an SSH repository uses it). */
   deploy_key?: string;
   passkeys: SetupPasskey[] | null;
   current?: SetupRun | null;
   refused?: { at: string; reason: string } | null;
   tasks: SetupTask[] | null;
-  update_sources: Record<string, string> | null;
+  update_sources: UpdateSources | null;
+}
+
+/** Where releases come from. The three addresses are fixed at the machine (its configuration
+ * or `maint-init`); "Enable self-update" signs exactly these and the runner accepts no others. */
+export interface UpdateSources {
+  /** Git remote: https://… (anonymous, a public repository) or ssh://… (deploy key + host keys). */
+  repo: string;
+  github_api: string;
+  /** "" = no second source: GitHub and the machine's own rebuild are compared. */
+  second_api: string;
+  origin: "pinned" | "config" | "default";
+  /** The published sources by name: "GitHub", "second source (HOST)". */
+  compared: string[] | null;
+  /** The same for the configuration the broker runs with now; empty while self-update is off. */
+  active: string[] | null;
+  note?: string;
 }
 
 export interface HostKeys {
@@ -286,8 +302,8 @@ export function canonicalParams(task: string, params: Record<string, unknown>): 
       // The broker sorts the lines before signing (bytewise; they are ASCII).
       const sorted = [...hosts].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
       out =
-        `{"repo":${f.str("repo")},"forgejo_api":${f.str("forgejo_api")},"github_api":${f.str("github_api")},` +
-        `"known_hosts":[${sorted.map(goString).join(",")}],"forgejo_token":${f.bool("forgejo_token")},"github_token":${f.bool("github_token")}}`;
+        `{"repo":${f.str("repo")},"github_api":${f.str("github_api")},"second_api":${f.str("second_api")},` +
+        `"known_hosts":[${sorted.map(goString).join(",")}],"github_token":${f.bool("github_token")},"second_token":${f.bool("second_token")}}`;
       break;
     }
     case "sync-passkeys": {
@@ -376,7 +392,7 @@ export function paramLines(task: string, p: Record<string, unknown>): string[] {
 /** The secrets a task with these parameters must carry, sorted (maint.SecretNames). */
 export function secretNames(task: string, params: Record<string, unknown>): string[] {
   if (task === "seal") return params["lock_alert"] === true ? ["ntfy_token", "ntfy_topic_url"] : [];
-  if (task === "enable-updates") return [...(params["forgejo_token"] === true ? ["forgejo_token"] : []), ...(params["github_token"] === true ? ["github_token"] : [])];
+  if (task === "enable-updates") return [...(params["github_token"] === true ? ["github_token"] : []), ...(params["second_token"] === true ? ["second_token"] : [])];
   return [];
 }
 

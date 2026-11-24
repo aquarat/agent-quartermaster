@@ -36,7 +36,7 @@ const hex = (b: ArrayBuffer | Uint8Array) => Buffer.from(b as ArrayBuffer).toStr
 const suite = new CipherSuite({ kem: new DhkemP256HkdfSha256(), kdf: new HkdfSha256(), aead: new Aes128Gcm() });
 const HOST_A = "forge.example.com ecdsa-sha2-nistp256 " + "A".repeat(60);
 const HOST_B = "forge.example.com ssh-ed25519 " + "B".repeat(44);
-const UPDATES = { repo: "ssh://git@forge.example.com/owner/agent-quartermaster.git", forgejo_api: "https://forge.example.com/api/v1/repos/owner/agent-quartermaster", github_api: "https://api.github.com/repos/owner/agent-quartermaster" };
+const UPDATES = { repo: "ssh://git@forge.example.com/owner/agent-quartermaster.git", github_api: "https://api.github.com/repos/owner/agent-quartermaster", second_api: "https://forge.example.com/api/v1/repos/owner/agent-quartermaster" };
 
 describe("canonicalParams: exactly Go's json.Marshal of the typed parameters", () => {
   test("cutover", () => {
@@ -61,13 +61,17 @@ describe("canonicalParams: exactly Go's json.Marshal of the typed parameters", (
   });
 
   test("enable-updates: known_hosts sorted, flags last, no HTML escaping", () => {
-    expect(canonicalParams("enable-updates", { ...UPDATES, github_token: true, forgejo_token: false, known_hosts: [HOST_B, HOST_A] })).toBe(
-      `{"repo":"${UPDATES.repo}","forgejo_api":"${UPDATES.forgejo_api}","github_api":"${UPDATES.github_api}","known_hosts":["${HOST_A}","${HOST_B}"],"forgejo_token":false,"github_token":true}`,
+    expect(canonicalParams("enable-updates", { ...UPDATES, github_token: true, second_token: false, known_hosts: [HOST_B, HOST_A] })).toBe(
+      `{"repo":"${UPDATES.repo}","github_api":"${UPDATES.github_api}","second_api":"${UPDATES.second_api}","known_hosts":["${HOST_A}","${HOST_B}"],"github_token":true,"second_token":false}`,
     );
-    expect(canonicalParams("enable-updates", { repo: "a&b<c>", forgejo_api: 'q"\\', github_api: " ", known_hosts: [], forgejo_token: false, github_token: false })).toBe(
-      '{"repo":"a&b<c>","forgejo_api":"q\\"\\\\","github_api":"\\u2028","known_hosts":[],"forgejo_token":false,"github_token":false}',
+    // GitHub only: an HTTPS repository, no second source, no host keys, no tokens.
+    expect(canonicalParams("enable-updates", { repo: "https://github.com/owner/agent-quartermaster.git", github_api: UPDATES.github_api, second_api: "", known_hosts: [], github_token: false, second_token: false })).toBe(
+      `{"repo":"https://github.com/owner/agent-quartermaster.git","github_api":"${UPDATES.github_api}","second_api":"","known_hosts":[],"github_token":false,"second_token":false}`,
     );
-    expect(() => canonicalParams("enable-updates", { ...UPDATES, known_hosts: [1], forgejo_token: false, github_token: false })).toThrow();
+    expect(canonicalParams("enable-updates", { repo: "a&b<c>", github_api: 'q"\\', second_api: " ", known_hosts: [], github_token: false, second_token: false })).toBe(
+      '{"repo":"a&b<c>","github_api":"q\\"\\\\","second_api":"\\u2028","known_hosts":[],"github_token":false,"second_token":false}',
+    );
+    expect(() => canonicalParams("enable-updates", { ...UPDATES, known_hosts: [1], github_token: false, second_token: false })).toThrow();
   });
 
   test("sync-passkeys: pins in the order given", () => {

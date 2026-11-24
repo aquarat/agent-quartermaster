@@ -76,7 +76,7 @@ client_cert_days = 2
 
 [updates]
 cache_dir = "$T/releases"
-[updates.forgejo]
+[updates.second]
 api = "http://127.0.0.1:$PF/api/v1/repos/example/aqmas"
 [updates.github]
 api = "http://127.0.0.1:$PG"
@@ -171,7 +171,8 @@ grep -q "Ref ${EID: -6}" "$T/enroll.err" || fail "enroll did not print the card'
 ok "enrolled interop-host (Ref ${EID: -6})"
 
 # An older, locally built CLI updates itself using the enrolled mTLS identity. Seed
-# the server's release cache from the same two-source bootstrap used by the owner.
+# the server's release cache as the owner's bootstrap does, in both forms: one published
+# source (GitHub only) and two (GitHub and a second source that agrees).
 v=$(cat "$ROOT/VERSION")
 make -C "$ROOT" release >/dev/null
 mkdir -p "$T/releases/$v" "$T/upgrade"
@@ -182,15 +183,22 @@ for port in "$PF" "$PG"; do
 done
 # Both sources must serve the same manifest before it becomes the cached release identity.
 bun -e 'const [v,commit,...ports]=process.argv.slice(1);const sums=[];for(const p of ports){const r=await (await fetch(`http://127.0.0.1:${p}/releases/tags/v${v}`)).json();const a=r.assets.find(a=>a.name==="SHA256SUMS");sums.push(await (await fetch(`http://127.0.0.1:${p}/releases/assets/${a.id}`)).text())}
-if(sums[0]!==sums[1])process.exit(1);const m=Object.fromEntries(sums[0].trim().split("\n").map(l=>l.split("  ").reverse()));console.log(JSON.stringify({version:v,commit,forgejo:m,github:m}))' "$v" "$(git -C "$ROOT" rev-parse HEAD)" "$PF" "$PG" > "$T/releases/latest.json"
+if(sums[0]!==sums[1])process.exit(1);const m=Object.fromEntries(sums[0].trim().split("\n").map(l=>l.split("  ").reverse()));console.log(JSON.stringify({version:v,commit,github:m,second:m,sources:2}))' "$v" "$(git -C "$ROOT" rev-parse HEAD)" "$PF" "$PG" > "$T/releases/latest-two.json"
+bun -e 'const m=await Bun.file(process.argv[1]).json();delete m.second;m.sources=1;console.log(JSON.stringify(m))' "$T/releases/latest-two.json" > "$T/releases/latest.json"
 (cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags '-X github.com/aquarat/agent-quartermaster/internal/client.Version=0.0.0' -o "$T/upgrade/aqmas" ./cmd/aqmas)
 printf '\n[github]\napi = "http://127.0.0.1:%s"\n' "$PG" >> "$AQMAS_CONFIG_DIR/config.toml"
 want=$(awk -v n="aqmas-linux-$ARCH" '$2==n {print $1}' "$T/releases/$v/SHA256SUMS")
+# GitHub only: the bastion compared one published source; the CLI asks GitHub itself.
+"$T/upgrade/aqmas" update --check >"$T/upgrade/check-one.out" 2>&1 || { cat "$T/upgrade/check-one.out"; fail "CLI check against a GitHub-only bastion"; }
+grep -F "$want" "$T/upgrade/check-one.out" >/dev/null && grep -F 'against GitHub and its own rebuild' "$T/upgrade/check-one.out" >/dev/null || fail "GitHub-only check: $(cat "$T/upgrade/check-one.out")"
+# With a second source: the same, and the CLI says the bastion compared two.
+cp "$T/releases/latest-two.json" "$T/releases/latest.json"
+"$T/upgrade/aqmas" update --check 2>&1 | grep -F 'against GitHub and a second source and its own rebuild' >/dev/null || fail "two-source check"
 "$T/upgrade/aqmas" update --check 2>&1 | grep -F "$want" >/dev/null
 "$T/upgrade/aqmas" upgrade --yes --expect-sha256 "$want" </dev/null
 "$T/upgrade/aqmas" version | grep -F "aqmas $v " >/dev/null
 "$T/upgrade/aqmas.prev" version | grep -F 'aqmas 0.0.0 ' >/dev/null
-ok 'old CLI verified both releases, replaced itself and retained runnable previous version'
+ok 'old CLI verified the release (bastion with one source, then two) against GitHub, replaced itself and retained runnable previous version'
 
 # --- ssh: first request, approved for 10 min ---
 "$AQMAS" ssh 127.0.0.1 --ttl 15m --why "interop first login" -- echo ok </dev/null >"$T/ssh1.out" 2>"$T/ssh1.err" &

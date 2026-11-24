@@ -16,6 +16,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/aquarat/agent-quartermaster/internal/release"
+	"github.com/aquarat/agent-quartermaster/internal/server/config"
 )
 
 // Layout is every path the runner touches. Production uses the constants below and nothing
@@ -23,7 +26,7 @@ import (
 type Layout struct {
 	Bin        string // the installed aqmasd, which is also this runner
 	Config     string // root-owned broker configuration
-	ConfigDir  string // /etc/aqmas: tokens, deploy key, pins
+	ConfigDir  string // /etc/aqmas: tokens, deploy key (SSH remotes only), pins
 	UnitDir    string // /etc/systemd/system
 	RunDropIn  string // transient drop-in that selects a maintenance mode until reboot
 	Spool      string // aqmasd writes signed requests here
@@ -88,12 +91,61 @@ func (l Layout) key() string     { return filepath.Join(l.ConfigDir, keyName) }
 func (l Layout) unit() string    { return filepath.Join(l.UnitDir, unitName) }
 func (l Layout) sources() string { return filepath.Join(l.ConfigDir, sourcesName) }
 
-// Sources are release sources pinned from a terminal on the machine (`maint-init --repo …`).
-// While they exist, "Enable self-update" accepts exactly these and nothing else.
+// Sources are the release sources "Enable self-update" may use: the git remote, the GitHub
+// release API and, optionally, the release API of a second source ("" = GitHub only). They
+// are decided at the machine and never by a request: pinned from a terminal
+// (`maint-init --repo …`), else read from the root-owned configuration, else the compiled
+// GitHub defaults.
 type Sources struct {
-	Repo       string `json:"repo"`
-	ForgejoAPI string `json:"forgejo_api"`
-	GitHubAPI  string `json:"github_api"`
+	Repo      string `json:"repo"`
+	GitHubAPI string `json:"github_api"`
+	SecondAPI string `json:"second_api"`
+}
+
+// UnmarshalJSON also reads a pin written by 0.8.1 or earlier, which called the second
+// source "forgejo_api".
+func (s *Sources) UnmarshalJSON(b []byte) error {
+	var v struct {
+		Repo      string `json:"repo"`
+		GitHubAPI string `json:"github_api"`
+		SecondAPI string `json:"second_api"`
+		Legacy    string `json:"forgejo_api"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	if v.SecondAPI == "" {
+		v.SecondAPI = v.Legacy
+	}
+	*s = Sources{Repo: v.Repo, GitHubAPI: v.GitHubAPI, SecondAPI: v.SecondAPI}
+	return nil
+}
+
+// Origins of the effective sources.
+const (
+	SourcesPinned  = "pinned"  // maint-init --repo …
+	SourcesConfig  = "config"  // the [updates] table of the root-owned configuration
+	SourcesDefault = "default" // nothing configured: the public GitHub repository alone
+)
+
+// EffectiveSources returns the sources "Enable self-update" accepts and where they come
+// from. A pin wins; without one the configuration's own [updates] table is kept (so that
+// running the task again never drops a configured second source); with neither it is GitHub
+// alone. A missing GitHub address is the compiled default; a second source has no default.
+func EffectiveSources(pinned *Sources, u config.Updates) (Sources, string) {
+	s, origin := Sources{Repo: u.Repo, GitHubAPI: u.GitHub.API, SecondAPI: u.Second.API}, SourcesConfig
+	if pinned != nil {
+		s, origin = *pinned, SourcesPinned
+	} else if s == (Sources{}) {
+		origin = SourcesDefault
+	}
+	if s.GitHubAPI == "" {
+		s.GitHubAPI = release.GitHubAPI
+	}
+	if s.Repo == "" {
+		s.Repo = release.RepoFor(s.GitHubAPI)
+	}
+	return s, origin
 }
 
 func (l Layout) readSources() *Sources {

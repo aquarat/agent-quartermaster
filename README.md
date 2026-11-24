@@ -5,6 +5,18 @@ passkey-approved access (SSH certificates, Cloudflare API grants, env credential
 signatures from keys that never leave the broker; GitHub, Forgejo and HTTP APIs later) instead of holding long-lived keys. The server (`aqmasd`) runs on a dedicated
 bastion host; hosts enroll with the `aqmas` CLI.
 
+## Status: alpha, use at your own risk
+
+- This is **alpha software**. It works for its author's one installation; expect rough edges.
+- It has **not had an independent security review**.
+- It **brokers credentials**: SSH certificates, API tokens, signing keys. A mistake in it, or
+  in how you deploy it, can expose them.
+- **Use it at your own risk** (caveat emptor). There is no warranty; see the licence.
+- **APIs, configuration and storage formats may change without a migration path** between
+  versions.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
 The approval page has seven tabs: **Approvals** for daily work, **Vault** for the credentials
 (a searchable list of env sets, signing keys and what the broker holds; Add item; Reveal after a
 tap), **Hosts**, **Activity**, **Security** (passkeys, open buckets, recovery key), **Settings**
@@ -21,6 +33,9 @@ server’s URL and CA pin. The review behind this layout is [docs/UI-REVIEW.md](
 - Cloudflare (milestone 2): [docs/CLOUDFLARE.md](docs/CLOUDFLARE.md)
 - Setup from the approval page (organisations cutover, sealing, self-update, upgrades) and the root maintenance runner: [docs/SETUP.md](docs/SETUP.md)
 - Reproducible releases, `aqmas upgrade` and passkey-approved bastion updates: [docs/UPDATES.md](docs/UPDATES.md)
+  Releases come from this GitHub repository alone by default (one published source, plus the
+  bastion's own rebuild from source); a second, independent release source is optional and is
+  named only in the bastion's configuration.
 
 Toolchain: Go 1.27, Bun 1.4.4 for `web/`. `make vet test build`, `cd web && bun test`,
 `make interop`, `make interop-cf`.
@@ -31,7 +46,8 @@ Every site-specific value lives in configuration, never in the code:
 
 - the bastion's `/etc/aqmas/config.toml` (`deploy/bastion/config.example.toml`): public URL
   (e.g. `https://approvals.example.com`), TLS SANs, targets with pinned host keys, ntfy topic,
-  Cloudflare Access and Cloudflare account settings;
+  Cloudflare Access and Cloudflare account settings, and where releases come from (`[updates]`:
+  GitHub by default, an optional second source);
 - each enrolled host's `~/.config/aqmas/config.toml`, written by
   `aqmas enroll --name web-1 --server https://192.0.2.10:8443 --ca-pin sha256:...`;
 - each target host's `/etc/aqmas/host-trust.conf` for `deploy/hosts/install-host-trust.sh`

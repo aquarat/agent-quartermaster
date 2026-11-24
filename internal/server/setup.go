@@ -109,7 +109,42 @@ type setupView struct {
 	Current   *maint.TaskStatus `json:"current,omitempty"`
 	Refused   *maint.Refusal    `json:"refused,omitempty"`
 	Tasks     []setupTask       `json:"tasks"`
-	Updates   map[string]string `json:"update_sources"`
+	Updates   setupSources      `json:"update_sources"`
+}
+
+// setupSources says where releases come from. Repo, GitHubAPI and SecondAPI are the sources
+// "Enable self-update" will accept (fixed at the machine; maint.EffectiveSources) and
+// Origin where they were decided. Active names what this broker compares right now.
+type setupSources struct {
+	Repo      string `json:"repo"`
+	GitHubAPI string `json:"github_api"`
+	SecondAPI string `json:"second_api"` // "" = GitHub only
+	Origin    string `json:"origin"`     // pinned | config | default
+	// Compared lists the published sources by name: "GitHub", "second source (HOST)".
+	Compared []string `json:"compared"`
+	// Active is the same list for the configuration the broker is running with; empty while
+	// self-update is not enabled.
+	Active []string `json:"active"`
+	Note   string   `json:"note,omitempty"`
+}
+
+func (s *Server) setupSources(pinned *maint.Sources) setupSources {
+	u := s.cfg.Updates
+	eff, origin := maint.EffectiveSources(pinned, u)
+	v := setupSources{Repo: eff.Repo, GitHubAPI: eff.GitHubAPI, SecondAPI: eff.SecondAPI, Origin: origin, Active: []string{},
+		Compared: release.Sources{Second: release.Source{API: eff.SecondAPI}}.Names()}
+	if u.Repo != "" {
+		v.Active = u.Sources().Names()
+	}
+	switch {
+	case u.SecondIgnored():
+		v.Note = "The configuration names a token for a second release source but not its address, so no second source is used: releases are compared with GitHub only. To use one, add api = \"https://HOST/api/v1/repos/OWNER/NAME\" under [updates.second] in the configuration and restart the broker."
+	case u.Repo != "" && !u.Sources().HasSecond() && eff.SecondAPI == "":
+		v.Note = "No second release source is configured: releases are compared with GitHub and this machine's own rebuild."
+	case u.Repo != "" && (u.Second.API != eff.SecondAPI || u.Repo != eff.Repo):
+		v.Note = "The sources fixed for this task differ from the ones the broker is using now; running the task applies them."
+	}
+	return v
 }
 
 func (s *Server) setupRoutes(m *http.ServeMux) {
@@ -142,17 +177,13 @@ func (s *Server) updatesReady() bool {
 func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) {
 	st, installed := s.runnerStatus()
 	v := setupView{Mode: "serve", Installed: installed, Version: st.Runner.Version, SecretKey: st.Runner.SecretsKey, DeployKey: st.Runner.DeployKey,
-		Current: st.Current, Refused: st.Refused, Passkeys: []setupPasskey{}, Updates: map[string]string{}}
+		Current: st.Current, Refused: st.Refused, Passkeys: []setupPasskey{}, Updates: s.setupSources(st.Runner.Sources)}
 	if s.maintenance {
 		v.Mode = "cutover"
 	} else if s.bucketMigrate {
 		v.Mode = "bucket-migrate"
 	} else if s.sealSetup {
 		v.Mode = "seal-setup"
-	}
-	// The release sources pinned on the machine: the only ones the runner accepts.
-	if src := st.Runner.Sources; src != nil {
-		v.Updates = map[string]string{"repo": src.Repo, "forgejo_api": src.ForgejoAPI, "github_api": src.GitHubAPI, "pinned": "true"}
 	}
 	q := s.store.Q()
 	keys, err := loadPasskeys(ctx, q)
@@ -203,10 +234,6 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 			t.Rerunnable = true
 			if s.updatesReady() {
 				t.State = "done"
-			}
-			if installed && st.Runner.Sources == nil {
-				// Where releases come from is decided at the machine, never by a request.
-				t.State, t.Blocked, t.Rerunnable = "blocked", "Pin the release sources on the machine first: sudo aqmasd maint-init --repo … --forgejo-api … --github-api …", false
 			}
 		case maint.TaskPins:
 			t.Rerunnable = true
@@ -346,7 +373,7 @@ func (s *Server) setupHostKey(w http.ResponseWriter, r *http.Request, _ string) 
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		p := maint.UpdatesParams{Repo: in.Repo, ForgejoAPI: "https://x/api/v1/repos/x", GitHubAPI: "https://x/x", KnownHosts: []string{line}}
+		p := maint.UpdatesParams{Repo: in.Repo, GitHubAPI: "https://x/x", KnownHosts: []string{line}}
 		if _, err := maint.Canonical(maint.TaskUpdates, p); err != nil {
 			continue
 		}
@@ -405,8 +432,8 @@ func (s *Server) setupParams(ctx context.Context, task string, raw json.RawMessa
 		}
 		// Say so now if the runner would refuse these sources (it decides; this is courtesy).
 		st, _ := s.runnerStatus()
-		if want := st.Runner.Sources; err == nil && (want == nil || p.Repo != want.Repo || p.ForgejoAPI != want.ForgejoAPI || p.GitHubAPI != want.GitHubAPI) {
-			return "", nil, errConflict("the release sources are fixed on this machine; to set or change them run `sudo aqmasd maint-init --repo … --forgejo-api … --github-api …` there")
+		if want, _ := maint.EffectiveSources(st.Runner.Sources, s.cfg.Updates); err == nil && (p.Repo != want.Repo || p.GitHubAPI != want.GitHubAPI || p.SecondAPI != want.SecondAPI) {
+			return "", nil, errConflict("the release sources are fixed on this machine; to change them edit the [updates] table of its configuration or run `sudo aqmasd maint-init --repo … [--second-api …]` there")
 		}
 		v = p
 	case maint.TaskPins:

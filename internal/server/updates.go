@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,10 +26,14 @@ type updateView struct {
 	Current   string           `json:"current"`
 	Commit    string           `json:"commit"`
 	Candidate release.Metadata `json:"candidate"`
-	Stat      string           `json:"stat"`
-	Diff      string           `json:"diff"`
-	Error     string           `json:"error"`
-	Status    string           `json:"status"`
+	// Sources names the published sources the candidate's hashes were compared across:
+	// "GitHub", and "second source (HOST)" when one is configured. The bastion's own rebuild
+	// is compared with them at install time.
+	Sources []string `json:"sources"`
+	Stat    string   `json:"stat"`
+	Diff    string   `json:"diff"`
+	Error   string   `json:"error"`
+	Status  string   `json:"status"`
 }
 type updateState struct {
 	sync.RWMutex
@@ -57,12 +60,24 @@ func (s *Server) pollUpdates(ctx context.Context) {
 	}
 }
 
+// gitEnv is the whole environment of the broker's git for one kind of remote: exactly one
+// transport is allowed. An SSH remote uses the read-only deploy key and pinned host keys.
+// An HTTPS remote (the public GitHub repository) is anonymous: no credential helper, no
+// prompt, and the system's certificate authorities decide whom git is talking to.
+func gitEnv(proto, key string) []string {
+	env := []string{"PATH=/usr/bin:/bin", "GIT_ALLOW_PROTOCOL=" + proto, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "HOME=/nonexistent", "LC_ALL=C", "GIT_TERMINAL_PROMPT=0"}
+	if proto == "ssh" {
+		env = append(env, "GIT_SSH_COMMAND=ssh -F /dev/null -oBatchMode=yes -oIdentitiesOnly=yes -oStrictHostKeyChecking=yes -oUserKnownHostsFile=/dev/null -oGlobalKnownHostsFile='/etc/ssh/ssh_known_hosts "+filepath.Join(filepath.Dir(key), "known_hosts")+"' -i "+key)
+	}
+	return env
+}
+
 // Git never checks out remote files in the broker. Closed output bounds matter even for
 // an authenticated remote: kill git rather than buffering an arbitrarily large patch.
-func gitOutput(ctx context.Context, dir, key string, limit int64, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "fetch.fsckObjects=true"}, args...)...)
+func gitOutput(ctx context.Context, dir string, env []string, limit int64, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "fetch.fsckObjects=true", "-c", "credential.helper=", "-c", "http.followRedirects=false"}, args...)...)
 	cmd.Dir = dir
-	cmd.Env = []string{"PATH=/usr/bin:/bin", "GIT_ALLOW_PROTOCOL=ssh", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "HOME=/nonexistent", "LC_ALL=C", "GIT_SSH_COMMAND=ssh -F /dev/null -oBatchMode=yes -oIdentitiesOnly=yes -oStrictHostKeyChecking=yes -oUserKnownHostsFile=/dev/null -oGlobalKnownHostsFile='/etc/ssh/ssh_known_hosts " + filepath.Join(filepath.Dir(key), "known_hosts") + "' -i " + key}
+	cmd.Env = env
 	pipe, e := cmd.StdoutPipe()
 	if e != nil {
 		return "", e
@@ -99,16 +114,23 @@ func quotePatch(text string) string {
 
 func (s *Server) discover(ctx context.Context, v *updateView) error {
 	cfg := s.cfg.Updates
-	u, e := url.Parse(cfg.Repo)
-	if e != nil || u.Scheme != "ssh" || u.Host == "" || !keyPath.MatchString(cfg.DeployKey) {
-		return errors.New("updates require an SSH repo URL and absolute deploy_key")
+	src := cfg.Sources()
+	v.Sources = src.Names()
+	proto := release.GitProtocol(cfg.Repo)
+	switch {
+	case proto == "":
+		return errors.New("updates require repo = https://HOST/OWNER/NAME.git or ssh://git@HOST/OWNER/NAME.git")
+	case proto == "ssh" && !keyPath.MatchString(cfg.DeployKey):
+		return errors.New("an SSH repo URL requires an absolute deploy_key")
 	}
 	dir := filepath.Join(s.cfg.DataDir, "update.git")
+	var e error
 	if e = os.MkdirAll(dir, 0700); e != nil {
 		return e
 	}
+	env := gitEnv(proto, cfg.DeployKey)
 	git := func(limit int64, args ...string) (string, error) {
-		return gitOutput(ctx, dir, cfg.DeployKey, limit, args...)
+		return gitOutput(ctx, dir, env, limit, args...)
 	}
 	if _, e = git(4096, "init", "--bare", "--quiet"); e != nil {
 		return e
@@ -170,14 +192,13 @@ func (s *Server) discover(ctx context.Context, v *updateView) error {
 		return fmt.Errorf("cannot display complete diff: %w", e)
 	}
 	v.Stat, v.Diff = quotePatch(v.Stat), quotePatch(v.Diff)
-	if v.Candidate.Forgejo, e = cfg.Forgejo.Hashes(ctx, ver, false); e != nil {
-		return fmt.Errorf("Forgejo: %w", e)
-	}
-	if v.Candidate.GitHub, e = cfg.GitHub.Hashes(ctx, ver, true); e != nil {
-		return fmt.Errorf("GitHub: %w", e)
+	// Every configured source must answer and agree: a second source that is configured but
+	// unreachable blocks the update instead of quietly leaving GitHub as the only one.
+	if e = src.Fill(ctx, &v.Candidate); e != nil {
+		return e
 	}
 	if !v.Candidate.Valid() {
-		return errors.New("release hashes disagree")
+		return errors.New("release hashes are not usable")
 	}
 	return nil
 }
@@ -188,6 +209,9 @@ func (s *Server) handleUpdates(w http.ResponseWriter, r *http.Request, _ string)
 	v.Current, v.Commit = release.Version, release.Commit
 	if s.cfg.Updates.Repo == "" {
 		v.Error = "Update discovery is disabled"
+	}
+	if v.Sources == nil {
+		v.Sources = s.cfg.Updates.Sources().Names()
 	}
 	if b, e := os.ReadFile(filepath.Join(s.cfg.Updates.Cache(), "status")); e == nil {
 		v.Status = string(b)
@@ -202,7 +226,7 @@ func (s *Server) updateAction(id string) (canon.Action, error) {
 	if s.cfg.Updates.Repo == "" || v.Error != "" || !m.Valid() || m.Commit != id {
 		return canon.Action{}, errConflict("update is not available or sources disagree")
 	}
-	return canon.Action{Object: "update", ID: id, Action: "approve", Update: canon.Update{FromVersion: release.Version, FromCommit: release.Commit, ToVersion: m.Version, ToCommit: id, DaemonHash: m.Forgejo[release.Daemon], LinuxARM: m.Forgejo["aqmas-linux-arm64"], LinuxAMD: m.Forgejo["aqmas-linux-amd64"], DarwinARM: m.Forgejo["aqmas-darwin-arm64"]}}, nil
+	return canon.Action{Object: "update", ID: id, Action: "approve", Update: canon.Update{FromVersion: release.Version, FromCommit: release.Commit, ToVersion: m.Version, ToCommit: id, DaemonHash: m.GitHub[release.Daemon], LinuxARM: m.GitHub["aqmas-linux-arm64"], LinuxAMD: m.GitHub["aqmas-linux-amd64"], DarwinARM: m.GitHub["aqmas-darwin-arm64"]}}, nil
 }
 func (s *Server) queueUpdate(w http.ResponseWriter, r *http.Request, sg canon.Signed, assertion json.RawMessage, pkID int64) {
 	a, e := s.updateAction(sg.ID)
@@ -233,7 +257,15 @@ func (s *Server) latestRelease(w http.ResponseWriter, r *http.Request, _ *store.
 		http.NotFound(w, r)
 		return
 	}
-	writeJSON(w, 200, m)
+	// A CLI of 0.8.1 or earlier reads the bastion's verified digests from "forgejo" and
+	// refuses a reply without it; newer CLIs read "github" (and "second" when present). The
+	// duplicate keeps old CLIs able to upgrade themselves and goes when none are left.
+	if b, e = m.LegacyJSON(); e != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(append(b, '\n'))
 }
 func (s *Server) releaseAsset(w http.ResponseWriter, r *http.Request, _ *store.Host) {
 	v, a := r.PathValue("version"), r.PathValue("asset")

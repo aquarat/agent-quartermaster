@@ -75,7 +75,7 @@ func pinSeal(raw []byte, manifest string) ([]byte, error) {
 }
 
 var tableHeader = regexp.MustCompile(`(?m)^[ \t]*\[`)
-var updatesHeader = regexp.MustCompile(`(?m)^[ \t]*\[updates(\.(forgejo|github))?\][ \t]*(#[^\n]*)?\n`)
+var updatesHeader = regexp.MustCompile(`(?m)^[ \t]*\[updates(\.(forgejo|second|github))?\][ \t]*(#[^\n]*)?\n`)
 
 // setUpdates replaces any [updates] tables with the given sources.
 func setUpdates(raw []byte, u config.Updates) ([]byte, error) {
@@ -98,20 +98,31 @@ func setUpdates(raw []byte, u config.Updates) ([]byte, error) {
 	q := strconv.Quote
 	// A relocated cache or spool (test servers) is the operator's own setting: keep it.
 	u.CacheDir, u.SpoolDir = old.Updates.CacheDir, old.Updates.SpoolDir
-	s += "\n[updates]\nrepo = " + q(u.Repo) + "\ndeploy_key = " + q(u.DeployKey) + "\n"
+	// The operator's own check interval survives too.
+	u.CheckMinutes = old.Updates.CheckMinutes
+	s += "\n[updates]\nrepo = " + q(u.Repo) + "\n"
+	if u.DeployKey != "" {
+		s += "deploy_key = " + q(u.DeployKey) + "\n"
+	}
+	if u.CheckMinutes != 0 {
+		s += "check_minutes = " + strconv.Itoa(u.CheckMinutes) + "\n"
+	}
 	if u.CacheDir != "" {
 		s += "cache_dir = " + q(u.CacheDir) + "\n"
 	}
 	if u.SpoolDir != "" {
 		s += "spool_dir = " + q(u.SpoolDir) + "\n"
 	}
-	s += "[updates.forgejo]\napi = " + q(u.Forgejo.API) + "\n"
-	if u.Forgejo.TokenFile != "" {
-		s += "token_file = " + q(u.Forgejo.TokenFile) + "\n"
-	}
 	s += "[updates.github]\napi = " + q(u.GitHub.API) + "\n"
 	if u.GitHub.TokenFile != "" {
 		s += "token_file = " + q(u.GitHub.TokenFile) + "\n"
+	}
+	// No second source, no table: nothing about one is written unless it is configured.
+	if u.Second.API != "" {
+		s += "[updates.second]\napi = " + q(u.Second.API) + "\n"
+		if u.Second.TokenFile != "" {
+			s += "token_file = " + q(u.Second.TokenFile) + "\n"
+		}
 	}
 	return checked(old, []byte(s), func(c *config.Config) { c.Updates = u })
 }

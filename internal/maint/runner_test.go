@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -50,7 +51,7 @@ func mode(t *testing.T, path string) os.FileMode {
 const (
 	secretTopic = "https://ntfy.example.com/SENTINELtopic0123456789"
 	secretToken = "tk_SENTINELpublishTOKEN0123456789"
-	secretForge = "fj_SENTINELforgejoTOKEN0123456789"
+	secretForge = "fj_SENTINELsecondTOKEN0123456789"
 	secretHub   = "ghp_SENTINELgithubTOKEN0123456789"
 	legacyTopic = "https://ntfy.example.com/SENTINELlegacyAPPROVALS"
 )
@@ -66,8 +67,12 @@ type lab struct {
 	health *httptest.Server
 	forge  *httptest.Server
 	sums   release.Sums
-	// forgeOpen lets the Forgejo side answer without a token.
+	// forgeOpen lets the second source answer without a token.
 	forgeOpen bool
+	// hubOpen lets GitHub answer without a token (a public repository).
+	hubOpen bool
+	// secondBad makes the second source publish another manifest; secondDown makes it fail.
+	secondBad, secondDown bool
 }
 
 func cose(a *vauth.Authenticator) []byte {
@@ -812,7 +817,8 @@ func TestHostileSpoolAndStaging(t *testing.T) {
 	}
 }
 
-// releases serves both release APIs (Forgejo and GitHub shapes) for the lab's versions.
+// releases serves both release APIs (the second source's Forgejo shape and GitHub's) for
+// the lab's versions.
 func (b *lab) releases(versions ...string) {
 	assets := map[string][]byte{}
 	b.sums = release.Sums{}
@@ -828,8 +834,13 @@ func (b *lab) releases(versions ...string) {
 	names := []string{"SHA256SUMS", "aqmas-darwin-arm64", "aqmas-linux-amd64", "aqmas-linux-arm64"}
 	b.forge = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		want := map[string]string{"/api/v1/repos/example/aqmas": secretForge, "/gh/repos/example/aqmas": secretHub}
+		second := strings.HasPrefix(r.URL.Path, "/api/v1/") || strings.HasPrefix(r.URL.Path, "/attachments/")
+		if second && b.secondDown {
+			http.Error(w, "down", 503)
+			return
+		}
 		for prefix, token := range want {
-			if b.forgeOpen && token == secretForge {
+			if b.forgeOpen && token == secretForge || b.hubOpen && token == secretHub {
 				continue
 			}
 			if strings.HasPrefix(r.URL.Path, prefix) && r.Header.Get("Authorization") != "Bearer "+token {
@@ -849,6 +860,12 @@ func (b *lab) releases(versions ...string) {
 		}
 		for i, n := range names {
 			if strings.HasSuffix(r.URL.Path, fmt.Sprintf("/releases/assets/%d", i+1)) || strings.HasSuffix(r.URL.Path, fmt.Sprintf("/attachments/00000000-0000-0000-0000-%012d", i+1)) {
+				if second && b.secondBad && n == "SHA256SUMS" {
+					other := maps.Clone(b.sums)
+					other["aqmas-linux-amd64"] = strings.Repeat("9", 64)
+					_, _ = io.WriteString(w, other.Text())
+					return
+				}
 				_, _ = w.Write(assets[n])
 				return
 			}
@@ -859,15 +876,15 @@ func (b *lab) releases(versions ...string) {
 }
 
 func (b *lab) updatesParams() UpdatesParams {
-	return UpdatesParams{Repo: "ssh://git@forge.example.com:2222/example/aqmas.git", ForgejoAPI: b.forge.URL + "/api/v1/repos/example/aqmas", GitHubAPI: b.forge.URL + "/gh/repos/example/aqmas",
-		KnownHosts: []string{"[forge.example.com]:2222 ssh-ed25519 " + strings.Repeat("A", 68)}, ForgejoToken: true, GitHubToken: true}
+	return UpdatesParams{Repo: "ssh://git@forge.example.com:2222/example/aqmas.git", SecondAPI: b.forge.URL + "/api/v1/repos/example/aqmas", GitHubAPI: b.forge.URL + "/gh/repos/example/aqmas",
+		KnownHosts: []string{"[forge.example.com]:2222 ssh-ed25519 " + strings.Repeat("A", 68)}, SecondToken: true, GitHubToken: true}
 }
 
 // pinSources is `maint-init --repo …`: the owner, at the machine, names the release sources.
 func (b *lab) pinSources() {
 	b.t.Helper()
 	p := b.updatesParams()
-	if err := Init(context.Background(), b.l, false, &Sources{Repo: p.Repo, ForgejoAPI: p.ForgejoAPI, GitHubAPI: p.GitHubAPI}, io.Discard); err != nil {
+	if err := Init(context.Background(), b.l, false, &Sources{Repo: p.Repo, SecondAPI: p.SecondAPI, GitHubAPI: p.GitHubAPI}, io.Discard); err != nil {
 		b.t.Fatal(err)
 	}
 }
@@ -877,18 +894,18 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 	b.releases("0.3.0", "0.3.1")
 	before := b.read("etc", "config.toml")
 	// Where releases come from is decided at the machine: without a pin a request is refused.
-	b.queue(b.sign(TaskUpdates, b.updatesParams(), map[string]string{"forgejo_token": secretForge, "github_token": secretHub}))
-	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "pin the release sources") || b.read("etc", "forgejo-read-token") != "" {
+	b.queue(b.sign(TaskUpdates, b.updatesParams(), map[string]string{"second_token": secretForge, "github_token": secretHub}))
+	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "fixed on this machine") || b.read("etc", "second-read-token") != "" {
 		t.Fatalf("a request chose the release sources: %+v", b.last(TaskUpdates))
 	}
 	b.pinSources()
-	tokens := map[string]string{"forgejo_token": secretForge, "github_token": secretHub}
+	tokens := map[string]string{"second_token": secretForge, "github_token": secretHub}
 
 	// The restart fails: the previous configuration comes back.
 	b.write(0600, "", "refuse-once-serve")
-	b.write(0440, "old-forgejo-token\n", "etc", "forgejo-read-token")
+	b.write(0440, "old-forgejo-token\n", "etc", "second-read-token")
 	b.queue(b.sign(TaskUpdates, b.updatesParams(), tokens))
-	if err := b.runner().Run(context.Background()); err == nil || b.read("etc", "config.toml") != before || b.read("etc", "forgejo-read-token") != "old-forgejo-token\n" || b.read("etc", "github-read-token") != "" {
+	if err := b.runner().Run(context.Background()); err == nil || b.read("etc", "config.toml") != before || b.read("etc", "second-read-token") != "old-forgejo-token\n" || b.read("etc", "github-read-token") != "" {
 		t.Fatalf("configuration or tokens not rolled back: %+v", b.last(TaskUpdates))
 	}
 
@@ -896,7 +913,7 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 	b.queue(b.sign(TaskUpdates, b.updatesParams(), tokens))
 	published := b.read("aqmasd")
 	b.write(0755, published+"# changed\n", "aqmasd")
-	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "not the published") || b.read("etc", "config.toml") != before || b.read("etc", "forgejo-read-token") != "old-forgejo-token\n" {
+	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "not the published") || b.read("etc", "config.toml") != before || b.read("etc", "second-read-token") != "old-forgejo-token\n" {
 		t.Fatalf("unpublished binary accepted: %+v", b.last(TaskUpdates))
 	}
 	b.write(0755, published, "aqmasd")
@@ -912,15 +929,15 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 	moved := b.updatesParams()
 	moved.GitHubAPI = strings.Replace(moved.GitHubAPI, "/gh/", "/elsewhere/", 1)
 	b.queue(b.sign(TaskUpdates, moved, tokens))
-	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "pinned on this machine") {
+	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "fixed on this machine") {
 		t.Fatalf("a request moved the release sources: %+v", b.last(TaskUpdates))
 	}
 	// A re-run that no longer carries a token removes the old one.
 	onlyHub := b.updatesParams()
-	onlyHub.ForgejoToken = false
+	onlyHub.SecondToken = false
 	b.forgeOpen = true
 	b.queue(b.sign(TaskUpdates, onlyHub, map[string]string{"github_token": secretHub}))
-	if err := b.runner().Run(context.Background()); err != nil || b.read("etc", "forgejo-read-token") != "" || strings.Contains(b.read("etc", "config.toml"), "forgejo-read-token") {
+	if err := b.runner().Run(context.Background()); err != nil || b.read("etc", "second-read-token") != "" || strings.Contains(b.read("etc", "config.toml"), "second-read-token") {
 		t.Fatalf("stale token kept: %v", err)
 	}
 	b.forgeOpen = false
@@ -935,7 +952,7 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 		t.Fatalf("%+v", s)
 	case !strings.Contains(cfg, `repo = "ssh://git@forge.example.com:2222/example/aqmas.git"`) || !strings.Contains(cfg, `cache_dir = "`+b.l.Cache+`"`) || !strings.Contains(cfg, "# owner's notes stay"):
 		t.Fatal("configuration:\n" + cfg)
-	case strings.TrimSpace(b.read("etc", "forgejo-read-token")) != secretForge || strings.TrimSpace(b.read("etc", "github-read-token")) != secretHub:
+	case strings.TrimSpace(b.read("etc", "second-read-token")) != secretForge || strings.TrimSpace(b.read("etc", "github-read-token")) != secretHub:
 		t.Fatal("tokens not stored")
 	case !strings.Contains(b.read("etc", "known_hosts"), "[forge.example.com]:2222 ssh-ed25519 "):
 		t.Fatal("host key not trusted")
@@ -948,7 +965,7 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 			t.Errorf("%s has mode %o, want %o", strings.TrimPrefix(path, b.dir), got, want)
 		}
 	}
-	b.noSecrets("etc/forgejo-read-token", "etc/github-read-token")
+	b.noSecrets("etc/second-read-token", "etc/github-read-token")
 
 	// Upgrade: an "update" approval bound to the installed identity and all four digests.
 	update := func(from string, sums release.Sums) Request {
@@ -1065,8 +1082,8 @@ func TestRefusals(t *testing.T) {
 	cases["unknown parameter"] = resign(setup(TaskCutover, `{"exec":"id"}`), time.Now())
 	cases["non-canonical parameters"] = resign(setup(TaskSeal, `{"purge_backups":true,"recipient":"`+sealParams().Recipient+`","lock_alert":false}`), time.Now())
 	cases["recipient injection"] = resign(setup(TaskSeal, `{"recipient":"age1\"\nrequired = false\n#","purge_backups":true,"lock_alert":false}`), time.Now())
-	cases["repo injection"] = resign(setup(TaskUpdates, `{"repo":"ssh://git@forge.example.com/a/b.git\"\n[cloudflare]","forgejo_api":"https://forge.example.com/api/v1/repos/a/b","github_api":"https://api.github.com/repos/a/b","known_hosts":["forge.example.com ssh-ed25519 `+strings.Repeat("A", 68)+`"],"forgejo_token":false,"github_token":false}`), time.Now())
-	cases["host key for another host"] = resign(setup(TaskUpdates, `{"repo":"ssh://git@forge.example.com/a/b.git","forgejo_api":"https://forge.example.com/api/v1/repos/a/b","github_api":"https://api.github.com/repos/a/b","known_hosts":["* ssh-ed25519 `+strings.Repeat("A", 68)+`"],"forgejo_token":false,"github_token":false}`), time.Now())
+	cases["repo injection"] = resign(setup(TaskUpdates, `{"repo":"ssh://git@forge.example.com/a/b.git\"\n[cloudflare]","github_api":"https://api.github.com/repos/a/b","second_api":"https://forge.example.com/api/v1/repos/a/b","known_hosts":["forge.example.com ssh-ed25519 `+strings.Repeat("A", 68)+`"],"second_token":false,"github_token":false}`), time.Now())
+	cases["host key for another host"] = resign(setup(TaskUpdates, `{"repo":"ssh://git@forge.example.com/a/b.git","github_api":"https://api.github.com/repos/a/b","second_api":"https://forge.example.com/api/v1/repos/a/b","known_hosts":["* ssh-ed25519 `+strings.Repeat("A", 68)+`"],"second_token":false,"github_token":false}`), time.Now())
 	cases["another object"] = resign(canon.Action{Object: canon.ObjectPasskey, Action: canon.ActionAdd, ID: "new"}, time.Now())
 	cases["stale"] = resign(setup(TaskCutover, "{}"), time.Now().Add(-3*time.Minute))
 	cases["from the future"] = resign(setup(TaskCutover, "{}"), time.Now().Add(time.Minute))
@@ -1125,7 +1142,7 @@ func TestRefusals(t *testing.T) {
 
 func TestParamsCanonical(t *testing.T) {
 	for task, v := range map[string]any{TaskCutover: CutoverParams{}, TaskSeal: sealParams(),
-		TaskUpdates: UpdatesParams{Repo: "ssh://git@forge.example.com/a/b.git", ForgejoAPI: "https://forge.example.com/api/v1/repos/a/b", GitHubAPI: "https://api.github.com/repos/a/b", KnownHosts: []string{"forge.example.com ssh-ed25519 " + strings.Repeat("A", 68)}},
+		TaskUpdates: UpdatesParams{Repo: "ssh://git@forge.example.com/a/b.git", SecondAPI: "https://forge.example.com/api/v1/repos/a/b", GitHubAPI: "https://api.github.com/repos/a/b", KnownHosts: []string{"forge.example.com ssh-ed25519 " + strings.Repeat("A", 68)}},
 		TaskPins:    PinsParams{Pins: []Pin{{ID: strings.Repeat("A", 43), KeyHash: strings.Repeat("a", 64)}}}} {
 		text, err := Canonical(task, v)
 		if err != nil {

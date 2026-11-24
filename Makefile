@@ -12,7 +12,7 @@ MODULE  := github.com/aquarat/agent-quartermaster
 LDFLAGS := -s -w -X main.version=$(VERSION) -X $(MODULE)/internal/client.Version=$(VERSION) -X $(MODULE)/internal/release.Version=$(VERSION) -X $(MODULE)/internal/release.Commit=$(COMMIT)
 GOBUILD := CGO_ENABLED=0 GOAMD64=v1 GOARM64=v8.0 GOTOOLCHAIN=local $(GO) build -mod=readonly -buildvcs=false -trimpath -ldflags "$(LDFLAGS)"
 
-.PHONY: all build aqmasd aqmas web webui test vet clean interop interop-cf
+.PHONY: all build aqmasd aqmas web webui test vet clean interop interop-cf check-private
 
 all: build
 
@@ -51,7 +51,15 @@ webui: web
 	@if [ -f web/dist/index.html ]; then cp -R web/dist/. internal/webui/dist/; echo "webui: embedding web/dist"; \
 	else echo "webui: web/dist not built, embedding the placeholder page"; fi
 
-vet:
+# The repository is public; the first installation's own hosts are not. Fails if a private
+# host name, address or name is in any tracked file (internal/release has the same check as
+# a test, which also sees untracked files). Written with one-character classes so that the
+# pattern does not match itself.
+PRIVATE_RE := example[.]invalid
+check-private:
+	@! git grep -nE '$(PRIVATE_RE)' || { echo 'site-specific names in the tree (see above)'; exit 1; }
+
+vet: check-private
 	$(GO) vet ./...
 	@test -z "$$(gofmt -l cmd internal deploy test)" || { gofmt -l cmd internal deploy test; echo "gofmt needed"; exit 1; }
 

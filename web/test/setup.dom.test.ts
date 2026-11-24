@@ -3,7 +3,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { ApiError, createApi, type Api } from "../src/api";
-import type { SetupTask, SetupView } from "../src/setup";
+import type { SetupTask, SetupView, UpdateSources } from "../src/setup";
+import { updateCard, type UpdateView } from "../src/admin";
 import { startMock } from "../mock/server";
 import { createHash } from "node:crypto";
 import { fakeAuth, jarFetch, prfAuth } from "./helpers";
@@ -40,6 +41,23 @@ const KEYS = [
   { id: "aa", credential: "cred-phone-xxxxxxxxxxxx", key_sha256: "a".repeat(64), name: "Phone", pinned: true, current: true },
   { id: "bb", credential: "cred-key-xxxxxxxxxxxxxx", key_sha256: "b".repeat(64), name: "Desk <b>key</b>", pinned: true, current: false },
 ];
+const TWO_SOURCES: UpdateSources = {
+  repo: "ssh://git@forge.example.com/owner/agent-quartermaster.git",
+  github_api: "https://api.github.com/repos/owner/agent-quartermaster",
+  second_api: "https://forge.example.com/api/v1/repos/owner/agent-quartermaster",
+  origin: "pinned",
+  compared: ["GitHub", "second source (forge.example.com)"],
+  active: [],
+};
+const GITHUB_ONLY: UpdateSources = {
+  repo: "https://github.com/owner/agent-quartermaster.git",
+  github_api: "https://api.github.com/repos/owner/agent-quartermaster",
+  second_api: "",
+  origin: "default",
+  compared: ["GitHub"],
+  active: ["GitHub"],
+  note: "No second release source is configured: releases are compared with GitHub and this machine's own rebuild.",
+};
 function baseView(over: Partial<SetupView> = {}): SetupView {
   return {
     mode: "serve",
@@ -55,7 +73,7 @@ function baseView(over: Partial<SetupView> = {}): SetupView {
       task("sync-passkeys", "done", { rerunnable: true }),
       task("upgrade", "blocked", { blocked_by: "Enable self-update first." }),
     ],
-    update_sources: {},
+    update_sources: TWO_SOURCES,
     ...over,
   };
 }
@@ -132,8 +150,58 @@ describe("the Setup queue against a scripted server", () => {
     const c = card("enable-updates");
     expect(c.querySelector("[data-deploy-key]")!.textContent).toBe(baseView().deploy_key!);
     expect(c.textContent).toContain("read-only deploy key");
-    expect([...c.querySelectorAll("input")].some((i) => (i as HTMLInputElement).placeholder === "ssh://git@forge.example.com/owner/agent-quartermaster.git")).toBe(true);
+    // The sources are shown, not asked for: they are fixed at the machine.
+    expect(c.querySelectorAll('input[type="text"]').length).toBe(0);
+    expect(c.querySelector("[data-sources]")!.getAttribute("data-sources")).toBe("2");
+    expect(c.textContent).toContain("Two published sources are compared: GitHub and second source (forge.example.com).");
+    expect(c.textContent).toContain("If the second source cannot be reached, the update waits.");
+    expect(c.textContent).toContain(TWO_SOURCES.second_api);
+    expect(c.textContent).toContain("maint-init --repo");
+    expect([...c.querySelectorAll("button")].some((b) => b.textContent === "Fetch host key")).toBe(true);
     expect(c.querySelectorAll('input[type="password"]').length).toBe(2);
+  });
+
+  test("GitHub only: one source is named, and there is no deploy key, host key or second token to deal with", async () => {
+    script = () => baseView({ update_sources: GITHUB_ONLY });
+    await until(() => card("enable-updates").querySelector("[data-sources]")?.getAttribute("data-sources") === "1");
+    const c = card("enable-updates");
+    expect(c.textContent).toContain("One published source is compared: GitHub.");
+    expect(c.textContent).toContain("No second source is configured.");
+    expect(c.textContent).toContain("this machine's own rebuild from source matches the hashes GitHub publishes");
+    expect(c.querySelector("[data-sources-note]")!.textContent).toBe(GITHUB_ONLY.note!);
+    expect(c.textContent).toContain("built-in defaults");
+    expect(c.querySelector("[data-deploy-key]")).toBeNull();
+    expect(c.textContent).not.toContain("deploy key");
+    expect([...c.querySelectorAll("button")].some((b) => b.textContent === "Fetch host key")).toBe(false);
+    expect(c.querySelectorAll('input[type="password"]').length).toBe(1);
+    expect(c.textContent).not.toContain("forge.example.com");
+    script = () => baseView();
+    await until(() => card("enable-updates").querySelector("[data-sources]")?.getAttribute("data-sources") === "2");
+  });
+
+  test("the upgrade card says how many published sources were compared and names them", () => {
+    const sums = Object.fromEntries(["aqmasd-linux-arm64", "aqmas-linux-arm64", "aqmas-linux-amd64", "aqmas-darwin-arm64"].map((a, i) => [a, String(i).repeat(64)]));
+    const view = (over: Partial<UpdateView["candidate"]>, sources: string[]): UpdateView => ({
+      current: "1.4.0", commit: "a".repeat(40), status: "", error: "", stat: "", diff: "", sources,
+      candidate: { version: "1.5.0", commit: "b".repeat(40), github: sums, ...over },
+    });
+    const approvable = (el: HTMLElement) => [...el.querySelectorAll("button")].some((b) => b.textContent === "Approve update…");
+    const one = updateCard(view({ sources: 1 }, ["GitHub"]), () => {});
+    expect(one.querySelector("[data-sources]")!.getAttribute("data-sources")).toBe("1");
+    expect(one.textContent).toContain("Compared 1 published source: GitHub.");
+    expect(one.textContent).toContain("rebuilds the release from source");
+    expect(one.textContent).not.toContain("Second:");
+    expect(approvable(one)).toBe(true);
+    const two = updateCard(view({ second: sums, sources: 2 }, ["GitHub", "second source (forge.example.com)"]), () => {});
+    expect(two.querySelector("[data-sources]")!.getAttribute("data-sources")).toBe("2");
+    expect(two.textContent).toContain("Compared 2 published sources: GitHub and second source (forge.example.com). They agree.");
+    expect(two.textContent).toContain("Second: " + sums["aqmasd-linux-arm64"]);
+    expect(approvable(two)).toBe(true);
+    // A second source that disagrees, or a GitHub manifest that is missing, cannot be approved.
+    const bad = updateCard(view({ second: { ...sums, "aqmas-linux-amd64": "f".repeat(64) }, sources: 2 }, ["GitHub", "second source (forge.example.com)"]), () => {});
+    expect(bad.textContent).toContain("Release hashes disagree or are unavailable");
+    expect(approvable(bad)).toBe(false);
+    expect(approvable(updateCard(view({ github: null, second: sums }, ["GitHub"]), () => {}))).toBe(false);
   });
 
   test("no notices when the runner is installed and this passkey is pinned", () => {
@@ -262,12 +330,15 @@ describe("Setup through the App and the mock", () => {
   let identity = "";
   const token = "tk_LOCKALERT_publish_only_4242";
 
+  /** The plain-language line of the last review run() confirmed. */
+  let headline = "";
   /** Run… → check → Confirm with passkey; the prompt must start inside the second tap. */
   async function run(id: string) {
     card(id).querySelector<HTMLButtonElement>(".setup-go")!.click();
     await until(() => !!card(id).querySelector("button.confirm") || !!card(id).querySelector(".setup-run .error")?.textContent);
     expect(card(id).querySelector(".setup-run .error")?.textContent ?? "").toBe("");
     const signed = card(id).querySelector(".signed pre")!.textContent!;
+    headline = card(id).querySelector(".headline")?.textContent ?? "";
     const gets = auth.gets.length;
     const fetches = f.log.length;
     card(id).querySelector<HTMLButtonElement>("button.confirm")!.click();
@@ -511,46 +582,75 @@ describe("Setup through the App and the mock", () => {
     m.store.setup.format1 = false;
   }, 30000);
 
-  test("enable self-update: API addresses follow the repository, host keys are fetched to compare, tokens go sealed", async () => {
+  test("enable self-update, GitHub only: nothing to type, no host key, no token, one source signed", async () => {
+    await until(() => card("enable-updates").querySelector("[data-sources]")?.getAttribute("data-sources") === "1");
     const c = card("enable-updates");
-    const inputs = [...c.querySelectorAll<HTMLInputElement>("input")];
-    const [repo, forgejo, github, forgejoToken, githubToken] = inputs;
+    expect(c.textContent).toContain("One published source is compared: GitHub.");
+    expect(c.querySelector("[data-deploy-key]")).toBeNull();
+    expect(button(c, "Fetch host key")).toBeUndefined();
+    expect(c.querySelectorAll('input[type="password"]').length).toBe(1);
+    const signed = await run("enable-updates");
+    expect(headline).toBe("Enable self-update from 1 source: GitHub.");
+    const params = JSON.parse(signed["params"] as string);
+    expect(Object.keys(params)).toEqual(["repo", "github_api", "second_api", "known_hosts", "github_token", "second_token"]);
+    expect(params).toEqual({ repo: "https://github.com/aquarat/agent-quartermaster.git", github_api: "https://api.github.com/repos/aquarat/agent-quartermaster", second_api: "", known_hosts: [], github_token: false, second_token: false });
+    expect(signed["secrets_sha256"]).toBe("");
+    await until(() => m.store.setup.updatesReady, 8000);
+    await until(() => state("enable-updates") === "done", 8000);
+    expect(m.store.setup.received.at(-1)!.secrets).toEqual({});
+    await until(() => !!card("enable-updates").querySelector("[data-sources-note]"));
+    expect(card("enable-updates").querySelector("[data-sources-note]")!.textContent).toContain("No second release source is configured");
+    // The upgrade card counts the same single source.
+    await until(() => card("upgrade").querySelector("[data-sources]")?.getAttribute("data-sources") === "1", 8000);
+    expect(card("upgrade").textContent).toContain("Compared 1 published source: GitHub.");
+  }, 30000);
+
+  test("enable self-update with a second source: host keys are fetched to compare, tokens go sealed, both sources signed", async () => {
+    m.store.setup.useSecondSource(true);
+    await until(() => card("enable-updates").querySelector("[data-sources]")?.getAttribute("data-sources") === "2", 8000);
+    const c = card("enable-updates");
+    expect(c.textContent).toContain("Two published sources are compared: GitHub and second source (forge.example.com).");
+    expect(c.querySelector("[data-deploy-key]")!.textContent).toContain("ssh-ed25519 ");
     c.querySelector<HTMLButtonElement>(".setup-go")!.click();
-    expect(c.querySelector(".setup-run .error")!.textContent).toContain("repository address");
-    repo!.value = "ssh://git@forge.example.com/owner/agent-quartermaster.git";
-    repo!.dispatchEvent(new win.Event("input") as unknown as Event);
-    expect(forgejo!.value).toBe("https://forge.example.com/api/v1/repos/owner/agent-quartermaster");
-    expect(github!.value).toBe("https://api.github.com/repos/owner/agent-quartermaster");
-    c.querySelector<HTMLButtonElement>(".setup-go")!.click();
+    await until(() => !!c.querySelector(".setup-run .error")?.textContent);
     expect(c.querySelector(".setup-run .error")!.textContent).toContain("host key first");
     button(c, "Fetch host key").click();
     await until(() => c.querySelectorAll(".setup-fingerprints li").length === 2);
     expect(c.querySelector(".setup-fingerprints")!.textContent).toMatch(/ssh-ed25519 SHA256:[A-Za-z0-9+/]{43}/);
+    const [githubToken, secondToken] = [...c.querySelectorAll<HTMLInputElement>('input[type="password"]')];
     githubToken!.value = "ghp_READONLYTOKEN_0123456789";
-    expect(forgejoToken!.value).toBe("");
+    expect(secondToken!.value).toBe("");
 
     const start = f.log.length;
     const signed = await run("enable-updates");
+    expect(headline).toBe("Enable self-update from 2 sources: GitHub and second source (forge.example.com).");
     const params = JSON.parse(signed["params"] as string);
-    expect(Object.keys(params)).toEqual(["repo", "forgejo_api", "github_api", "known_hosts", "forgejo_token", "github_token"]);
+    expect(Object.keys(params)).toEqual(["repo", "github_api", "second_api", "known_hosts", "github_token", "second_token"]);
     expect(params.known_hosts.length).toBe(2);
     expect([...params.known_hosts].sort()).toEqual(params.known_hosts);
-    expect(params).toMatchObject({ forgejo_token: false, github_token: true });
-    await until(() => m.store.setup.updatesReady, 8000);
+    expect(params).toMatchObject({ repo: "ssh://git@forge.example.com/owner/agent-quartermaster.git", second_api: "https://forge.example.com/api/v1/repos/owner/agent-quartermaster", github_token: true, second_token: false });
+    await until(() => m.store.setup.received.at(-1)?.secrets?.["github_token"] === "ghp_READONLYTOKEN_0123456789", 8000);
     await until(() => state("enable-updates") === "done", 8000);
     expect(JSON.stringify(f.log.slice(start).map((x) => x.body)).includes("READONLYTOKEN")).toBe(false);
     expect(m.store.setup.received.at(-1)!.secrets).toEqual({ github_token: "ghp_READONLYTOKEN_0123456789" });
-    // The form is back for another run, prefilled from the configuration, with empty token fields.
-    await until(() => card("enable-updates").querySelector<HTMLInputElement>("input")?.value === params.repo);
+    // The form is back for another run with empty token fields.
+    await until(() => card("enable-updates").querySelectorAll('input[type="password"]').length === 2);
     expect([...card("enable-updates").querySelectorAll<HTMLInputElement>('input[type="password"]')].map((i) => i.value)).toEqual(["", ""]);
   }, 30000);
+
+  test("a request for other sources than the machine's is refused by the broker", async () => {
+    const e = await api.setupPost!("/enable-updates/challenge", { params: { repo: "https://github.com/owner/other.git", github_api: "https://api.github.com/repos/owner/other", second_api: "", known_hosts: [], github_token: false, second_token: false } }).catch((x) => x);
+    expect(e).toBeInstanceOf(ApiError);
+    expect((e as ApiError).status).toBe(409);
+    expect((e as ApiError).message).toContain("fixed on this machine");
+  });
 
   test("upgrade: the release review lives in the queue and is approved through the update flow", async () => {
     await until(() => state("upgrade") === "available");
     const c = card("upgrade");
     await until(() => !!button(c, "Approve update…"));
     expect(c.textContent).toContain("Available: 1.5.0");
-    expect(c.textContent).toContain("Release hashes agree");
+    expect(c.textContent).toContain("Compared 2 published sources: GitHub and second source (forge.example.com). They agree.");
     button(c, "Approve update…").click();
     await until(() => !!dlg().querySelector("button.confirm"));
     expect(dlg().querySelector(".headline")!.textContent).toBe("Install aqmasd 1.5.0 on the bastion, replacing 1.4.0.");

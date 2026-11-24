@@ -101,17 +101,26 @@ func (e *Env) upgrade(ctx context.Context, c *APIClient, source release.Source, 
 		e.logf("no newer verified release (running %s)", current)
 		return nil
 	}
+	// The bastion has already compared the published sources it is configured with (GitHub,
+	// and a second source where one exists) with its own rebuild. This host asks GitHub
+	// itself, with its own HTTPS client, so that the bastion alone is never believed.
+	compared := "GitHub"
+	if m.Second != nil {
+		compared = "GitHub and a second source"
+	}
 	gh, err := source.Hashes(ctx, m.Version, true)
 	switch {
 	case single && errors.Is(err, release.ErrOffline):
 		e.logf("WARNING: SINGLE SOURCE — GitHub unreachable; trusting only the bastion")
 	case err != nil:
 		return fmt.Errorf("GitHub verification: %w", err)
-	case !m.Forgejo.Agrees(gh):
-		return errors.New("Forgejo and GitHub SHA256SUMS disagree")
+	case !m.GitHub.Agrees(gh):
+		return errors.New("the bastion's verified release and GitHub's SHA256SUMS disagree")
+	default:
+		e.logf("bastion verified %s against %s and its own rebuild; GitHub agrees", m.Version, compared)
 	}
 	asset := "aqmas-" + runtime.GOOS + "-" + runtime.GOARCH
-	want := m.Forgejo[asset]
+	want := m.GitHub[asset]
 	if want == "" {
 		return errors.New("unsupported platform")
 	}

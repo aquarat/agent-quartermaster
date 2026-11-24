@@ -95,9 +95,9 @@ const SPECS = [
     id: "enable-updates",
     title: "Enable self-update",
     summary: "Prepares this machine to rebuild and install new releases itself, each one approved by you on this page.",
-    steps: ["Install build tools, the pinned Go and Bun toolchains and a locked build user", "Create the read-only deploy key and trust the forge's host key", "Store the release-reading tokens", "Check the installed broker against both published releases and cache the matching CLIs", "Add the update sources to the configuration and restart the broker"],
+    steps: ["Install build tools, the pinned Go and Bun toolchains and a locked build user", "For an SSH repository only: create the read-only deploy key and trust the forge's host key", "Store the release-reading tokens, if any", "Check the installed broker against the published release at GitHub (and at the second source when one is configured) and cache the matching CLIs", "Add the update sources to the configuration and restart the broker"],
     reversible: "The previous configuration is restored if the release check or the restart fails. Installed tools stay.",
-    secrets: ["forgejo_token", "github_token"],
+    secrets: ["github_token", "second_token"],
   },
   {
     id: "sync-passkeys",
@@ -109,8 +109,8 @@ const SPECS = [
   {
     id: "upgrade",
     title: "Upgrade aqmas",
-    summary: "Rebuilds the approved release from source in a sandbox, checks all four binaries against both published releases, installs the broker and restarts it.",
-    steps: ["Verify the approval and both releases", "Fetch, build and test in a sandbox without network", "Install, restart and check health"],
+    summary: "Rebuilds the approved release from source in a sandbox, checks all four binaries against the published release (GitHub, and the second source when one is configured), installs the broker and restarts it.",
+    steps: ["Verify the approval and the published release at every configured source", "Fetch, build and test in a sandbox without network", "Install, restart and check health"],
     reversible: "The previous binary is restored automatically if the new one is unhealthy. Database migrations are not reversed.",
   },
 ] as const;
@@ -206,7 +206,23 @@ export class MockSetup {
   current: MockRun | null = null;
   refused: { at: string; reason: string } | null = null;
   last: Record<string, MockRun> = {};
-  updateSources: Record<string, string> = {};
+  /** The release sources fixed "at the machine". Out of the box: GitHub alone, over HTTPS.
+   * useSecondSource() switches to an SSH forge remote plus a second release source. */
+  updateSources: { repo: string; github_api: string; second_api: string; origin: "pinned" | "config" | "default" } = {
+    repo: "https://github.com/aquarat/agent-quartermaster.git",
+    github_api: "https://api.github.com/repos/aquarat/agent-quartermaster",
+    second_api: "",
+    origin: "default",
+  };
+  useSecondSource(on: boolean): void {
+    this.updateSources = on
+      ? { repo: "ssh://git@forge.example.com/owner/agent-quartermaster.git", github_api: "https://api.github.com/repos/owner/agent-quartermaster", second_api: "https://forge.example.com/api/v1/repos/owner/agent-quartermaster", origin: "pinned" }
+      : { repo: "https://github.com/aquarat/agent-quartermaster.git", github_api: "https://api.github.com/repos/aquarat/agent-quartermaster", second_api: "", origin: "default" };
+  }
+  private sourceNames(): string[] {
+    const s = this.updateSources;
+    return s.second_api ? ["GitHub", `second source (${new URL(s.second_api).host})`] : ["GitHub"];
+  }
   secretsKey = newKey();
   drillKey = newKey();
   deployKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockDeployKeyMockDeployKeyMockDeployKey0 aqmas-update@bastion";
@@ -402,8 +418,8 @@ export class MockSetup {
         for (let i = 1; i < steps.length; i++) this.later(i, () => this.step(at(i), i === steps.length - 1));
         this.later(steps.length, () => {
           this.updatesReady = true;
-          this.updateSources = { repo: String(params["repo"]), forgejo_api: String(params["forgejo_api"]), github_api: String(params["github_api"]) };
-          this.finish("done", "Self-update is enabled. New releases will be offered here.", { release_cache: "/var/lib/aqmas-releases", known_hosts: String((params["known_hosts"] as string[]).length) + " host key(s) trusted" });
+          if (this.updateSources.origin === "default") this.updateSources.origin = "config";
+          this.finish("done", `Self-update is ready, comparing ${this.sourceNames().length} published source${this.sourceNames().length === 1 ? "" : "s"} (${this.sourceNames().join(" and ")}) and this machine's own rebuild.`, { release: "1.4.0", sources: this.sourceNames().join(" and ") });
         });
         break;
       case "sync-passkeys": {
@@ -514,7 +530,10 @@ export class MockSetup {
       if (last) t.last = last;
       return t;
     });
-    const v: Record<string, unknown> = { mode: this.mode, runner_installed: this.installed, passkeys, tasks, update_sources: this.updateSources };
+    const names = this.sourceNames();
+    const sources: Record<string, unknown> = { ...this.updateSources, compared: names, active: this.updatesReady ? names : [] };
+    if (this.updatesReady && !this.updateSources.second_api) sources.note = "No second release source is configured: releases are compared with GitHub and this machine's own rebuild.";
+    const v: Record<string, unknown> = { mode: this.mode, runner_installed: this.installed, passkeys, tasks, update_sources: sources };
     if (this.installed) Object.assign(v, { runner_version: this.version, secrets_key: this.secretsKey.pub, deploy_key: this.deployKey });
     if (this.current) v.current = this.current;
     if (this.refused) v.refused = this.refused;
@@ -524,13 +543,14 @@ export class MockSetup {
   updatesView() {
     const commit = (c: string) => c.repeat(40);
     const sums = Object.fromEntries(["aqmasd-linux-arm64", "aqmas-linux-arm64", "aqmas-linux-amd64", "aqmas-darwin-arm64"].map((a) => [a, sha256hex("mock release " + a)]));
-    const base = { current: this.version, commit: this.version === "1.4.0" ? commit("a") : commit("b"), status: "", stat: "", diff: "" };
+    const names = this.sourceNames();
+    const base = { current: this.version, commit: this.version === "1.4.0" ? commit("a") : commit("b"), status: "", stat: "", diff: "", sources: names };
     if (!this.updatesReady) return { ...base, error: "Update discovery is disabled", candidate: {} };
     if (!this.candidate) return { ...base, error: "", candidate: {} };
     return {
       ...base,
       error: "",
-      candidate: { version: "1.5.0", commit: commit("b"), forgejo: sums, github: sums },
+      candidate: { version: "1.5.0", commit: commit("b"), github: sums, ...(names.length === 2 ? { second: sums } : {}), sources: names.length },
       stat: " internal/server/setup.go | 12 ++++++------\n 1 file changed, 6 insertions(+), 6 deletions(-)",
       diff: "diff --git a/internal/server/setup.go b/internal/server/setup.go\n--- a/internal/server/setup.go\n+++ b/internal/server/setup.go\n@@ -1,3 +1,3 @@\n-old line\n+new line\n",
     };
@@ -574,19 +594,29 @@ export class MockSetup {
         return { text: `{"purge_backups":${v.purge_backups}}`, value: v, secrets: [] };
       }
       case "enable-updates": {
-        only(o, ["repo", "forgejo_api", "github_api", "known_hosts", "forgejo_token", "github_token"]);
+        only(o, ["repo", "github_api", "second_api", "known_hosts", "github_token", "second_token"]);
         const hosts = (Array.isArray(o.known_hosts) ? [...o.known_hosts] : o.known_hosts === undefined ? [] : fail("invalid task parameters")).map(s).sort();
-        const v = { repo: s(o.repo), forgejo_api: s(o.forgejo_api), github_api: s(o.github_api), known_hosts: hosts, forgejo_token: b(o.forgejo_token), github_token: b(o.github_token) };
+        const v = { repo: s(o.repo), github_api: s(o.github_api), second_api: o.second_api === undefined ? "" : s(o.second_api), known_hosts: hosts, github_token: b(o.github_token), second_token: b(o.second_token) };
         const host = knownHost(v.repo);
-        if (!host) fail("repo must look like ssh://git@forge.example.com/owner/name.git");
-        if (!RE.api.test(v.forgejo_api) || !RE.api.test(v.github_api)) fail("release API must be a plain https URL");
-        if (!v.forgejo_api.includes("/api/v1/repos/")) fail("Forgejo API must contain /api/v1/repos/");
-        if (hosts.length < 1 || hosts.length > 4 || new Set(hosts).size !== hosts.length) fail("one to four sorted, distinct known_hosts lines required");
-        for (const line of hosts) if (!RE.hostKey.test(line) || !line.startsWith(host + " ")) fail(`known_hosts lines must be “${host} <key type> <key>”`);
+        const https = /^https:\/\/[a-z0-9][a-z0-9.-]{0,252}(:[0-9]{1,5})?\/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}\.git$/.test(v.repo) && !v.repo.includes("..");
+        if (!host && !https) fail("repo must look like https://github.com/owner/name.git or ssh://git@forge.example.com/owner/name.git");
+        if (v.second_api !== "" && !v.second_api.includes("/api/v1/repos/")) fail("the second source's API must contain /api/v1/repos/");
+        if (v.second_api === "" && v.second_token) fail("a second-source token needs a second source");
+        if (!RE.api.test(v.github_api) || (v.second_api !== "" && !RE.api.test(v.second_api))) fail("release API must be a plain https URL");
+        if (https) {
+          if (hosts.length) fail("known_hosts lines are only for an SSH repository");
+        } else {
+          if (hosts.length < 1 || hosts.length > 4 || new Set(hosts).size !== hosts.length) fail("one to four sorted, distinct known_hosts lines required");
+          for (const line of hosts) if (!RE.hostKey.test(line) || !line.startsWith(host + " ")) fail(`known_hosts lines must be “${host} <key type> <key>”`);
+        }
+        // Where releases come from is fixed at the machine: a request cannot choose.
+        const want = this.updateSources;
+        if (v.repo !== want.repo || v.github_api !== want.github_api || v.second_api !== want.second_api)
+          this.host.fail(409, "conflict", "the release sources are fixed on this machine; to change them edit the [updates] table of its configuration or run `sudo aqmasd maint-init --repo … [--second-api …]` there");
         return {
-          text: `{"repo":${q(v.repo)},"forgejo_api":${q(v.forgejo_api)},"github_api":${q(v.github_api)},"known_hosts":[${hosts.map((h) => q(h)).join(",")}],"forgejo_token":${v.forgejo_token},"github_token":${v.github_token}}`,
+          text: `{"repo":${q(v.repo)},"github_api":${q(v.github_api)},"second_api":${q(v.second_api)},"known_hosts":[${hosts.map((h) => q(h)).join(",")}],"github_token":${v.github_token},"second_token":${v.second_token}}`,
           value: v,
-          secrets: [...(v.forgejo_token ? ["forgejo_token"] : []), ...(v.github_token ? ["github_token"] : [])],
+          secrets: [...(v.github_token ? ["github_token"] : []), ...(v.second_token ? ["second_token"] : [])],
         };
       }
       case "sync-passkeys": {
@@ -717,10 +747,10 @@ export class MockSetup {
     // An upgrade to approve (the page's existing update flow).
     if ((m = p.match(/^\/api\/ui\/updates\/([0-9a-f]{40})\/(challenge|decide)$/)) && post) {
       const u = this.updatesView();
-      const cand = u.candidate as { version?: string; commit?: string; forgejo?: Record<string, string> };
+      const cand = u.candidate as { version?: string; commit?: string; github?: Record<string, string> };
       if (!cand.commit || cand.commit !== m[1] || this.current || this.mode !== "serve") fail(409, "conflict", "no such update to approve now");
       if (m[2] === "challenge") {
-        const f = cand.forgejo!;
+        const f = cand.github!;
         const canonical = {
           v: 1, action: "approve", object: "update", id: cand.commit, nonce: b64url(randomBytes(32)), issued_at: nowISO(),
           from_version: u.current, from_commit: u.commit, to_version: cand.version, to_commit: cand.commit,
