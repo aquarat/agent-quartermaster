@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/aquarat/agent-quartermaster/internal/maint"
+	"github.com/aquarat/agent-quartermaster/internal/release"
 	"github.com/aquarat/agent-quartermaster/internal/server/canon"
 )
 
@@ -217,5 +218,47 @@ func TestSetupNeedsPinnedPasskey(t *testing.T) {
 	mustStatus(t, "unpinned", e.webDo("POST", "/api/ui/setup/cutover/run", map[string]any{"challenge_id": cr.ChallengeID, "assertion": as}, nil), 409)
 	if _, err := os.Stat(maint.RequestPath(e.cfg.Updates.Spool())); err == nil {
 		t.Fatal("an unpinned approval reached the spool")
+	}
+}
+
+// The upgrade task only reads "idle" (shown as "Up to date") after a check that succeeded and
+// found nothing newer. A failed check, or none yet, says so instead.
+func TestSetupUpgradeCheckFailed(t *testing.T) {
+	e := newEnv(t)
+	e.cfg.Updates.Repo = "https://forge.example.com/example/aqmas.git"
+	e.cfg.Updates.SpoolDir, e.cfg.Updates.CacheDir = t.TempDir(), t.TempDir()
+	e.setupOwner()
+	e.installRunner()
+	sums := release.Sums{}
+	for _, a := range release.Assets {
+		sums[a] = strings.Repeat("a", 64)
+	}
+	b, err := json.Marshal(release.Metadata{Version: "1.0.0", Commit: strings.Repeat("1", 40), GitHub: sums})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.cfg.Updates.Cache(), "latest.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !e.s.updatesReady() {
+		t.Fatal("fixture: self-update should read as enabled")
+	}
+	state := func(v updateView) string {
+		e.s.updates.Lock()
+		e.s.updates.view = v
+		e.s.updates.Unlock()
+		var out setupOut
+		mustStatus(t, "view", e.webDo("GET", "/api/ui/setup", nil, &out), 200)
+		return out.state("upgrade")
+	}
+	if got := state(updateView{}); !strings.HasPrefix(got, "blocked:The first check") {
+		t.Fatalf("before the first check: %q", got)
+	}
+	got := state(updateView{checked: true, Error: "git fetch failed"})
+	if !strings.HasPrefix(got, "blocked:The check for a new release failed: git fetch failed") {
+		t.Fatalf("after a failed check: %q", got)
+	}
+	if got := state(updateView{checked: true}); got != "idle:" {
+		t.Fatalf("after a clean check with nothing newer: %q", got)
 	}
 }

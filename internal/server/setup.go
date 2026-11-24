@@ -212,6 +212,7 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 	migration := s.seal != nil && s.seal.mode == modeMigration
 	s.updates.RLock()
 	candidate := s.updates.view.Error == "" && s.updates.view.Candidate.Valid()
+	checked, checkErr := s.updates.view.checked, s.updates.view.Error
 	s.updates.RUnlock()
 	for _, spec := range maint.Specs {
 		t := setupTask{Spec: spec, State: "available", Last: st.Tasks[spec.ID]}
@@ -251,6 +252,11 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 				t.State, t.Blocked = "blocked", "Enable self-update first."
 			} else if v.Updates.Problem != "" {
 				t.State, t.Blocked = "blocked", v.Updates.Problem
+			} else if checkErr != "" {
+				// A failed check knows nothing about newer releases: never "up to date".
+				t.State, t.Blocked = "blocked", "The check for a new release failed: "+checkErr+". The broker checks again on its own."
+			} else if !checked {
+				t.State, t.Blocked = "blocked", "The first check for a new release has not finished yet."
 			} else if !candidate {
 				t.State = "idle"
 			}

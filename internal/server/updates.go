@@ -34,6 +34,9 @@ type updateView struct {
 	Diff    string   `json:"diff"`
 	Error   string   `json:"error"`
 	Status  string   `json:"status"`
+	// checked is set once a discovery pass has finished (with or without an error): until
+	// then nothing is known about newer releases, which is not the same as "up to date".
+	checked bool
 }
 type updateState struct {
 	sync.RWMutex
@@ -49,6 +52,7 @@ func (s *Server) pollUpdates(ctx context.Context) {
 		if err != nil {
 			v.Error = err.Error()
 		}
+		v.checked = true
 		s.updates.Lock()
 		s.updates.view = v
 		s.updates.Unlock()

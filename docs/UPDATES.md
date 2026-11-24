@@ -167,8 +167,11 @@ installation has on disk keeps its meaning:
 | `/var/lib/aqmas-releases/latest.json`, the rollback journal | `{"forgejo":…,"github":…}` | a record of two agreeing sources; the installer reads the digests from `"github"`, present in both forms |
 | the spool, the updater's environment | no source address | unchanged |
 
-Nothing on disk refers to the removed compiled address. The upgrade itself is installed by
-the 0.8.1 runner, with its two-source check.
+Nothing on disk refers to the removed compiled address. Where the installed runner can
+follow the published history to the new release, it installs the upgrade itself, with its
+two-source check. An installation whose published history was rewritten in between cannot be
+upgraded that way (the runner refuses a release its running commit is not an ancestor of):
+it is reinstalled from a release as described in [SETUP.md](SETUP.md).
 
 **Before upgrading, check `[updates.forgejo]` in `/etc/aqmas/config.toml`.** "Enable
 self-update" of 0.8.1 wrote the second source's `api` line explicitly; then nothing needs to

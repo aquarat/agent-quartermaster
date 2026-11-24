@@ -278,7 +278,9 @@ grep -q "^repo = \"$HTTP_REPO\"" "$L/etc/config.toml" && grep -q '^cache_dir' "$
 grep -q '"sources":1' "$L/releases/latest.json" && ! grep -q '"second"' "$L/releases/latest.json" && grep -q "\"commit\":\"$COMMIT\"" "$L/releases/latest.json" || fail "GitHub-only release identity: $(cat "$L/releases/latest.json")"
 [[ $(cat "$L/releases/$VERSION/aqmas-linux-amd64") == "cli aqmas-linux-amd64" ]] || fail "release cache not seeded"
 owner login >/dev/null
-[[ $(owner setup-state enable-updates) == done && $(owner setup-state upgrade) == idle && $(sources) == "pinned 1 1 github-only" ]] || fail "queue after GitHub-only enable: $(owner setup-state upgrade) / $(sources)"
+# Nothing serves the repository, so the check for a new release cannot succeed: the upgrade
+# task says so (first check pending, or failed) and never reads "idle" (shown as "Up to date").
+[[ $(owner setup-state enable-updates) == done && $(owner setup-state upgrade) == blocked:*"check for a new release"* && $(sources) == "pinned 1 1 github-only" ]] || fail "queue after GitHub-only enable: $(owner setup-state upgrade) / $(sources)"
 owner setup | grep -q 'No second release source is configured' || fail "the Setup page does not say that only GitHub is compared"
 owner updates | grep -q '"sources":\["GitHub"\]' || fail "the update view does not name its one source: $(owner updates)"
 grant "enabling self-update with GitHub only"
@@ -327,7 +329,7 @@ grep -qF "$HOSTKEY" "$L/etc/known_hosts" || fail "forge host key not trusted"
 [[ $(cat "$L/releases/$VERSION/aqmas-linux-amd64") == "cli aqmas-linux-amd64" ]] && grep -q "\"commit\":\"$COMMIT\"" "$L/releases/latest.json" && grep -q '"sources":2' "$L/releases/latest.json" || fail "release cache not seeded"
 owner login >/dev/null
 [[ $(owner seal-status) == buckets && -z $(owner open-buckets) ]] || fail "restart after enable-updates left something open"
-[[ $(owner setup-state enable-updates) == done && $(owner setup-state upgrade) == idle && $(sources) == "pinned 2 2 second" ]] || fail "queue after enable-updates: $(owner setup-state upgrade) / $(sources)"
+[[ $(owner setup-state enable-updates) == done && $(owner setup-state upgrade) == @(idle|blocked:*"check for a new release"*) && $(sources) == "pinned 2 2 second" ]] || fail "queue after enable-updates: $(owner setup-state upgrade) / $(sources)"
 owner updates | grep -q "\"sources\":\[\"GitHub\",\"second source (127.0.0.1:$PF)\"\]" || fail "the update view does not name its two sources: $(owner updates)"
 # From here on the second source cannot be dropped by leaving it out: not by a new pin ...
 if maint maint-init --repo "$HTTP_REPO" --github-api "$GH_API"; then fail "a pin without --second-api dropped the second source"; fi

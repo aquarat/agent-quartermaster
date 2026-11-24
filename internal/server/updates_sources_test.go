@@ -113,6 +113,7 @@ func (e *env) discoverNow() updateView {
 	if err := e.s.discover(e.t.Context(), &v); err != nil {
 		v.Error = err.Error()
 	}
+	v.checked = true
 	e.s.updates.Lock()
 	e.s.updates.view = v
 	e.s.updates.Unlock()
@@ -310,6 +311,9 @@ func TestSetupSources(t *testing.T) {
 		t.Fatalf("pin and configuration disagree: %+v", s)
 	}
 	p.cfg.Updates.Second.API = p.sources.SecondAPI
+	p.s.updates.Lock()
+	p.s.updates.view.checked = true // a finished check that found nothing newer
+	p.s.updates.Unlock()
 	if pv = view(p); pv.Sources.Problem != "" || strings.HasPrefix(pv.state("upgrade"), "blocked") {
 		t.Fatalf("pin and configuration agree: %+v", pv.Sources)
 	}
@@ -327,6 +331,9 @@ func TestSetupSources(t *testing.T) {
 	}
 	r.sources = &maint.Sources{Repo: release.GitHubRepo, GitHubAPI: release.GitHubAPI}
 	r.installRunner()
+	r.s.updates.Lock()
+	r.s.updates.view.checked = true
+	r.s.updates.Unlock()
 	if rv := view(r); rv.Sources.Problem != "" || strings.HasPrefix(rv.state("upgrade"), "blocked") {
 		t.Fatalf("after pinning GitHub alone: %+v %s", rv.Sources, rv.state("upgrade"))
 	}
