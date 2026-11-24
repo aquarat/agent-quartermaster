@@ -219,6 +219,8 @@ export class MockSetup {
       ? { repo: "ssh://git@forge.example.com/owner/agent-quartermaster.git", github_api: "https://api.github.com/repos/owner/agent-quartermaster", second_api: "https://forge.example.com/api/v1/repos/owner/agent-quartermaster", origin: "pinned" }
       : { repo: "https://github.com/aquarat/agent-quartermaster.git", github_api: "https://api.github.com/repos/aquarat/agent-quartermaster", second_api: "", origin: "default" };
   }
+  /** Tests: the blocking state where the configuration lost a source the machine is bound to. */
+  sourcesProblem = "";
   private sourceNames(): string[] {
     const s = this.updateSources;
     return s.second_api ? ["GitHub", `second source (${new URL(s.second_api).host})`] : ["GitHub"];
@@ -532,7 +534,8 @@ export class MockSetup {
     });
     const names = this.sourceNames();
     const sources: Record<string, unknown> = { ...this.updateSources, compared: names, active: this.updatesReady ? names : [] };
-    if (this.updatesReady && !this.updateSources.second_api) sources.note = "No second release source is configured: releases are compared with GitHub and this machine's own rebuild.";
+    if (this.sourcesProblem) sources.problem = this.sourcesProblem;
+    else if (this.updatesReady && !this.updateSources.second_api) sources.note = "No second release source is configured: releases are compared with GitHub and this machine's own rebuild.";
     const v: Record<string, unknown> = { mode: this.mode, runner_installed: this.installed, passkeys, tasks, update_sources: sources };
     if (this.installed) Object.assign(v, { runner_version: this.version, secrets_key: this.secretsKey.pub, deploy_key: this.deployKey });
     if (this.current) v.current = this.current;

@@ -47,7 +47,16 @@ api = "https://forge.example.com/api/v1/repos/example/agent-quartermaster"
 | `updates.second.api` | Release API base of the second source, repository path included: `https://HOST/api/v1/repos/OWNER/NAME`. Setting it is what configures a second source. |
 | `updates.second.token_file` | Optional read token for the second source. |
 
-Addresses must be `https`, without credentials, query or fragment, at most 512 characters; the broker refuses to start otherwise. `[updates.forgejo]` is accepted as the old name of `[updates.second]` (see [Upgrading from 0.8.1](#upgrading-from-081)). A token file under `[updates.second]` without `api` configures nothing: the broker runs GitHub-only and the Setup page says so.
+Addresses must be `https`, without credentials, query or fragment, at most 512 characters; the broker refuses to start otherwise. `[updates.forgejo]` is accepted as the old name of `[updates.second]` (see [Upgrading from 0.8.1](#upgrading-from-081)). A token file under `[updates.second]` (or `[updates.forgejo]`) without `api` is refused at start, with the two lines to add in the error: it looks like a second source and would configure none. Plain `http` is refused everywhere, loopback included; only test builds accept it.
+
+### A second source cannot disappear by itself
+
+Dropping a second source is a decision for the owner at the machine, never a side effect of an edit, a lost line or an upgrade:
+
+- If the sources pinned at the machine (`maint-init`, `/etc/aqmas/maint-sources.json`) name a second source, the configuration must name exactly the same one. Otherwise the broker fetches and offers nothing, and the root runner refuses to install.
+- If the installed release (`latest.json`) was verified against two sources and the configuration names one, the same applies ("no fewer sources than before"), and "Enable self-update" refuses too.
+- The Setup page shows this as a blocking problem under "Enable self-update" and on "Upgrade aqmas", with the fix: add the two lines back (`[updates.second]` and its `api`), or decide at the machine to compare GitHub alone: `sudo aqmasd maint-init --repo URL --github-only`.
+- `maint-init --repo URL` without `--second-api` is refused on a machine whose pin, configuration or installed release has a second source; `--github-only` says it is intended.
 
 ## Rebuild a release
 
@@ -66,11 +75,11 @@ make verify-release VERSION=0.1.0 SUMS=/path/to/downloaded/SHA256SUMS
 
 Its last job, `compare`, checks the published manifest against a second source **when one is configured for the repository**, and passes with a notice when none is:
 
-| Setting | Value |
+| Actions secret | Value |
 |---|---|
-| `SECOND_SOURCE_RELEASES_URL` | The second source's release-download base, e.g. `https://forge.example.com/OWNER/NAME/releases/download`. The job fetches `<base>/<tag>/SHA256SUMS`. |
+| `SECOND_SOURCE_RELEASES_URL` | The second source's release-download base, e.g. `https://forge.example.com/OWNER/NAME/releases/download`. The job fetches `<base>/<tag>/SHA256SUMS`, following the forge's redirect to the attachment (https only). |
 
-Set it as an Actions **secret** if the host name should stay private; an Actions **variable** of the same name works too, but GitHub prints variables in the job log, which is public for a public repository. A second source the runner cannot reach (private network, an access policy) is a notice, not a failure: the checks at install time are what count.
+It is read from a **secret only**: GitHub prints repository *variables* in the job log, which is public for a public repository, while secrets are masked. The job prints nothing but the final HTTP status. A second source the runner cannot reach (private network, an access policy) is a notice, not a failure: the checks at install time are what count. A manifest that was served and differs fails the job.
 
 **A second builder** (`.forgejo/workflows/release.yml`, optional): the generic workflow for a Forgejo/Gitea instance that hosts a copy of the repository. It names no host (it uses the instance it runs on). Its `linux-arm64` Docker job runs tests on a `VERSION` change on main, skips an existing tag, then creates the tag/release for the event commit and uploads the assets. Use the repository job token with `contents: write`. If release creation is denied, use the `RELEASE_TOKEN` Actions secret restricted to **this repository** with `write:repository`, and expire/rotate it. A failed upload leaves a draft; inspect it, verify the tag and assets, then complete it manually. Do not move a published tag.
 
@@ -90,7 +99,7 @@ host and the maintenance runner installed (`sudo aqmasd maint-init`, [SETUP.md](
 **Where releases come from is decided at the machine, never by a request.** "Enable
 self-update" signs and uses exactly one set of sources, in this order of precedence:
 
-1. sources pinned from a terminal: `sudo aqmasd maint-init --repo URL [--github-api URL] [--second-api URL]`
+1. sources pinned from a terminal: `sudo aqmasd maint-init --repo URL [--github-api URL] [--second-api URL | --github-only]`
    (`/etc/aqmas/maint-sources.json`);
 2. else the `[updates]` table of the root-owned configuration, as it stands;
 3. else, with nothing configured, the public GitHub repository alone.
@@ -161,30 +170,34 @@ installation has on disk keeps its meaning:
 Nothing on disk refers to the removed compiled address. The upgrade itself is installed by
 the 0.8.1 runner, with its two-source check.
 
-**After the upgrade, check `/etc/aqmas/config.toml`.** "Enable self-update" of 0.8.1 wrote the
-second source's `api` line explicitly; then nothing needs to change and both sources stay in
-use (renaming the table to `[updates.second]` is optional). If your `[updates.forgejo]` table
-has **no `api` line** (it relied on the compiled default), the broker starts, compares
-**GitHub only**, and the Setup page says that a second-source token is configured without
-its address. To keep the second source add these lines (placeholders: your forge's host, the
-repository's owner and name) and restart `aqmasd`:
+**Before upgrading, check `[updates.forgejo]` in `/etc/aqmas/config.toml`.** "Enable
+self-update" of 0.8.1 wrote the second source's `api` line explicitly; then nothing needs to
+change and both sources stay in use (renaming the table to `[updates.second]` is optional).
+
+If the table has a `token_file` but **no `api` line** (0.8.1 then used its compiled address),
+add the line first. 0.8.1 accepts it too, so this is safe to do before the upgrade
+(placeholders: your forge's host, the repository's owner and name):
 
 ```toml
-[updates.second]
+[updates.forgejo]            # or [updates.second] once the new version runs
 api = "https://<FORGE_HOST>/api/v1/repos/<OWNER>/<NAME>"
-token_file = "/etc/aqmas/forgejo-read-token"   # the existing token file; omit if that repository is public
+token_file = "/etc/aqmas/forgejo-read-token"   # the existing line; omit if that repository is public
 ```
 
-and delete the old `[updates.forgejo]` table (a configuration with both tables naming
-different sources is refused). Where the sources were pinned by 0.8.1
-(`sudo cat /etc/aqmas/maint-sources.json` shows the second source's API), running "Enable
-self-update" again does the same edit for you: it rewrites `[updates]` from that pin. `[updates] repo`, `deploy_key` and `[updates.github]` stay as
-they are. Settings → Setup → Enable self-update then shows "Two published sources are
-compared: GitHub and second source (<FORGE_HOST>)".
+Without it the new broker **refuses to start** (its error names these lines) and the 0.8.1
+installer restores 0.8.1. It does not start as a GitHub-only broker.
 
-To drop the second source instead, remove its table, and re-pin if sources were pinned:
-`sudo aqmasd maint-init --repo https://github.com/aquarat/agent-quartermaster.git`, then run
-"Enable self-update" again.
+If there is **no second-source table at all** while `maint-sources.json` or `latest.json`
+records a second source, the new broker starts and serves credentials, but updates are
+blocked and the Setup page says why and shows the two lines to add
+(see [A second source cannot disappear by itself](#a-second-source-cannot-disappear-by-itself)).
+
+`[updates] repo`, `deploy_key` and `[updates.github]` stay as they are. Settings → Setup →
+Enable self-update then shows "Two published sources are compared: GitHub and second source
+(<FORGE_HOST>)".
+
+To drop the second source instead: `sudo aqmasd maint-init --repo https://github.com/aquarat/agent-quartermaster.git --github-only`,
+remove its table from the configuration, restart, and run "Enable self-update" again.
 
 ## Approval, install and recovery
 
@@ -218,7 +231,7 @@ Ordinary installation/restart alone does not advance the version.
 
 Install `aqmas` at `~/.local/bin/aqmas` on Apple Silicon or `/usr/local/bin/aqmas` on Linux. Use `aqmas upgrade --check`; `aqmas upgrade` (alias `update`) displays the version and digest, downloads and verifies the executable over mTLS, then prompts. For a deliberate non-interactive install supply **both** `--yes` and `--expect-sha256 HEX`. For root-owned installs use `sudo aqmas upgrade` with root's own enrolled, protected CLI configuration. Do not point a privileged installer at an agent-writable config, token, executable directory or trust store. GitHub uses a separate system-CA HTTPS client, never the mTLS client identity. The CLI's `[github]` table (in the host's `~/.config/aqmas/config.toml`) accepts the same optional `api` and `token_file` settings as `[updates.github]` above; without it the CLI asks the public repository. The CLI never talks to a second source and no credential for one goes on fleet hosts: the bastion has already compared it (the CLI prints whether the bastion compared one published source or two), and the CLI then checks the bastion's digests against GitHub itself.
 
-The only degraded mode is an explicit `--allow-single-source` when GitHub is unreachable from that host; it warns loudly and trusts the previously verified cache on the broker alone. It never overrides a malformed manifest or a mismatch. Without that exception, failure to verify is fatal. Interactive runs check the enrolled API for a one-line notice at most daily; no implicit install or prompt. **CLI and bastion of different versions** keep working in both directions: a bastion of this version repeats its verified digests under the key a 0.8.1 CLI reads (`forgejo`), and a CLI of this version reads a 0.8.1 bastion's two-source record. Roll back with a rename of `aqmas.prev` over `aqmas` in the install directory. On macOS Go's arm64 linker already ad-hoc signs release binaries. The installer clears quarantine on its staged file if present and checks the signature. Invalid signatures require a corrected release; re-signing bytes locally after verification would invalidate the approved digest.
+The only degraded mode is an explicit `--allow-single-source` when GitHub is unreachable from that host; it warns loudly and trusts the previously verified cache on the broker alone. It never overrides a malformed manifest or a mismatch. Without that exception, failure to verify is fatal. Interactive runs check the enrolled API for a one-line notice at most daily; no implicit install or prompt. **CLI and bastion of different versions** keep working in both directions: a bastion of this version repeats its verified digests under the key a 0.8.1 CLI reads (`forgejo`), and a CLI of this version reads a 0.8.1 bastion's two-source record. That repeat is GitHub's digests even when the bastion compared GitHub alone, so a 0.8.1 CLI believes two sources agreed where there was one plus the bastion's rebuild; it still fetches GitHub's manifest itself and refuses a mismatch. Roll back with a rename of `aqmas.prev` over `aqmas` in the install directory. On macOS Go's arm64 linker already ad-hoc signs release binaries. The installer clears quarantine on its staged file if present and checks the signature. Invalid signatures require a corrected release; re-signing bytes locally after verification would invalidate the approved digest.
 **Vault tables (web form, reveal policy, signers):** additive tables and triggers created on a
 sealed start (`signer_keys`, `org_vault`, `sign_requests`), with no schema-version change. A
 previous binary ignores them. A signer set is stored as an application set at revision 0 with no

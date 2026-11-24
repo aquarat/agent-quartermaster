@@ -8,13 +8,13 @@ review**. It brokers credentials. Use it at your own risk; see the status sectio
 
 Please report privately, not in a public issue or pull request:
 
-- Use **GitHub private vulnerability reporting** on this repository: the **Security** tab →
-  **Advisories** → **Report a vulnerability**. This opens a draft security advisory that only
-  the maintainers and you can see.
+- Use the repository's **Security** tab → **Report a vulnerability** on GitHub. Where that
+  button is offered, it opens a private report (a draft security advisory) that only the
+  maintainers and you can see.
 
-There is no security email address. If private reporting is not available to you, open a
-public issue that says only that you have a security report and how to reach you, with no
-details.
+There is no security email address. If the Security tab offers no way to report privately,
+open a public issue that says only that you have a security report and how to reach you,
+with no details.
 
 A useful report says which version or commit is affected, what an attacker needs (an
 enrolled host, a web session, network position, a compromised component), what they gain, and

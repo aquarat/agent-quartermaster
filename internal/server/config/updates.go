@@ -63,10 +63,6 @@ func (u Updates) Sources() release.Sources {
 	return release.Sources{GitHub: u.GitHub, Second: u.Second}
 }
 
-// SecondIgnored reports a second-source table that names a token but no API: the source is
-// then not configured and not used (up to 0.8.1 a compiled default stood in for the API).
-func (u Updates) SecondIgnored() bool { return u.Second.API == "" && u.Second.TokenFile != "" }
-
 // normalize folds the legacy table name into Second and checks the shape of every address:
 // https only, no credentials, bounded length. What the addresses are is the operator's call.
 func (u *Updates) normalize() error {
@@ -75,6 +71,12 @@ func (u *Updates) normalize() error {
 			return fmt.Errorf("config: [updates.forgejo] is the old name of [updates.second]; keep only [updates.second]")
 		}
 		u.Second, u.Legacy = u.Legacy, release.Source{}
+	}
+	// Up to 0.8.1 a compiled address stood in for a missing api line. There is none now, and
+	// a table that looks like a second source but configures nothing must not start a broker
+	// that quietly compares fewer sources.
+	if u.Second.API == "" && u.Second.TokenFile != "" {
+		return fmt.Errorf("config: the second release source has a token_file but no address (0.8.1 had a built-in one; this version has none). Add these two lines, or remove the old [updates.forgejo]/[updates.second] table to compare GitHub only:\n[updates.second]\napi = \"https://HOST/api/v1/repos/OWNER/NAME\"")
 	}
 	if u.Repo != "" && release.GitProtocol(u.Repo) == "" {
 		return fmt.Errorf("config: updates.repo must be https://HOST/OWNER/NAME.git or ssh://git@HOST/OWNER/NAME.git, without a password")

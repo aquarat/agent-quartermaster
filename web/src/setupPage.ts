@@ -94,7 +94,7 @@ const BADGES: Record<string, string> = {
 };
 
 // The runner's patterns (internal/maint/spec.go), for a friendly message before the tap.
-const REPO_RE = /^(ssh:\/\/[a-z_][a-z0-9_-]{0,31}@|https:\/\/|http:\/\/(?=127\.0\.0\.1:))([a-z0-9][a-z0-9.-]{0,252})(:[0-9]{1,5})?\/([A-Za-z0-9][A-Za-z0-9._/-]{0,200})\.git$/;
+const REPO_RE = /^(ssh:\/\/[a-z_][a-z0-9_-]{0,31}@|https:\/\/)([a-z0-9][a-z0-9.-]{0,252})(:[0-9]{1,5})?\/([A-Za-z0-9][A-Za-z0-9._/-]{0,200})\.git$/;
 const API_RE = /^https?:\/\/[A-Za-z0-9.:-]{1,255}\/[A-Za-z0-9._/-]{1,200}$/;
 const TOKEN_RE = /^[A-Za-z0-9_.~+/=:-]{8,512}$/;
 const TOPIC_RE = /^https:\/\/[a-z0-9][a-z0-9.-]{0,252}(:[0-9]{1,5})?\/[A-Za-z0-9_-]{1,128}$/;
@@ -1024,6 +1024,9 @@ export class SetupPage {
             h("dt", null, "Second source"),
             h("dd", null, second ? h("span", { class: "mono" }, vt(second)) : "none"),
           ),
+          src.problem
+            ? h("div", { class: "error", role: "alert", "data-sources-problem": "" }, h("p", null, h("strong", null, "Updates are blocked.")), src.problem.split("\n").map((line) => h("p", { class: /^(\[|api = )/.test(line) ? "mono" : "" }, vt(line))))
+            : null,
           src.note ? h("p", { class: "muted", "data-sources-note": "" }, vt(src.note)) : null,
           h(
             "p",

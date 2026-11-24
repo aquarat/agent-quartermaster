@@ -28,12 +28,12 @@ case $(uname -m) in aarch64 | arm64) ARCH=arm64 ;; x86_64 | amd64) ARCH=amd64 ;;
 
 VERSION=$(cat "$ROOT/VERSION") COMMIT=$(git -C "$ROOT" rev-parse HEAD)
 if [[ -z ${AQMASD:-} || -z ${AQMAS:-} ]]; then
+	# The suite's release sources are plain http on 127.0.0.1, which only a binary built with
+	# the "interop" tag accepts (release builds are https only): build both for this machine.
 	make -C "$ROOT" --no-print-directory web build >/dev/null
-	AQMASD=${AQMASD:-$ROOT/bin/aqmasd-linux-$ARCH} AQMAS=${AQMAS:-$ROOT/bin/aqmas-linux-$ARCH}
-	if [[ ! -x $AQMASD ]]; then # make builds aqmasd for arm64 only; the runner needs a release identity
-		AQMASD=$ROOT/bin/aqmasd-interop
-		(cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "-X main.version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/release.Version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/release.Commit=$COMMIT" -o "$AQMASD" ./cmd/aqmasd)
-	fi
+	AQMASD=${AQMASD:-$ROOT/bin/aqmasd-interop} AQMAS=${AQMAS:-$ROOT/bin/aqmas-interop}
+	(cd "$ROOT" && CGO_ENABLED=0 go build -tags interop -trimpath -buildvcs=false -ldflags "-X main.version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/client.Version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/release.Version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/release.Commit=$COMMIT" -o "$ROOT/bin/aqmasd-interop" ./cmd/aqmasd &&
+		CGO_ENABLED=0 go build -tags interop -trimpath -buildvcs=false -ldflags "-X main.version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/client.Version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/release.Version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/release.Commit=$COMMIT" -o "$ROOT/bin/aqmas-interop" ./cmd/aqmas)
 fi
 "$AQMASD" version | grep -q 'web ui: embedded' || fail "aqmasd has no embedded web UI"
 
@@ -329,6 +329,10 @@ owner login >/dev/null
 [[ $(owner seal-status) == buckets && -z $(owner open-buckets) ]] || fail "restart after enable-updates left something open"
 [[ $(owner setup-state enable-updates) == done && $(owner setup-state upgrade) == idle && $(sources) == "pinned 2 2 second" ]] || fail "queue after enable-updates: $(owner setup-state upgrade) / $(sources)"
 owner updates | grep -q "\"sources\":\[\"GitHub\",\"second source (127.0.0.1:$PF)\"\]" || fail "the update view does not name its two sources: $(owner updates)"
+# From here on the second source cannot be dropped by leaving it out: not by a new pin ...
+if maint maint-init --repo "$HTTP_REPO" --github-api "$GH_API"; then fail "a pin without --second-api dropped the second source"; fi
+grep -q -- '--github-only' "$T/maint.log" || fail "the refusal does not name --github-only"
+[[ $(sources) == "pinned 2 2 second" ]] || fail "sources after a refused re-pin: $(sources)"
 ok "self-update enabled with a second source: it must agree and must answer"
 grant "enabling self-update"
 

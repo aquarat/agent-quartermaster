@@ -267,12 +267,6 @@ func TestSetupSources(t *testing.T) {
 	if s := view(e).Sources; s.Origin != maint.SourcesConfig || len(s.Active) != 1 || !strings.Contains(s.Note, "No second release source") {
 		t.Fatalf("GitHub only: %+v", s)
 	}
-	// A token for a second source without its address (a 0.8.1 configuration that relied on
-	// the compiled address): not used, and said.
-	e.cfg.Updates.Second.TokenFile = "/etc/aqmas/forgejo-read-token"
-	if s := view(e).Sources; s.SecondAPI != "" || len(s.Active) != 1 || !strings.Contains(s.Note, "[updates.second]") {
-		t.Fatalf("token without address: %+v", s)
-	}
 	e.cfg.Updates.Second.API = "https://forge.example.com/api/v1/repos/example/agent-quartermaster"
 	if s := view(e).Sources; s.SecondAPI != e.cfg.Updates.Second.API || len(s.Active) != 2 || s.Active[1] != "second source (forge.example.com)" || s.Compared[1] != s.Active[1] || s.Note != "" {
 		t.Fatalf("second source: %+v", s)
@@ -285,10 +279,56 @@ func TestSetupSources(t *testing.T) {
 	if s := view(p).Sources; s.Origin != maint.SourcesPinned || s.GitHubAPI != release.GitHubAPI || len(s.Compared) != 2 {
 		t.Fatalf("pinned: %+v", s)
 	}
-	// ... and where the configuration lost the second source's address, the pin can restore it.
-	p.cfg.Updates.Repo, p.cfg.Updates.Second.TokenFile = p.sources.Repo, "/etc/aqmas/forgejo-read-token"
-	if s := view(p).Sources; len(s.Active) != 1 || len(s.Compared) != 2 || !strings.Contains(s.Note, "again does the same") {
-		t.Fatalf("pinned second source, configuration without its address: %+v", s)
+	// Before self-update is enabled there is nothing to complain about: the task writes the pin.
+	if s := view(p).Sources; s.Problem != "" {
+		t.Fatalf("problem before self-update is on: %+v", s)
+	}
+	// Enabled, but the configuration lacks the second source the pin names (a 0.8.1
+	// configuration without the table): a blocking problem with the fix, and no upgrade.
+	two := release.Metadata{Version: "1.0.0", Commit: strings.Repeat("c", 40), GitHub: release.Sums{}}
+	for _, a := range release.Assets {
+		two.GitHub[a] = strings.Repeat("a", 64)
+	}
+	two.Second = two.GitHub
+	record, _ := json.Marshal(two)
+	if err := os.WriteFile(filepath.Join(p.cfg.Updates.Cache(), "latest.json"), record, 0644); err != nil {
+		t.Fatal(err)
+	}
+	p.cfg.Updates.Repo = p.sources.Repo
+	pv := view(p)
+	if s := pv.Sources; !strings.Contains(s.Problem, "[updates.second]\napi = \""+p.sources.SecondAPI+"\"") || !strings.Contains(s.Problem, "--github-only") || s.Note != "" ||
+		!strings.HasPrefix(pv.state("upgrade"), "blocked:The release sources pinned on this machine include a second source") {
+		t.Fatalf("pin with a second source, configuration without: %+v / %s", s, pv.state("upgrade"))
+	}
+	// Discovery refuses too: nothing is fetched or offered.
+	var dv updateView
+	if err := p.s.discover(t.Context(), &dv); err == nil || !strings.Contains(err.Error(), "pinned on this machine") {
+		t.Fatalf("discovery with a dropped second source: %v", err)
+	}
+	p.cfg.Updates.Second.API = "https://other.example.com/api/v1/repos/a/b"
+	if s := view(p).Sources; !strings.Contains(s.Problem, "names a different one") {
+		t.Fatalf("pin and configuration disagree: %+v", s)
+	}
+	p.cfg.Updates.Second.API = p.sources.SecondAPI
+	if pv = view(p); pv.Sources.Problem != "" || strings.HasPrefix(pv.state("upgrade"), "blocked") {
+		t.Fatalf("pin and configuration agree: %+v", pv.Sources)
+	}
+	// No pin: the installed release was verified against two sources, the configuration
+	// names one. Blocked until the owner pins GitHub alone at the machine.
+	r := newEnv(t)
+	r.setupOwner()
+	r.installRunner()
+	r.cfg.Updates.Repo = release.GitHubRepo
+	if err := os.WriteFile(filepath.Join(r.cfg.Updates.Cache(), "latest.json"), record, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if rv := view(r); !strings.Contains(rv.Sources.Problem, "verified against two published sources") || !strings.HasPrefix(rv.state("upgrade"), "blocked:") {
+		t.Fatalf("two-source identity, one-source configuration: %+v", rv.Sources)
+	}
+	r.sources = &maint.Sources{Repo: release.GitHubRepo, GitHubAPI: release.GitHubAPI}
+	r.installRunner()
+	if rv := view(r); rv.Sources.Problem != "" || strings.HasPrefix(rv.state("upgrade"), "blocked") {
+		t.Fatalf("after pinning GitHub alone: %+v %s", rv.Sources, rv.state("upgrade"))
 	}
 	// The broker refuses, before any tap, a request for sources other than the fixed ones.
 	for name, params := range map[string]map[string]any{

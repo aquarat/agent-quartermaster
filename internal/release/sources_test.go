@@ -10,9 +10,28 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+func init() { loopbackHTTP = true }
+
+// A production binary accepts https only: plain http is refused even to a loopback
+// address, for release APIs, redirects and git remotes alike.
+func TestHTTPRefusedOutsideTests(t *testing.T) {
+	loopbackHTTP = false
+	defer func() { loopbackHTTP = true }()
+	if SafeURL("http://127.0.0.1:8080/x") || ValidAPI("http://127.0.0.1:8080/api/v1/repos/a/b") || GitProtocol("http://127.0.0.1:8080/a/b.git") != "" {
+		t.Fatal("plain http accepted by a production build")
+	}
+	if !SafeURL("https://forge.example.com/x") || GitProtocol("https://github.com/a/b.git") != "https" {
+		t.Fatal("https refused")
+	}
+	if _, e := (Source{API: "http://127.0.0.1:1/repos/a/b"}).Hashes(t.Context(), "1.0.0", true); e == nil || !strings.Contains(e.Error(), "invalid release API URL") {
+		t.Fatalf("http source asked: %v", e)
+	}
+}
 
 func testSums(c string) Sums {
 	s := Sums{}
@@ -161,10 +180,33 @@ func TestAddressShapes(t *testing.T) {
 	}
 }
 
-// The second release source of the first installation is private: its host name, and that
-// installation's domain, may not appear anywhere in the tree. (`make check-private` asks
-// git the same question; this walk also covers files that are not committed yet.)
-func TestNoPrivateHostInTree(t *testing.T) {
+// privatePatterns are the regexes of names that must not be published, from the untracked
+// file .private-patterns at the repository root (one per line) or from the environment
+// variable AQMAS_PRIVATE_PATTERNS (newline-separated). They are private themselves, so none
+// is written in this repository.
+func privatePatterns(t *testing.T, root string) []*regexp.Regexp {
+	text := os.Getenv("AQMAS_PRIVATE_PATTERNS")
+	if text == "" {
+		b, _ := os.ReadFile(filepath.Join(root, ".private-patterns"))
+		text = string(b)
+	}
+	var out []*regexp.Regexp
+	for _, line := range strings.Split(text, "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		re, err := regexp.Compile(line)
+		if err != nil {
+			t.Fatalf("private pattern %d does not compile", len(out)+1)
+		}
+		out = append(out, re)
+	}
+	return out
+}
+
+// No file in the tree may match a private pattern (`make check-private` asks git the same;
+// this walk also covers files that are not committed yet). Skipped where no patterns exist.
+func TestNoPrivateNamesInTree(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +214,10 @@ func TestNoPrivateHostInTree(t *testing.T) {
 	if _, err = os.Stat(filepath.Join(root, "go.mod")); err != nil {
 		t.Skip("not in a source tree")
 	}
-	private := []byte("example" + ".invalid")
+	patterns := privatePatterns(t, root)
+	if len(patterns) == 0 {
+		t.Skip("no private patterns here (.private-patterns or AQMAS_PRIVATE_PATTERNS)")
+	}
 	skip := map[string]bool{".git": true, "node_modules": true, "dist": true, "bin": true}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -184,13 +229,19 @@ func TestNoPrivateHostInTree(t *testing.T) {
 			}
 			return nil
 		}
-		if info, e := d.Info(); e != nil || !info.Mode().IsRegular() || info.Size() > 8<<20 {
+		if info, e := d.Info(); e != nil || !info.Mode().IsRegular() || info.Size() > 8<<20 || d.Name() == ".private-patterns" {
 			return nil
 		}
 		b, e := os.ReadFile(path)
-		if e == nil && strings.Contains(strings.ToLower(string(b)), string(private)) {
-			rel, _ := filepath.Rel(root, path)
-			t.Errorf("%s names the private host", rel)
+		if e != nil {
+			return nil
+		}
+		for i, re := range patterns {
+			if re.Match(b) {
+				rel, _ := filepath.Rel(root, path)
+				// The match itself is not printed: test logs can be public.
+				t.Errorf("%s matches private pattern %d", rel, i+1)
+			}
 		}
 		return nil
 	})

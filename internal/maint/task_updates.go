@@ -356,6 +356,10 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 		u.Second.TokenFile = filepath.Join(r.l.ConfigDir, tokenFiles["second_token"])
 	}
 	names := strings.Join(u.Sources().Names(), " and ")
+	// The task may not be the way a second source disappears from this machine.
+	if p := SourcesProblem(r.l.readSources(), u, ReadInstalled(r.l.Cache)); p != "" {
+		return "", errors.New(p)
+	}
 	next, err := setUpdates(r.raw, u)
 	if err != nil {
 		return "", err
@@ -522,6 +526,11 @@ func (r *Runner) upgrade(ctx context.Context, sg canon.Signed) (string, error) {
 	}
 	if sg.FromCommit != current.Commit || sg.FromVersion != current.Version {
 		return "", errors.New("the approval is for another installed version")
+	}
+	// The sources come from the configuration, and the configuration alone may not have
+	// dropped one: the root pin and the installed identity are checked against it first.
+	if p := SourcesProblem(r.l.readSources(), u, &current); p != "" {
+		return "", errors.New(p)
 	}
 	src := u.Sources()
 	r.step("Verifying release " + sg.ToVersion + " at " + strings.Join(src.Names(), " and "))

@@ -116,6 +116,12 @@ func (s *Server) discover(ctx context.Context, v *updateView) error {
 	cfg := s.cfg.Updates
 	src := cfg.Sources()
 	v.Sources = src.Names()
+	// The configuration alone may not have dropped a release source (maint.SourcesProblem):
+	// then nothing is fetched or offered, and the runner would refuse the install anyway.
+	st, _ := s.runnerStatus()
+	if p := maint.SourcesProblem(st.Runner.Sources, cfg, maint.ReadInstalled(cfg.Cache())); p != "" {
+		return errors.New(p)
+	}
 	proto := release.GitProtocol(cfg.Repo)
 	switch {
 	case proto == "":

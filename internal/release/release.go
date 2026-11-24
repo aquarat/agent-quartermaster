@@ -106,6 +106,12 @@ func (m Metadata) MarshalJSON() ([]byte, error) {
 // LegacyJSON is the record with the verified digests repeated under "forgejo", where a CLI
 // of 0.8.1 or earlier looks for them (and refuses a reply without them). Current readers
 // ignore that key because the record says how many sources it holds.
+//
+// Know what this tells an old CLI: it copies GitHub's digests under "forgejo" even when the
+// bastion compared GitHub alone, so a 0.8.1 CLI believes two sources agreed where there was
+// one (plus the bastion's rebuild). That is accepted for compatibility, so that old CLIs can
+// still upgrade themselves. It does not weaken their own check: the old CLI still fetches
+// GitHub's manifest itself and refuses a mismatch.
 func (m Metadata) LegacyJSON() ([]byte, error) {
 	return json.Marshal(record{Version: m.Version, Commit: m.Commit, GitHub: m.GitHub, Second: m.Second, Sources: m.Compared(), Legacy: m.GitHub})
 }

@@ -49,12 +49,13 @@ jobs:
           gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" "${files[@]}" SHA256SUMS --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
   # Optional: compare with the same release built independently by a second source (for
   # example the Forgejo workflow in .forgejo/workflows/release.yml running on another forge).
-  # Where that is comes only from this repository's settings, never from the code:
+  # Where that is comes only from this repository's settings, never from the code: the
+  # Actions *secret*
   #   SECOND_SOURCE_RELEASES_URL = https://forge.example.com/OWNER/NAME/releases/download
-  # Set it as an Actions *secret* if the host name should stay private: a repository
-  # variable works too, but GitHub prints variables in the (public) job log, while secrets
-  # are masked. With neither set the job says so and passes: GitHub is then the only
-  # published source, and installations still rebuild from source and compare.
+  # It is read from a secret only. A repository variable would be printed in the job log,
+  # which is public for a public repository; a secret is masked. Nothing below prints the
+  # URL or any part of it. With the secret unset the job says so and passes: GitHub is then
+  # the only published source, and installations still rebuild from source and compare.
   compare:
     needs: publish
     runs-on: ubuntu-24.04
@@ -63,20 +64,23 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-          SECOND_SOURCE_RELEASES_URL: ${{ secrets.SECOND_SOURCE_RELEASES_URL || vars.SECOND_SOURCE_RELEASES_URL }}
+          SECOND_SOURCE_RELEASES_URL: ${{ secrets.SECOND_SOURCE_RELEASES_URL }}
         run: |
           set -eu
           base=${SECOND_SOURCE_RELEASES_URL%/}
           if [ -z "$base" ]; then
-            echo '::notice::No second release source is configured (SECOND_SOURCE_RELEASES_URL is unset); nothing to compare.'
+            echo '::notice::No second release source is configured (the secret SECOND_SOURCE_RELEASES_URL is unset); nothing to compare.'
             exit 0
           fi
           case "$base" in https://*) ;; *) echo 'SECOND_SOURCE_RELEASES_URL must be an https URL'; exit 1 ;; esac
           gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -p SHA256SUMS
-          # Quiet on purpose: curl's own messages would name the host in a public log.
-          code=$(curl --max-time 20 -s -o second.sums -w '%{http_code}' "$base/$GITHUB_REF_NAME/SHA256SUMS" 2>/dev/null) || code=000
+          # A forge answers a release download with a redirect to the attachment: follow it,
+          # https only. Quiet on purpose: curl's own messages would name the host in a public
+          # log, so its stderr is discarded and only the final status code is printed.
+          code=$(curl --max-time 30 -s -L --proto '=https' --proto-redir '=https' --max-redirs 5 -o second.sums -w '%{http_code}' "$base/$GITHUB_REF_NAME/SHA256SUMS" 2>/dev/null) || code=000
           case "$code" in
-            200) cmp SHA256SUMS second.sums && echo 'The second source published the same SHA256SUMS.' ;;
-            000|302|401|403|404) echo '::notice::The second source is not reachable from this runner; an installation that configures it still requires matching manifests.' ;;
-            *) echo "Unexpected response $code from the second source"; exit 1 ;;
+            200) cmp -s SHA256SUMS second.sums || { echo 'The second source published a different SHA256SUMS.'; exit 1; }
+                 echo 'The second source published the same SHA256SUMS.' ;;
+            000|401|403|404) echo "::notice::The second source did not serve the manifest to this runner (status $code); an installation that configures it still requires matching manifests." ;;
+            *) echo "Unexpected status $code from the second source"; exit 1 ;;
           esac

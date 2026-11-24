@@ -51,13 +51,17 @@ webui: web
 	@if [ -f web/dist/index.html ]; then cp -R web/dist/. internal/webui/dist/; echo "webui: embedding web/dist"; \
 	else echo "webui: web/dist not built, embedding the placeholder page"; fi
 
-# The repository is public; the first installation's own hosts are not. Fails if a private
-# host name, address or name is in any tracked file (internal/release has the same check as
-# a test, which also sees untracked files). Written with one-character classes so that the
-# pattern does not match itself.
-PRIVATE_RE := example[.]invalid
+# Keeps names that must not be published (an installation's own hosts, domains, projects)
+# out of the tree. The patterns themselves are private, so they are not in the repository:
+# put one extended regex per line in the untracked file .private-patterns, or in the
+# environment variable AQMAS_PRIVATE_PATTERNS (newline-separated). With neither, this is a
+# no-op that says so. internal/release has the same check as a test (it also sees untracked files).
 check-private:
-	@! git grep -nE '$(PRIVATE_RE)' || { echo 'site-specific names in the tree (see above)'; exit 1; }
+	@set -e; f=.private-patterns; tmp=; \
+	if [ -n "$$AQMAS_PRIVATE_PATTERNS" ]; then tmp=$$(mktemp); trap 'rm -f "$$tmp"' EXIT; printf '%s\n' "$$AQMAS_PRIVATE_PATTERNS" > "$$tmp"; f=$$tmp; fi; \
+	if [ ! -s "$$f" ]; then echo 'check-private: no patterns (.private-patterns or AQMAS_PRIVATE_PATTERNS); nothing checked'; exit 0; fi; \
+	if git grep -nE -f "$$f" -- .; then echo 'check-private: names that must stay private are in the tree (see above)'; exit 1; fi; \
+	echo 'check-private: clean'
 
 vet: check-private
 	$(GO) vet ./...

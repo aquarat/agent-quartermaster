@@ -94,6 +94,9 @@ export interface UpdateSources {
   /** The same for the configuration the broker runs with now; empty while self-update is off. */
   active: string[] | null;
   note?: string;
+  /** Blocking: the configuration names fewer sources than this machine is bound to (its pin,
+   * or the two sources its installed release was verified against). Says how to fix it. */
+  problem?: string;
 }
 
 export interface HostKeys {

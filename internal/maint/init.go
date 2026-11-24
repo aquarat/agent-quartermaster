@@ -91,8 +91,19 @@ func Init(ctx context.Context, l Layout, repin bool, sources *Sources, out io.Wr
 		}
 	}
 	if sources != nil {
+		// Dropping a second source this machine has been using is never a side effect of
+		// leaving a flag out: it takes --github-only.
+		old, installed := l.readSources(), ReadInstalled(l.Cache)
+		had := old != nil && old.SecondAPI != "" || r.cfg.Updates.Second.API != "" || installed != nil && installed.Compared() == 2
+		switch {
+		case sources.GitHubOnly && sources.SecondAPI != "":
+			return errors.New("--github-only and --second-api contradict each other")
+		case sources.SecondAPI == "" && had && !sources.GitHubOnly:
+			return errors.New("this machine uses a second release source (its pin, its configuration or its installed release names one): pass --second-api URL to keep it, or --github-only to drop it and compare GitHub alone")
+		}
 		// Typed at the machine by its owner: validated for shape, not for policy.
 		full, _ := EffectiveSources(sources, r.cfg.Updates)
+		full.GitHubOnly = false
 		*sources = full
 		p := UpdatesParams{Repo: sources.Repo, GitHubAPI: sources.GitHubAPI, SecondAPI: sources.SecondAPI}
 		if release.GitProtocol(p.Repo) == "ssh" {

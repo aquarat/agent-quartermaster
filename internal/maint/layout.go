@@ -100,6 +100,9 @@ type Sources struct {
 	Repo      string `json:"repo"`
 	GitHubAPI string `json:"github_api"`
 	SecondAPI string `json:"second_api"`
+	// GitHubOnly is `maint-init --github-only`: the owner, at the machine, drops a second
+	// source this installation has been using. It is a request to Init, not part of the pin.
+	GitHubOnly bool `json:"-"`
 }
 
 // UnmarshalJSON also reads a pin written by 0.8.1 or earlier, which called the second
@@ -155,6 +158,45 @@ func (l Layout) readSources() *Sources {
 		return nil
 	}
 	return &s
+}
+
+// ReadInstalled returns the installed release identity (latest.json in the release cache),
+// or nil when there is none or it is not valid.
+func ReadInstalled(cache string) *release.Metadata {
+	var m release.Metadata
+	b, err := os.ReadFile(filepath.Join(cache, "latest.json"))
+	if err != nil || json.Unmarshal(b, &m) != nil || !m.Valid() {
+		return nil
+	}
+	return &m
+}
+
+// SourcesProblem says why this machine must not look for or install a release with the
+// sources its configuration names ("" when it may). The configuration alone cannot take a
+// second source away, whether by an edit, a lost line or an upgrade that stopped supplying
+// a default address:
+//
+//   - a pin made at the machine that names a second source must be matched by the
+//     configuration exactly;
+//   - an installation whose installed release was verified against two published sources
+//     keeps needing two, until the owner pins GitHub alone at the machine
+//     (`maint-init --repo … --github-only`).
+//
+// Both the root runner (before an install, and before "Enable self-update" changes the
+// configuration) and the broker (discovery, the Setup page) apply it.
+func SourcesProblem(pinned *Sources, u config.Updates, installed *release.Metadata) string {
+	const repin = " or, to compare GitHub alone from now on, decide that at the machine: sudo aqmasd maint-init --repo URL --github-only."
+	if pinned != nil && pinned.SecondAPI != "" && u.Second.API != pinned.SecondAPI {
+		state := "does not name one"
+		if u.Second.API != "" {
+			state = "names a different one"
+		}
+		return "The release sources pinned on this machine include a second source, but its configuration " + state + ". Nothing is checked or installed until they agree. Add these two lines to /etc/aqmas/config.toml and restart aqmasd:\n[updates.second]\napi = \"" + pinned.SecondAPI + "\"\n(running “Enable self-update” again writes them for you)," + repin
+	}
+	if installed != nil && installed.Compared() == 2 && u.Second.API == "" && (pinned == nil || pinned.SecondAPI != "") {
+		return "The installed release was verified against two published sources, but the configuration now names GitHub only. Nothing is checked or installed on fewer sources than before. Add the second source back to /etc/aqmas/config.toml and restart aqmasd:\n[updates.second]\napi = \"https://HOST/api/v1/repos/OWNER/NAME\"\n" + strings.TrimPrefix(repin, " ")
+	}
+	return ""
 }
 
 // AllowPath is the root-owned bastion allowlist next to the configuration.

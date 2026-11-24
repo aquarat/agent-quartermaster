@@ -66,7 +66,7 @@ lost).
 
 The source flags **pin the release sources** (`/etc/aqmas/maint-sources.json`): `--repo`
 (required when pinning), `--github-api` (default: the compiled GitHub repository) and
-`--second-api` (default: none, GitHub only; `--forgejo-api` is its old name). "Enable
+`--second-api` (default: none, GitHub only; `--forgejo-api` is its old name). On a machine that already uses a second source, leaving `--second-api` out is refused unless `--github-only` says that dropping it is intended. "Enable
 self-update" accepts exactly one set of sources: the pinned ones; without a pin the
 `[updates]` table of the root-owned configuration; with neither, the public GitHub
 repository alone. Where releases come from is decided at the machine, so no request from the
@@ -210,7 +210,9 @@ All under a signed-in session. `GET` works in every mode, with every bucket clos
   where they were decided (`origin`: `pinned`, `config` or `default`), their names
   (`compared`: `"GitHub"`, `"second source (HOST)"`), the names the running broker compares
   now (`active`, empty while self-update is off) and a `note` when the page should say
-  something (GitHub only; a second-source token without an address).
+  something (GitHub only), and a `problem` when updates are blocked because the configuration
+  names fewer sources than the machine's pin or its installed release ([UPDATES.md](UPDATES.md)):
+  the page shows it as an error with the fix, and “Upgrade aqmas” is blocked by it.
 * `GET /api/ui/setup/cutover/preview` → `{id, plan}`: the plan the cutover would propose now.
 * `POST /api/ui/setup/host-key {repo}` → `{host, keys:[{line, fingerprint}]}`: the forge's SSH
   host keys as the broker sees them, for you to compare (an `ssh://` repository only). They

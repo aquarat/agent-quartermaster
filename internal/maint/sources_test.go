@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -251,5 +252,106 @@ func TestLegacyInstallationKeepsItsSecondSource(t *testing.T) {
 	if strings.Contains(cfg, "forgejo") || !strings.Contains(cfg, "[updates.second]\napi = \""+p.SecondAPI+"\"") || !strings.Contains(cfg, "check_minutes = 15") || b.read("etc", "forgejo-read-token") != "" ||
 		strings.TrimSpace(b.read("etc", "second-read-token")) != secretForge {
 		t.Fatalf("not renamed:\n%s", cfg)
+	}
+}
+
+// writeIdentity records an installed release as verified against one or two sources.
+func (b *lab) writeIdentity(two bool) {
+	b.t.Helper()
+	m := release.Metadata{Version: "0.3.0", Commit: b.facts.Commit, GitHub: b.sums}
+	if two {
+		m.Second = b.sums
+	}
+	text, _ := json.Marshal(m)
+	if err := os.MkdirAll(b.path("releases"), 0755); err != nil {
+		b.t.Fatal(err)
+	}
+	b.write(0644, string(text)+"\n", "releases", "latest.json")
+}
+
+func (b *lab) setUpdates(tables string) {
+	b.t.Helper()
+	cfg := b.read("etc", "config.toml")
+	if i := strings.Index(cfg, "\n# test sources\n"); i >= 0 {
+		cfg = cfg[:i]
+	}
+	b.write(0640, cfg+"\n# test sources\n"+tables, "etc", "config.toml")
+}
+
+// The configuration alone cannot take a release source away: not by a missing line, not by
+// a missing table, not by disagreeing with the pin, and not once the installed release has
+// been verified against two sources. Only the owner at the machine can (--github-only).
+func TestSecondSourceCannotBeDroppedByConfiguration(t *testing.T) {
+	b := newLab(t)
+	b.releases("0.3.0", "0.3.1")
+	b.hubOpen, b.forgeOpen = true, true
+	p := b.updatesParams()
+	pin := `{"repo":"` + p.Repo + `","forgejo_api":"` + p.SecondAPI + `","github_api":"` + p.GitHubAPI + `"}` + "\n"
+	base := b.read("etc", "config.toml")
+	withRepo := strings.Replace(base, "[updates]\n", "[updates]\nrepo = \""+p.Repo+"\"\ndeploy_key = \""+b.path("etc", "repo-key")+"\"\n", 1)
+	b.write(0640, withRepo, "etc", "config.toml")
+	github := "[updates.github]\napi = \"" + p.GitHubAPI + "\"\n"
+	refused := func(name, want string) {
+		t.Helper()
+		_ = os.Remove(b.path("installed-metadata.json"))
+		b.queue(b.approveUpdate())
+		if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpgrade).Message, want) || b.read("installed-metadata.json") != "" {
+			t.Fatalf("%s: installed, or refused for another reason: %v %+v", name, err, b.last(TaskUpgrade))
+		}
+	}
+
+	// A 0.8.1 pin with a second source, and a token-only table (0.8.1 supplied the address):
+	// the configuration does not load at all, for the broker or the runner.
+	b.write(0644, pin, "etc", sourcesName)
+	b.writeIdentity(true)
+	b.setUpdates("[updates.forgejo]\ntoken_file = \"" + b.path("etc", "forgejo-read-token") + "\"\n" + github)
+	if _, err := New(b.l, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil || !strings.Contains(err.Error(), "[updates.second]\napi = ") {
+		t.Fatalf("token-only second-source table loaded: %v", err)
+	}
+	// The same pin and no table at all: GitHub only by configuration. Refused.
+	b.setUpdates(github)
+	refused("pin names a second source, configuration has none", "pinned on this machine include a second source")
+	// Pin and configuration name different second sources. Refused.
+	b.setUpdates("[updates.second]\napi = \"" + b.forge.URL + "/api/v1/repos/example/other\"\n" + github)
+	refused("pin and configuration disagree", "names a different one")
+	// No pin, but the installed release was verified against two sources. Refused.
+	_ = os.Remove(b.path("etc", sourcesName))
+	b.setUpdates(github)
+	refused("two-source identity, one-source configuration", "verified against two published sources")
+	// "Enable self-update" is not a way around it either (its sources are now the configuration's).
+	one := UpdatesParams{Repo: p.Repo, GitHubAPI: p.GitHubAPI, KnownHosts: p.KnownHosts}
+	b.queue(b.sign(TaskUpdates, one, nil))
+	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "verified against two published sources") || !strings.Contains(b.read("releases", "latest.json"), `"sources":2`) {
+		t.Fatalf("Enable self-update dropped the second source: %+v", b.last(TaskUpdates))
+	}
+	// Re-pinning without saying so does not drop it; --github-only does.
+	if err := Init(context.Background(), b.l, false, &Sources{Repo: p.Repo, GitHubAPI: p.GitHubAPI}, io.Discard); err == nil || !strings.Contains(err.Error(), "--github-only") {
+		t.Fatalf("a pin without --second-api dropped the second source: %v", err)
+	}
+	if err := Init(context.Background(), b.l, false, &Sources{Repo: p.Repo, GitHubAPI: p.GitHubAPI, SecondAPI: p.SecondAPI, GitHubOnly: true}, io.Discard); err == nil {
+		t.Fatal("--github-only together with --second-api accepted")
+	}
+	if err := Init(context.Background(), b.l, false, &Sources{Repo: p.Repo, GitHubAPI: p.GitHubAPI, GitHubOnly: true}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(b.read("etc", sourcesName), "github_only") || !strings.Contains(b.read("etc", sourcesName), `"second_api":""`) {
+		t.Fatalf("pin: %s", b.read("etc", sourcesName))
+	}
+	// The owner decided at the machine: one source is allowed now.
+	b.queue(b.approveUpdate())
+	if err := b.runner().Run(context.Background()); err != nil {
+		t.Fatalf("upgrade after an explicit GitHub-only pin: %v %+v", err, b.last(TaskUpgrade))
+	}
+	var m release.Metadata
+	if err := json.Unmarshal([]byte(b.read("installed-metadata.json")), &m); err != nil || m.Compared() != 1 {
+		t.Fatalf("installer was handed %s", b.read("installed-metadata.json"))
+	}
+	// A configured second source is never dropped by leaving the flag out either.
+	b.setUpdates("[updates.second]\napi = \"" + p.SecondAPI + "\"\n" + github)
+	if err := Init(context.Background(), b.l, false, &Sources{Repo: p.Repo}, io.Discard); err == nil || !strings.Contains(err.Error(), "--github-only") {
+		t.Fatalf("a pin without --second-api dropped a configured second source: %v", err)
+	}
+	if err := Init(context.Background(), b.l, false, &Sources{Repo: p.Repo, GitHubAPI: p.GitHubAPI, SecondAPI: p.SecondAPI}, io.Discard); err != nil {
+		t.Fatal(err)
 	}
 }

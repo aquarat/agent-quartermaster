@@ -32,14 +32,14 @@ aarch64 | arm64) ARCH=arm64 ;;
 x86_64 | amd64) ARCH=amd64 ;;
 *) fail "unsupported arch $(uname -m)" ;;
 esac
+VERSION=$(cat "$ROOT/VERSION") COMMIT=$(git -C "$ROOT" rev-parse HEAD)
 if [[ -z ${AQMASD:-} || -z ${AQMAS:-} ]]; then
+	# The suite's release sources are plain http on 127.0.0.1, which only a binary built with
+	# the "interop" tag accepts (release builds are https only): build both for this machine.
 	make -C "$ROOT" --no-print-directory web build >/dev/null
-	AQMASD=${AQMASD:-$ROOT/bin/aqmasd-linux-$ARCH}
-	AQMAS=${AQMAS:-$ROOT/bin/aqmas-linux-$ARCH}
-	if [[ ! -x $AQMASD ]]; then # make builds aqmasd for arm64 only; build it for this machine
-		AQMASD=$ROOT/bin/aqmasd-interop
-		(cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -o "$AQMASD" ./cmd/aqmasd)
-	fi
+	AQMASD=${AQMASD:-$ROOT/bin/aqmasd-interop} AQMAS=${AQMAS:-$ROOT/bin/aqmas-interop}
+	(cd "$ROOT" && CGO_ENABLED=0 go build -tags interop -trimpath -buildvcs=false -ldflags "-X main.version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/client.Version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/release.Version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/release.Commit=$COMMIT" -o "$ROOT/bin/aqmasd-interop" ./cmd/aqmasd &&
+		CGO_ENABLED=0 go build -tags interop -trimpath -buildvcs=false -ldflags "-X main.version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/client.Version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/release.Version=$VERSION -X github.com/aquarat/agent-quartermaster/internal/release.Commit=$COMMIT" -o "$ROOT/bin/aqmas-interop" ./cmd/aqmas)
 fi
 "$AQMASD" version | grep -q 'web ui: embedded' || fail "aqmasd has no embedded web UI"
 
@@ -185,7 +185,7 @@ done
 bun -e 'const [v,commit,...ports]=process.argv.slice(1);const sums=[];for(const p of ports){const r=await (await fetch(`http://127.0.0.1:${p}/releases/tags/v${v}`)).json();const a=r.assets.find(a=>a.name==="SHA256SUMS");sums.push(await (await fetch(`http://127.0.0.1:${p}/releases/assets/${a.id}`)).text())}
 if(sums[0]!==sums[1])process.exit(1);const m=Object.fromEntries(sums[0].trim().split("\n").map(l=>l.split("  ").reverse()));console.log(JSON.stringify({version:v,commit,github:m,second:m,sources:2}))' "$v" "$(git -C "$ROOT" rev-parse HEAD)" "$PF" "$PG" > "$T/releases/latest-two.json"
 bun -e 'const m=await Bun.file(process.argv[1]).json();delete m.second;m.sources=1;console.log(JSON.stringify(m))' "$T/releases/latest-two.json" > "$T/releases/latest.json"
-(cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags '-X github.com/aquarat/agent-quartermaster/internal/client.Version=0.0.0' -o "$T/upgrade/aqmas" ./cmd/aqmas)
+(cd "$ROOT" && CGO_ENABLED=0 go build -tags interop -trimpath -buildvcs=false -ldflags '-X github.com/aquarat/agent-quartermaster/internal/client.Version=0.0.0' -o "$T/upgrade/aqmas" ./cmd/aqmas)
 printf '\n[github]\napi = "http://127.0.0.1:%s"\n' "$PG" >> "$AQMAS_CONFIG_DIR/config.toml"
 want=$(awk -v n="aqmas-linux-$ARCH" '$2==n {print $1}' "$T/releases/$v/SHA256SUMS")
 # GitHub only: the bastion compared one published source; the CLI asks GitHub itself.

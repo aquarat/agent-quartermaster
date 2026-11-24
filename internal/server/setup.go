@@ -126,6 +126,9 @@ type setupSources struct {
 	// self-update is not enabled.
 	Active []string `json:"active"`
 	Note   string   `json:"note,omitempty"`
+	// Problem is set when the configuration names fewer sources than this machine is bound
+	// to (maint.SourcesProblem): nothing is discovered or installed until it is fixed.
+	Problem string `json:"problem,omitempty"`
 }
 
 func (s *Server) setupSources(pinned *maint.Sources) setupSources {
@@ -136,13 +139,12 @@ func (s *Server) setupSources(pinned *maint.Sources) setupSources {
 	if u.Repo != "" {
 		v.Active = u.Sources().Names()
 	}
+	if u.Repo != "" {
+		// Only once self-update is on: before that the task itself writes the sources.
+		v.Problem = maint.SourcesProblem(pinned, u, maint.ReadInstalled(u.Cache()))
+	}
 	switch {
-	case u.SecondIgnored():
-		v.Note = "The configuration names a token for a second release source but not its address, so no second source is used: releases are compared with GitHub only. To use one, add api = \"https://HOST/api/v1/repos/OWNER/NAME\" under [updates.second] in the configuration and restart the broker."
-		if eff.SecondAPI != "" {
-			// The pin made at the machine still names it: the task writes it back.
-			v.Note += " Running “Enable self-update” again does the same: the sources fixed for it include a second source."
-		}
+	case v.Problem != "":
 	case u.Repo != "" && !u.Sources().HasSecond() && eff.SecondAPI == "":
 		v.Note = "No second release source is configured: releases are compared with GitHub and this machine's own rebuild."
 	case u.Repo != "" && (u.Second.API != eff.SecondAPI || u.Repo != eff.Repo):
@@ -247,6 +249,8 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 		case maint.TaskUpgrade:
 			if !s.updatesReady() {
 				t.State, t.Blocked = "blocked", "Enable self-update first."
+			} else if v.Updates.Problem != "" {
+				t.State, t.Blocked = "blocked", v.Updates.Problem
 			} else if !candidate {
 				t.State = "idle"
 			}

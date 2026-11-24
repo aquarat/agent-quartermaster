@@ -50,7 +50,7 @@ commands:
   version               print the version
 
 as root (docs/SETUP.md):
-  maint-init [--repin] [--repo URL [--github-api URL] [--second-api URL]]
+  maint-init [--repin] [--repo URL [--github-api URL] [--second-api URL | --github-only]]
                         install the maintenance runner: units, spool, keys and passkey pins;
                         optionally pin the release sources self-update may use
   maint-run             run one owner-approved maintenance request (started by aqmas-maint.path)
@@ -255,7 +255,8 @@ func maintenance(cmd string, args []string) error {
 	fs.StringVar(&src.SecondAPI, "second-api", "", "pin the release API of an optional second source (https://HOST/api/v1/repos/OWNER/NAME)")
 	// The name of --second-api up to 0.8.1.
 	legacy := fs.String("forgejo-api", "", "deprecated: use --second-api")
-	usage := fmt.Errorf("usage: aqmasd maint-run | aqmasd maint-init [--repin] [--repo URL [--github-api URL] [--second-api URL]]")
+	fs.BoolVar(&src.GitHubOnly, "github-only", false, "with --repo: drop the second source this machine has been using")
+	usage := fmt.Errorf("usage: aqmasd maint-run | aqmasd maint-init [--repin] [--repo URL [--github-api URL] [--second-api URL | --github-only]]")
 	if err := fs.Parse(args); err != nil {
 		return usage
 	}

@@ -15,7 +15,7 @@ func TestUpdatesSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if src := c.Updates.Sources(); src.HasSecond() || src.GitHub.API != "" || strings.Join(src.Names(), ",") != "GitHub" || c.Updates.SecondIgnored() {
+	if src := c.Updates.Sources(); src.HasSecond() || src.GitHub.API != "" || strings.Join(src.Names(), ",") != "GitHub" {
 		t.Fatalf("default sources: %+v", src)
 	}
 
@@ -53,10 +53,13 @@ token_file = "/etc/aqmas/forgejo-read-token"
 	}
 
 	// 0.8.1 fell back to a compiled address when the table had none. There is no such
-	// address any more: the broker still starts, compares GitHub only, and can say so.
-	c, err = Parse([]byte(updatesBase + "[updates.forgejo]\ntoken_file = \"/etc/aqmas/forgejo-read-token\"\n"))
-	if err != nil || c.Updates.Sources().HasSecond() || !c.Updates.SecondIgnored() {
-		t.Fatalf("token without an address: %v", err)
+	// address any more, and a broker that would quietly compare GitHub alone does not start:
+	// the error says which two lines to add.
+	for _, table := range []string{"forgejo", "second"} {
+		_, err = Parse([]byte(updatesBase + "[updates." + table + "]\ntoken_file = \"/etc/aqmas/forgejo-read-token\"\n"))
+		if err == nil || !strings.Contains(err.Error(), "[updates.second]\napi = \"https://HOST/api/v1/repos/OWNER/NAME\"") {
+			t.Fatalf("[updates.%s] with a token and no address: %v", table, err)
+		}
 	}
 }
 

@@ -38,8 +38,18 @@ func (s Source) Host() string {
 	return u.Host
 }
 
-// ValidAPI reports whether s is acceptable as a release API base: https (plain http only to
-// a loopback address, for tests), no credentials, query or fragment, and a bounded length.
+// loopbackHTTP lets plain http to a loopback address stand in for https. It is off in
+// every production binary: only Go tests (EnableLoopbackHTTPForTests) and binaries built
+// with the "interop" tag for the interop suite turn it on, because their fake release
+// sources and git remotes listen on 127.0.0.1 without TLS.
+var loopbackHTTP bool
+
+// EnableLoopbackHTTPForTests is for tests only: it accepts http://127.0.0.1 where https is
+// required. Nothing in a release build calls it.
+func EnableLoopbackHTTPForTests() { loopbackHTTP = true }
+
+// ValidAPI reports whether s is acceptable as a release API base: https only, no
+// credentials, query or fragment, and a bounded length.
 func ValidAPI(s string) bool {
 	u, e := url.Parse(s)
 	return e == nil && len(s) <= 512 && SafeURL(s) && u.RawQuery == "" && u.Fragment == "" && !strings.Contains(s, "..") && !strings.ContainsAny(s, "?#@ \t\r\n\"\\")
@@ -50,8 +60,8 @@ var httpsRepoRE = regexp.MustCompile(`^https://[a-z0-9][a-z0-9.-]{0,252}(:[0-9]{
 var loopbackRepoRE = regexp.MustCompile(`^http://127\.0\.0\.1:[0-9]{1,5}/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}\.git$`)
 
 // GitProtocol classifies a git remote the update path may fetch from: "ssh" (with a deploy
-// key and pinned host keys), "https" (anonymous, a public repository), "http" (loopback
-// only, for tests), or "" for anything else. No form carries a password.
+// key and pinned host keys), "https" (anonymous, a public repository), or "" for anything
+// else ("http" to loopback exists in test builds only). No form carries a password.
 func GitProtocol(repo string) string {
 	switch {
 	case strings.Contains(repo, ".."):
@@ -59,7 +69,7 @@ func GitProtocol(repo string) string {
 		return "ssh"
 	case httpsRepoRE.MatchString(repo):
 		return "https"
-	case loopbackRepoRE.MatchString(repo):
+	case loopbackHTTP && loopbackRepoRE.MatchString(repo):
 		return "http"
 	}
 	return ""
@@ -117,7 +127,7 @@ func (s Sources) Fill(ctx context.Context, m *Metadata) error {
 
 func SafeURL(s string) bool {
 	u, e := url.Parse(s)
-	return e == nil && u.Host != "" && u.User == nil && (u.Scheme == "https" || u.Scheme == "http" && net.ParseIP(u.Hostname()).IsLoopback())
+	return e == nil && u.Host != "" && u.User == nil && (u.Scheme == "https" || loopbackHTTP && u.Scheme == "http" && net.ParseIP(u.Hostname()).IsLoopback())
 }
 func ReadLimit(r io.Reader, limit int64) ([]byte, error) {
 	b, e := io.ReadAll(io.LimitReader(r, limit+1))

@@ -179,6 +179,26 @@ describe("the Setup queue against a scripted server", () => {
     await until(() => card("enable-updates").querySelector("[data-sources]")?.getAttribute("data-sources") === "2");
   });
 
+  test("a dropped release source is shown as a blocking problem with its fix, on the task and on Upgrade", async () => {
+    const problem = "The release sources pinned on this machine include a second source, but its configuration does not name one. Nothing is checked or installed until they agree. Add these two lines to /etc/aqmas/config.toml and restart aqmasd:\n[updates.second]\napi = \"https://forge.example.com/api/v1/repos/owner/agent-quartermaster\"\n(running “Enable self-update” again writes them for you), or, to compare GitHub alone from now on, decide that at the machine: sudo aqmasd maint-init --repo URL --github-only.";
+    script = () => {
+      const v = baseView({ update_sources: { ...TWO_SOURCES, active: ["GitHub"], problem } });
+      v.tasks = v.tasks!.map((t) => (t.id === "upgrade" ? { ...t, state: "blocked", blocked_by: problem } : t));
+      return v;
+    };
+    await until(() => !!card("enable-updates").querySelector("[data-sources-problem]"));
+    const box = card("enable-updates").querySelector("[data-sources-problem]")!;
+    expect(box.getAttribute("role")).toBe("alert");
+    expect(box.classList.contains("error")).toBe(true);
+    expect(box.textContent).toContain("Updates are blocked.");
+    expect([...box.querySelectorAll("p.mono")].map((p) => p.textContent)).toEqual(["[updates.second]", 'api = "https://forge.example.com/api/v1/repos/owner/agent-quartermaster"']);
+    expect(box.textContent).toContain("--github-only");
+    expect(card("enable-updates").querySelector("[data-sources-note]")).toBeNull();
+    await until(() => !!card("upgrade").querySelector(".setup-blocked")?.textContent?.includes("pinned on this machine"));
+    script = () => baseView();
+    await until(() => !card("enable-updates").querySelector("[data-sources-problem]"));
+  });
+
   test("the upgrade card says how many published sources were compared and names them", () => {
     const sums = Object.fromEntries(["aqmasd-linux-arm64", "aqmas-linux-arm64", "aqmas-linux-amd64", "aqmas-darwin-arm64"].map((a, i) => [a, String(i).repeat(64)]));
     const view = (over: Partial<UpdateView["candidate"]>, sources: string[]): UpdateView => ({
