@@ -30,9 +30,12 @@ type HelpConfig struct {
 	ReleaseVersion string `json:"release_version,omitempty"`
 	// CLISHA256 maps each CLI asset name to the SHA-256 in the verified record of the
 	// installed release. Absent unless that record exists and is of the running release.
-	CLISHA256       map[string]string `json:"cli_sha256,omitempty"`
-	CAPin           string            `json:"ca_pin"`
-	OwnerMaxSeconds int               `json:"owner_max_seconds"`
+	CLISHA256 map[string]string `json:"cli_sha256,omitempty"`
+	// CLISHA256Sources is how many published sources that record holds agreeing manifests
+	// of (1: GitHub alone, 2: GitHub and a second source); absent with CLISHA256.
+	CLISHA256Sources int    `json:"cli_sha256_sources,omitempty"`
+	CAPin            string `json:"ca_pin"`
+	OwnerMaxSeconds  int    `json:"owner_max_seconds"`
 }
 
 type ResolvedTarget struct {

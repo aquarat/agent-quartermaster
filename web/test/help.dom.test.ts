@@ -17,6 +17,7 @@ const cfg = (over: Partial<HelpConfig> = {}): HelpConfig => ({
   cli_download_source: "github",
   release_version: "1.2.3",
   cli_sha256: sums,
+  cli_sha256_sources: 1,
   ca_pin: "sha256:" + "0".repeat(64),
   owner_max_seconds: 86400,
   ...over,
@@ -51,14 +52,23 @@ describe("Help: install the aqmas CLI", () => {
         `curl -fLsS --proto '=https' --proto-redir '=https' -o ${p.asset} -- '${base}/${p.asset}'`,
         `echo '${sums[p.asset]}  ${p.asset}' | ${sum} -c -`,
         'mkdir -p "$HOME/.local/bin"',
-        `install -m 755 ${p.asset} "$HOME/.local/bin/aqmas"`,
-        '"$HOME/.local/bin/aqmas" version)',
+        `install -m 755 ${p.asset} "$HOME/.local/bin/aqmas.new"`,
+        'mv -f "$HOME/.local/bin/aqmas.new" "$HOME/.local/bin/aqmas"',
+        '"$HOME/.local/bin/aqmas" version',
+        "p=$(command -v aqmas || true)",
+        'if [ -n "$p" ] && ! [ "$p" -ef "$HOME/.local/bin/aqmas" ]; then echo "Note: $p comes first on PATH and is what \\"aqmas\\" runs; remove it or put ~/.local/bin first."; fi)',
       ]);
       expect(text).not.toContain("SHA256SUMS");
       expect(card.textContent).toContain(p.uname);
     }
     expect(card.querySelector(".install-check")!.getAttribute("data-check")).toBe("broker");
     expect(card.textContent).toContain("aqmas 1.2.3 from GitHub");
+    // Where the hashes come from is said as it is: one source is GitHub's own word.
+    expect(card.textContent).toContain("GitHub’s published checksums alone");
+    expect(card.textContent).not.toContain("second, independent source");
+    const two = cardOf(helpPage(cfg({ cli_sha256_sources: 2 })), "Install the aqmas CLI");
+    expect(two.textContent).toContain("GitHub and a second, independent source published the same hashes");
+    expect(two.textContent).not.toContain("checksums alone");
     expect(card.textContent).toContain("uname -sm");
     expect(card.textContent).toContain("~/.zshrc");
     expect(card.textContent).toContain("~/.bashrc");
@@ -92,7 +102,7 @@ describe("Help: install the aqmas CLI", () => {
         const text = block(page, p.asset);
         const sum = p.asset === "aqmas-darwin-arm64" ? "shasum -a 256" : "sha256sum";
         expect(text).toContain(`-o SHA256SUMS -- '${base}/SHA256SUMS'\ngrep '  ${p.asset}$' SHA256SUMS > expected\n${sum} -c expected\n`);
-        expect(text).not.toContain("echo");
+        expect(text).not.toContain("echo '");
         expect(text).not.toContain("rm -rf ~");
       }
     }

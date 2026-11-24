@@ -28,9 +28,10 @@ server’s URL and CA pin. The review behind this layout is [docs/UI-REVIEW.md](
 Open **Help** on your broker's approval page. "Install the aqmas CLI" has one copy-paste block
 each for Linux arm64, Linux x86-64 and macOS on Apple Silicon (`uname -sm` on the machine tells
 you which). A block downloads the CLI of the release the broker runs from this repository's
-GitHub release, checks it against the SHA-256 the broker itself verified for that release
-(the hash is in the command, so it does not come from the download's origin), stops on a
-mismatch, installs `~/.local/bin/aqmas` and prints its version. It works in bash and zsh and
+GitHub release, checks it against the SHA-256 the broker recorded when it verified that release
+(the hash is in the command; on a broker that compares GitHub alone it is GitHub's published
+hash as it stood then, with a second source it is what both agreed on), stops on a mismatch,
+installs `~/.local/bin/aqmas` and prints its version. It works in bash and zsh and
 needs no configuration on the broker. A broker without a verified record of its release yet
 (before self-update is set up) shows the same blocks checking against GitHub's published
 `SHA256SUMS`, and says that this is a check against GitHub only.

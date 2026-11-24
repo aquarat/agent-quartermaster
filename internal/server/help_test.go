@@ -56,6 +56,20 @@ func TestHelpInstallFields(t *testing.T) {
 		t.Fatal("the daemon is not a CLI asset")
 	}
 
+	// How many sources agreed on those hashes is said too: a record of 0.8.1 or earlier
+	// (digests under "forgejo", no count) always held two.
+	if v.CLISHA256Sources != 1 {
+		t.Fatalf("GitHub-only record: %+v", v)
+	}
+	for name, latest := range map[string]string{
+		"two sources":      `{"version":"1.2.3","commit":"` + commit + `","github":` + string(text) + `,"second":` + string(text) + `,"sources":2}`,
+		"written by 0.8.1": `{"version":"1.2.3","commit":"` + commit + `","forgejo":` + string(text) + `,"github":` + string(text) + `}`,
+	} {
+		if v := help(latest); v.CLISHA256Sources != 2 || len(v.CLISHA256) != 3 || v.CLISHA256["aqmas-linux-arm64"] != sums["aqmas-linux-arm64"] {
+			t.Fatalf("%s: %+v", name, v)
+		}
+	}
+
 	for name, latest := range map[string]string{
 		"no record":         "",
 		"another version":   record("1.2.4", commit),
@@ -63,7 +77,7 @@ func TestHelpInstallFields(t *testing.T) {
 		"invalid record":    `{"version":"1.2.3","commit":"` + commit + `","github":{},"sources":1}`,
 		"unreadable record": "{",
 	} {
-		if v := help(latest); v.CLISHA256 != nil || v.ReleaseVersion != "1.2.3" || v.CLIDownloadBaseURL != github || v.CLIDownloadSource != "github" {
+		if v := help(latest); v.CLISHA256 != nil || v.CLISHA256Sources != 0 || v.ReleaseVersion != "1.2.3" || v.CLIDownloadBaseURL != github || v.CLIDownloadSource != "github" {
 			t.Fatalf("%s: %+v", name, v)
 		}
 	}
@@ -73,6 +87,12 @@ func TestHelpInstallFields(t *testing.T) {
 	if v := help(""); v.CLIDownloadBaseURL != "https://github.com/example/fork/releases/download/v1.2.3" {
 		t.Fatalf("fork: %+v", v)
 	}
+	// A read token means a private repository: its release downloads are not public.
+	e.cfg.Updates.GitHub.TokenFile = "/etc/aqmas/github-read-token"
+	if v := help(record("1.2.3", commit)); v.CLIDownloadBaseURL != "" || v.CLIDownloadSource != "" || len(v.CLISHA256) != 3 {
+		t.Fatalf("private repository: %+v", v)
+	}
+	e.cfg.Updates.GitHub.TokenFile = ""
 	e.cfg.Updates.GitHub.API = "https://git.example.com/api/v3/repos/example/fork"
 	if v := help(record("1.2.3", commit)); v.CLIDownloadBaseURL != "" || v.CLIDownloadSource != "" || len(v.CLISHA256) != 3 {
 		t.Fatalf("unknown source: %+v", v)

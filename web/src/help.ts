@@ -10,6 +10,8 @@ export interface HelpConfig {
   release_version?: string;
   /** SHA-256 per CLI asset from the broker's verified record of that release; absent without one. */
   cli_sha256?: Record<string, string>;
+  /** How many published sources agreed on those hashes when the record was made (1 or 2). */
+  cli_sha256_sources?: number;
   ca_pin: string;
   owner_max_seconds: number;
 }
@@ -51,6 +53,9 @@ export function cliHashes(c: HelpConfig): Record<string, string> | undefined {
  * out of the user's shell, and any failing step ends it before the install.
  * With `hash` the download is checked against that value, which the broker supplied. Without
  * it the only reference left is the SHA256SUMS published beside the download.
+ * The file goes in beside the old one and is renamed over it, so a running or half-written
+ * aqmas is never what the name points at. Last, a copy elsewhere that comes first on PATH
+ * (an older system-wide install) is named, because it is what typing "aqmas" would still run.
  */
 export function installCommand(base: string, asset: string, hash?: string) {
   const check = asset.startsWith("aqmas-darwin-") ? "shasum -a 256" : "sha256sum";
@@ -64,8 +69,11 @@ export function installCommand(base: string, asset: string, hash?: string) {
     `${curl} -o ${asset} -- ${quote(base + "/" + asset)}`,
     ...verify,
     'mkdir -p "$HOME/.local/bin"',
-    `install -m 755 ${asset} "$HOME/.local/bin/aqmas"`,
-    '"$HOME/.local/bin/aqmas" version)',
+    `install -m 755 ${asset} "$HOME/.local/bin/aqmas.new"`,
+    'mv -f "$HOME/.local/bin/aqmas.new" "$HOME/.local/bin/aqmas"',
+    '"$HOME/.local/bin/aqmas" version',
+    'p=$(command -v aqmas || true)',
+    'if [ -n "$p" ] && ! [ "$p" -ef "$HOME/.local/bin/aqmas" ]; then echo "Note: $p comes first on PATH and is what \\"aqmas\\" runs; remove it or put ~/.local/bin first."; fi)',
   ].join("\n");
 }
 
@@ -87,7 +95,7 @@ function installCard(c: HelpConfig, card: (title: string, ...children: Child[]) 
     return card(
       "Install the aqmas CLI",
       p("This broker knows no download address for its release. Copy the aqmas binary for this machine from the operator’s build, then install it where your user can replace it:"),
-      command('mkdir -p "$HOME/.local/bin" && install -m 755 aqmas "$HOME/.local/bin/aqmas" && "$HOME/.local/bin/aqmas" version'),
+      command('mkdir -p "$HOME/.local/bin" && install -m 755 aqmas "$HOME/.local/bin/aqmas.new" && mv -f "$HOME/.local/bin/aqmas.new" "$HOME/.local/bin/aqmas" && "$HOME/.local/bin/aqmas" version'),
       after,
     );
   const from = c.cli_download_source === "github" ? "GitHub" : "the address the operator configured";
@@ -100,9 +108,13 @@ function installCard(c: HelpConfig, card: (title: string, ...children: Child[]) 
       ? h(
           "p",
           { class: "install-check", "data-check": "broker" },
-          `Each block downloads ${version} from ${from} into a temporary directory and checks it against the SHA-256 this broker verified for the release it runs. That hash is in the command itself, so it does not come from the place the download does. If they differ the block stops and installs nothing; otherwise it installs `,
+          `Each block downloads ${version} from ${from} into a temporary directory and checks it against the SHA-256 this broker recorded when it verified the release it runs. `,
+          c.cli_sha256_sources === 2
+            ? "GitHub and a second, independent source published the same hashes then. "
+            : "That record was made from GitHub’s published checksums alone, so it is GitHub’s word as it stood then, not a second opinion. ",
+          "The hash is in the command itself: a file that differs from the recorded release stops the block and nothing is installed. Otherwise it installs ",
           code("~/.local/bin/aqmas"),
-          " and prints its version.",
+          " and prints its version. If another aqmas comes first on PATH, the block says so.",
         )
       : h(
           "p",

@@ -98,7 +98,7 @@ func DownloadBase(githubAPI, version string) string {
 	if m == nil || !ValidVersion(version) {
 		return ""
 	}
-	return "https://github.com/" + m[1] + "/releases/download/v" + version
+	return "https://github.com/" + strings.TrimSuffix(m[1], ".git") + "/releases/download/v" + version
 }
 
 // Sources are the published release sources an installation compares: GitHub always, and a
