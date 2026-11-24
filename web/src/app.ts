@@ -233,7 +233,8 @@ export class App {
       }
     } finally {
       this.refreshing = false;
-      if(requested!==route().page) void this.refresh();
+      // A page torn down mid-refresh (tests restore the globals) has no location left.
+      if (typeof location !== "undefined" && requested !== route().page) void this.refresh();
     }
   }
 
