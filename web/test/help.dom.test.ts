@@ -79,8 +79,8 @@ describe("Help: install the aqmas CLI", () => {
     const cards = [...page.querySelectorAll("section.card h2")].map((e) => e.textContent);
     expect(cards.indexOf("Enroll a machine")).toBe(cards.indexOf("Install the aqmas CLI") + 1);
     const enroll = cardOf(page, "Enroll a machine");
-    expect(enroll.querySelector("pre")!.textContent).toBe(`aqmas enroll --name '<name>' --server 'https://agent.example.com:8443' --ca-pin 'sha256:${"0".repeat(64)}'`);
-    for (const s of ["not the address of this web page", "--force", "admitted to an organisation"]) expect(enroll.textContent).toContain(s);
+    expect(enroll.querySelector("pre")!.textContent).toBe(`aqmas enroll --server 'https://agent.example.com:8443' --ca-pin 'sha256:${"0".repeat(64)}'`);
+    for (const s of ["enrolled under its hostname", "--name <name>", "not the address of this web page", "--force", "admitted to an organisation"]) expect(enroll.textContent).toContain(s);
   });
 
   test("an operator's address is used with the broker's hashes", () => {

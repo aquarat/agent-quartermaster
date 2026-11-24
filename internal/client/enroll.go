@@ -27,10 +27,26 @@ import (
 
 var hostNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
+// DefaultHostName is the name `aqmas enroll` uses without --name: the machine's hostname up
+// to its first dot, lowercased ("Foo-MacBook-Pro.local" -> "foo-macbook-pro"). A hostname
+// that is not then a valid host name is refused rather than rewritten.
+func DefaultHostName(hostname func() (string, error)) (string, error) {
+	h, err := hostname()
+	if err != nil {
+		return "", &UsageError{Msg: "cannot read this machine's hostname (" + sanitize(err.Error()) + "); pass --name HOST"}
+	}
+	name, _, _ := strings.Cut(h, ".")
+	name = strings.ToLower(name)
+	if !hostNameRE.MatchString(name) {
+		return "", &UsageError{Msg: fmt.Sprintf("this machine's hostname %q does not give a usable host name (lowercase letters, digits and '-', at most 63 characters); pass --name HOST", sanitize(h))}
+	}
+	return name, nil
+}
+
 // EnrollOptions are the flags of `aqmas enroll`.
 type EnrollOptions struct {
 	OwnerDevice bool
-	Name        string
+	Name        string // empty: DefaultHostName
 	Server      string // empty: the server in the existing config; required on a first enrollment
 	CAPin       string // "sha256:<hex>"; empty: existing config pin, else TOFU
 	Force       bool   // replace an existing client certificate
@@ -41,7 +57,18 @@ type EnrollOptions struct {
 
 // Enroll runs `aqmas enroll`.
 func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
-	if !hostNameRE.MatchString(o.Name) {
+	fromHostname := o.Name == ""
+	if fromHostname {
+		hostname := e.Hostname
+		if hostname == nil {
+			hostname = os.Hostname
+		}
+		name, err := DefaultHostName(hostname)
+		if err != nil {
+			return err
+		}
+		o.Name = name
+	} else if !hostNameRE.MatchString(o.Name) {
 		return &UsageError{Msg: fmt.Sprintf("--name %q: use a lowercase host name (letters, digits, '-')", o.Name)}
 	}
 	old, err := LoadConfig(e.Paths)
@@ -52,6 +79,15 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 		if _, statErr := os.Stat(expandHome(old.ClientCert)); statErr == nil {
 			return &UsageError{Msg: fmt.Sprintf("already enrolled as %q (%s); pass --force to request a replacement (the owner must approve it)", old.HostName, old.ClientCert)}
 		}
+	}
+	if fromHostname {
+		// A configuration copied from another machine keeps that machine's name; --force
+		// without --name takes this machine's, and says what it replaces.
+		replacing := ""
+		if o.Force && old != nil && old.HostName != "" && old.HostName != o.Name {
+			replacing = fmt.Sprintf(", replacing the enrolment as %q", sanitize(old.HostName))
+		}
+		e.logf("enrolling as %q (from this machine's hostname%s; use --name to choose another)", o.Name, replacing)
 	}
 	server := o.Server
 	if server == "" {

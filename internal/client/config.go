@@ -87,7 +87,7 @@ func isPrivateDir(dir string) bool {
 func (p Paths) ConfigFile() string { return filepath.Join(p.ConfigDir, "config.toml") }
 
 // ErrNotEnrolled means there is no usable config yet.
-var ErrNotEnrolled = errors.New("this host is not enrolled: run `aqmas enroll --name <host>` first")
+var ErrNotEnrolled = errors.New("this host is not enrolled: run `aqmas enroll` first")
 
 // LoadConfig reads and checks the config. A missing file yields ErrNotEnrolled.
 func LoadConfig(p Paths) (*Config, error) {

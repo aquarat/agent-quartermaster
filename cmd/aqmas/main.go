@@ -25,8 +25,9 @@ import (
 const usage = `aqmas: request short-lived, owner-approved access through agent-quartermaster
 
 Usage:
-  aqmas enroll --name HOST --server URL [--ca-pin sha256:HEX] [--force] [--owner-device]
+  aqmas enroll [--name HOST] --server URL [--ca-pin sha256:HEX] [--force] [--owner-device]
       Enroll this host once: creates a client key, waits for the owner to approve.
+      --name defaults to this machine's hostname (up to the first dot, lowercased).
       --server (the bastion's agent API, https://HOST:8443) is required the first time.
       Without --ca-pin, the server CA is trusted only after you confirm its
       fingerprint at a terminal.
@@ -250,8 +251,9 @@ func run(args []string) int {
 		if len(f.pos) > 0 || f.cmd != nil {
 			return fail(&client.UsageError{Msg: "enroll takes no positional arguments"})
 		}
-		if f.str["name"] == "" {
-			return fail(&client.UsageError{Msg: "enroll needs --name HOST (the name aqmasd will know this host by)"})
+		if name, given := f.str["name"]; given && name == "" {
+			// Without --name the hostname is used; an empty --name is a mistake, not that.
+			return fail(&client.UsageError{Msg: "enroll: --name is empty (leave it out to use this machine's hostname)"})
 		}
 		return fail(env.Enroll(ctx, client.EnrollOptions{
 			Name: f.str["name"], Server: f.str["server"], CAPin: f.str["ca-pin"],

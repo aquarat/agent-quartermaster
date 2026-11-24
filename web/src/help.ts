@@ -167,10 +167,10 @@ export function helpPage(c: HelpConfig) {
       "Enroll a machine",
       p("With aqmas installed (above), enroll the machine with this broker. Cross-check the CA pin once against an independently recorded copy. A faked help page could point a new host at another server."),
       c.agent_api_url
-        ? command(`aqmas enroll --name '<name>' --server ${quote(c.agent_api_url)} --ca-pin ${quote(c.ca_pin)}`)
+        ? command(`aqmas enroll --server ${quote(c.agent_api_url)} --ca-pin ${quote(c.ca_pin)}`)
         : p("Ask the operator to set agent_api_url to show the enrollment command."),
       p(
-        "Replace <name> with the new host name. --server is the agent API address shown here, not the address of this web page: the CLI cannot enroll through the web UI. If the machine already has an enrollment (for example a configuration copied from another machine, or an expired certificate), add --force to replace it.",
+        "The machine is enrolled under its hostname (up to the first dot, lowercased); add --name <name> to choose another. --server is the agent API address shown here, not the address of this web page: the CLI cannot enroll through the web UI. If the machine already has an enrollment (for example a configuration copied from another machine, or an expired certificate), add --force to replace it.",
       ),
       p(
         "The command prints a Ref and waits. Under Approvals, match the Ref and client key to the terminal, confirm its connecting address and class, and check “replaces”: approving a replacement revokes the old identity.",

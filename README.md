@@ -66,7 +66,8 @@ Every site-specific value lives in configuration, never in the code:
   Cloudflare Access and Cloudflare account settings, and where releases come from (`[updates]`:
   GitHub by default, an optional second source);
 - each enrolled host's `~/.config/aqmas/config.toml`, written by
-  `aqmas enroll --name web-1 --server https://192.0.2.10:8443 --ca-pin sha256:...`;
+  `aqmas enroll --server https://192.0.2.10:8443 --ca-pin sha256:...` (the host name defaults
+  to the machine's hostname; `--name web-1` sets another);
 - each target host's `/etc/aqmas/host-trust.conf` for `deploy/hosts/install-host-trust.sh`
   (`deploy/hosts/host-trust.conf.example`).
 

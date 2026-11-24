@@ -25,8 +25,10 @@ type Env struct {
 	Environ     func() []string
 	Now         func() time.Time
 	Getwd       func() (string, error)
-	PID         int
-	User        string
+	// Hostname gives `aqmas enroll` its default name (nil: os.Hostname).
+	Hostname func() (string, error)
+	PID      int
+	User     string
 	// Elevate, when set, takes root back just before `upgrade` replaces the executable: the
 	// rest of a `sudo aqmas upgrade` runs as the invoking user (sudo.go).
 	Elevate func() error
@@ -140,6 +142,7 @@ func DefaultEnv(stdinIsTTY bool) (*Env, error) {
 		Environ:    os.Environ,
 		Now:        time.Now,
 		Getwd:      os.Getwd,
+		Hostname:   os.Hostname,
 		PID:        os.Getpid(),
 		User:       currentUser(),
 	}, nil
