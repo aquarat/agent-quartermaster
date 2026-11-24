@@ -659,6 +659,8 @@ describe("Setup through the App and the mock", () => {
   }, 30000);
 
   test("a request for other sources than the machine's is refused by the broker", async () => {
+    // The previous test's run may still be finishing in the mock: wait until nothing runs.
+    await until(() => m.store.setup.current === null, 8000);
     const e = await api.setupPost!("/enable-updates/challenge", { params: { repo: "https://github.com/owner/other.git", github_api: "https://api.github.com/repos/owner/other", second_api: "", known_hosts: [], github_token: false, second_token: false } }).catch((x) => x);
     expect(e).toBeInstanceOf(ApiError);
     expect((e as ApiError).status).toBe(409);
