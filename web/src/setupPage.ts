@@ -94,14 +94,15 @@ const BADGES: Record<string, string> = {
 };
 
 // The runner's patterns (internal/maint/spec.go), for a friendly message before the tap.
-const REPO_RE = /^ssh:\/\/[a-z_][a-z0-9_-]{0,31}@([a-z0-9][a-z0-9.-]{0,252})(:[0-9]{1,5})?\/([A-Za-z0-9][A-Za-z0-9._/-]{0,200})\.git$/;
+const REPO_RE = /^(ssh:\/\/[a-z_][a-z0-9_-]{0,31}@|https:\/\/)([a-z0-9][a-z0-9.-]{0,252})(:[0-9]{1,5})?\/([A-Za-z0-9][A-Za-z0-9._/-]{0,200})\.git$/;
 const API_RE = /^https?:\/\/[A-Za-z0-9.:-]{1,255}\/[A-Za-z0-9._/-]{1,200}$/;
 const TOKEN_RE = /^[A-Za-z0-9_.~+/=:-]{8,512}$/;
 const TOPIC_RE = /^https:\/\/[a-z0-9][a-z0-9.-]{0,252}(:[0-9]{1,5})?\/[A-Za-z0-9_-]{1,128}$/;
 const IDENTITY_RE = /^AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}$/;
 
-const REPO_HINT = "ssh://git@forge.example.com/owner/agent-quartermaster.git";
-const FORGEJO_HINT = "https://forge.example.com/api/v1/repos/owner/agent-quartermaster";
+const REPO_HINT = "https://github.com/owner/agent-quartermaster.git";
+const SSH_REPO_HINT = "ssh://git@forge.example.com/owner/agent-quartermaster.git";
+const SECOND_HINT = "https://forge.example.com/api/v1/repos/owner/agent-quartermaster";
 const GITHUB_HINT = "https://api.github.com/repos/owner/agent-quartermaster";
 
 /** aqmas's own words for a refusal (a 4xx carries the reason); otherwise the usual wording. */
@@ -988,27 +989,61 @@ export class SetupPage {
   }
 
   private updatesForm(t: SetupTask, v: SetupView, can: boolean, label: string): Child[] {
-    const key = v.deploy_key ?? "";
+    // Where releases come from is fixed at the machine; this page shows it and signs it.
+    const src = v.update_sources;
+    const repoUrl = src?.repo ?? "";
+    const ssh = repoUrl.startsWith("ssh://");
+    const second = src?.second_api ?? "";
+    const compared = src?.compared?.length ? src.compared : ["GitHub"];
+    // The deploy key matters only for an SSH repository.
+    const key = ssh ? (v.deploy_key ?? "") : "";
     const deploy: Child[] = key
       ? [
-          h("h4", null, "1. Let this machine read the repository"),
+          h("h4", null, "Let this machine read the repository"),
           h("p", null, "Add this as a ", h("strong", null, "read-only deploy key"), " on the forge repository (repository settings → deploy keys, without write access):"),
           h("div", { class: "setup-copy" }, h("pre", { class: "cmd", "data-deploy-key": "" }, vt(key)), copyButton(() => key)),
         ]
       : [];
-    if (!can) return t.state === "blocked" || !key ? [] : [h("details", { class: "setup-more", "data-keep": "deploy" }, h("summary", null, "Deploy key"), deploy.slice(1))];
+    const sources: Child[] = src
+      ? [
+          h("h4", null, "Where releases come from"),
+          h(
+            "p",
+            { "data-sources": String(compared.length) },
+            second
+              ? `Two published sources are compared: ${compared.join(" and ")}. A release is offered only when both publish the same hashes, and installed only when this machine's own rebuild matches them. If the second source cannot be reached, the update waits.`
+              : "One published source is compared: GitHub. A release is installed only when this machine's own rebuild from source matches the hashes GitHub publishes. No second source is configured.",
+          ),
+          h(
+            "dl",
+            { class: "facts" },
+            h("dt", null, "Repository"),
+            h("dd", null, h("span", { class: "mono" }, vt(repoUrl))),
+            h("dt", null, "GitHub releases"),
+            h("dd", null, h("span", { class: "mono" }, vt(src.github_api))),
+            h("dt", null, "Second source"),
+            h("dd", null, second ? h("span", { class: "mono" }, vt(second)) : "none"),
+          ),
+          src.problem
+            ? h("div", { class: "error", role: "alert", "data-sources-problem": "" }, h("p", null, h("strong", null, "Updates are blocked.")), src.problem.split("\n").map((line) => h("p", { class: /^(\[|api = )/.test(line) ? "mono" : "" }, vt(line))))
+            : null,
+          src.note ? h("p", { class: "muted", "data-sources-note": "" }, vt(src.note)) : null,
+          h(
+            "p",
+            { class: "muted" },
+            src.origin === "pinned"
+              ? "Fixed on the machine with “aqmasd maint-init --repo …”. This page cannot change them."
+              : src.origin === "config"
+                ? "Taken from the [updates] table of the machine's configuration. This page cannot change them."
+                : "Nothing is configured, so these are the built-in defaults. A second source or another repository is set in the [updates] table of the machine's configuration, never from this page.",
+          ),
+        ]
+      : [];
+    if (!can) return t.state === "blocked" || !sources.length ? [] : [h("details", { class: "setup-more", "data-keep": "sources" }, h("summary", null, "Release sources"), sources.slice(1), deploy.slice(1))];
 
-    const src = v.update_sources ?? {};
-    const repo = input("text", REPO_HINT);
-    const forgejo = input("text", FORGEJO_HINT);
-    const github = input("text", GITHUB_HINT);
-    repo.value = src["repo"] ?? "";
-    forgejo.value = src["forgejo_api"] ?? "";
-    github.value = src["github_api"] ?? "";
-    const forgejoToken = input("password");
     const githubToken = input("password");
+    const secondToken = input("password");
     let keys: HostKeys["keys"] = [];
-    let keysFor = "";
     const hostBox = h("div", { class: "setup-hostkeys", role: "status" });
     const fetchBtn = h("button", { type: "button", class: "btn" }, "Fetch host key");
     const showKeys = () =>
@@ -1021,35 +1056,15 @@ export class SetupPage {
             ]
           : [],
       );
-    // The API addresses usually follow from the repository address: fill them in until the
-    // owner types their own.
-    let guessed = { forgejo: forgejo.value === "", github: github.value === "" };
-    forgejo.addEventListener("input", () => (guessed.forgejo = false));
-    github.addEventListener("input", () => (guessed.github = false));
-    repo.addEventListener("input", () => {
-      const m = REPO_RE.exec(repo.value.trim());
-      if (m && guessed.forgejo) forgejo.value = `https://${m[1]}/api/v1/repos/${m[3]}`;
-      if (m && guessed.github) github.value = `https://api.github.com/repos/${m[3]}`;
-      if (repo.value.trim() !== keysFor && keys.length) {
-        keys = [];
-        showKeys();
-      }
-    });
     fetchBtn.addEventListener("click", async () => {
-      const url = repo.value.trim();
-      if (!REPO_RE.test(url)) {
-        replace(hostBox, h("p", { class: "error" }, `Enter the repository address first, like ${REPO_HINT}`));
-        return;
-      }
       fetchBtn.disabled = true;
       replace(hostBox, h("p", { class: "spinner" }, "Asking the forge…"));
       try {
-        const r = await this.api.setupPost!<HostKeys>("/host-key", { repo: url });
+        const r = await this.api.setupPost!<HostKeys>("/host-key", { repo: repoUrl });
         // Fingerprints are computed here from the lines that will be signed, not taken from the reply.
         keys = await Promise.all(
           (r.keys ?? []).filter((k) => typeof k?.line === "string").map(async (k) => ({ line: k.line, fingerprint: await hostKeyFingerprint(k.line) })),
         );
-        keysFor = url;
         if (!keys.length) throw new Error("The forge returned no usable host key.");
         showKeys();
       } catch (e) {
@@ -1061,56 +1076,58 @@ export class SetupPage {
     });
 
     const collect = (): Collected => {
-      const p = { repo: repo.value.trim(), forgejo_api: forgejo.value.trim(), github_api: github.value.trim() };
-      if (!REPO_RE.test(p.repo)) throw new Invalid(`The repository address must look like ${REPO_HINT}`);
-      if (!API_RE.test(p.forgejo_api) || !p.forgejo_api.includes("/api/v1/repos/")) throw new Invalid(`The Forgejo API address must look like ${FORGEJO_HINT}`);
-      if (!API_RE.test(p.github_api)) throw new Invalid(`The GitHub API address must look like ${GITHUB_HINT}`);
-      if (!keys.length || keysFor !== p.repo) throw new Invalid("Fetch the forge's host key first and compare its fingerprint.");
+      if (!src) throw new Invalid("The release sources are not known yet. Reload the page.");
+      const p = { repo: repoUrl, github_api: src.github_api, second_api: second };
+      if (!REPO_RE.test(p.repo)) throw new Invalid(`The repository address must look like ${REPO_HINT} or ${SSH_REPO_HINT}. It is set on the machine.`);
+      if (!API_RE.test(p.github_api)) throw new Invalid(`The GitHub API address must look like ${GITHUB_HINT}. It is set on the machine.`);
+      if (second && (!API_RE.test(second) || !second.includes("/api/v1/repos/"))) throw new Invalid(`The second source's API address must look like ${SECOND_HINT}. It is set on the machine.`);
+      if (ssh && !keys.length) throw new Invalid("Fetch the forge's host key first and compare its fingerprint.");
       const secrets: Record<string, string> = {};
-      for (const [name, el, what] of [["forgejo_token", forgejoToken, "Forgejo"], ["github_token", githubToken, "GitHub"]] as const) {
+      for (const [name, el, what] of [["github_token", githubToken, "GitHub"], ["second_token", secondToken, "second-source"]] as const) {
         const val = el.value.trim();
-        if (!val) continue;
+        if (!val || (name === "second_token" && !second)) continue;
         if (!TOKEN_RE.test(val)) throw new Invalid(`The ${what} token contains characters a token cannot have. Paste it again.`);
         secrets[name] = val;
       }
       const fingerprints = keys.map((k) => k.fingerprint);
+      const named = Object.keys(secrets).map((k) => (k === "github_token" ? "GitHub" : "second source"));
       return {
-        params: { ...p, known_hosts: keys.map((k) => k.line).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), forgejo_token: "forgejo_token" in secrets, github_token: "github_token" in secrets },
+        params: {
+          ...p,
+          known_hosts: ssh ? keys.map((k) => k.line).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)) : [],
+          github_token: "github_token" in secrets,
+          second_token: "second_token" in secrets,
+        },
         secrets: Object.keys(secrets).length ? secrets : undefined,
         summary: [
-          h("p", { class: "headline pos" }, "Enable self-update: install the build tools, trust the forge and store the release tokens."),
+          h("p", { class: "headline pos" }, second ? `Enable self-update from 2 sources: ${compared.join(" and ")}.` : "Enable self-update from 1 source: GitHub."),
           h(
             "dl",
             { class: "facts" },
             h("dt", null, "Repository"),
             h("dd", null, h("span", { class: "mono" }, vt(p.repo))),
-            h("dt", null, "Forgejo releases"),
-            h("dd", null, h("span", { class: "mono" }, vt(p.forgejo_api))),
             h("dt", null, "GitHub releases"),
             h("dd", null, h("span", { class: "mono" }, vt(p.github_api))),
-            h("dt", null, "Forge host keys"),
-            h("dd", null, fingerprints.map((f) => h("span", { class: "mono block" }, vt(f)))),
+            h("dt", null, "Second source"),
+            h("dd", null, second ? h("span", { class: "mono" }, vt(second)) : "none: GitHub and this machine's own rebuild"),
+            ssh ? [h("dt", null, "Forge host keys"), h("dd", null, fingerprints.map((f) => h("span", { class: "mono block" }, vt(f))))] : null,
             h("dt", null, "Tokens"),
-            h("dd", null, Object.keys(secrets).length ? `${Object.keys(secrets).map((k) => (k === "forgejo_token" ? "Forgejo" : "GitHub")).join(" and ")}, encrypted to the runner` : "none"),
+            h("dd", null, named.length ? `${named.join(" and ")}, encrypted to the runner` : "none"),
           ),
         ],
         onSent: () => {
-          forgejoToken.value = githubToken.value = "";
+          githubToken.value = secondToken.value = "";
         },
       };
     };
 
     return [
+      sources,
       deploy,
-      h("h4", null, key ? "2. Where releases come from" : "Where releases come from"),
-      field("Repository (SSH address)", repo, "The forge repository this machine rebuilds releases from."),
-      field("Forgejo API address", forgejo),
-      field("GitHub API address", github, "The mirror: a release is only offered when both publish the same hashes."),
-      h("div", { class: "actions" }, fetchBtn),
-      hostBox,
-      h("h4", null, key ? "3. Release tokens (only for private repositories)" : "Release tokens (only for private repositories)"),
-      field("Forgejo read token (optional)", forgejoToken),
-      field("GitHub read-only token (optional)", githubToken, "Tokens are sealed in this browser for the runner. The broker and the tunnel only see ciphertext."),
+      ssh ? [h("h4", null, "The forge's host key"), h("div", { class: "actions" }, fetchBtn), hostBox] : null,
+      h("h4", null, "Release tokens (only for private repositories)"),
+      field("GitHub read-only token (optional)", githubToken, second ? undefined : "Leave empty for a public repository. A token is sealed in this browser for the runner; the broker and the tunnel only see ciphertext."),
+      second ? field("Second-source read token (optional)", secondToken, "Tokens are sealed in this browser for the runner. The broker and the tunnel only see ciphertext.") : null,
       this.runPanel(t, label, collect),
     ];
   }

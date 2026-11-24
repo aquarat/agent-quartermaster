@@ -84,6 +84,24 @@ owner_email = ""  # if set, the Access identity's email must match; sessions are
 # max_ttl_seconds = 3600
 # no_token_mode   = true
 
+# Self-update (docs/UPDATES.md). Settings → Setup → "Enable self-update" writes this table;
+# it is shown here for reference. With nothing configured, releases come from the public
+# GitHub repository alone: one published source, plus this machine's own rebuild from source.
+# [updates]
+# repo = "https://github.com/aquarat/agent-quartermaster.git"   # or ssh://… with deploy_key
+# # deploy_key    = "/etc/aqmas/repo-key"                        # only for an ssh:// repo
+# # check_minutes = 5
+# [updates.github]
+# api = "https://api.github.com/repos/aquarat/agent-quartermaster"   # change both for a fork
+# # token_file = "/etc/aqmas/github-read-token"                       # only while private
+#
+# Optional second release source (an independent builder on a Forgejo/Gitea-compatible forge).
+# Once configured, its hashes must agree with GitHub's and it must be reachable: there is no
+# fallback to GitHub alone. Leave the table out for GitHub only.
+# [updates.second]
+# api = "https://forge.example.com/api/v1/repos/example/agent-quartermaster"
+# # token_file = "/etc/aqmas/second-read-token"
+
 # Hosts aqmas may issue SSH certificates for. Principal: "<login_user>@<name>" (see docs/HOSTS.md).
 [[targets]]
 name     = "db-1"

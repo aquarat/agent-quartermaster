@@ -13,16 +13,19 @@ import (
 	"strings"
 
 	"github.com/aquarat/agent-quartermaster/deploy/bastion"
+	"github.com/aquarat/agent-quartermaster/internal/release"
 )
 
 // Init installs the runner on a bastion (root, idempotent): directories, the key pasted
-// secrets are sealed to, the deploy key, the systemd units and, when none exist yet, the
+// secrets are sealed to, the systemd units and, when none exist yet, the
 // maintenance pins. The first pins are the passkeys the broker has registered at this
 // moment, which is why Init is run by the owner from a terminal and never by a request.
 // repin replaces existing pins the same way (the out-of-band recovery for lost keys).
 //
-// sources, when given, pins the release sources "Enable self-update" may use; a request from
-// the web page can then neither choose nor change them.
+// sources, when given, pins the release sources "Enable self-update" may use. Without a pin
+// the task uses the configuration's [updates] table, or the public GitHub repository alone;
+// in every case a request from the web page can neither choose nor change them. The
+// read-only deploy key is created only when the repository is an SSH remote.
 func Init(ctx context.Context, l Layout, repin bool, sources *Sources, out io.Writer) error {
 	r, err := New(l, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if err != nil {
@@ -87,12 +90,25 @@ func Init(ctx context.Context, l Layout, repin bool, sources *Sources, out io.Wr
 			return err
 		}
 	}
-	if err := r.ensureDeployKey(ctx); err != nil {
-		return err
-	}
 	if sources != nil {
+		// Dropping a second source this machine has been using is never a side effect of
+		// leaving a flag out: it takes --github-only.
+		old, installed := l.readSources(), ReadInstalled(l.Cache)
+		had := old != nil && old.SecondAPI != "" || r.cfg.Updates.Second.API != "" || installed != nil && installed.Compared() == 2
+		switch {
+		case sources.GitHubOnly && sources.SecondAPI != "":
+			return errors.New("--github-only and --second-api contradict each other")
+		case sources.SecondAPI == "" && had && !sources.GitHubOnly:
+			return errors.New("this machine uses a second release source (its pin, its configuration or its installed release names one): pass --second-api URL to keep it, or --github-only to drop it and compare GitHub alone")
+		}
 		// Typed at the machine by its owner: validated for shape, not for policy.
-		p := UpdatesParams{Repo: sources.Repo, ForgejoAPI: sources.ForgejoAPI, GitHubAPI: sources.GitHubAPI, KnownHosts: []string{KnownHost(sources.Repo) + " ssh-ed25519 " + strings.Repeat("A", 68)}}
+		full, _ := EffectiveSources(sources, r.cfg.Updates)
+		full.GitHubOnly = false
+		*sources = full
+		p := UpdatesParams{Repo: sources.Repo, GitHubAPI: sources.GitHubAPI, SecondAPI: sources.SecondAPI}
+		if release.GitProtocol(p.Repo) == "ssh" {
+			p.KnownHosts = []string{KnownHost(sources.Repo) + " ssh-ed25519 " + strings.Repeat("A", 68)}
+		}
 		if err := p.validate(); err != nil {
 			return err
 		}
@@ -103,7 +119,17 @@ func Init(ctx context.Context, l Layout, repin bool, sources *Sources, out io.Wr
 		if err = writeOwned(l.sources(), append(b, '\n'), 0, 0, 0644); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "release sources pinned: %s\n", sources.Repo)
+		second := "none (GitHub only)"
+		if sources.SecondAPI != "" {
+			second = sources.SecondAPI
+		}
+		fmt.Fprintf(out, "release sources pinned: repository %s, GitHub %s, second source %s\n", sources.Repo, sources.GitHubAPI, second)
+	}
+	effective, _ := EffectiveSources(l.readSources(), r.cfg.Updates)
+	if release.GitProtocol(effective.Repo) == "ssh" {
+		if err := r.ensureDeployKey(ctx); err != nil {
+			return err
+		}
 	}
 	for name, body := range map[string][]byte{"aqmas-maint.service": bastion.MaintUnit, "aqmas-maint.path": bastion.MaintPath} {
 		if err := writeOwned(filepath.Join(l.UnitDir, name), body, 0, 0, 0644); err != nil {
@@ -128,7 +154,11 @@ func Init(ctx context.Context, l Layout, repin bool, sources *Sources, out io.Wr
 			return err
 		}
 	}
-	fmt.Fprintf(out, "maintenance runner ready; deploy key: %s\n", r.st.Runner.DeployKey)
+	if r.st.Runner.DeployKey != "" {
+		fmt.Fprintf(out, "maintenance runner ready; deploy key: %s\n", r.st.Runner.DeployKey)
+	} else {
+		fmt.Fprintln(out, "maintenance runner ready")
+	}
 	return nil
 }
 

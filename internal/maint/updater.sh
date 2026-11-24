@@ -1,10 +1,14 @@
 #!/bin/bash
 # Trusted installer, embedded in the maintenance runner (`aqmasd maint-run`), which has
-# already verified the owner's approval and both release manifests and passes them as
-# $METADATA. All git, dependency and candidate build commands run without root in a new
+# already verified the owner's approval and the release manifest of every configured source
+# (GitHub, and a second source where one is configured) and passes them as $METADATA. The
+# agreed digests are read from its "github" member, which every record format has. All git,
+# dependency and candidate build commands run without root in a new
 # PID/user/mount namespace. No candidate script runs on the host.
 # Environment (fixed by the runner, never by a request): CACHE BIN STATE TOOLS KNOWN_HOSTS
 # REPO DEPLOY_KEY HEALTH_URL METADATA (empty when only recovering an interrupted install).
+# REPO is https://… (anonymous fetch of a public repository; DEPLOY_KEY and KNOWN_HOSTS are
+# then unused) or ssh://… (read-only DEPLOY_KEY, host keys pinned in KNOWN_HOSTS).
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/bin
 cache=$CACHE
@@ -27,22 +31,25 @@ cleanup() {
 }
 health() { for _ in {1..20}; do pid=$(systemctl show -p MainPID --value aqmasd); [[ $pid != 0 && /proc/$pid/exe -ef $bin ]] && systemctl is-active -q aqmasd && [[ $(curl --noproxy '*' -fsS --max-time 1 "$HEALTH_URL") == ok ]] && return 0; sleep 1; done; return 1; }
 restore() {
-  [[ $(sha256sum "$bin.prev" | cut -d' ' -f1) == "$(jq -er '.forgejo["aqmasd-linux-arm64"]' "$journal")" ]] || return 1
+  [[ $(sha256sum "$bin.prev" | cut -d' ' -f1) == "$(jq -er '.github["aqmasd-linux-arm64"]' "$journal")" ]] || return 1
   if ! [[ $bin -ef $bin.prev ]]; then ln "$bin.prev" "$installstage/rollback" && mv -T "$installstage/rollback" "$bin" || return 1; fi
   systemctl restart aqmasd && health && install -m0644 "$journal" "$out/restored.json" && mv -T "$out/restored.json" "$cache/latest.json" && sync -f "$cache" && sync -f "$bin" && rm -- "$journal" && sync -f "$STATE"
 }
 trap cleanup EXIT
 if [[ -e $journal ]]; then rollback=1; exit 0; fi
-[[ -n $METADATA && $REPO == ssh://* && $DEPLOY_KEY == /* ]]
+[[ -n $METADATA ]]
+case $REPO in
+  ssh://*) [[ $DEPLOY_KEY == /* ]]; proto=ssh ;;
+  https://*) proto=https ;;
+  *) exit 1 ;;
+esac
 install -m 0600 "$METADATA" "$out/metadata"
 v=$(jq -er .version "$out/metadata"); sha=$(jq -er .commit "$out/metadata")
-old=$(jq -er '.forgejo["aqmasd-linux-arm64"]' "$cache/latest.json")
+old=$(jq -er '.github["aqmasd-linux-arm64"]' "$cache/latest.json")
 pid=$(systemctl show -p MainPID --value aqmasd)
 [[ $pid != 0 && /proc/$pid/exe -ef $bin && $(sha256sum "$bin"|cut -d' ' -f1) == "$old" ]]
 status "Building approved $v ($sha)."
 install -d -o aqmas-build -g aqmas-build -m 0700 "$t/work"
-install -o aqmas-build -g aqmas-build -m 0400 "$DEPLOY_KEY" "$t/fetch-key"
-install -o aqmas-build -g aqmas-build -m 0400 "$KNOWN_HOSTS" "$t/known_hosts"
 uid=$(id -u aqmas-build); gid=$(id -g aqmas-build)
 echo "aqmas-build:x:$uid:$gid:Builder:/tmp/home:/bin/sh" > "$t/passwd"
 echo "aqmas-build:x:$gid:" > "$t/group"
@@ -62,10 +69,18 @@ box=(setpriv --reuid=aqmas-build --regid=aqmas-build --clear-groups --no-new-pri
   --setenv BUN_INSTALL_CACHE_DIR /work/buncache)
 net=(--share-net --ro-bind /etc/resolv.conf /etc/resolv.conf --ro-bind /etc/ssl /etc/ssl
   --ro-bind-try /etc/pki /etc/pki)
-"${box[@]}" "${net[@]}" --ro-bind "$t/fetch-key" /key --ro-bind "$t/known_hosts" /known_hosts \
-  --setenv GIT_ALLOW_PROTOCOL ssh --setenv GIT_SSH_COMMAND 'ssh -F /dev/null -oBatchMode=yes -oIdentitiesOnly=yes -oStrictHostKeyChecking=yes -oUserKnownHostsFile=/known_hosts -i /key' \
-  /bin/sh -ec 'git init -q src; cd src; git -c fetch.fsckObjects=true fetch -q --no-tags -- "$1" refs/heads/main:refs/remotes/source/main "+refs/tags/v*:refs/tags/v*"; test "$(git rev-parse "refs/tags/v$2^{commit}")" = "$3"; test "$(git show refs/remotes/source/main:VERSION)" = "$2"; test "$(git tag --list | grep -Ex "v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)" | sort -V | tail -1)" = "v$2"; git merge-base --is-ancestor "$4" "$3"; git merge-base --is-ancestor "$3" refs/remotes/source/main' sh "$REPO" "$v" "$sha" "$(jq -er .commit "$cache/latest.json")"
-rm "$t/fetch-key" "$t/known_hosts"
+# Exactly one git transport. SSH: the read-only key and the pinned host keys, nothing else.
+# HTTPS: anonymous, no credential helper or prompt, no redirects; the system CAs apply.
+fetch=(--setenv GIT_ALLOW_PROTOCOL "$proto" --setenv GIT_TERMINAL_PROMPT 0)
+if [[ $proto == ssh ]]; then
+  install -o aqmas-build -g aqmas-build -m 0400 "$DEPLOY_KEY" "$t/fetch-key"
+  install -o aqmas-build -g aqmas-build -m 0400 "$KNOWN_HOSTS" "$t/known_hosts"
+  fetch+=(--ro-bind "$t/fetch-key" /key --ro-bind "$t/known_hosts" /known_hosts
+    --setenv GIT_SSH_COMMAND 'ssh -F /dev/null -oBatchMode=yes -oIdentitiesOnly=yes -oStrictHostKeyChecking=yes -oUserKnownHostsFile=/known_hosts -i /key')
+fi
+"${box[@]}" "${net[@]}" "${fetch[@]}" \
+  /bin/sh -ec 'git init -q src; cd src; git -c fetch.fsckObjects=true -c credential.helper= -c http.followRedirects=false fetch -q --no-tags -- "$1" refs/heads/main:refs/remotes/source/main "+refs/tags/v*:refs/tags/v*"; test "$(git rev-parse "refs/tags/v$2^{commit}")" = "$3"; test "$(git show refs/remotes/source/main:VERSION)" = "$2"; test "$(git tag --list | grep -Ex "v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)" | sort -V | tail -1)" = "v$2"; git merge-base --is-ancestor "$4" "$3"; git merge-base --is-ancestor "$3" refs/remotes/source/main' sh "$REPO" "$v" "$sha" "$(jq -er .commit "$cache/latest.json")"
+rm -f "$t/fetch-key" "$t/known_hosts"
 status "Fetched $v. Downloading dependencies, then testing and building offline."
 "${box[@]}" /bin/sh -ec 'cd src; git -c core.hooksPath=/dev/null checkout -q --detach "$1"; test "$(cat VERSION)" = "$2"' sh "$sha" "$v"
 "${box[@]}" "${net[@]}" --setenv GOPROXY https://proxy.golang.org --setenv GOSUMDB sum.golang.org \
@@ -82,7 +97,7 @@ mkdir "$out/assets"
 for a in aqmasd-linux-arm64 aqmas-linux-arm64 aqmas-linux-amd64 aqmas-darwin-arm64; do
   "${box[@]}" /usr/bin/timeout 30 /usr/bin/head -c 134217729 "/work/src/dist/$a" > "$out/assets/$a"
   [[ $(wc -c < "$out/assets/$a") -le 134217728 ]]
-  [[ $(sha256sum "$out/assets/$a"|cut -d' ' -f1) == "$(jq -er --arg a "$a" '.forgejo[$a]' "$out/metadata")" ]]
+  [[ $(sha256sum "$out/assets/$a"|cut -d' ' -f1) == "$(jq -er --arg a "$a" '.github[$a]' "$out/metadata")" ]]
 done
 (cd "$out/assets" && sha256sum aqmas-* aqmasd-linux-arm64 > SHA256SUMS)
 install -m 0755 "$out/assets/aqmasd-linux-arm64" "$installstage/new"; rm "$out/assets/aqmasd-linux-arm64"

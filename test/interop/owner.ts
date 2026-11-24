@@ -220,7 +220,7 @@ try {
     case 'setup-cancel': await api.setupPost!('/cancel',{});break;
     case 'updates': console.log(JSON.stringify(await api.updates()));break;
     case 'approve-update': { // "Upgrade aqmas": the update approval, exactly as the card builds it
-      const v=await api.updates(),c=v.candidate,f=c.forgejo??{};if(v.error||!c.version)throw Error('no verified update: '+v.error);
+      const v=await api.updates(),c=v.candidate,f=c.github??{};if(v.error||!c.version)throw Error('no verified update: '+v.error);
       const p=await flows.prepareAction(api,{object:'update',id:c.commit,facts:{from_version:v.current,from_commit:v.commit,to_version:c.version,to_commit:c.commit,daemon_sha256:f['aqmasd-linux-arm64']!,linux_arm64_sha256:f['aqmas-linux-arm64']!,linux_amd64_sha256:f['aqmas-linux-amd64']!,darwin_arm64_sha256:f['aqmas-darwin-arm64']!}},{action:'approve'});
       await flows.completeAction(api,auth,p);ranId=await requestId(p.canonicalText);console.log(c.version);break;
     }

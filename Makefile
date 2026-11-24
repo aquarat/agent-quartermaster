@@ -12,7 +12,7 @@ MODULE  := github.com/aquarat/agent-quartermaster
 LDFLAGS := -s -w -X main.version=$(VERSION) -X $(MODULE)/internal/client.Version=$(VERSION) -X $(MODULE)/internal/release.Version=$(VERSION) -X $(MODULE)/internal/release.Commit=$(COMMIT)
 GOBUILD := CGO_ENABLED=0 GOAMD64=v1 GOARM64=v8.0 GOTOOLCHAIN=local $(GO) build -mod=readonly -buildvcs=false -trimpath -ldflags "$(LDFLAGS)"
 
-.PHONY: all build aqmasd aqmas web webui test vet clean interop interop-cf
+.PHONY: all build aqmasd aqmas web webui test vet clean interop interop-cf check-private
 
 all: build
 
@@ -51,7 +51,19 @@ webui: web
 	@if [ -f web/dist/index.html ]; then cp -R web/dist/. internal/webui/dist/; echo "webui: embedding web/dist"; \
 	else echo "webui: web/dist not built, embedding the placeholder page"; fi
 
-vet:
+# Keeps names that must not be published (an installation's own hosts, domains, projects)
+# out of the tree. The patterns themselves are private, so they are not in the repository:
+# put one extended regex per line in the untracked file .private-patterns, or in the
+# environment variable AQMAS_PRIVATE_PATTERNS (newline-separated). With neither, this is a
+# no-op that says so. internal/release has the same check as a test (it also sees untracked files).
+check-private:
+	@set -e; f=.private-patterns; tmp=; \
+	if [ -n "$$AQMAS_PRIVATE_PATTERNS" ]; then tmp=$$(mktemp); trap 'rm -f "$$tmp"' EXIT; printf '%s\n' "$$AQMAS_PRIVATE_PATTERNS" > "$$tmp"; f=$$tmp; fi; \
+	if [ ! -s "$$f" ]; then echo 'check-private: no patterns (.private-patterns or AQMAS_PRIVATE_PATTERNS); nothing checked'; exit 0; fi; \
+	if git grep -nE -f "$$f" -- .; then echo 'check-private: names that must stay private are in the tree (see above)'; exit 1; fi; \
+	echo 'check-private: clean'
+
+vet: check-private
 	$(GO) vet ./...
 	@test -z "$$(gofmt -l cmd internal deploy test)" || { gofmt -l cmd internal deploy test; echo "gofmt needed"; exit 1; }
 

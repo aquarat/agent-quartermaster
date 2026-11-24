@@ -10,9 +10,9 @@ carries the task out. After the runner is installed there is nothing left to do 
 | **Switch to organisations** | Backup, fenced review mode, the signed cutover, restart ([ORGANISATIONS.md](ORGANISATIONS.md)) | Tap **Run**; review the plan; tap **Activate** | Cancel any time before activating. An unhealthy broker afterwards restores the backup. |
 | **Seal the store** | Backup, seal import into per-credential buckets (seal format 2), recovery drill, activation pin, deletion of plaintext keys and old backups, restart alert, restart with every bucket closed ([BUCKETS.md](BUCKETS.md)) | Save the recovery key; tap **Run**; create and test your passkey's scope keys (one tap per two scopes for each); paste the recovery key; tap **Activate**. Nothing to unlock afterwards: each approval opens what it needs | Cancel any time before activating. Not after. |
 | **Move to per-credential buckets** | Only for a store sealed by v0.4.1 (format 1): backup, migration mode, the format-1 store opened once and staged in buckets, recovery drill, activation pin, restart, deletion of format-1 backups if `purge_backups` ([SEAL-OPERATIONS.md](SEAL-OPERATIONS.md)) | Tap **Run**; tap **Open the old store** with a format-1 unlock passkey; create and test the remaining scope keys (one tap per two scopes); paste the recovery key; tap **Activate**; afterwards enable your other passkeys | No — one-way; before activation the backup restores everything |
-| **Enable self-update** | Build tools, pinned toolchains, build user, deploy key, forge host key, release tokens, release cache, `[updates]` | Register the deploy key on the forge; paste the token(s); tap **Run** | Configuration is restored if the release check or restart fails. |
+| **Enable self-update** | Build tools, pinned toolchains, build user, release cache, `[updates]`; for an SSH repository also the deploy key and forge host key; release tokens only for private repositories | With the default (public GitHub over HTTPS): tap **Run**. With an SSH repository: register the deploy key on the forge, compare the host key; paste any token(s); tap **Run** | Configuration is restored if the release check or restart fails. |
 | **Sync maintenance passkeys** | Replaces the runner's pinned passkeys with the listed ones | Tap **Run** with an already pinned passkey | Run again. |
-| **Upgrade aqmas** | Rebuild in a sandbox, compare with both releases, install, restart ([UPDATES.md](UPDATES.md)) | Review the diff; tap **Approve** | The previous binary is restored if the new one is unhealthy. |
+| **Upgrade aqmas** | Rebuild in a sandbox, compare with the published release (GitHub, and the second source when one is configured), install, restart ([UPDATES.md](UPDATES.md)) | Review the diff; tap **Approve** | The previous binary is restored if the new one is unhealthy. |
 
 Below the queue, **Settings → Setup** shows the tasks that concern the bastion machine itself
 ([BASTION-ACCESS.md](BASTION-ACCESS.md)); they run through the same runner with the same
@@ -40,28 +40,39 @@ run again after a failure.
 ## Install the runner (once, as root)
 
 ```sh
+sudo aqmasd maint-init
+```
+
+That is all for the default, where releases come from the public GitHub repository alone.
+To pin other sources (a fork, an SSH remote, an optional second release source):
+
+```sh
 sudo aqmasd maint-init --repo ssh://git@forge.example.com/example/agent-quartermaster.git \
-     --forgejo-api https://forge.example.com/api/v1/repos/example/agent-quartermaster \
-     --github-api https://api.github.com/repos/example/agent-quartermaster
+     --github-api https://api.github.com/repos/example/agent-quartermaster \
+     --second-api https://forge.example.com/api/v1/repos/example/agent-quartermaster
 ```
 
 This creates the spool (`/var/spool/aqmas-update`, root:aqmas 0730), the release cache and
 status directory (`/var/lib/aqmas-releases`), root-only state (`/var/lib/aqmas-maint`) and
 backups (`/var/lib/aqmas-backups`); a key that pasted secrets are sealed to
-(`/etc/aqmas/maint-secrets.key`, root 0600); the read-only deploy key
-(`/etc/aqmas/repo-key`, public half shown on the Setup page); the units `aqmas-maint.path`
+(`/etc/aqmas/maint-secrets.key`, root 0600); the read-only deploy key, only when the
+release repository is an `ssh://` remote (`/etc/aqmas/repo-key`, public half shown on the
+Setup page); the units `aqmas-maint.path`
 and `aqmas-maint.service`; and, **only if there are none yet**, the maintenance pins
 (`/etc/aqmas/update-passkeys.json`, root 0600) from the passkeys registered at that moment.
 That first pinning is trust on first use, which is why it happens in your terminal session
 and not through a request. `--repin` repeats it (the way back in if every pinned passkey is
 lost).
 
-The three source flags **pin the release sources** (`/etc/aqmas/maint-sources.json`).
-"Enable self-update" accepts exactly these and stays blocked until they are pinned: where
-releases come from is decided at the machine, so no request from the page, and no misused
-passkey tap, can point the bastion at another publisher. Changing them is a
-`maint-init --repo …` at the machine, followed by "Enable self-update" again. The flags can
-be left out on a bastion that will not use self-update.
+The source flags **pin the release sources** (`/etc/aqmas/maint-sources.json`): `--repo`
+(required when pinning), `--github-api` (default: the compiled GitHub repository) and
+`--second-api` (default: none, GitHub only; `--forgejo-api` is its old name). On a machine that already uses a second source, leaving `--second-api` out is refused unless `--github-only` says that dropping it is intended. "Enable
+self-update" accepts exactly one set of sources: the pinned ones; without a pin the
+`[updates]` table of the root-owned configuration; with neither, the public GitHub
+repository alone. Where releases come from is decided at the machine, so no request from the
+page, and no misused passkey tap, can point the bastion at another publisher, add a source
+or drop a configured one. Changing them is an edit of `[updates]` or a `maint-init --repo …`
+at the machine, followed by "Enable self-update" again ([UPDATES.md](UPDATES.md)).
 
 `aqmasd.service` must allow the spool (`ReadWritePaths=-/var/spool/aqmas-update`, as
 shipped); because that entry only takes effect if the directory exists when the broker
@@ -194,9 +205,18 @@ All under a signed-in session. `GET` works in every mode, with every bucket clos
   `started_at`, `finished_at`, `message`, `log[]`, `result{}`; `request` is the first 16
   hex characters of SHA-256 of the canonical text that started it). `passkeys[]` are
   `{id, credential, key_sha256, name, pinned, current}`.
+  `update_sources` is `{repo, github_api, second_api, origin, compared[], active[], note?}`:
+  the release sources "Enable self-update" accepts (`second_api` is `""` for GitHub only),
+  where they were decided (`origin`: `pinned`, `config` or `default`), their names
+  (`compared`: `"GitHub"`, `"second source (HOST)"`), the names the running broker compares
+  now (`active`, empty while self-update is off) and a `note` when the page should say
+  something (GitHub only), and a `problem` when updates are blocked because the configuration
+  names fewer sources than the machine's pin or its installed release ([UPDATES.md](UPDATES.md)):
+  the page shows it as an error with the fix, and “Upgrade aqmas” is blocked by it.
 * `GET /api/ui/setup/cutover/preview` → `{id, plan}`: the plan the cutover would propose now.
 * `POST /api/ui/setup/host-key {repo}` → `{host, keys:[{line, fingerprint}]}`: the forge's SSH
-  host keys as the broker sees them, for you to compare. They only count once signed.
+  host keys as the broker sees them, for you to compare (an `ssh://` repository only). They
+  only count once signed.
 * `POST /api/ui/setup/{task}/challenge {params, secrets_sha256}` → the usual
   `{challenge_id, canonical, public_key}`.
 * `POST /api/ui/setup/{task}/run {challenge_id, assertion, secrets, request?}` → `{ok}`; the
@@ -225,7 +245,7 @@ extra whitespace; `secrets_sha256` is the SHA-256 of the raw secrets packet, or 
 | `cutover` | `{}` | none |
 | `seal` | `{"recipient","purge_backups","lock_alert"}` | `ntfy_token`, `ntfy_topic_url` when `lock_alert` |
 | `buckets` | `{"purge_backups"}` | none |
-| `enable-updates` | `{"repo","forgejo_api","github_api","known_hosts":[sorted lines],"forgejo_token":bool,"github_token":bool}` | `forgejo_token` and/or `github_token` as flagged |
+| `enable-updates` | `{"repo","github_api","second_api","known_hosts":[sorted lines],"github_token":bool,"second_token":bool}`; `second_api` is `""` without a second source, `known_hosts` is `[]` unless `repo` is `ssh://` | `github_token` and/or `second_token` as flagged |
 | `sync-passkeys` | `{"pins":[{"id","key_sha256"}]}` | none |
 | `bastion-access` | `{"name","address","port","admin_user","ssh_ca"}` | none |
 | `bastion-allow` | `{"hosts":[{"id","name","address"}]}` (sorted by `id`) | none |

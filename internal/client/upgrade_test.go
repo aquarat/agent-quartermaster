@@ -22,7 +22,7 @@ func TestUpgradeVerifiesBeforeReplacing(t *testing.T) {
 	for _, a := range release.Assets {
 		sums[a] = digest
 	}
-	m := release.Metadata{Version: "0.2.0", Commit: strings.Repeat("b", 40), Forgejo: sums, GitHub: sums}
+	m := release.Metadata{Version: "0.2.0", Commit: strings.Repeat("b", 40), GitHub: sums}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/releases/latest", func(w http.ResponseWriter, r *http.Request) { json.NewEncoder(w).Encode(m) })
 	mux.HandleFunc("GET /v1/releases/0.2.0/{asset}", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, binary) })
@@ -104,5 +104,64 @@ func TestPackageManagerChangedInstall(t *testing.T) {
 	}
 	if _, err = os.Stat(path + ".prev"); !os.IsNotExist(err) {
 		t.Fatal("changed backup")
+	}
+}
+
+// The bastion may compare GitHub alone or GitHub and a second source; an older bastion
+// (0.8.1) always had two and named the second one "forgejo". The CLI accepts each form and
+// in every one checks the bastion's digests against GitHub itself.
+func TestUpgradeBastionModes(t *testing.T) {
+	sums := release.Sums{}
+	for _, a := range release.Assets {
+		sums[a] = strings.Repeat("a", 64)
+	}
+	other := release.Sums{}
+	for _, a := range release.Assets {
+		other[a] = strings.Repeat("b", 64)
+	}
+	commit := strings.Repeat("c", 40)
+	raw := func(v any) string { b, _ := json.Marshal(v); return string(b) }
+	one := release.Metadata{Version: "0.9.0", Commit: commit, GitHub: sums}
+	two := release.Metadata{Version: "0.9.0", Commit: commit, GitHub: sums, Second: sums}
+	wire := func(m release.Metadata) string { b, _ := m.LegacyJSON(); return string(b) }
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/releases/tags/v0.9.0":
+			fmt.Fprint(w, `{"tag_name":"v0.9.0","assets":[{"name":"SHA256SUMS","id":1}]}`)
+		case "/releases/assets/1":
+			fmt.Fprint(w, sums.Text())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer gh.Close()
+	for name, tc := range map[string]struct {
+		reply, says string
+		ok          bool
+	}{
+		"GitHub only":                     {wire(one), "against GitHub and its own rebuild", true},
+		"second source":                   {wire(two), "against GitHub and a second source and its own rebuild", true},
+		"bastion without the legacy key":  {raw(one), "against GitHub and its own rebuild", true},
+		"0.8.1 bastion":                   {`{"version":"0.9.0","commit":"` + commit + `","forgejo":` + raw(sums) + `,"github":` + raw(sums) + `}`, "against GitHub and a second source", true},
+		"0.8.1 bastion, sources disagree": {`{"version":"0.9.0","commit":"` + commit + `","forgejo":` + raw(other) + `,"github":` + raw(sums) + `}`, "", false},
+		"bastion disagrees with GitHub":   {wire(release.Metadata{Version: "0.9.0", Commit: commit, GitHub: other}), "", false},
+		"second disagrees":                {raw(release.Metadata{Version: "0.9.0", Commit: commit, GitHub: sums, Second: other}), "", false},
+		"miscounted sources":              {`{"version":"0.9.0","commit":"` + commit + `","github":` + raw(sums) + `,"sources":2}`, "", false},
+		"no github digests":               {`{"version":"0.9.0","commit":"` + commit + `","forgejo":` + raw(sums) + `}`, "", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bastion := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, tc.reply) }))
+			defer bastion.Close()
+			p := filepath.Join(t.TempDir(), "aqmas")
+			if e := os.WriteFile(p, []byte("old"), 0755); e != nil {
+				t.Fatal(e)
+			}
+			var log bytes.Buffer
+			env := Env{Stderr: &log, Environ: func() []string { return nil }}
+			err := env.upgrade(t.Context(), &APIClient{base: bastion.URL, http: bastion.Client(), maxRsp: 4096}, release.Source{API: gh.URL}, p, "0.8.1", true, false, false, "", false)
+			if (err == nil) != tc.ok || tc.ok && !strings.Contains(log.String(), tc.says) {
+				t.Fatalf("%v\n%s", err, log.String())
+			}
+		})
 	}
 }

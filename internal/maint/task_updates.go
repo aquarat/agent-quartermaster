@@ -152,16 +152,15 @@ func sameFile(a, b string) bool {
 	return e1 == nil && e2 == nil && os.SameFile(x, y)
 }
 
-// checkSources is the rule for where releases may come from: only the sources pinned from a
-// terminal on the machine (`maint-init --repo …`). A request can use them; it can neither
-// choose nor change them, so no passkey tap can point the bastion at another publisher.
+// checkSources is the rule for where releases may come from: only the sources decided at
+// the machine (EffectiveSources: a pin from `maint-init --repo …`, else the root-owned
+// configuration, else the public GitHub repository alone). A request can use them; it can
+// neither choose nor change them, so no passkey tap can point the bastion at another
+// publisher, add a second source or drop a configured one.
 func (r *Runner) checkSources(p UpdatesParams) error {
-	pinned := r.l.readSources()
-	if pinned == nil {
-		return errors.New("pin the release sources on the machine first: sudo aqmasd maint-init --repo … --forgejo-api … --github-api …")
-	}
-	if p.Repo != pinned.Repo || p.ForgejoAPI != pinned.ForgejoAPI || p.GitHubAPI != pinned.GitHubAPI {
-		return errors.New("these are not the release sources pinned on this machine (sudo aqmasd maint-init --repo … changes them)")
+	want, _ := EffectiveSources(r.l.readSources(), r.cfg.Updates)
+	if p.Repo != want.Repo || p.GitHubAPI != want.GitHubAPI || p.SecondAPI != want.SecondAPI {
+		return errors.New("these are not the release sources fixed on this machine (the [updates] table of its configuration, or sudo aqmasd maint-init --repo …, changes them)")
 	}
 	return nil
 }
@@ -174,7 +173,9 @@ type tokenSwap struct {
 	gid int
 }
 
-var tokenFiles = map[string]string{"forgejo_token": "forgejo-read-token", "github_token": "github-read-token"}
+// The last entry is the second source's token file as 0.8.1 and earlier named it: no request
+// carries that name, so a run sets the old file aside like any token it no longer carries.
+var tokenFiles = map[string]string{"github_token": "github-read-token", "second_token": "second-read-token", "": "forgejo-read-token"}
 
 func (r *Runner) tokens() tokenSwap {
 	_, gid, _ := r.l.serviceIDs()
@@ -257,8 +258,9 @@ func fileHash(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// seed checks the installed broker against both published releases of its own version and
-// fills the release cache. Nothing is trusted from one source alone.
+// seed checks the installed broker against the published release of its own version at
+// every configured source (GitHub; the second source too when there is one) and fills the
+// release cache. A configured source that is unreachable or disagrees refuses the task.
 func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) (release.Metadata, error) {
 	// The identity that later upgrades are anchored on is this binary's own, compiled in.
 	// (The test layout's stand-in broker is a script, so there the facts supply it.)
@@ -273,17 +275,14 @@ func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) (release.M
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
-	var err error
-	if m.Forgejo, err = u.Forgejo.Hashes(ctx, m.Version, false); err != nil {
-		return m, errors.New("Forgejo release " + m.Version + ": " + err.Error())
-	}
-	if m.GitHub, err = u.GitHub.Hashes(ctx, m.Version, true); err != nil {
-		return m, errors.New("GitHub release " + m.Version + ": " + err.Error())
+	src := u.Sources()
+	if err := src.Fill(ctx, &m); err != nil {
+		return m, errors.New("release " + m.Version + ": " + err.Error())
 	}
 	if !m.Valid() {
-		return m, errors.New("the two releases of " + m.Version + " disagree")
+		return m, errors.New("the published release " + m.Version + " is not usable")
 	}
-	if got, err := fileHash(r.l.Bin); err != nil || got != m.Forgejo[release.Daemon] {
+	if got, err := fileHash(r.l.Bin); err != nil || got != m.GitHub[release.Daemon] {
 		return m, errors.New("the installed broker is not the published " + m.Version + " binary")
 	}
 	stage, err := os.MkdirTemp(r.l.Cache, ".seed-")
@@ -295,14 +294,16 @@ func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) (release.M
 		if name == release.Daemon {
 			continue
 		}
-		b, err := u.Forgejo.Asset(ctx, m.Version, name, false, 128<<20)
+		// Whichever source delivers it: the bytes are checked against the agreed digest.
+		b, err := src.GitHub.Asset(ctx, m.Version, name, true, 128<<20)
+		if err != nil && src.HasSecond() {
+			b, err = src.Second.Asset(ctx, m.Version, name, false, 128<<20)
+		}
 		if err != nil {
-			if b, err = u.GitHub.Asset(ctx, m.Version, name, true, 128<<20); err != nil {
-				return m, errors.New("could not download " + name)
-			}
+			return m, errors.New("could not download " + name)
 		}
 		sum := sha256.Sum256(b)
-		if hex.EncodeToString(sum[:]) != m.Forgejo[name] {
+		if hex.EncodeToString(sum[:]) != m.GitHub[name] {
 			return m, errors.New(name + " does not match the published digest")
 		}
 		// Explicit modes: the runner's umask is 077 and the broker serves these files.
@@ -310,7 +311,7 @@ func (r *Runner) seed(ctx context.Context, u config.Updates, f Facts) (release.M
 			return m, err
 		}
 	}
-	if err = writeOwned(filepath.Join(stage, "SHA256SUMS"), []byte(m.Forgejo.Text()), 0, 0, 0644); err != nil {
+	if err = writeOwned(filepath.Join(stage, "SHA256SUMS"), []byte(m.GitHub.Text()), 0, 0, 0644); err != nil {
 		return m, err
 	}
 	if err = os.Chmod(stage, 0755); err != nil {
@@ -340,13 +341,24 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 	if err = r.l.healthy(ctx, r.cfg.ListenWeb); err != nil {
 		return "", errors.New("the broker is not healthy; fix that first")
 	}
-	u := config.Updates{Repo: p.Repo, DeployKey: r.l.deployKey()}
-	u.Forgejo.API, u.GitHub.API = p.ForgejoAPI, p.GitHubAPI
-	if p.ForgejoToken {
-		u.Forgejo.TokenFile = filepath.Join(r.l.ConfigDir, "forgejo-read-token")
+	// An SSH remote needs the deploy key and pinned host keys; an HTTPS one (the public
+	// GitHub repository) needs neither.
+	ssh := release.GitProtocol(p.Repo) == "ssh"
+	u := config.Updates{Repo: p.Repo}
+	if ssh {
+		u.DeployKey = r.l.deployKey()
 	}
+	u.GitHub.API, u.Second.API = p.GitHubAPI, p.SecondAPI
 	if p.GitHubToken {
-		u.GitHub.TokenFile = filepath.Join(r.l.ConfigDir, "github-read-token")
+		u.GitHub.TokenFile = filepath.Join(r.l.ConfigDir, tokenFiles["github_token"])
+	}
+	if p.SecondToken {
+		u.Second.TokenFile = filepath.Join(r.l.ConfigDir, tokenFiles["second_token"])
+	}
+	names := strings.Join(u.Sources().Names(), " and ")
+	// The task may not be the way a second source disappears from this machine.
+	if p := SourcesProblem(r.l.readSources(), u, ReadInstalled(r.l.Cache)); p != "" {
+		return "", errors.New(p)
 	}
 	next, err := setUpdates(r.raw, u)
 	if err != nil {
@@ -368,17 +380,19 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 			return "", err
 		}
 	}
-	r.step("Creating the read-only deploy key")
-	if err = r.ensureDeployKey(ctx); err != nil {
-		return "", err
+	if ssh {
+		r.step("Creating the read-only deploy key")
+		if err = r.ensureDeployKey(ctx); err != nil {
+			return "", err
+		}
+		r.st.Runner.DeployKey = readDeployKey(r.l)
+		r.result("deploy_key", r.st.Runner.DeployKey)
+		r.step("Trusting the forge's host key")
+		if err = r.trustHost(p.KnownHosts); err != nil {
+			return "", err
+		}
 	}
-	r.st.Runner.DeployKey = readDeployKey(r.l)
-	r.result("deploy_key", r.st.Runner.DeployKey)
-	r.step("Trusting the forge's host key")
-	if err = r.trustHost(p.KnownHosts); err != nil {
-		return "", err
-	}
-	r.step("Checking the installed broker against both published releases")
+	r.step("Checking the installed broker against the published release at " + names)
 	// The new tokens are only staged until they have proved themselves against the releases.
 	swap := r.tokens()
 	staged, err := swap.stage(secrets)
@@ -387,13 +401,14 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 		return "", err
 	}
 	probe := u
-	probe.Forgejo.TokenFile, probe.GitHub.TokenFile = staged["forgejo_token"], staged["github_token"]
+	probe.GitHub.TokenFile, probe.Second.TokenFile = staged["github_token"], staged["second_token"]
 	m, err := r.seed(ctx, probe, f)
 	if err != nil {
 		swap.rollback()
 		return "", err
 	}
 	r.result("release", m.Version+" ("+m.Commit[:12]+")")
+	r.result("sources", names)
 	r.step("Adding the update sources to the configuration and restarting the broker")
 	// A copy of the configuration for the few seconds of the restart; it may still contain
 	// the notification URL, so it never outlives the task.
@@ -438,7 +453,13 @@ func (r *Runner) enableUpdates(ctx context.Context, p UpdatesParams, secrets map
 	r.clearJournal()
 	_ = os.RemoveAll(before)
 	swap.finish()
-	return "Self-update is ready. Register the deploy key on the forge (read-only) if you have not yet; new releases then appear under “Upgrade aqmas”.", nil
+	msg := "Self-update is ready, comparing " + plural(len(u.Sources().Names()), "published source") + " (" + names + ") and this machine's own rebuild. "
+	if ssh {
+		msg += "Register the deploy key on the forge (read-only) if you have not yet; new releases then appear under “Upgrade aqmas”."
+	} else {
+		msg += "New releases appear under “Upgrade aqmas”."
+	}
+	return msg, nil
 }
 
 func (r *Runner) restart(ctx context.Context) error {
@@ -491,8 +512,8 @@ func plural(n int, noun string) string {
 	return strconv.Itoa(n) + " " + noun + "s"
 }
 
-// upgrade re-verifies the approved release against both sources and the installed identity,
-// then hands the already-verified metadata to the embedded installer.
+// upgrade re-verifies the approved release against every configured source and the
+// installed identity, then hands the already-verified metadata to the embedded installer.
 func (r *Runner) upgrade(ctx context.Context, sg canon.Signed) (string, error) {
 	u := r.cfg.Updates
 	if u.Repo == "" {
@@ -506,18 +527,21 @@ func (r *Runner) upgrade(ctx context.Context, sg canon.Signed) (string, error) {
 	if sg.FromCommit != current.Commit || sg.FromVersion != current.Version {
 		return "", errors.New("the approval is for another installed version")
 	}
-	r.step("Verifying both releases of " + sg.ToVersion)
+	// The sources come from the configuration, and the configuration alone may not have
+	// dropped one: the root pin and the installed identity are checked against it first.
+	if p := SourcesProblem(r.l.readSources(), u, &current); p != "" {
+		return "", errors.New(p)
+	}
+	src := u.Sources()
+	r.step("Verifying release " + sg.ToVersion + " at " + strings.Join(src.Names(), " and "))
 	m := release.Metadata{Version: sg.ToVersion, Commit: sg.ToCommit}
 	hctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	if m.Forgejo, err = u.Forgejo.Hashes(hctx, m.Version, false); err != nil {
-		return "", errors.New("Forgejo: " + err.Error())
+	if err = src.Fill(hctx, &m); err != nil {
+		return "", err
 	}
-	if m.GitHub, err = u.GitHub.Hashes(hctx, m.Version, true); err != nil {
-		return "", errors.New("GitHub: " + err.Error())
-	}
-	if !m.Valid() || !sg.Sums().Agrees(m.Forgejo) {
-		return "", errors.New("the releases or the approval disagree")
+	if !m.Valid() || !sg.Sums().Agrees(m.GitHub) {
+		return "", errors.New("the published release and the approval disagree")
 	}
 	if b, err = json.Marshal(m); err != nil {
 		return "", err

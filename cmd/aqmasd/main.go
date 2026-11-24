@@ -50,7 +50,7 @@ commands:
   version               print the version
 
 as root (docs/SETUP.md):
-  maint-init [--repin] [--repo URL --forgejo-api URL --github-api URL]
+  maint-init [--repin] [--repo URL [--github-api URL] [--second-api URL | --github-only]]
                         install the maintenance runner: units, spool, keys and passkey pins;
                         optionally pin the release sources self-update may use
   maint-run             run one owner-approved maintenance request (started by aqmas-maint.path)
@@ -250,16 +250,25 @@ func maintenance(cmd string, args []string) error {
 	test := fs.Bool("test-layout", false, "DIR HOOK follow: relocate everything (never as root)")
 	repin := fs.Bool("repin", false, "replace the maintenance pins with the passkeys registered now")
 	var src maint.Sources
-	fs.StringVar(&src.Repo, "repo", "", "pin the release repository (ssh://…)")
-	fs.StringVar(&src.ForgejoAPI, "forgejo-api", "", "pin the Forgejo release API")
-	fs.StringVar(&src.GitHubAPI, "github-api", "", "pin the GitHub release API")
-	usage := fmt.Errorf("usage: aqmasd maint-run | aqmasd maint-init [--repin] [--repo URL --forgejo-api URL --github-api URL]")
+	fs.StringVar(&src.Repo, "repo", "", "pin the release repository (https://… or ssh://…)")
+	fs.StringVar(&src.GitHubAPI, "github-api", "", "pin the GitHub release API (default: the compiled one)")
+	fs.StringVar(&src.SecondAPI, "second-api", "", "pin the release API of an optional second source (https://HOST/api/v1/repos/OWNER/NAME)")
+	// The name of --second-api up to 0.8.1.
+	legacy := fs.String("forgejo-api", "", "deprecated: use --second-api")
+	fs.BoolVar(&src.GitHubOnly, "github-only", false, "with --repo: drop the second source this machine has been using")
+	usage := fmt.Errorf("usage: aqmasd maint-run | aqmasd maint-init [--repin] [--repo URL [--github-api URL] [--second-api URL | --github-only]]")
 	if err := fs.Parse(args); err != nil {
 		return usage
 	}
 	var sources *maint.Sources
+	if *legacy != "" {
+		if src.SecondAPI != "" && src.SecondAPI != *legacy {
+			return usage
+		}
+		src.SecondAPI = *legacy
+	}
 	if src != (maint.Sources{}) {
-		if src.Repo == "" || src.ForgejoAPI == "" || src.GitHubAPI == "" {
+		if src.Repo == "" {
 			return usage
 		}
 		sources = &src

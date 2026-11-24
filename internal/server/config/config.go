@@ -212,6 +212,9 @@ func Parse(b []byte) (*Config, error) {
 	if und := md.Undecoded(); len(und) > 0 {
 		return nil, fmt.Errorf("config: unknown keys: %v", und)
 	}
+	if err := c.Updates.normalize(); err != nil {
+		return nil, err
+	}
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}

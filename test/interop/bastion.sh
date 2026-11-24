@@ -73,7 +73,8 @@ bastion_scenario() {
 	CAFP=$(ssh-keygen -lf "$T/sshd/ca.pub" | cut -d' ' -f2)
 
 	# --- not installed: nothing to ask for, and only the access task is offered ---
-	"$AQMAS" bastion 2>&1 | grep -q 'not installed' || fail "bastion access offered before it is installed"
+	"$AQMAS" bastion >"$T/bastion-before.out" 2>&1 || true
+	grep -q "not installed" "$T/bastion-before.out" || fail "bastion access offered before it is installed: $(cat "$T/bastion-before.out")"
 	[[ $(owner setup-state bastion-access) == available && $(owner setup-state bastion-allow) == blocked:* && $(owner setup-state bastion-access-remove) == blocked:* ]] || fail "bastion tasks before install: $(owner setup-state bastion-access) / $(owner setup-state bastion-allow)"
 
 	# --- a CA other than the one root can verify is refused; nothing changes ---

@@ -1,3 +1,9 @@
+# The generic second-builder workflow, for a Forgejo (or Gitea) instance that hosts a copy of
+# this repository: on a VERSION change on main it tests, builds the same reproducible
+# release as .github/workflows/release.yml, and publishes it as a release of the instance it
+# runs on (github.server_url: nothing here names a host). An installation that lists that
+# instance as its optional second release source ([updates.second], docs/UPDATES.md) then
+# requires both builds to agree. Not needed for a GitHub-only setup.
 name: Release from VERSION
 on:
   push:

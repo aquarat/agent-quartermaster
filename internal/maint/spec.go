@@ -88,17 +88,17 @@ var Specs = []Spec{
 		Reversible: "No — one-way; before activation the backup restores everything"},
 	{ID: TaskUpdates, Title: "Enable self-update",
 		Summary: "Prepares this machine to rebuild and install new releases itself, each one approved by you on this page.",
-		Steps: []string{"Install build tools, the pinned Go and Bun toolchains and a locked build user", "Create the read-only deploy key and trust the forge's host key", "Store the release-reading tokens",
-			"Check the installed broker against both published releases and cache the matching CLIs", "Add the update sources to the configuration and restart the broker"},
+		Steps: []string{"Install build tools, the pinned Go and Bun toolchains and a locked build user", "For an SSH repository only: create the read-only deploy key and trust the forge's host key", "Store the release-reading tokens, if any",
+			"Check the installed broker against the published release at GitHub (and at the second source when one is configured) and cache the matching CLIs", "Add the update sources to the configuration and restart the broker"},
 		Reversible: "The previous configuration is restored if the release check or the restart fails. Installed tools stay.",
-		Secrets:    []string{"forgejo_token", "github_token"}},
+		Secrets:    []string{"github_token", "second_token"}},
 	{ID: TaskPins, Title: "Sync maintenance passkeys",
 		Summary:    "Replaces the root-owned list of passkeys that may approve tasks on this page with the passkeys listed here.",
 		Steps:      []string{"Compare each listed passkey with the broker's record", "Replace the pinned list"},
 		Reversible: "Run it again with another list. If no pinned passkey is left, re-pin from a terminal on the machine."},
 	{ID: TaskUpgrade, Title: "Upgrade aqmas",
-		Summary:    "Rebuilds the approved release from source in a sandbox, checks all four binaries against both published releases, installs the broker and restarts it.",
-		Steps:      []string{"Verify the approval and both releases", "Fetch, build and test in a sandbox without network", "Install, restart and check health"},
+		Summary:    "Rebuilds the approved release from source in a sandbox, checks all four binaries against the published release (GitHub, and the second source when one is configured), installs the broker and restarts it.",
+		Steps:      []string{"Verify the approval and the published release at every configured source", "Fetch, build and test in a sandbox without network", "Install, restart and check health"},
 		Reversible: "The previous binary is restored automatically if the new one is unhealthy. Database migrations are not reversed."},
 	{ID: TaskBastionAccess, Group: GroupBastion, Title: "Allow aqmas access to the bastion",
 		Summary: "Makes this machine's own sshd accept aqmas certificates for two accounts: a read-only inspect account that can only run fixed log and status commands, and your admin account (root, behind a red card, from hosts you allow). Your emergency keys are not touched and stay the way in when aqmas is down.",
@@ -172,14 +172,16 @@ type BucketsParams struct {
 
 func (BucketsParams) validate() error { return nil }
 
-// UpdatesParams names the release sources. The token flags say which sealed secrets follow.
+// UpdatesParams names the release sources. SecondAPI is "" without a second source;
+// KnownHosts is empty unless Repo is an SSH remote. The token flags say which sealed secrets
+// follow.
 type UpdatesParams struct {
-	Repo         string   `json:"repo"`
-	ForgejoAPI   string   `json:"forgejo_api"`
-	GitHubAPI    string   `json:"github_api"`
-	KnownHosts   []string `json:"known_hosts"`
-	ForgejoToken bool     `json:"forgejo_token"`
-	GitHubToken  bool     `json:"github_token"`
+	Repo        string   `json:"repo"`
+	GitHubAPI   string   `json:"github_api"`
+	SecondAPI   string   `json:"second_api"`
+	KnownHosts  []string `json:"known_hosts"`
+	GitHubToken bool     `json:"github_token"`
+	SecondToken bool     `json:"second_token"`
 }
 
 // Pin identifies one passkey by credential ID (base64url) and SHA-256 of its COSE public key.
@@ -338,18 +340,32 @@ func (p SealParams) validate() error {
 }
 
 func (p UpdatesParams) validate() error {
-	host := KnownHost(p.Repo)
-	if host == "" {
-		return errors.New("repo must look like ssh://git@forge.example.com/owner/name.git")
+	proto := release.GitProtocol(p.Repo)
+	if proto == "" {
+		return errors.New("repo must look like https://github.com/owner/name.git or ssh://git@forge.example.com/owner/name.git")
 	}
-	for _, u := range []string{p.ForgejoAPI, p.GitHubAPI} {
-		if !apiRE.MatchString(u) || !release.SafeURL(u) || strings.Contains(u, "..") {
+	apis := []string{p.GitHubAPI}
+	if p.SecondAPI != "" {
+		apis = append(apis, p.SecondAPI)
+		if !strings.Contains(p.SecondAPI, "/api/v1/repos/") {
+			return errors.New("the second source's API must contain /api/v1/repos/")
+		}
+	} else if p.SecondToken {
+		return errors.New("a second-source token needs a second source")
+	}
+	for _, u := range apis {
+		if !apiRE.MatchString(u) || !release.ValidAPI(u) {
 			return errors.New("release API must be a plain https URL")
 		}
 	}
-	if !strings.Contains(p.ForgejoAPI, "/api/v1/repos/") {
-		return errors.New("Forgejo API must contain /api/v1/repos/")
+	if proto != "ssh" {
+		// An HTTPS remote is checked against the system's certificate authorities.
+		if len(p.KnownHosts) != 0 {
+			return errors.New("known_hosts lines are only for an SSH repository")
+		}
+		return nil
 	}
+	host := KnownHost(p.Repo)
 	if len(p.KnownHosts) == 0 || len(p.KnownHosts) > 4 || !slices.IsSorted(p.KnownHosts) || len(slices.Compact(slices.Clone(p.KnownHosts))) != len(p.KnownHosts) {
 		return errors.New("one to four sorted, distinct known_hosts lines required")
 	}
@@ -550,11 +566,11 @@ func SecretNames(task string, params any) []string {
 			out = []string{"ntfy_token", "ntfy_topic_url"}
 		}
 	case UpdatesParams:
-		if p.ForgejoToken {
-			out = append(out, "forgejo_token")
-		}
 		if p.GitHubToken {
 			out = append(out, "github_token")
+		}
+		if p.SecondToken {
+			out = append(out, "second_token")
 		}
 	}
 	return out
@@ -565,7 +581,7 @@ func validSecret(name, value string) bool {
 	case "ntfy_topic_url":
 		u, err := url.Parse(value)
 		return topicRE.MatchString(value) && err == nil && u.User == nil
-	case "ntfy_token", "forgejo_token", "github_token":
+	case "ntfy_token", "github_token", "second_token":
 		return tokenRE.MatchString(value)
 	}
 	return false

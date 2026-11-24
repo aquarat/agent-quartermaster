@@ -26,17 +26,17 @@ func TestUpdateCeremony(t *testing.T) {
 		s[a] = strings.Repeat("a", 64)
 	}
 	id := strings.Repeat("1", 40)
-	m := release.Metadata{Version: "1.0.1", Commit: id, Forgejo: s, GitHub: maps.Clone(s)}
+	m := release.Metadata{Version: "1.0.1", Commit: id, GitHub: s, Second: maps.Clone(s)}
 	e.s.updates.view = updateView{Candidate: m}
 	path := "/api/ui/updates/" + id
 	choice := api.ChallengeRequest{Action: "approve"}
 	c, code := e.challenge(path, choice)
 	mustStatus(t, "challenge", code, 200)
-	m.GitHub[release.Daemon] = strings.Repeat("b", 64)
+	m.Second[release.Daemon] = strings.Repeat("b", 64)
 	_, code = e.challenge(path, choice)
 	mustStatus(t, "mismatch", code, 409)
 	mustStatus(t, "changed since challenge", e.decide(path, "decide", c, nil), 409)
-	m.GitHub[release.Daemon] = s[release.Daemon]
+	m.Second[release.Daemon] = s[release.Daemon]
 	c, code = e.challenge(path, choice)
 	mustStatus(t, "challenge", code, 200)
 	mustStatus(t, "queue", e.decide(path, "decide", c, nil), 200)

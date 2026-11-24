@@ -5,3 +5,5 @@
 *.db
 *.db-*
 /tmp/
+# Patterns for `make check-private`: private by nature, never committed.
+/.private-patterns
