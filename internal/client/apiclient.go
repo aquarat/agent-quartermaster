@@ -40,6 +40,16 @@ type APIError struct {
 	HTTPStatus int
 	Code       string
 	Message    string
+	// NotAPI names the address that answered when the answer cannot have come from the
+	// agent API: a redirect or an HTML page (a web UI, or a sign-in proxy in front of one).
+	NotAPI string
+}
+
+// notAgentAPI is the explanation for an answer that is not the agent API's.
+func notAgentAPI(server, what string) string {
+	return fmt.Sprintf("%s does not look like the aqmas agent API (%s). "+
+		"The server address must be the bastion's agent API, https://HOST:8443, not the address of the web UI. "+
+		"The Help page in the web UI shows the exact `aqmas enroll` command with --server and --ca-pin", sanitize(server), what)
 }
 
 // lockedNotice is what the CLI prints while a bucket it needs is closed (423
@@ -65,6 +75,9 @@ func plainNotFound(err error) bool {
 }
 
 func (e *APIError) Error() string {
+	if e.NotAPI != "" {
+		return notAgentAPI(e.NotAPI, sanitize(e.Message))
+	}
 	if e.Code == api.ErrNotAdmitted {
 		return "this host is enrolled but not admitted to an organisation yet, so the broker shows it nothing. " +
 			"Ask the owner to admit it in the web UI (the organisation's Hosts page: Admit), then run the command again"
@@ -220,6 +233,19 @@ func (c *APIClient) doWith(ctx context.Context, method, path string, hdr http.He
 			return ErrCancelled
 		}
 		return &UnreachableError{Err: err}
+	}
+	// The agent API never redirects and never answers with a page. Either means the
+	// address is something else, typically the web UI or the sign-in proxy in front of it.
+	html := strings.HasPrefix(strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type"))), "text/html")
+	if redirect := resp.StatusCode >= 300 && resp.StatusCode <= 399; redirect || html {
+		what := fmt.Sprintf("it answered HTTP %d with a web page", resp.StatusCode)
+		if redirect {
+			what = fmt.Sprintf("it answered HTTP %d, a redirect", resp.StatusCode)
+			if u, err := url.Parse(resp.Header.Get("Location")); err == nil && u.Host != "" && len(u.Host) <= 255 {
+				what += " to " + u.Host
+			}
+		}
+		return &APIError{HTTPStatus: resp.StatusCode, Code: fmt.Sprintf("http_%d", resp.StatusCode), Message: what, NotAPI: c.base}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		ae := &APIError{HTTPStatus: resp.StatusCode}

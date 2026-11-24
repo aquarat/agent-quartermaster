@@ -246,6 +246,26 @@ func ProbeChain(ctx context.Context, server string) ([]*x509.Certificate, error)
 	return chain, nil
 }
 
+// publicRoots is the system's WebPKI trust store (a variable so that tests supply their own).
+var publicRoots = x509.SystemCertPool
+
+// PubliclyTrusted reports whether the presented chain verifies for host against the system's
+// public certificate authorities. The agent API is served under the bastion's own private CA,
+// so a publicly trusted chain means the address is something else: usually the web UI behind
+// a public hostname. It is a hint for the person enrolling and never a reason to trust.
+func PubliclyTrusted(host string, chain []*x509.Certificate, now time.Time) bool {
+	roots, err := publicRoots()
+	if err != nil || roots == nil || len(chain) == 0 {
+		return false
+	}
+	inter := x509.NewCertPool()
+	for _, c := range chain[1:] {
+		inter.AddCert(c)
+	}
+	_, err = chain[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: inter, DNSName: host, CurrentTime: now})
+	return err == nil
+}
+
 // TOFUCandidate picks the certificate to pin from a presented chain: the top-most CA
 // certificate, or the leaf when the server sent no CA certificate.
 func TOFUCandidate(chain []*x509.Certificate) *x509.Certificate {

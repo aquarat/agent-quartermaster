@@ -27,6 +27,9 @@ type Env struct {
 	Getwd       func() (string, error)
 	PID         int
 	User        string
+	// Elevate, when set, takes root back just before `upgrade` replaces the executable: the
+	// rest of a `sudo aqmas upgrade` runs as the invoking user (sudo.go).
+	Elevate func() error
 	// PollMin is the minimum delay between polls when the server answers a long-poll at once.
 	PollMin time.Duration
 	// RetryDelay is the backoff unit for transient failures while waiting (default 2 s).

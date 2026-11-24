@@ -32,8 +32,8 @@ func errNotFound() *apiErr            { return &apiErr{http.StatusNotFound, "not
 func errNotAdmitted() *apiErr {
 	return &apiErr{http.StatusNotFound, api.ErrNotAdmitted, "this host is enrolled but not admitted to an organisation yet; the owner admits it under the organisation's Hosts"}
 }
-func errConflict(msg string) *apiErr  { return &apiErr{http.StatusConflict, "conflict", msg} }
-func errExpired(msg string) *apiErr   { return &apiErr{http.StatusGone, "expired", msg} }
+func errConflict(msg string) *apiErr { return &apiErr{http.StatusConflict, "conflict", msg} }
+func errExpired(msg string) *apiErr  { return &apiErr{http.StatusGone, "expired", msg} }
 func errInternal() *apiErr {
 	return &apiErr{http.StatusInternalServerError, "internal", "internal error"}
 }

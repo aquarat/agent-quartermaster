@@ -58,7 +58,7 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 		if old != nil && old.Server != "" {
 			server = old.Server
 		} else {
-			return &UsageError{Msg: "--server is required (the bastion's agent API, e.g. https://192.0.2.10:8443)"}
+			return &UsageError{Msg: "--server is required: the bastion's agent API, e.g. https://192.0.2.10:8443 (not the web UI's address; the web UI's Help page shows the exact command)"}
 		}
 	}
 	if _, _, err := serverHostPort(server); err != nil {
@@ -88,6 +88,13 @@ func (e *Env) Enroll(ctx context.Context, o EnrollOptions) error {
 		chain, err := ProbeChain(ctx, server)
 		if err != nil {
 			return err
+		}
+		// Before asking anyone to pin anything: a chain the public web trusts is not the
+		// agent API's (that one is issued by the bastion's private CA). Pinning a public CA
+		// would be wrong twice over, so say what the address most likely is instead.
+		if host, _, _ := serverHostPort(server); PubliclyTrusted(host, chain, e.now()) {
+			return errors.New(notAgentAPI(server, fmt.Sprintf("its certificate is issued by a public certificate authority, %q, and the agent API uses the bastion's own private CA", sanitize(chain[0].Issuer.CommonName))) +
+				". Nothing was pinned or sent. If this address really is the agent API, pass its CA fingerprint with --ca-pin")
 		}
 		cand := TOFUCandidate(chain)
 		ok, err := ConfirmTOFU(ctx, e.Stdin, e.Stderr, server, chain, cand)

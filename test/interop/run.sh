@@ -195,6 +195,28 @@ grep -F "$want" "$T/upgrade/check-one.out" >/dev/null && grep -F 'against GitHub
 cp "$T/releases/latest-two.json" "$T/releases/latest.json"
 "$T/upgrade/aqmas" update --check 2>&1 | grep -F 'against GitHub and a second source and its own rebuild' >/dev/null || fail "two-source check"
 "$T/upgrade/aqmas" update --check 2>&1 | grep -F "$want" >/dev/null
+# A system-wide install: the directory is not writable, so the upgrade stops before it
+# downloads anything and names the one way forward.
+mkdir "$T/upgrade-system" && cp "$T/upgrade/aqmas" "$T/upgrade-system/aqmas" && chmod 555 "$T/upgrade-system"
+if [[ $(id -u) != 0 ]]; then
+  if "$T/upgrade-system/aqmas" upgrade --yes --expect-sha256 "$want" </dev/null 2>"$T/upgrade/system.err"; then fail "upgrade in a read-only directory succeeded"; fi
+  grep -F "sudo $T/upgrade-system/aqmas upgrade" "$T/upgrade/system.err" >/dev/null && grep -F 'nothing was downloaded' "$T/upgrade/system.err" >/dev/null || fail "system-install hint: $(cat "$T/upgrade/system.err")"
+  "$T/upgrade-system/aqmas" version | grep -F 'aqmas 0.0.0 ' >/dev/null || fail "refused upgrade changed the executable"
+fi
+chmod 755 "$T/upgrade-system"
+# Opt-in (AQMAS_INTEROP_SUDO=1, needs password-less sudo): the same install in a root-owned
+# directory is upgraded with sudo, using this user's enrolment, and root leaves nothing of
+# its own in the user's configuration or cache.
+if [[ ${AQMAS_INTEROP_SUDO:-} == 1 ]] && sudo -n true 2>/dev/null; then
+  SD=$(sudo -n mktemp -d /tmp/aqmas-interop-root.XXXXXX)
+  sudo -n chmod 755 "$SD" && sudo -n install -o 0 -g 0 -m 755 "$T/upgrade/aqmas" "$SD/aqmas"
+  sudo -n AQMAS_CONFIG_DIR="$AQMAS_CONFIG_DIR" AQMAS_CACHE_DIR="$AQMAS_CACHE_DIR" "$SD/aqmas" upgrade --yes --expect-sha256 "$want" </dev/null 2>"$T/upgrade/sudo.err" || { sudo -n rm -rf "$SD"; fail "sudo upgrade: $(cat "$T/upgrade/sudo.err")"; }
+  grep -F 'only replacing the executable runs as root' "$T/upgrade/sudo.err" >/dev/null || fail "sudo upgrade did not say whose enrolment it used"
+  "$SD/aqmas" version | grep -F "aqmas $v " >/dev/null && [[ $(stat -c %u "$SD/aqmas") == 0 ]] || fail "sudo upgrade did not install the release as root"
+  [[ -z $(find "$AQMAS_CONFIG_DIR" "$AQMAS_CACHE_DIR" ! -user "$(id -u)" 2>/dev/null) ]] || fail "sudo upgrade left files that are not the user's in the configuration or cache"
+  sudo -n rm -rf "$SD"
+  ok 'sudo upgrade of a root-owned install used the invoking user'"'"'s enrolment and left its files alone'
+fi
 "$T/upgrade/aqmas" upgrade --yes --expect-sha256 "$want" </dev/null
 "$T/upgrade/aqmas" version | grep -F "aqmas $v " >/dev/null
 "$T/upgrade/aqmas.prev" version | grep -F 'aqmas 0.0.0 ' >/dev/null

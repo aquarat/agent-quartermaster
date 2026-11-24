@@ -212,7 +212,9 @@ func ownedByMe(fi fs.FileInfo) bool {
 	if !ok {
 		return true
 	}
-	return int(st.Uid) == os.Getuid()
+	// The effective user: the identity file access is decided by, and the one a root
+	// `sudo aqmas upgrade` takes on for everything but the final replacement (sudo.go).
+	return int(st.Uid) == os.Geteuid()
 }
 
 // writeFileAtomic writes data to a temp file in the same directory, fsyncs and renames it.

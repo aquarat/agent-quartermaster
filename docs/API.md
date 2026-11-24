@@ -372,7 +372,12 @@ proxy choice and does not make the grants it issues indefinite.
   `AQMAS_CACHE_DIR`.
 - `aqmas enroll --name HOST --server URL [--ca-pin sha256:HEX] [--note TEXT] [--force] [--owner-device]`:
   creates the client key + CSR, prints the approve URL and Ref, waits. Without `--ca-pin`, the
-  CA is trusted only after the user confirms its fingerprint at a terminal.
+  CA is trusted only after the user confirms its fingerprint at a terminal. `--server` is the
+  agent API (`https://HOST:8443`), not the web UI's address; the web UI's Help page shows the
+  exact command with the pin. An address that is not the agent API is said to be so: before
+  any prompt when its certificate chain is one the public web trusts (the agent API uses the
+  bastion's private CA; an explicit `--ca-pin` is still honoured), and after the pinned
+  handshake when the answer is a redirect or a web page.
 - `aqmas ssh [USER@]HOST [--ttl 30m] [--why "..."] [--fresh] [-- COMMAND...]`: reuses a cached
   certificate for (user, host) from `$XDG_RUNTIME_DIR/aqmas/` (or `~/.cache/aqmas/`) while at
   least 2 min remain, whichever aqmas process of the same Unix user requested it (the owner

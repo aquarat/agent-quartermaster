@@ -67,6 +67,8 @@ Usage:
   aqmas signer ORG/SERVICE/KEY [--pem]   the key's scheme and public key
   aqmas version | help
   aqmas upgrade | update [--check] [--yes --expect-sha256 HEX] [--allow-single-source]
+      A system-wide install (e.g. /usr/local/bin/aqmas): sudo aqmas upgrade. It uses
+      the enrolment of the user who ran sudo; only the replacement runs as root.
 
 Exit codes: 0 ok (or ssh's own), 1 error, 2 usage, 3 denied, 4 expired,
 5 server unreachable / TLS failure, 130 cancelled.
@@ -213,6 +215,20 @@ func run(args []string) int {
 		}
 		if len(f.pos) > 0 || f.cmd != nil {
 			return fail(&client.UsageError{Msg: "upgrade takes flags only"})
+		}
+		// A system-wide install is upgraded with `sudo aqmas upgrade`: it runs as the user
+		// who called sudo, with that user's enrolment, until the executable is replaced.
+		inv, err := client.SudoInvoker(os.Getenv, os.Geteuid())
+		if err != nil {
+			return fail(err)
+		}
+		if inv != nil {
+			env.Paths = inv.Paths()
+			if env.Elevate, err = inv.Drop(); err != nil {
+				return fail(err)
+			}
+			env.User = inv.Name
+			fmt.Fprintf(os.Stderr, "aqmas: started with sudo: using the enrolment of %s in %s; only replacing the executable runs as root\n", inv.Name, inv.ConfigDir)
 		}
 		return fail(env.Upgrade(ctx, f.bool["check"], f.bool["yes"], f.bool["allow-single-source"], f.str["expect-sha256"], term.IsTerminal(int(os.Stderr.Fd()))))
 	case "help", "-h", "--help":

@@ -73,6 +73,10 @@ func (e *Env) Upgrade(ctx context.Context, check, yes, single bool, expect strin
 	}
 	cfg, c, err := e.authedClient()
 	if err != nil {
+		if errors.Is(err, ErrNotEnrolled) && os.Geteuid() == 0 && e.Getenv("SUDO_UID") != "" {
+			return fmt.Errorf("no aqmas enrolment found for the user who ran sudo (looked in that user's ~/.config/aqmas) or for root. "+
+				"Enrol as the user first, or name the enrolment: sudo AQMAS_CONFIG_DIR=/path/to/.config/aqmas aqmas upgrade (%w)", err)
+		}
 		return err
 	}
 	path, err := os.Executable()
@@ -100,6 +104,12 @@ func (e *Env) upgrade(ctx context.Context, c *APIClient, source release.Source, 
 	if !release.Newer(m.Version, current) {
 		e.logf("no newer verified release (running %s)", current)
 		return nil
+	}
+	// Before anything is verified or downloaded: can this run replace the executable at all?
+	if !check {
+		if err = e.canInstall(path); err != nil {
+			return err
+		}
 	}
 	// The bastion has already compared the published sources it is configured with (GitHub,
 	// and a second source where one exists) with its own rebuild. This host asks GitHub
@@ -154,19 +164,60 @@ func (e *Env) upgrade(ctx context.Context, c *APIClient, source release.Source, 
 		answer, _ := bufio.NewReader(e.Stdin).ReadString('\n')
 		return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes")
 	}
+	if e.Elevate != nil {
+		// Everything so far ran as the user who called sudo. Only the replacement is root's.
+		if err = e.Elevate(); err != nil {
+			return err
+		}
+	}
 	return replaceBinary(path, original, resp.Body, want, confirm)
 }
+
+// rootControlled is the condition for replacing an executable as root: its directory and
+// every parent belong to root and nobody else can rename things in them.
+func rootControlled(dir string) error {
+	for p := dir; ; p = filepath.Dir(p) {
+		st, e := os.Lstat(p)
+		if e != nil || !st.IsDir() || st.Sys().(*syscall.Stat_t).Uid != 0 || (st.Mode().Perm()&0022 != 0 && st.Mode()&os.ModeSticky == 0) {
+			return fmt.Errorf("privileged upgrade requires a root-controlled install directory and parents (%s is not); an install in a user's own directory is upgraded without sudo", p)
+		}
+		if p == filepath.Dir(p) {
+			return nil
+		}
+	}
+}
+
+// sudoHint is the one way to upgrade a system-wide install.
+func sudoHint(path string) string {
+	return fmt.Sprintf("run `sudo %s upgrade` with the same flags: it uses this user's enrolment and verifies exactly as now, and only the final replacement runs as root", path)
+}
+
+// canInstall refuses, before any verification or download, an upgrade that cannot end in a
+// replaced executable. A run that will take root back for the replacement (Elevate) is
+// judged as root will be; any other run needs to be able to write the install directory.
+func (e *Env) canInstall(path string) error {
+	dir := filepath.Dir(path)
+	if e.Elevate != nil || os.Geteuid() == 0 {
+		return rootControlled(dir)
+	}
+	if err := unix.Access(dir, unix.W_OK); err != nil {
+		return fmt.Errorf("%s is a system-wide install: %s is not writable by %s, and nothing was downloaded. To upgrade it, %s", path, dir, e.userName(), sudoHint(path))
+	}
+	return nil
+}
+
+func (e *Env) userName() string {
+	if e.User != "" {
+		return e.User
+	}
+	return "this user"
+}
+
 func replaceBinary(path string, original os.FileInfo, body io.Reader, want string, confirm func() bool) error {
 	dir := filepath.Dir(path)
 	if os.Geteuid() == 0 {
-		for p := dir; ; p = filepath.Dir(p) {
-			st, e := os.Lstat(p)
-			if e != nil || !st.IsDir() || st.Sys().(*syscall.Stat_t).Uid != 0 || (st.Mode().Perm()&0022 != 0 && st.Mode()&os.ModeSticky == 0) {
-				return errors.New("privileged upgrade requires a root-controlled install directory and parents")
-			}
-			if p == filepath.Dir(p) {
-				break
-			}
+		if err := rootControlled(dir); err != nil {
+			return err
 		}
 	}
 	d, err := os.Open(dir)
@@ -183,7 +234,7 @@ func replaceBinary(path string, original os.FileInfo, body io.Reader, want strin
 	}
 	stage, err := os.MkdirTemp(dir, ".aqmas-upgrade-")
 	if err != nil {
-		return fmt.Errorf("cannot stage upgrade (system install: sudo aqmas upgrade): %w", err)
+		return fmt.Errorf("cannot stage upgrade in %s (for a system-wide install, %s): %w", dir, sudoHint(path), err)
 	}
 	defer os.RemoveAll(stage)
 	tmp := filepath.Join(stage, "new")
