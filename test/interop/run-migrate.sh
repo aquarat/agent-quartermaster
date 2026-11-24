@@ -29,7 +29,8 @@ SSHD=$(command -v sshd || true)
 [[ -n $SSHD ]] || for p in /usr/sbin/sshd /usr/local/sbin/sshd; do [[ -x $p ]] && SSHD=$p; done
 [[ -n $SSHD ]] || fail "sshd not found"
 case $(uname -m) in aarch64 | arm64) ARCH=arm64 ;; x86_64 | amd64) ARCH=amd64 ;; *) fail "unsupported arch" ;; esac
-OLD_TAG=v0.4.1
+# The last format-1 release (0.4.1), by commit: the test must not depend on a tag existing.
+OLD_TAG=52db7eb88dbd0fad770b51c5c33782f2b7799f2e
 
 T=$(mktemp -d "${TMPDIR:-/tmp}/aqmas-migrate.XXXXXX")
 L=$T/lab OLD=$T/v041
