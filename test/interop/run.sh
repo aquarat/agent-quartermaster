@@ -286,7 +286,7 @@ RC=0
 wait $CPID || RC=$?
 ((RC == 130)) || { cat "$T/cancel.err"; fail "cancelled aqmas exited $RC, want 130"; }
 grep -q "cancelled request $CID" "$T/cancel.err" || { cat "$T/cancel.err"; fail "cancel message"; }
-"$AQMAS" status "$CID" | grep -q 'status *cancelled' || fail "server status is not cancelled"
+"$AQMAS" status "$CID" | grep 'status *cancelled' >/dev/null || fail "server status is not cancelled"
 owner state | grep -q "\"id\":\"$CID\"" && fail "cancelled request still pending in the UI"
 ok "Ctrl-C cancelled request $CID (exit 130, status cancelled, gone from the owner's queue)"
 

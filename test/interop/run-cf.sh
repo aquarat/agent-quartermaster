@@ -228,7 +228,7 @@ const i = r.indexOf("GET T/configurations"), p = r.indexOf("PUT T/configurations
 if (i < 0 || p < 0 || i > p) { console.error(r); process.exit(1) }' || fail "upstream did not see the snapshot GET before the PUT"
 "$AQMAS" cf snapshot get "$BEFORE" -o "$T/snap-before.json" 2>/dev/null || fail "snapshot get"
 grep -q foo.example.com "$T/snap-before.json" && fail "before-snapshot already has the new hostname"
-"$AQMAS" cf snapshot get "$AFTER" 2>/dev/null | grep -q foo.example.com || fail "after-snapshot lacks the new hostname"
+"$AQMAS" cf snapshot get "$AFTER" 2>/dev/null | grep foo.example.com >/dev/null || fail "after-snapshot lacks the new hostname"
 "$AQMAS" cf snapshot list --object "tunnel-config:$TUN" --json | bun -e 'const j = await Bun.stdin.json(); const s = j.snapshots ?? j; if (s.length < 2 || !s.every((x) => x.object_type === "tunnel-config")) process.exit(1)' ||
 	fail "snapshot list"
 ls "$T"/data/cf-snapshots/*/"$BEFORE".json >/dev/null || fail "snapshot file not in data_dir/cf-snapshots"

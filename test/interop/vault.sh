@@ -38,7 +38,7 @@ vault_scenario() {
   owner vault-signer "$s1" ed25519-sha256 generate >"$w/signer1.json"
   "$AQMAS" signer "$s1" --pem >"$w/pub1.pem"
   fp=$(bun -e 'console.log((await Bun.file(process.argv[1]).json()).fingerprint)' "$w/signer1.json")
-  "$AQMAS" signer "$s1" | grep -q "sha256:$fp" || fail 'CLI and page disagree about the signer public key'
+  "$AQMAS" signer "$s1" | grep "sha256:$fp" >/dev/null || fail 'CLI and page disagree about the signer public key'
   head -c 300000 /dev/urandom >"$w/image.bin"; echo 'release notes' >"$w/notes.txt"
   "$AQMAS" sign "$s1" --why 'interop release' "$w/image.bin" "$w/notes.txt" >"$T/vault-sign1.out" 2>"$T/vault-sign1.err" & pid=$!
   owner vault-sign approve; wait "$pid" || { cat "$T/vault-sign1.err"; fail 'aqmas sign (single use)'; }

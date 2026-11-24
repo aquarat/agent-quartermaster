@@ -202,6 +202,6 @@ bastion_scenario() {
 	! grep -q '^\[bastion\]' "$L/etc/config.toml" && grep -q 'comments must survive' "$L/etc/config.toml" || fail "[bastion] not removed"
 	[[ ! -e $L/sysroot/etc/ssh/aqmas_user_ca.pub && ! -e $L/sysroot/etc/ssh/sshd_config.d/90-aqmas-inspect.conf && ! -e $L/sysroot/etc/ssh/aqmas_principals/$ME && ! -e $L/etc/bastion-allow.json && ! -e $T/inspect-account ]] || fail "removal left files: $(ls -R "$L/sysroot/etc/ssh")"
 	owner login >/dev/null
-	"$AQMAS" bastion 2>&1 | grep -q 'not installed' || fail "bastion access still offered after removal"
+	"$AQMAS" bastion 2>&1 | grep 'not installed' >/dev/null || fail "bastion access still offered after removal"
 	ok "access to the bastion removed"
 }
