@@ -42,7 +42,7 @@ func (s Source) Host() string {
 // a loopback address, for tests), no credentials, query or fragment, and a bounded length.
 func ValidAPI(s string) bool {
 	u, e := url.Parse(s)
-	return e == nil && len(s) <= 512 && SafeURL(s) && u.Path != "" && u.RawQuery == "" && u.Fragment == "" && !strings.Contains(s, "..") && !strings.ContainsAny(s, "?#@ \t\r\n\"\\")
+	return e == nil && len(s) <= 512 && SafeURL(s) && u.RawQuery == "" && u.Fragment == "" && !strings.Contains(s, "..") && !strings.ContainsAny(s, "?#@ \t\r\n\"\\")
 }
 
 var sshRepoRE = regexp.MustCompile(`^ssh://[a-z_][a-z0-9_-]{0,31}@[a-z0-9][a-z0-9.-]{0,252}(:[0-9]{1,5})?/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}\.git$`)

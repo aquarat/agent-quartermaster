@@ -139,6 +139,10 @@ func (s *Server) setupSources(pinned *maint.Sources) setupSources {
 	switch {
 	case u.SecondIgnored():
 		v.Note = "The configuration names a token for a second release source but not its address, so no second source is used: releases are compared with GitHub only. To use one, add api = \"https://HOST/api/v1/repos/OWNER/NAME\" under [updates.second] in the configuration and restart the broker."
+		if eff.SecondAPI != "" {
+			// The pin made at the machine still names it: the task writes it back.
+			v.Note += " Running “Enable self-update” again does the same: the sources fixed for it include a second source."
+		}
 	case u.Repo != "" && !u.Sources().HasSecond() && eff.SecondAPI == "":
 		v.Note = "No second release source is configured: releases are compared with GitHub and this machine's own rebuild."
 	case u.Repo != "" && (u.Second.API != eff.SecondAPI || u.Repo != eff.Repo):

@@ -176,7 +176,9 @@ token_file = "/etc/aqmas/forgejo-read-token"   # the existing token file; omit i
 ```
 
 and delete the old `[updates.forgejo]` table (a configuration with both tables naming
-different sources is refused). `[updates] repo`, `deploy_key` and `[updates.github]` stay as
+different sources is refused). Where the sources were pinned by 0.8.1
+(`sudo cat /etc/aqmas/maint-sources.json` shows the second source's API), running "Enable
+self-update" again does the same edit for you: it rewrites `[updates]` from that pin. `[updates] repo`, `deploy_key` and `[updates.github]` stay as
 they are. Settings → Setup → Enable self-update then shows "Two published sources are
 compared: GitHub and second source (<FORGE_HOST>)".
 

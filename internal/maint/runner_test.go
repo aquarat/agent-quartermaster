@@ -903,9 +903,9 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 
 	// The restart fails: the previous configuration comes back.
 	b.write(0600, "", "refuse-once-serve")
-	b.write(0440, "old-forgejo-token\n", "etc", "second-read-token")
+	b.write(0440, "old-second-token\n", "etc", "second-read-token")
 	b.queue(b.sign(TaskUpdates, b.updatesParams(), tokens))
-	if err := b.runner().Run(context.Background()); err == nil || b.read("etc", "config.toml") != before || b.read("etc", "second-read-token") != "old-forgejo-token\n" || b.read("etc", "github-read-token") != "" {
+	if err := b.runner().Run(context.Background()); err == nil || b.read("etc", "config.toml") != before || b.read("etc", "second-read-token") != "old-second-token\n" || b.read("etc", "github-read-token") != "" {
 		t.Fatalf("configuration or tokens not rolled back: %+v", b.last(TaskUpdates))
 	}
 
@@ -913,7 +913,7 @@ func TestEnableUpdatesAndUpgrade(t *testing.T) {
 	b.queue(b.sign(TaskUpdates, b.updatesParams(), tokens))
 	published := b.read("aqmasd")
 	b.write(0755, published+"# changed\n", "aqmasd")
-	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "not the published") || b.read("etc", "config.toml") != before || b.read("etc", "second-read-token") != "old-forgejo-token\n" {
+	if err := b.runner().Run(context.Background()); err == nil || !strings.Contains(b.last(TaskUpdates).Message, "not the published") || b.read("etc", "config.toml") != before || b.read("etc", "second-read-token") != "old-second-token\n" {
 		t.Fatalf("unpublished binary accepted: %+v", b.last(TaskUpdates))
 	}
 	b.write(0755, published, "aqmasd")

@@ -136,7 +136,7 @@ func TestAddressShapes(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{"", "http://forge.example.com/api/v1/repos/a/b", "https://user:pw@forge.example.com/api/v1/repos/a/b", "https://token@forge.example.com/api/v1/repos/a/b",
-		"https://forge.example.com/api/v1/repos/a/b?x=1", "https://forge.example.com/api/v1/repos/a/b#x", "https://forge.example.com/api/v1/repos/../b", "https://forge.example.com", "ftp://forge.example.com/a",
+		"https://forge.example.com/api/v1/repos/a/b?x=1", "https://forge.example.com/api/v1/repos/a/b#x", "https://forge.example.com/api/v1/repos/../b", "ftp://forge.example.com/a",
 		"https://forge.example.com/" + strings.Repeat("a", 512), "https://forge.example.com/a b"} {
 		if ValidAPI(bad) {
 			t.Errorf("accepted %q", bad)

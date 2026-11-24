@@ -285,6 +285,11 @@ func TestSetupSources(t *testing.T) {
 	if s := view(p).Sources; s.Origin != maint.SourcesPinned || s.GitHubAPI != release.GitHubAPI || len(s.Compared) != 2 {
 		t.Fatalf("pinned: %+v", s)
 	}
+	// ... and where the configuration lost the second source's address, the pin can restore it.
+	p.cfg.Updates.Repo, p.cfg.Updates.Second.TokenFile = p.sources.Repo, "/etc/aqmas/forgejo-read-token"
+	if s := view(p).Sources; len(s.Active) != 1 || len(s.Compared) != 2 || !strings.Contains(s.Note, "again does the same") {
+		t.Fatalf("pinned second source, configuration without its address: %+v", s)
+	}
 	// The broker refuses, before any tap, a request for sources other than the fixed ones.
 	for name, params := range map[string]map[string]any{
 		"adds a second source": {"repo": release.GitHubRepo, "github_api": release.GitHubAPI, "second_api": "https://forge.example.com/api/v1/repos/a/b", "known_hosts": []string{}},
