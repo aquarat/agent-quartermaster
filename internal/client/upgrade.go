@@ -178,14 +178,29 @@ func (e *Env) upgrade(ctx context.Context, c *APIClient, source release.Source, 
 func rootControlled(dir string) error {
 	for p := dir; ; p = filepath.Dir(p) {
 		st, e := os.Lstat(p)
-		if e != nil || !st.IsDir() || st.Sys().(*syscall.Stat_t).Uid != 0 || (st.Mode().Perm()&0022 != 0 && st.Mode()&os.ModeSticky == 0) {
-			return fmt.Errorf("privileged upgrade requires a root-controlled install directory and parents (%s is not); an install in a user's own directory is upgraded without sudo", p)
+		const elsewhere = "This check is not relaxed; install aqmas in your own ~/.local/bin instead and upgrade it there without sudo"
+		switch {
+		case e != nil || !st.IsDir():
+			return fmt.Errorf("privileged upgrade requires a root-controlled install directory and parents (%s cannot be checked). %s", p, elsewhere)
+		case st.Sys().(*syscall.Stat_t).Uid != 0:
+			return fmt.Errorf("privileged upgrade requires a root-controlled install directory and parents: %s is not owned by root. An install in a user's own directory is upgraded without sudo", p)
+		case st.Mode().Perm()&0022 != 0 && st.Mode()&os.ModeSticky == 0:
+			who := "a group other than root"
+			if st.Mode().Perm()&0002 != 0 {
+				who = "everyone"
+			} else if st.Sys().(*syscall.Stat_t).Gid == 0 {
+				who = "group root"
+			}
+			return fmt.Errorf("privileged upgrade requires a root-controlled install directory and parents: %s (mode %04o) is writable by %s, whose members could swap the executable. %s", p, st.Mode().Perm(), who, elsewhere)
 		}
 		if p == filepath.Dir(p) {
 			return nil
 		}
 	}
 }
+
+// installCheck is rootControlled (a variable so that tests can stand in for root).
+var installCheck = rootControlled
 
 // sudoHint is the one way to upgrade a system-wide install.
 func sudoHint(path string) string {
@@ -198,7 +213,7 @@ func sudoHint(path string) string {
 func (e *Env) canInstall(path string) error {
 	dir := filepath.Dir(path)
 	if e.Elevate != nil || os.Geteuid() == 0 {
-		return rootControlled(dir)
+		return installCheck(dir)
 	}
 	if err := unix.Access(dir, unix.W_OK); err != nil {
 		return fmt.Errorf("%s is a system-wide install: %s is not writable by %s, and nothing was downloaded. To upgrade it, %s", path, dir, e.userName(), sudoHint(path))

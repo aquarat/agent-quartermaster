@@ -318,6 +318,37 @@ describe("navigation", () => {
     await soon(() => !cards().find((c) => c.querySelector("h3 bdi")?.textContent === "kiosk-4")?.querySelector(".badge.not-admitted"));
   });
 
+  test("Hosts: an expired certificate is said to be that, not “Not admitted”", async () => {
+    // As aqmasd: the host list still has the host, the catalogue no longer lists it.
+    const hosts = api.hosts, catalogue = api.catalogue!;
+    api.hosts = async () => (await hosts()).map((x) => (x.name === "web-1" ? { ...x, not_after: new Date(Date.now() - 86_400_000).toISOString() } : x));
+    api.catalogue = async () => {
+      const cat = (await catalogue())!;
+      return { ...cat, organisations: cat.organisations.map((o) => ({ ...o, hosts: o.hosts.filter((x) => x.name !== "web-1") })) };
+    };
+    try {
+      go("#/");
+      await soon(() => current()[0] === "Approvals");
+      go("#/hosts");
+      const web = () => [...root.querySelectorAll<HTMLElement>("#sec-hosts article.card")].find((c) => c.querySelector("h3 bdi")?.textContent === "web-1");
+      await soon(() => !!web()?.querySelector(".badge.cert-expired"));
+      const card = web()!;
+      expect(card.querySelector(".badge.cert-expired")!.textContent).toBe("Certificate expired");
+      expect(card.querySelector(".badge.not-admitted")).toBeNull();
+      expect(card.classList.contains("unadmitted")).toBe(false);
+      expect(card.textContent).toContain("client certificate has expired");
+      expect(card.textContent).not.toContain("Create an organisation first");
+      expect(card.querySelectorAll(".admission-list button").length).toBe(0);
+    } finally {
+      api.hosts = hosts;
+      api.catalogue = catalogue;
+    }
+    go("#/");
+    await soon(() => current()[0] === "Approvals");
+    go("#/hosts");
+    await soon(() => [...root.querySelectorAll<HTMLElement>("#sec-hosts article.card")].some((c) => c.querySelector("h3 bdi")?.textContent === "web-1" && !c.querySelector(".badge.cert-expired")));
+  });
+
   test("the tray: what is open and Close all, reviewed before its tap", async () => {
     const trayButton = root.querySelector<HTMLButtonElement>(".tray-button")!;
     expect(trayButton.getAttribute("aria-expanded")).toBe("false");

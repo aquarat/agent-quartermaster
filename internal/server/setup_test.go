@@ -258,6 +258,12 @@ func TestSetupUpgradeCheckFailed(t *testing.T) {
 	if !strings.HasPrefix(got, "blocked:The check for a new release failed: git fetch failed") {
 		t.Fatalf("after a failed check: %q", got)
 	}
+	// In a setup or maintenance mode the poller is not running: say that, not "not finished yet".
+	e.s.maintenance = true
+	if got := state(updateView{}); !strings.Contains(got, "Releases are not checked while the broker is in a setup or maintenance mode") {
+		t.Fatalf("no poller: %q", got)
+	}
+	e.s.maintenance = false
 	if got := state(updateView{checked: true}); got != "idle:" {
 		t.Fatalf("after a clean check with nothing newer: %q", got)
 	}

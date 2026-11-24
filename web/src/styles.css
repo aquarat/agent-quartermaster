@@ -2885,7 +2885,8 @@ dialog.search-dialog::backdrop {
   border-left: 3px solid currentColor;
   border-radius: 4px;
 }
-.badge.not-admitted {
+.badge.not-admitted,
+.badge.cert-expired {
   background: var(--warn-bg);
   color: var(--warn-ink);
   vertical-align: middle;

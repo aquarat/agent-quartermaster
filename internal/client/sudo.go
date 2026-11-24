@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"syscall"
 )
@@ -47,11 +48,36 @@ func ownerUID(path string) (int, fs.FileInfo, error) {
 	return int(st.Uid), fi, nil
 }
 
-// SudoInvoker resolves whose enrolment a root `aqmas upgrade` uses. It returns nil when the
+// RootPaths are root's own directories, from the account database and not from HOME: sudo
+// keeps the invoking user's HOME on some systems (macOS, sudo -E, env_keep), and root's own
+// enrolment is by definition not there.
+func RootPaths() Paths {
+	_, home, err := lookupHome(0)
+	if err != nil || home == "" {
+		home = "/root"
+		if runtime.GOOS == "darwin" {
+			home = "/var/root"
+		}
+	}
+	return Paths{ConfigDir: filepath.Join(home, ".config", "aqmas"), CacheDir: filepath.Join(home, ".cache", "aqmas")}
+}
+
+// SudoInvoker resolves whose enrolment a root `aqmas upgrade` uses. inv is nil when the
 // process is not root, was not started through sudo by another user, or that user has no
-// enrolment (then root's own configuration is used, as before). An enrolment directory that
-// exists but is not owned by exactly the invoking user is an error, never a fallback.
-func SudoInvoker(getenv func(string) string, euid int) (*Invoker, error) {
+// enrolment. In that last case rootOwn is true: root's own configuration is used, as before,
+// and the caller takes it from RootPaths. An enrolment directory that exists but is not
+// owned by exactly the invoking user is an error, never a fallback.
+func SudoInvoker(getenv func(string) string, euid int) (inv *Invoker, rootOwn bool, err error) {
+	inv, err = sudoInvoker(getenv, euid)
+	if errors.Is(err, errInvokerNotEnrolled) {
+		return nil, true, nil
+	}
+	return inv, false, err
+}
+
+var errInvokerNotEnrolled = errors.New("the user who ran sudo has no enrolment")
+
+func sudoInvoker(getenv func(string) string, euid int) (*Invoker, error) {
 	if euid != 0 {
 		return nil, nil
 	}
@@ -93,7 +119,7 @@ func SudoInvoker(getenv func(string) string, euid int) (*Invoker, error) {
 	owner, fi, err := ownerUID(inv.ConfigDir)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return nil, nil // that user is not enrolled: root's own enrolment, if any
+		return nil, errInvokerNotEnrolled // root's own enrolment, if any
 	case err != nil:
 		return nil, err
 	case fi.Mode()&fs.ModeSymlink != 0 || !fi.IsDir():

@@ -257,6 +257,10 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 				t.State, t.Blocked = "blocked", "The check for a new release failed: "+checkErr+". The broker checks again on its own."
 			} else if !checked {
 				t.State, t.Blocked = "blocked", "The first check for a new release has not finished yet."
+				if s.maintenance || s.sealSetup {
+					// pollUpdates does not run in these modes (server.go).
+					t.Blocked = "Releases are not checked while the broker is in a setup or maintenance mode; the check starts when it serves again."
+				}
 			} else if !candidate {
 				t.State = "idle"
 			}

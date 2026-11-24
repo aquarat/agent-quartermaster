@@ -13,9 +13,13 @@ Errors: non-2xx with `api.Error` `{"error": "<code>", "message": "<human text>"}
 `not_admitted` (404) replaces `not_found` on the agent API for one case only: the calling
 host is enrolled but has no active admission to any organisation (the owner admits it under
 the organisation's Hosts, or together with the enrolment approval). It describes the
-caller's own state and is sent for every "not found" answer to that host alike, so it does
-not reveal whether the thing asked for exists. A host that is admitted somewhere and asks
-for something it cannot see still gets `not_found`, indistinguishable from a missing object.
+caller's own state. It is sent, for every "not found" answer to that host alike, on the
+routes that depend on admission: requests, grants, `ssh-ca`, `ssh-target`, bastion and setup
+requests, the Cloudflare catalogue, snapshots and proxy, env sets and signing. So it does
+not reveal whether the thing asked for exists. Routes that do not depend on admission are
+unchanged: enrolment, and the release routes (`/v1/releases/...`, whose missing asset is a
+plain 404 for any enrolled host). A host that is admitted somewhere and asks for something
+it cannot see still gets `not_found`, indistinguishable from a missing object.
 The status is 404 so that clients older than the code behave as before and print it.
 
 Statuses (`api.Status*`): `pending`, `approved`, `denied`, `expired`, `revoked`, `cancelled`.

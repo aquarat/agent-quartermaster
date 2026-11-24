@@ -218,9 +218,14 @@ func run(args []string) int {
 		}
 		// A system-wide install is upgraded with `sudo aqmas upgrade`: it runs as the user
 		// who called sudo, with that user's enrolment, until the executable is replaced.
-		inv, err := client.SudoInvoker(os.Getenv, os.Geteuid())
+		inv, rootOwn, err := client.SudoInvoker(os.Getenv, os.Geteuid())
 		if err != nil {
 			return fail(err)
+		}
+		if rootOwn {
+			// The user who ran sudo is not enrolled: root's own enrolment, found from root's
+			// account and not from a HOME that sudo may have kept.
+			env.Paths = client.RootPaths()
 		}
 		if inv != nil {
 			env.Paths = inv.Paths()

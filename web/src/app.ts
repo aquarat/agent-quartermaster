@@ -673,7 +673,14 @@ export class App {
       const card = hostCard(host, (t) => this.sheet.openRevoke(t));
       if (cat && !host.revoked_at) {
         const rows = cat.organisations.map((o) => ({ o, x: o.hosts.find((x) => x.enrollment === host.id) })).filter((r) => r.x);
-        if (!rows.some((r) => r.x!.active)) {
+        const expired = Date.parse(host.not_after) <= Date.now();
+        if (expired) {
+          // The catalogue no longer lists a host whose certificate ran out, so "not admitted"
+          // would be the wrong thing to say and admitting is not what helps.
+          card.classList.add("cert-expired");
+          card.querySelector("h3")!.append(" ", h("span", { class: "badge cert-expired" }, "Certificate expired"));
+          card.insertBefore(h("p", { class: "warn not-admitted-note" }, "This host's client certificate has expired, so it can ask for nothing. It has to enrol again (aqmas enroll --force on the host) and be let in again."), card.querySelector("dl.facts"));
+        } else if (!rows.some((r) => r.x!.active)) {
           // Enrolled, admitted nowhere: say so where the host is listed, next to the way out.
           card.classList.add("unadmitted");
           card.querySelector("h3")!.append(" ", h("span", { class: "badge not-admitted" }, "Not admitted"));
@@ -686,7 +693,7 @@ export class App {
             h("h4", null, "May ask for credentials of"),
             rows.length
               ? h("ul", { class: "admission-list" }, rows.map(({ o, x }) => h("li", { class: x!.active ? "in" : "out" }, h("bdi", null, vt(o.title)), h("span", { class: "badge" }, x!.active ? "admitted" : "not admitted"), admissionButton(cat, o, x!, (t, c) => this.sheet.openCatalogue(t, c)))))
-              : h("p", { class: "muted" }, "No organisation lists this host."),
+              : h("p", { class: "muted" }, expired ? "Not listed by any organisation while its certificate is expired." : "No organisation lists this host."),
           ),
           card.querySelector("dl.facts"),
         );
