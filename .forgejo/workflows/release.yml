@@ -9,6 +9,8 @@ on:
   push:
     branches: [main]
     paths: [VERSION]
+  # Manual run on main: publishes VERSION if its tag does not exist yet (re-run of a failed build).
+  workflow_dispatch:
 jobs:
   build:
     runs-on: linux-arm64
