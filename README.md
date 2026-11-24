@@ -23,6 +23,22 @@ tap), **Hosts**, **Activity**, **Security** (passkeys, open buckets, recovery ke
 (Setup, upgrades, policies) and **Help** for enrollment and command examples using the running
 server’s URL and CA pin. The review behind this layout is [docs/UI-REVIEW.md](docs/UI-REVIEW.md).
 
+## Install the CLI on a machine
+
+Open **Help** on your broker's approval page. "Install the aqmas CLI" has one copy-paste block
+each for Linux arm64, Linux x86-64 and macOS on Apple Silicon (`uname -sm` on the machine tells
+you which). A block downloads the CLI of the release the broker runs from this repository's
+GitHub release, checks it against the SHA-256 the broker itself verified for that release
+(the hash is in the command, so it does not come from the download's origin), stops on a
+mismatch, installs `~/.local/bin/aqmas` and prints its version. It works in bash and zsh and
+needs no configuration on the broker. A broker without a verified record of its release yet
+(before self-update is set up) shows the same blocks checking against GitHub's published
+`SHA256SUMS`, and says that this is a check against GitHub only.
+
+"Enroll a machine" on the same page then gives the `aqmas enroll` command with the agent API
+address and CA pin. Later, `aqmas upgrade` upgrades the CLI from the broker
+([docs/UPDATES.md](docs/UPDATES.md)); installed in `~/.local/bin` it needs no sudo.
+
 - Design and milestone 1 scope: [docs/DESIGN.md](docs/DESIGN.md)
 - API contract: [docs/API.md](docs/API.md), shared types in `internal/api`
 - Credential sets from the Vault tab (write-only form, reveal) and signing inside aqmas:

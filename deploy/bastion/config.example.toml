@@ -6,7 +6,10 @@ listen_web      = "127.0.0.1:8080"              # web UI/API, reached only via c
 data_dir        = "/var/lib/aqmas"
 public_base_url = "https://approvals.example.com" # approve links, WebAuthn RP ID and origin
 agent_api_url   = "https://192.0.2.10:8443"       # client-facing URL for the Help page; must match a TLS SAN
-# cli_download_base_url = "https://downloads.example.com/releases/current" # CLI binaries + SHA256SUMS
+# Help page install commands download the CLI from the public GitHub release of the running
+# version by default (the fork named by [updates.github] api). Set this only to serve the
+# same files (aqmas-<os>-<arch> + SHA256SUMS) from somewhere else:
+# cli_download_base_url = "https://downloads.example.com/releases/current"
 owner_name      = "alice"
 # SANs of the agent-API server certificate (issued by the internal CA; clients pin that CA).
 tls_sans        = ["192.0.2.10", "bastion"]

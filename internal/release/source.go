@@ -86,6 +86,21 @@ func RepoFor(githubAPI string) string {
 	return GitHubRepo
 }
 
+// DownloadBase is where GitHub publishes the assets of a release: the public download
+// address that goes with a GitHub release API ("" for the compiled default) and a version.
+// It is "" for an invalid version, and for an API that is not api.github.com: nothing is
+// known about where such a source serves downloads.
+func DownloadBase(githubAPI, version string) string {
+	if githubAPI == "" {
+		githubAPI = GitHubAPI
+	}
+	m := githubAPIRE.FindStringSubmatch(strings.TrimRight(githubAPI, "/"))
+	if m == nil || !ValidVersion(version) {
+		return ""
+	}
+	return "https://github.com/" + m[1] + "/releases/download/v" + version
+}
+
 // Sources are the published release sources an installation compares: GitHub always, and a
 // second, independent builder (a Forgejo/Gitea-compatible forge) only when configured.
 type Sources struct {

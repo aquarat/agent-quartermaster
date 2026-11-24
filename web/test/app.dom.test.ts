@@ -195,10 +195,15 @@ describe("App in a DOM", () => {
 
   test('Help uses live values and every displayed command has a copy button', async () => {
     win.location.hash='#/help';win.dispatchEvent(new win.Event('hashchange'));
-    await until(()=>!!root.querySelector('.command'));
+    await until(()=>!!root.querySelector('[data-platform="aqmas-linux-arm64"] pre'));
     expect(root.querySelector('#sec-passkeys')).toBeNull();
     expect(root.textContent).toContain('https://agent.example.com:8443');
     expect(root.textContent).toContain('sha256:'+'0'.repeat(64));
     expect(root.querySelectorAll('pre').length).toBe(root.querySelectorAll('.command button').length);
+    // The install blocks carry the broker's own hashes for the release it runs.
+    const block=root.querySelector('[data-platform="aqmas-linux-arm64"] pre')!.textContent!;
+    expect(block).toContain("'https://github.com/example/agent-quartermaster/releases/download/v1.2.3/aqmas-linux-arm64'");
+    expect(block).toContain("echo '"+'b'.repeat(64)+"  aqmas-linux-arm64' | sha256sum -c -");
+    expect(root.querySelector('.install-check')!.getAttribute('data-check')).toBe('broker');
   });
 });

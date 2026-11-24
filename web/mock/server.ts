@@ -982,7 +982,7 @@ export function startMock(opts: MockOptions = {}) {
       const out = await store.vault.handle(req, url, body, session);
       if (out !== undefined) return json(out);
     }
-    if(p==='/api/ui/help' && !isPost){needSession();return json({agent_api_url:'https://agent.example.com:8443',cli_download_base_url:'',ca_pin:'sha256:'+ '0'.repeat(64),owner_max_seconds:86400});}
+    if(p==='/api/ui/help' && !isPost){needSession();return json({agent_api_url:'https://agent.example.com:8443',cli_download_base_url:'https://github.com/example/agent-quartermaster/releases/download/v1.2.3',cli_download_source:'github',release_version:'1.2.3',cli_sha256:{'aqmas-darwin-arm64':'d'.repeat(64),'aqmas-linux-amd64':'a'.repeat(64),'aqmas-linux-arm64':'b'.repeat(64)},ca_pin:'sha256:'+ '0'.repeat(64),owner_max_seconds:86400});}
 
     if (p === "/api/ui/state" && !isPost) {
       needSession();
