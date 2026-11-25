@@ -47,6 +47,42 @@ client certificate; every other endpoint returns 401 without one.
 Long-polls: `?wait=25s` (or `?wait=25`), capped at 25 s. `poll_after_ms` says how long to wait
 before the next poll when an answer comes back early.
 
+### GET /v2/catalogue  (discovery)
+
+What the calling host may ask for, for `aqmas ls`, `aqmas targets` and the MCP listing
+tools. It lists the credential sets and SSH targets of the organisations that **admit this
+host and have "Hosts may list what they can ask for" on** (the `discovery` field of the
+organisation's policy, off by default; section 3, "Organisations"). Every other
+organisation contributes nothing: one with listing off cannot be told from one that does not
+exist, and the paths of its sets keep answering the uniform `not_found`. A host with no
+active admission gets `not_admitted` (404), as everywhere. Before organisations are active
+the route answers `not_found`.
+
+    {"discovery": true,
+     "credentials": [
+       {"path": "acme/infra/tailnet-api-key", "kind": "secret", "title": "Tailnet API key",
+        "env": "TAILNET_API_KEY", "note": "...", "url": "https://...", "approval": "owner",
+        "use": "aqmas run acme/infra/tailnet-api-key --why \"...\" -- COMMAND"},
+       {"path": "acme/billing/staging-env", "kind": "env-set", "title": "Staging env",
+        "names": ["APP_SECRET", "DATABASE_URL"], "approval": "owner", "use": "..."},
+       {"path": "acme/releases/firmware-key", "kind": "signer", "title": "Firmware key",
+        "scheme": "ed25519", "approval": "owner", "use": "aqmas sign ..."},
+       {"path": "personal/dns-cdn/proxy", "kind": "cloudflare-proxy", "title": "...",
+        "approval": "per-scope", "use": "aqmas cf scopes"}],
+     "targets": [
+       {"name": "web-1", "path": "personal/fleet/web-1", "aliases": [], "address": "192.0.2.61",
+        "port": 22, "users": ["alice"], "max_seconds": 0, "approval": "owner-or-standing",
+        "use": "aqmas ssh alice@web-1 --why \"...\""}]}
+
+`discovery` is false, and both lists empty, when no organisation that admits the host
+allows listing. Names only: an env set's key names, a secret's variable name, a signer's
+scheme, a target's address, port and login users. No value, no key, nothing about other
+hosts. A set with nothing stored yet is left out. `approval` is `owner` (a passkey tap for
+every request, unless a "don't ask again" rule the owner made covers it), `owner-or-standing`
+(SSH: a tap unless an auto-approval the owner made covers this host, target and user;
+high-risk targets are `owner`) or `per-scope` (Cloudflare: see `aqmas cf scopes`). The
+listing is not audited; what a host then asks for is.
+
 ### POST /v1/enroll  (no client cert)
 `EnrollRequest {hostname, class?, csr_pem, ssh_host_key_fingerprints[]?, note?, poll_token}` ->
 `201 EnrollResponse {id, status:"pending", approve_url, poll_after_ms}`.
@@ -286,6 +322,48 @@ flagged).
 
 ## 3. CLI (`aqmas`)
 
+### For agents: guide, discovery, MCP (0.10.0)
+
+* `aqmas guide` prints the agent guide ([AGENTS.md](AGENTS.md), embedded in the binary, so
+  it describes the installed version). `aqmas guide --json` prints `{version, rule,
+  commands:[{name, usage, summary, approval}], exit_codes, errors, mcp, guide}`; `approval`
+  is `none`, `owner` or `sometimes`. `aqmas help` stays the terse reference and points to it.
+* `aqmas ls [--json]` (alias `catalogue`) and `aqmas targets [--json]` print
+  `GET /v2/catalogue` (section 1). With listing off they say so in plain words and exit 0;
+  `--json` prints `{"discovery": false, ...}`. An unadmitted host gets the usual
+  "enrolled but not admitted" message; a broker without the route is named as such.
+* `aqmas run PATH --why R [--env NAME] -- COMMAND`: `--env` delivers a secret (or a one-key
+  set) under another variable name; it must pass the same name rules as a stored key.
+* `aqmas get PATH --why R [--ttl D]` prints one secret's value and a newline to stdout
+  (delivery mode `get`, "Env sets" below). Refused for a set with several keys before any
+  request is made, and by the broker for a set that is not a secret or when the
+  organisation's policy has `deny_get`.
+* `aqmas mcp` serves the Model Context Protocol on stdin/stdout: JSON-RPC 2.0, one message
+  per line, protocol versions `2025-06-18`, `2025-03-26` and `2024-11-05` (the client's is
+  echoed when known). Implemented: `initialize`, `notifications/initialized`, `ping`,
+  `tools/list`, `tools/call`, `notifications/cancelled` (withdraws a waiting request) and,
+  when the call carries `_meta.progressToken`, `notifications/progress` with the lines the
+  CLI prints while it waits (the Ref). Anything else is `-32601`. When stdin ends, calls
+  already running get five seconds to finish; requests still waiting for the owner are then
+  withdrawn. Tools:
+
+  | Tool | Arguments | Needs the owner |
+  |---|---|---|
+  | `aqmas_guide` | none | no |
+  | `aqmas_status` | none: enrolment, admission, listing on/off, cached certificates, active grants | no |
+  | `aqmas_list_credentials`, `aqmas_list_targets` | none: `GET /v2/catalogue`; with listing off the result is the sentence "discovery is disabled by the owner ..." (not an error) | no |
+  | `aqmas_run` | `path, why, command[]`, optional `env, cwd, ttl_seconds, timeout_seconds, approval_timeout_seconds` | yes |
+  | `aqmas_sign` | `path, why`, `files[]` or `digest`, optional `force, approval_timeout_seconds` | yes |
+  | `aqmas_ssh_exec` | `target, why, command`, optional `ttl_seconds, timeout_seconds, approval_timeout_seconds` | unless a cached certificate or auto-approval covers it |
+
+  A tool that needs the owner blocks until the decision or `approval_timeout_seconds`
+  (default 600, at most 3600), then withdraws the request; its description says so. Results
+  are one text item; a failure has `isError: true`, the CLI's message, `exit code: N` and
+  what to do. `aqmas_run` and `aqmas_ssh_exec` return `{exit_code, stdout, stderr,
+  truncated?, timed_out?, note}` with each stream cut at 64 KiB. **No tool returns a
+  secret's value** (there is no `get` tool); the output of a command is returned as printed,
+  so a command that prints the secret puts it in the result, and the result says so.
+
 ### Organisation cutover and canonical v2
 
 `GET /api/ui/migration` (owner session) returns `null` in ordinary operation and
@@ -341,7 +419,16 @@ A node contains `id,slug,title,revision`. For create, the new node has expected 
 zero and an allocated random ID. The owner becomes the initial approver in the creation
 transaction. Host row ID, enrollment, name, fingerprint, class, prior membership and
 generation are signed. `result_revision` on host actions means the next admission
-generation. `auto_access:[]` means **none**. Policy rules are sorted by `(set_id,scope)`;
+generation. `auto_access:[]` means **none**. A policy (`old_policy`, `new_policy`) is
+`default_seconds, soft_cap_seconds, indefinite, standing_default_seconds,
+standing_soft_cap_seconds, standing_indefinite` and then, **only while true**, `discovery`
+("Hosts may list what they can ask for": `GET /v2/catalogue` lists this organisation for
+its admitted hosts) and `deny_get` (`aqmas get` is refused for this organisation's secrets;
+`aqmas run` is unchanged). Both are omitted while false, so a plan that uses neither is
+byte-identical to one signed before 0.10.0, and the page refuses a switch out of that order.
+The confirmation states what a change of either switch means in words, from the signed
+plan. They are stored per policy revision in `org_flags`, a table of its own that an older
+binary ignores (a policy it replaces has both switches off again). Policy rules are sorted by `(set_id,scope)`;
 they bind policy-auto, standing eligibility, and explicit proxy-duration relaxation.
 A policy replacement expires pending work and ends active grants/standing in that org.
 Removal does so for that enrollment only. Re-admission never resurrects old bindings.
@@ -1019,13 +1106,65 @@ WAL frames, snapshots and backups can still retain old ciphertext.
 
 Session-only `/api/ui/seal/env/{state,ticket,challenge,finish}`. V3 `env`
 signs `action,id,installation,epoch,issued_at,nonce,metadata,ttl_seconds` and
-the common `v,object`. Metadata is the complete reviewed draft or release
+the common `v,object`, plus `standing_seconds` when the owner chose "don't ask
+again" (absent otherwise, so an approval without it reads as it always did).
+Metadata is the complete reviewed draft or release
 record (immutable IDs, path/title, revisions, admission, identity, manifest,
 mode, address and policy limits); the untrusted free-form reason is blank
 in the signed release. Approving a release opens the set's bucket until the
-values are collected (10 minutes at most). Releases need a fresh individual tap, including
-denials. No window, batch, standing or automatic env approval. Rotation
+values are collected (10 minutes at most). Every decision is a fresh individual tap, including
+denials; no window or batch approves an env release. Rotation
 means replacing the value at its provider as well as importing the new set.
+
+**Delivery modes.** `process` (`aqmas run`), `file` (`aqmas checkout`), `shell`
+(`aqmas checkout-shell`) and, since 0.10.0, `get` (`aqmas get`: the value is printed by
+the requesting process). `get` is accepted only for a secret (below) and only while the
+organisation's policy does not have `deny_get` (403 otherwise). The mode is part of the
+signed release record, and the card for `get` says that the value is handed to the
+requesting process and has then left aqmas. Collections are audited as
+`env_collect_<mode>`. (The `env_releases.mode` column's CHECK predates `get`; such a row
+stores `process` there and `get` in the added `delivery` column.)
+
+**Don't ask again (standing rules for env sets and secrets, 0.10.0).** Until 0.10.0 every
+release needed its own tap. The owner relaxed that on purpose: an approval may carry
+`standing_seconds` (the page offers 3600, 21600 and 86400; "just this once" is the
+default and nothing is preselected), at least 60 and at most the set's **longest don't
+ask again** (`standing_cap_seconds`: one hour unless the owner changes it with the vault
+action `standing-cap`, 0 turns it off, 86400 is the most), and only with a finite TTL.
+The approval then also records a rule, under the ID of the approved release. A later
+`POST /v2/env/requests` is approved without a tap when all of this holds:
+
+* the same enrolment, connecting from the address the approved request came from;
+* the same delivery mode (`get` matches only `get`);
+* the **exact binding** the owner approved: organisation, service and set IDs, the set's
+  revision and key names, the service and policy revisions and the admission generation.
+  A new value is a new revision, so it ends the rule (the owner approved that value; the
+  next request asks again, and the owner can choose "don't ask again" again);
+* a finite requested TTL (the release is capped at the TTL the owner signed; a request for
+  an indefinite release always asks);
+* the rule is live: not expired, not revoked, the set's limit not 0;
+* **the set's bucket is open.** A rule issues without a tap only while its bucket is open,
+  like every standing rule ([BUCKETS.md](BUCKETS.md) §5): its hold keeps the bucket open
+  until the rule ends, but after a restart or Close all the next request waits for one tap,
+  and that tap re-arms the rule.
+
+The `--why` text may differ. Each such release is still its own once-only collection with
+its own grant ID; it is audited as `env_auto_approve` (actor `system`, naming the rule,
+host, mode, TTL and address) followed by the usual `env_collect_<mode>`, and it does not
+count against the host's pending-request limit. The `POST` answers `pending` as for every
+new release (every CLI, including earlier ones, expects that of a request it just made);
+the first poll finds it approved. A rule ends at its time, with a tap on
+`{"id": RULE, "action": "standing-revoke"}` (the signed metadata is the rule record with
+`uses` 0), when the release that created it or a release it approved is revoked, when the
+host's admission to the organisation ends or the host is revoked, when the organisation's
+policy is replaced, when the set's revision changes and when the set's limit changes.
+Nothing else is relaxed: signing has its own time-boxed grants, and minted Cloudflare
+children, `cf.admin` and `cf.read.private` keep their exclusions.
+
+`GET state` → `{drafts, releases, standing, standing_caps}`: `standing` are the live
+rules (`path ... offers_indefinite` as in a release, then `id, mode, address,
+max_ttl_seconds, created_at, expires_at, uses`), `standing_caps` maps the set ID of each
+listed release to its limit in seconds, which is what the card may offer.
 
 `POST /v2/env/requests`, `GET /v2/env/requests/{id}`, `POST .../{id}/cancel`,
 `GET /v2/env/grants/{id}`, `POST .../{id}/checkin` return metadata only.
@@ -1074,7 +1213,7 @@ section is the wire contract.
 `{entries, last_changed_at, last_used_at}` for one application set: its newest
 20 audit rows (`{at, actor, action, object, detail}`, as in `/api/ui/state`
 `recent`) and, in Unix milliseconds, when it last changed (`vault_commit`,
-`vault_signer_create`, `env_commit`) and was last used (`env_collect_*`,
+`vault_signer_create`, `vault_secret_create`, `env_commit`) and was last used (`env_collect_*`,
 `sign`); 0 when no such row is among the newest 200 about the set. The rows are
 the owner's actions on the set (`object` `set:ID`), what admitted hosts asked
 for and collected (their `detail` begins with the set's path) and the owner's
@@ -1112,8 +1251,9 @@ response cannot be replayed into a later ceremony. Vectors:
 
 * `GET state` → `{schemes, organisations:[{id,slug,title,allow_reveal}], sets, requests}`.
   A set carries `org_id, org_slug, org_title, service_id, service_slug,
-  service_title, set_id, set_slug, set_title, kind ("env-set" | "signer"),
-  revision, names, allow_reveal` and, for a signer, `scheme, origin, created_at,
+  service_title, set_id, set_slug, set_title, kind ("env-set" | "secret" | "signer"),
+  revision, names, allow_reveal, standing_cap_seconds` (the set's longest "don't ask
+  again"; 0 for a signer), for a secret optionally `note, url`, and, for a signer, `scheme, origin, created_at,
   signatures, public_key, public_hex, public_pem, fingerprint` (SHA-256 of the
   raw public key). `requests` are pending signing requests and live signing
   grants (below). Metadata only; needs no open bucket.
@@ -1141,6 +1281,9 @@ set_title, kind, revision`.
 | `reveal`, set ID | `names` (sorted, unique, non-empty), `recipient` | target fields, `names, recipient` | `{enc, ciphertext}` |
 | `policy`, org ID | `allow_reveal` | `org_id, org_slug, org_title, old_allow_reveal, allow_reveal` | `{ok}` |
 | `signer-create`, new set ID (32 lower-case hex) | `service_id, set_slug, set_title, scheme, source` (`generate` or `import`); for import also `attempt_id, enc, ciphertext` | target fields of the new set (`kind` `signer`, `revision` 0), `scheme, source, attempt_id, recipient` (empty for a generated key), `public_key, fingerprint, result_revision` (0: a signer set stays at revision 0, its key is immutable) | `{set_id, path, scheme, public_key, public_hex, public_pem, fingerprint}` |
+| `secret-create`, new set ID (32 lower-case hex) | `service_id, set_slug, set_title, note, url, attempt_id, enc, ciphertext, commitment` | target fields of the new set (`kind` `secret`, `revision` 0), `attempt_id, recipient, env_name, note, url, commitment, result_revision` (1) | `{set_id, path, env_name}`; the set, its marker and revision 1 |
+| `secret-convert`, set ID | `note, url` | target fields (`kind` `env-set`), `env_name, note, url` | `{ok}`; the same set and revision, now a secret |
+| `standing-cap`, set ID | `standing_cap_seconds` (0 to 86400, whole minutes) | target fields, `old_standing_cap_seconds, standing_cap_seconds` | `{ok}`; the set's live "don't ask again" rules end |
 | `sign-approve`, `sign-deny`, `sign-revoke`; request ID | approve: `ttl_seconds, max_signatures` | target fields, `request_id, host, enrollment, address, scheme, fingerprint, items` (each `name, size, sha256` and, for a SHA-512 scheme, `sha512`), `requested_ttl_seconds, requested_max_signatures, ttl_seconds, max_signatures, admission_generation, policy_revision, service_revision, soft_cap_seconds, beyond_soft_cap` | `{ok}` |
 
 `facts` are unsigned conveniences: `attempt_id` (the broker allocates one for
@@ -1161,6 +1304,25 @@ of an env set (64 keys, 8192 bytes a value, 24 KiB in all); a value may hold
 any UTF-8 text except NUL, including newlines. The page stores line breaks
 as LF and refuses an imported value that contains a carriage return (a text
 box cannot keep one); `aqmas set import` stores such a value exactly.
+
+**Secret (0.10.0).** A secret is one value under one environment variable name, for a
+credential that is a single item (one API key). It is **stored as a one-key env set**: the
+same `credential_sets` row kind, the same per-set bucket, the same sealed entry record and
+the same immutable revisions, plus a row in `secret_sets(set_id, note, url, created)` that
+marks it. So nothing new exists in the crypto or bucket code, a secret is requested,
+approved, collected, revealed and replaced through the env paths above, and an earlier
+binary or CLI sees a one-key env set that `aqmas run` delivers just the same. What differs
+is presentation and three rules: the Vault, the catalogue (`kind` `secret`), the listing
+and the approval card show a single secret; a `commit` on a secret must leave exactly one
+key (400 otherwise; the page replaces the value with an `import` of the one name); CLI
+upload tickets (`aqmas set ...`) are refused for it. `secret-create` uploads the form-edit
+packet below with `operation` `import` and exactly one entry, sealed for the new set ID
+with the commitment over revision 0; one tap creates the set, the marker and revision 1.
+`note` is one line of at most 200 bytes without control characters; `url` is empty or an
+`http(s)` URL of at most 300 bytes with a host and no credentials. Both are public
+metadata and are signed. `secret-convert` marks an env set that has exactly one key (409
+otherwise); the stored value, the path and the revision stay. There is no way back in this
+release (create an env set instead).
 
 **Reveal.** Refused for a signer (always), when the organisation's
 `allow_reveal` is off. The tap opens the set's bucket for an instant. The plaintext is

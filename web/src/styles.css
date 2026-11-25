@@ -2896,3 +2896,29 @@ dialog.search-dialog::backdrop {
   padding: 0.5rem 0.75rem;
   border-radius: 6px;
 }
+
+/* 0.10.0: what hosts may list, secrets, "don't ask again" */
+.policy-switches {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  margin: 10px 0;
+}
+.policy-switches .hint {
+  margin: 0 0 6px 1.6rem;
+}
+.env-mode,
+.env-standing-words {
+  margin: 4px 0;
+}
+.env-rule {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.vault-standing select {
+  width: auto;
+}
+.vault-secret-facts a {
+  overflow-wrap: anywhere;
+}

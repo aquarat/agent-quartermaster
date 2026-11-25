@@ -121,7 +121,12 @@ so your own shell does not expand the variable first). The exit status is the co
 variable that is already set in your environment.
 
 Each `run` is one approval and one delivery. If you need the value for several commands,
-put them in one script and run that.
+put them in one script and run that. The owner can also choose "don't ask again" when
+approving: for a while (an hour, up to a day for a low-risk key) the same request from this
+host is approved without a tap. You cannot ask for that and you do not need to know whether
+it is in force: run the command the same way each time, with an honest `--why`; it either
+returns at once or waits for the owner. A rule covers one kind of use, so `aqmas get` after
+an approved `aqmas run` asks again.
 
 ### Get a secret's value
 

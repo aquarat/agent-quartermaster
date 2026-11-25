@@ -1,8 +1,9 @@
 # agent-quartermaster (`aqmas`)
 
 Credential broker for a single owner's fleet: AI agents and the owner request short-lived,
-passkey-approved access (SSH certificates, Cloudflare API grants, env credential sets,
-signatures from keys that never leave the broker; GitHub, Forgejo and HTTP APIs later) instead of holding long-lived keys. The server (`aqmasd`) runs on a dedicated
+passkey-approved access (SSH certificates, Cloudflare API grants, env credential sets and
+single-value secrets, signatures from keys that never leave the broker; GitHub, Forgejo and
+HTTP APIs later) instead of holding long-lived keys. The server (`aqmasd`) runs on a dedicated
 bastion host; hosts enroll with the `aqmas` CLI.
 
 ## Status: alpha, use at your own risk
@@ -18,8 +19,8 @@ bastion host; hosts enroll with the `aqmas` CLI.
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 The approval page has seven tabs: **Approvals** for daily work, **Vault** for the credentials
-(a searchable list of env sets, signing keys and what the broker holds; Add item; Reveal after a
-tap), **Hosts**, **Activity**, **Security** (passkeys, open buckets, recovery key), **Settings**
+(a searchable list of secrets, env sets, signing keys and what the broker holds; Add item;
+Reveal after a tap), **Hosts**, **Activity**, **Security** (passkeys, open buckets, recovery key), **Settings**
 (Setup, upgrades, policies) and **Help** for enrollment and command examples using the running
 server’s URL and CA pin. The review behind this layout is [docs/UI-REVIEW.md](docs/UI-REVIEW.md).
 
@@ -46,7 +47,35 @@ and the enroll-only command are on the same card for doing it by hand.
 Later, `aqmas upgrade` upgrades the CLI from the broker
 ([docs/UPDATES.md](docs/UPDATES.md)); installed in `~/.local/bin` it needs no sudo.
 
+## For agents
+
+An agent on an enrolled machine learns aqmas from aqmas: `aqmas guide` prints the agent guide
+of the installed version ([docs/AGENTS.md](docs/AGENTS.md): how approvals work, every command
+with examples, what to do on each error), and `aqmas guide --json` is a command summary for
+programs. Point an agent's notes or knowledge base at that command instead of copying it.
+
+- **Discovery.** `aqmas ls` and `aqmas targets` list what the machine may ask for (paths,
+  kinds, key names, SSH targets; never values). It is an owner switch per organisation,
+  "Hosts may list what they can ask for" under Settings, off by default; while it is off a
+  host has to be told each path.
+- **MCP.** `aqmas mcp` is an MCP server on stdin/stdout with the same abilities as tools
+  (guide, status, the two lists, run a command with a secret, sign, run a command over SSH).
+  Register it with `claude mcp add aqmas -- aqmas mcp`, or
+  `{"mcpServers": {"aqmas": {"command": "aqmas", "args": ["mcp"]}}}`. Tools that need the
+  owner block until the owner decides; no tool returns a secret's value.
+- **Secrets.** Vault → Add item → Secret holds one value (an API key, say) with the
+  environment variable it is delivered as: `aqmas run ORG/SERVICE/SECRET --why "..." --
+  COMMAND`, or `aqmas get` for the value itself.
+- **Don't ask again.** When approving an env set or secret release the owner may choose
+  "don't ask again" for 1, 6 or 24 hours, up to a limit set per item (one hour by default):
+  the same machine then gets the same value again without another tap. Every delivery is
+  still logged, and the rule ends when the value, the policy or the admission changes, or
+  when the owner revokes it.
+
+## Documentation
+
 - Design and milestone 1 scope: [docs/DESIGN.md](docs/DESIGN.md)
+- The guide for agents (`aqmas guide`): [docs/AGENTS.md](docs/AGENTS.md)
 - API contract: [docs/API.md](docs/API.md), shared types in `internal/api`
 - Credential sets from the Vault tab (write-only form, reveal) and signing inside aqmas:
   [docs/SIGNING.md](docs/SIGNING.md). Signing keys should not leave aqmas where a signer

@@ -142,14 +142,15 @@ Derived from the stored request and the signed choice, never from the page:
 | … auto-approvable, or with a new or matching standing rule | `cf-proxy` | + auto hold (until restart or policy change) / standing hold |
 | Approve enrollment (client certificate) | `internal-ca` | instant |
 | Renew agent TLS leaf | `internal-ca` | instant |
-| Approve env release (`aqmas run`, checkout) | the set | env hold until collected, revoked or 10 minutes |
+| Approve env or secret release (`aqmas run`, `get`, checkout) | the set | env hold until collected, revoked or 10 minutes |
+| … with "don't ask again" | the set | + standing hold until the rule ends; a tap for the same set also re-arms its live rules |
 | Reveal (vault) | the set | instant |
 | Approve signing (`aqmas sign`) | the signer | signing hold until used up, expired or revoked |
 | Open approval window | `ssh-ca` if its sets include SSH, the org's `cf-proxy` if they include Cloudflare | window hold until it ends |
 | Batch | union of its items | per item |
 | Reopen (Security, after a restart or Close all) | the named buckets | the holds of their live users |
 | Rekey scope | every bucket of the scope | instant |
-| Deny, revoke, policy, form commit, env commit, signer create/import, catalogue, passkey add/rename/remove, updates, setup, Close all | none | — |
+| Deny, revoke, policy, form commit, env commit, secret create/convert, don't-ask-again limit, signer create/import, catalogue, passkey add/rename/remove, updates, setup, Close all | none | — |
 
 Challenge paths that carry an open: `POST /api/ui/{requests,enrollments}/{id}/challenge`
 (web.go), `/api/ui/seal/batch/challenge`, `/api/ui/seal/windows/open/challenge`,
@@ -229,6 +230,17 @@ Approving a request that creates or matches one keeps the bucket open for the ru
 (auto: until restart). After a restart the first matching request waits for one tap, whose
 card says "re-arms standing rule … until …": one tap per restart per rule, none in between.
 Turning the rule off closes the bucket when idle.
+
+**"Don't ask again" for env sets and secrets (0.10.0)** follows the same decision. A rule
+made on an env approval puts a standing hold (`envstanding:<rule>`) on the set's own bucket
+until the rule expires or is revoked, so later matching releases are issued and collected
+without a tap. That is the cost the owner accepts with the choice: for that long, the value
+is decryptable by the running broker, and the card and Security → Buckets say so. A closed
+bucket (restart, Close all) never issues: the rule stays, the next request becomes an
+ordinary card, and the tap that approves it re-arms every live rule of that set (the card's
+open line lists them). Reopen (Security → Buckets) re-arms them too. A rule that ended by
+itself (new revision, policy replacement, admission ended, limit changed) loses its hold at
+once where the broker made the change, and in the reconcile pass otherwise.
 
 Cloudflare **snapshots** (`/v1/cf/snapshots`) are served only while the proxy parent's
 bucket is open (423 otherwise), as v0.4.1 served them only while unlocked.
@@ -402,13 +414,21 @@ config; then scope wraps (create, test), drill and activation as above.
     buckets(id BLOB32 PK, scope → bucket_scopes, kind, ref, public_key BLOB65, wrap BLOB113, payload BLOB NULL, created, UNIQUE(kind, ref))
     env_revisions.payload / env_drafts.payload = JSON [{"n":name,"i":entry-id,"c":record}…] (unset drafts: names only); .wrap = bucket ID
     signer_keys.payload = record, .wrap = bucket ID
+    secret_sets(set_id PK → credential_sets, note, url, created)             -- 0.10.0: marks a one-key env set as a secret; no ciphertext
+    env_standing(id PK, host, set_id, binding, mode, peer, max_ttl, created, expires, revoked_at, uses)   -- 0.10.0: "don't ask again" rules; no ciphertext
+    set_standing(set_id PK, cap_seconds 0..86400)                             -- 0.10.0: a set's longest "don't ask again" (no row: 3600)
+    env_releases.delivery ('get' | NULL), env_releases.standing (rule ID | NULL)   -- 0.10.0, added columns
     seal_active(manifest = format-2 manifest, inventory = '{}', canonical, assertion)   -- root-pinned activation
     notice_channel(singleton, topic_url)
 
 `browser_keys`, `browser_wraps`, `scope_openers` and `passkey_prf` came after schema 9 shipped. They are
 created empty at every boot (`CREATE … IF NOT EXISTS`, as the guard trigger is), so an
 existing store starts unchanged with nothing enabled and the schema version stays 9; an
-older build of schema 9 ignores them.
+older build of schema 9 ignores them. The 0.10.0 tables and columns are added the same
+way. A secret needs no new format: its value is an ordinary env entry record in its set's
+bucket, so recovery, rekey and the drills cover it without change. An older build sees a
+secret as a one-key env set, ignores the rules (it asks for a tap every time) and writes
+`process` releases only.
 
 **Downgrade fence:** v0.4.1 refuses schema 9 (it requires schema 8 and its tables); the new
 binary refuses schema 8 except for the pinned migration. The only way back is the
