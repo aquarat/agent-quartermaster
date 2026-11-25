@@ -237,6 +237,21 @@ The maintenance runner (`aqmasd maint-run` as root, [SETUP.md](SETUP.md)) indepe
 
 Verified executables install by rename, preserving the old inode. A synced root-owned rollback journal precedes activation. An unhealthy restart restores `aqmasd.prev`; the path unit also recovers an interrupted activation after boot. Cache publication follows process-identity and database health checks. Binary rollback does not reverse database migrations: require backwards-compatible migrations for self-update. For a breaking migration, take a consistent SQLite backup and perform a supervised manual upgrade. If recovery fails, stop the path unit, inspect the journal and hashes, and restore the compatible database backup if necessary before re-enabling.
 
+**Rolling back from 0.10.0 to an earlier release.** The 0.10.0 additions are tables and
+columns an earlier binary ignores, so it starts and serves. Three things it does not know,
+to re-check after a rollback (and again after returning to 0.10.0):
+
+- **Policy switches.** "Hosts may list what they can ask for" and the `aqmas get` switch
+  live in `org_flags`, per policy revision. An earlier binary that replaces an
+  organisation's policy writes no row for the new revision: both switches are off again
+  for that organisation (listing off, `get` allowed). Set them again under Settings.
+- **Don't-ask-again rules.** An earlier binary never applies them (every release asks),
+  but it also does not end them: its recovery, in particular, leaves `env_standing` rows
+  live. After a recovery done by an earlier binary, revoke the rules listed on Approvals
+  once 0.10.0 runs again, before approving anything for those items.
+- **Secrets** are one-key env sets to an earlier binary: `aqmas run` works, `aqmas get`
+  does not exist, and its Vault shows them as env sets (do not add a second key there).
+
 ### Trust limits
 
 **Organisation inventory and rollback:** The read-only `organisations-plan` preview

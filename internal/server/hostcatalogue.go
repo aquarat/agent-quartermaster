@@ -32,7 +32,11 @@ func (s *Server) handleHostCatalogue(w http.ResponseWriter, r *http.Request, h *
 		if err != nil {
 			return err
 		}
-		out.Discovery = len(sets) > 0
+		// From the switch itself, not from what there is to list: an organisation
+		// with listing on and nothing in it yet is "on, and empty".
+		if out.Discovery, err = q.HostListing(ctx, h.ID, s.now()); err != nil {
+			return err
+		}
 		vault := s.seal != nil && s.bucketsReady() == nil
 		for _, x := range sets {
 			path := x.OrgSlug + "/" + x.ServiceSlug + "/" + x.SetSlug

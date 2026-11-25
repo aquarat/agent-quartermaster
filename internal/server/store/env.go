@@ -7,6 +7,7 @@ import (
 	"errors"
 	"github.com/aquarat/agent-quartermaster/internal/envset"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -113,6 +114,46 @@ func (q *Q) RevokeEnvStanding(ctx context.Context, now time.Time, ids ...string)
 		n += int(k)
 	}
 	return n, nil
+}
+
+// RevokeEnvUnder revokes the releases these rules approved that are not
+// collected yet, and returns their IDs (their holds go with them): ending a
+// rule also ends what it has issued and nobody has picked up.
+func (q *Q) RevokeEnvUnder(ctx context.Context, rules ...string) ([]string, error) {
+	var out []string
+	for _, rule := range rules {
+		if rule == "" {
+			continue
+		}
+		if err := q.rows(ctx, `UPDATE env_releases SET status='revoked' WHERE status='approved' AND consumed=0 AND standing=? RETURNING id`, func(rs *sql.Rows) error {
+			var id string
+			err := rs.Scan(&id)
+			out = append(out, id)
+			return err
+		}, rule); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
+// EnvStandingLoad counts what a rule has issued: releases still waiting to be
+// collected, and approvals since a point in time (a release's deadline is its
+// creation time plus the pending expiry, which the caller accounts for).
+func (q *Q) EnvStandingLoad(ctx context.Context, rule string, now, deadlineAfter time.Time) (uncollected, recent int, err error) {
+	err = q.q.QueryRowContext(ctx, `SELECT coalesce(sum(status='approved' AND consumed=0 AND until_ms>?1),0),coalesce(sum(deadline>?2),0) FROM env_releases WHERE standing=?3`, ms(now), ms(deadlineAfter), rule).Scan(&uncollected, &recent)
+	return
+}
+
+// HostListing reports whether any organisation that admits the host lets
+// hosts list (org_flags.discovery at its current policy revision).
+func (q *Q) HostListing(ctx context.Context, host int64, now time.Time) (bool, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, `SELECT count(*) FROM org_hosts a JOIN hosts h ON h.id=a.host_id JOIN organisations o ON o.id=a.org_id JOIN org_flags f ON f.org_id=o.id AND f.revision=o.revision AND f.discovery=1 WHERE h.id=? AND a.active=1 AND o.archived=0 AND h.revoked_at IS NULL AND h.not_after>?`, host, ms(now)).Scan(&n)
+	if err != nil && strings.Contains(err.Error(), "no such table") {
+		return false, nil
+	}
+	return n > 0, err
 }
 
 // RevokeSetStanding ends every rule of a set (its ceiling changed).

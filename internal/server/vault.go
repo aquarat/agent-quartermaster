@@ -1073,8 +1073,12 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 			if err = q.RevokeSetStanding(ctx, t.SetID, now); err != nil {
 				return err
 			}
-			for _, st := range rules {
-				s.seal.pool.release("envstanding:" + st.ID)
+			ended := make([]string, len(rules))
+			for i, st := range rules {
+				ended[i] = st.ID
+			}
+			if err = s.revokeUnder(ctx, q, ended...); err != nil {
+				return err
 			}
 			path := t.OrgSlug + "/" + t.ServiceSlug + "/" + t.SetSlug
 			auditObject, detail, note = "set:"+t.SetID, fmt.Sprintf("%s standing_cap=%d was=%d", path, *f.StandingCap, t.StandingCap), fmt.Sprintf("Don't-ask-again limit of %s set to %d s", path, *f.StandingCap)

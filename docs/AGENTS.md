@@ -243,6 +243,9 @@ harness makes easier.
 ## What aqmas does not protect against
 
 The owner's approval is for this host, not for one process on it: anything running as your
-user can use the same enrolment. A value delivered by `run`, `get` or `checkout` is in a
+user can use the same enrolment. The delivery modes are about accidents, not about a hostile
+process: a command started by `aqmas run` can print its environment, so turning `aqmas get`
+off, or approving `run` rather than `get`, does not keep the value from a host that wants
+it. What limits a host is which organisations admit it and what the owner approves. A value delivered by `run`, `get` or `checkout` is in a
 process on this host from then on, and a certificate works until it expires even if the
 grant is revoked. That is why requests should be narrow, short and honestly described.

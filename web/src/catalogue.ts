@@ -140,7 +140,7 @@ export function policyForm(cat: Catalogue, o: Org, sign: Sign): HTMLElement {
           "On: every host admitted to this organisation can list the names of its items, the key names of env sets, the variable names of secrets and its SSH targets (aqmas ls, aqmas targets, the MCP tools). Values are never listed. Off (the default): a host has to be told each path; it cannot tell an item it was not told about from one that does not exist.",
         ),
         h("label", { class: "check", for: get.id }, get, " Hosts may ask for a secret's value itself (aqmas get)"),
-        h("p", { class: "hint muted" }, "Off: secrets of this organisation are only delivered into a command's environment (aqmas run). Each request still needs your approval either way."),
+        h("p", { class: "hint muted" }, "Off: secrets of this organisation are only delivered into a command's environment (aqmas run). Each request still needs your approval either way. This keeps a value out of an agent's output by accident; it is not a barrier against a host that wants the value, which can run a command that prints it."),
       );
     })(),
     rules.length ? h("p", { class: "muted" }, "Relaxing applies only to the selected proxy scope. cf.admin: at most 1 h; cf.read.private: at most 2 h. Configured scope ceilings still apply.") : null,

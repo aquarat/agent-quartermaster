@@ -214,7 +214,10 @@ describe("the tap", () => {
     expect(hex(ext.prf.evalByCredential[auth.id]!.first)).toBe(hex(s1));
     // Nothing of the PRF in the assertion.
     expect(signed.assertion.clientExtensionResults).toEqual({});
-    expect(JSON.stringify(signed.assertion)).not.toContain("prf");
+    // Checked on the parsed fields: the binary fields are random base64url, which can spell
+    // any three letters by chance.
+    expect(Object.keys(signed.assertion).filter((k) => /prf|extension/i.test(k))).toEqual(["clientExtensionResults"]);
+    expect(Object.keys(signed.assertion.response).some((k) => /prf|extension/i.test(k))).toBe(false);
     const plain = await openPacket(o.r.priv, o.inst, "approve", openAAD(o.attempt, o.epoch, o.ch, auth.rawId), signed.open!);
     const k1 = await deriveKEK(await auth.evaluate(s1), o.inst, RP, auth.rawId, "installation", s1);
     const k2 = await deriveKEK(await auth.evaluate(s2), o.inst, RP, auth.rawId, "org-1", s2);

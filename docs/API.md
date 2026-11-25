@@ -77,7 +77,8 @@ the route answers `not_found`.
 `discovery` is false, and both lists empty, when no organisation that admits the host
 allows listing. Names only: an env set's key names, a secret's variable name, a signer's
 scheme, a target's address, port and login users. No value, no key, nothing about other
-hosts. A set with nothing stored yet is left out. `approval` is `owner` (a passkey tap for
+hosts. A set with nothing stored yet is left out, and `discovery` is true with empty
+lists when listing is on but there is nothing to list. `approval` is `owner` (a passkey tap for
 every request, unless a "don't ask again" rule the owner made covers it), `owner-or-standing`
 (SSH: a tap unless an auto-approval the owner made covers this host, target and user;
 high-risk targets are `owner`) or `per-scope` (Cloudflare: see `aqmas cf scopes`). The
@@ -1150,8 +1151,12 @@ The approval then also records a rule, under the ID of the approved release. A l
 
 The `--why` text may differ. Each such release is still its own once-only collection with
 its own grant ID; it is audited as `env_auto_approve` (actor `system`, naming the rule,
-host, mode, TTL and address) followed by the usual `env_collect_<mode>`, and it does not
-count against the host's pending-request limit. The `POST` answers `pending` as for every
+host, mode, TTL and address) followed by the usual `env_collect_<mode>`. It does not
+count against the host's pending-request limit (that limit is about cards waiting for the
+owner) but has limits of its own, each answered with 429 `rate_limited`: at most 4
+releases a rule approved may be waiting to be collected, and a rule approves at most 60
+releases an hour. Ending a rule (revoke, limit change, or any of the events below) also
+revokes the releases it approved that nobody collected yet. The `POST` answers `pending` as for every
 new release (every CLI, including earlier ones, expects that of a request it just made);
 the first poll finds it approved. A rule ends at its time, with a tap on
 `{"id": RULE, "action": "standing-revoke"}` (the signed metadata is the rule record with

@@ -192,6 +192,20 @@ func (s *Server) envRequest(ctx context.Context, q *store.Q, r *http.Request, h 
 	if err != nil {
 		return nil, err
 	}
+	if st != nil {
+		// A rule replaces the owner's tap, not every limit: a host cannot pile up
+		// releases nobody collects, nor loop on approvals.
+		waiting, recent, err := q.EnvStandingLoad(ctx, st.ID, now, now.Add(secs(s.cfg.TTL.PendingExpirySeconds)-time.Hour))
+		if err != nil {
+			return nil, err
+		}
+		if waiting >= MaxStandingUncollected {
+			return nil, &apiErr{429, "rate_limited", fmt.Sprintf("%d releases approved without a tap are still waiting to be collected: collect them or let them expire before asking again", waiting)}
+		}
+		if recent >= MaxStandingPerHour {
+			return nil, &apiErr{429, "rate_limited", fmt.Sprintf("this don't-ask-again rule has approved %d releases in the last hour, its limit: wait, or ask the owner", recent)}
+		}
+	}
 	if st == nil && n >= MaxPendingPerHost {
 		return nil, &apiErr{429, "rate_limited", "too many pending requests"}
 	}
@@ -219,6 +233,12 @@ func (s *Server) envRequest(ctx context.Context, q *store.Q, r *http.Request, h 
 	// of a request it just made); its first poll finds it approved.
 	return out, q.Audit(ctx, now, "system", "env_auto_approve", "request:"+out.ID, fmt.Sprintf("%s revision=%d mode=%s standing=%s host=%s ttl=%d from=%s", b.Path, b.Revision, out.Mode, st.ID, h.Name, ttl, peer))
 }
+
+// Limits on what one "don't ask again" rule issues without a tap.
+const (
+	MaxStandingUncollected = 4
+	MaxStandingPerHour     = 60
+)
 
 type envRule struct {
 	envset.Standing
@@ -249,6 +269,24 @@ func (s *Server) envStandingFor(ctx context.Context, q *store.Q, host int64, r e
 		}
 	}
 	return nil, nil
+}
+
+// revokeUnder finishes ending rules: the releases they approved that are not
+// collected yet are revoked, and the rules' and those releases' holds dropped.
+func (s *Server) revokeUnder(ctx context.Context, q *store.Q, rules ...string) error {
+	released, err := q.RevokeEnvUnder(ctx, rules...)
+	if err != nil {
+		return err
+	}
+	refs := make([]string, 0, len(rules)+len(released))
+	for _, r := range rules {
+		refs = append(refs, "envstanding:"+r)
+	}
+	for _, id := range released {
+		refs = append(refs, "env:"+id)
+	}
+	s.seal.pool.release(refs...)
+	return nil
 }
 
 func envStandingHold(st envset.Standing) bucketHold {
@@ -579,7 +617,8 @@ func (s *Server) envFinish(ctx context.Context, r *http.Request, sess string) (a
 				err = errConflict("that rule has ended; reload")
 			}
 			if err == nil {
-				s.seal.pool.release("envstanding:" + m.ID)
+				// What the rule issued and nobody collected ends with it.
+				err = s.revokeUnder(ctx, q, m.ID)
 			}
 		case "deny":
 			err = q.DecideEnv(ctx, m.ID, "denied", "", 0, 0)
@@ -594,7 +633,8 @@ func (s *Server) envFinish(ctx context.Context, r *http.Request, sess string) (a
 				_, err = q.RevokeEnvStanding(ctx, s.now(), m.ID, by)
 			}
 			if err == nil {
-				s.seal.pool.release("env:"+m.ID, "envstanding:"+m.ID, "envstanding:"+by)
+				s.seal.pool.release("env:" + m.ID)
+				err = s.revokeUnder(ctx, q, m.ID, by)
 			}
 		}
 		if err != nil {

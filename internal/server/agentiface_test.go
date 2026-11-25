@@ -99,6 +99,19 @@ func (v *vaultEnv) askTTL(c *http.Client, path, mode string, ttl int) (envset.Re
 	return rel, st
 }
 
+// rawPost asks for a release and returns the status and body.
+func (v *vaultEnv) rawPost(c *http.Client, route, path, mode string) (int, string) {
+	v.t.Helper()
+	var b envset.Binding
+	mustStatus(v.t, "binding", v.host(c, "GET", "/v2/env/set?path="+path, nil, &b), 200)
+	raw, _ := json.Marshal(map[string]any{"binding": b, "mode": mode, "reason": "again", "ttl_seconds": 600})
+	resp, err := c.Post(v.env.agent.URL+route, "application/json", bytes.NewReader(raw))
+	requireNoError(v.t, err)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
+}
+
 // envDecide runs one env ceremony (approve, deny, revoke, standing-revoke).
 func (v *vaultEnv) envDecide(choice map[string]any) (string, int) {
 	v.t.Helper()
@@ -235,6 +248,20 @@ func TestHostCatalogueDiscovery(t *testing.T) {
 	requireNoError(t, json.Unmarshal([]byte(raw), &e))
 	if st != 404 || e.Code != api.ErrNotAdmitted {
 		t.Fatalf("unadmitted host: %d %s", st, raw)
+	}
+	// Listing on in an organisation with nothing to list is "on, and empty", not "off".
+	const empty = "99999999999999999999999999999999"
+	for _, q := range []string{
+		`INSERT INTO organisations(id,slug,title,revision) VALUES('` + empty + `','empty-org','Empty',1)`,
+		`INSERT INTO org_policies VALUES('` + empty + `',1,3600,86400,1,3600,86400,1)`,
+		`INSERT INTO org_flags VALUES('` + empty + `',1,1,0)`,
+		`INSERT INTO org_hosts SELECT '` + empty + `',id,1,1 FROM hosts WHERE name='other'`,
+	} {
+		_, err = v.s.store.DB().Exec(q)
+		requireNoError(t, err)
+	}
+	if other, body = v.hostCatalogue(v.other); !other.Discovery || len(other.Credentials) != 0 || len(other.Targets) != 0 {
+		t.Fatalf("listing on, nothing to list: %s", body)
 	}
 	if where := v.leaked([]byte(sentinel)); where != "" {
 		t.Fatalf("a value reached %s", where)
@@ -530,9 +557,23 @@ func TestEnvStanding(t *testing.T) {
 		t.Fatal("the rule was not re-armed by the tap that reopened the bucket")
 	}
 
-	// Revoke with a tap: the next request asks again.
+	// Revoke with a tap: the next request asks again, and a release the rule approved that
+	// nobody collected yet is revoked with it.
+	waiting, st := v.ask(v.agent, path, "get")
+	mustStatus(t, "request before the revoke", st, 200)
+	left := v.relStatus(v.agent, waiting)
+	if left.Status != "approved" {
+		t.Fatal("no uncollected release to end")
+	}
 	if _, st = v.envDecide(map[string]any{"id": rel.ID, "action": "standing-revoke", "ttl_seconds": 0}); st != 200 {
 		t.Fatalf("standing revoke: %d", st)
+	}
+	mustStatus(t, "collecting what a revoked rule issued", v.host(v.agent, "POST", "/v2/grants/"+left.Grant+"/collect", map[string]any{}, nil), 409)
+	if got := v.relStatus(v.agent, waiting); got.Status != "revoked" {
+		t.Fatalf("an uncollected release outlived its rule: %s", got.Status)
+	}
+	if open := openBuckets(t, v.s); len(open) != 0 {
+		t.Fatalf("holds left after the revoke: %v", open)
 	}
 	if !v.audited("env_standing_revoke", rel.ID) || len(read().Standing) != 0 {
 		t.Fatal("revocation not applied or not logged")
@@ -570,6 +611,41 @@ func TestEnvStanding(t *testing.T) {
 	next, _ = v.ask(v.agent, path, "get")
 	if v.relStatus(v.agent, next).Status != "approved" {
 		t.Fatal("six-hour rule not applied")
+	}
+	// A rule is not a licence to pile up releases: at most four may wait to be collected.
+	for i := 1; i < MaxStandingUncollected; i++ {
+		if _, st = v.ask(v.agent, path, "get"); st != 200 {
+			t.Fatalf("release %d under the rule: %d", i+1, st)
+		}
+	}
+	if _, st = v.ask(v.agent, path, "get"); st != 429 {
+		t.Fatalf("a fifth uncollected release under one rule: %d", st)
+	}
+	// Changing the item's limit ends its rules and what they issued and nobody collected.
+	mustStatus(t, "lower the limit", capChange(3600), 200)
+	if got := v.relStatus(v.agent, next); got.Status != "revoked" || len(read().Standing) != 0 {
+		t.Fatalf("after a limit change: release %s, %d rules", got.Status, len(read().Standing))
+	}
+	mustStatus(t, "collecting after a limit change", v.host(v.agent, "POST", "/v2/grants/"+v.relStatus(v.agent, next).Grant+"/collect", map[string]any{}, nil), 409)
+	mustStatus(t, "raise the limit again", capChange(21600), 200)
+	rel, st = v.ask(v.agent, path, "get")
+	mustStatus(t, "request", st, 200)
+	v.deliverWith(v.agent, rel, 21600)
+	// ... nor to loop: sixty approvals an hour per rule, each collected or not.
+	for i := 0; i < MaxStandingPerHour; i++ {
+		r, st := v.ask(v.agent, path, "get")
+		if st != 200 {
+			t.Fatalf("approval %d under the rule: %d", i+1, st)
+		}
+		mustStatus(t, "collect", v.host(v.agent, "POST", "/v2/grants/"+v.relStatus(v.agent, r).Grant+"/collect", map[string]any{}, nil), 200)
+	}
+	var limited api.Error
+	if st, body := v.rawPost(v.agent, "/v2/env/requests", path, "get"); st != 429 || json.Unmarshal([]byte(body), &limited) != nil || !strings.Contains(limited.Message, "in the last hour") {
+		t.Fatalf("the 61st approval in an hour: %d %s", st, body)
+	}
+	next, _ = v.ask(v.other, path, "get") // another host has no rule: an ordinary card
+	if v.relStatus(v.other, next).Status != "pending" {
+		t.Fatal("another host's request was not queued")
 	}
 	if _, st = v.envDecide(map[string]any{"id": rel.ID, "action": "revoke", "ttl_seconds": 0}); st != 200 || len(read().Standing) != 0 {
 		t.Fatalf("revoking the source release: %d", st)
