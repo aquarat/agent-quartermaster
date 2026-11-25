@@ -10,6 +10,13 @@ type DurationPolicy struct {
 	StandingDefault    int  `json:"standing_default_seconds"`
 	StandingSoft       int  `json:"standing_soft_cap_seconds"`
 	StandingIndefinite bool `json:"standing_indefinite"`
+	// Discovery ("Hosts may list what they can ask for") lets an admitted host
+	// list this organisation's sets and targets (GET /v2/catalogue): names and
+	// key names, never values. DenyGet turns `aqmas get` off for the
+	// organisation's secrets (`aqmas run` is unchanged). Both are omitted while
+	// false, so a policy that uses neither has the wire shape it always had.
+	Discovery bool `json:"discovery,omitempty"`
+	DenyGet   bool `json:"deny_get,omitempty"`
 }
 
 type CatalogueRule struct {
@@ -83,4 +90,47 @@ type CatalogueChange struct {
 	ResultRevision int                 `json:"result_revision"`
 	Auto           *[]AutoAccess       `json:"auto_access,omitempty"`
 	Resources      *[]CatalogueService `json:"admitted_services,omitempty"`
+}
+
+// HostCatalogue is GET /v2/catalogue: what the calling host may ask for, in
+// the organisations that admitted it and let hosts list. Names only.
+type HostCatalogue struct {
+	// Discovery is false when no organisation that admits the host allows
+	// listing; both lists are then empty.
+	Discovery   bool             `json:"discovery"`
+	Credentials []HostCredential `json:"credentials"`
+	Targets     []HostTarget     `json:"targets"`
+}
+
+// HostCredential is one credential set the host may request.
+type HostCredential struct {
+	Path  string `json:"path"`
+	Kind  string `json:"kind"` // env-set | secret | signer | cloudflare-proxy | cloudflare-mint
+	Title string `json:"title"`
+	// Names are an env set's key names; Env is a secret's variable name.
+	Names  []string `json:"names,omitempty"`
+	Env    string   `json:"env,omitempty"`
+	Note   string   `json:"note,omitempty"`
+	URL    string   `json:"url,omitempty"`
+	Scheme string   `json:"scheme,omitempty"`
+	// Approval: "owner" (a passkey tap for every request) or "per-scope"
+	// (Cloudflare: some scopes are approved by policy, see `aqmas cf scopes`).
+	Approval string `json:"approval"`
+	Use      string `json:"use"`
+}
+
+// HostTarget is one SSH target the host may ask a certificate for.
+type HostTarget struct {
+	Name       string   `json:"name"`
+	Path       string   `json:"path"`
+	Aliases    []string `json:"aliases,omitempty"`
+	Address    string   `json:"address"`
+	Port       int      `json:"port"`
+	Users      []string `json:"users"`
+	HighRisk   bool     `json:"high_risk,omitempty"`
+	MaxSeconds int      `json:"max_seconds,omitempty"`
+	// Approval: "owner" (every request), or "owner-or-standing" (a tap unless
+	// an auto-approval the owner made earlier covers this host, target and user).
+	Approval string `json:"approval"`
+	Use      string `json:"use"`
 }

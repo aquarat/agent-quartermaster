@@ -99,7 +99,10 @@ func (s *Store) migrate(ctx context.Context) error {
 				return fmt.Errorf("store: incomplete personal cutover: %w", err)
 			}
 			s.scoped = true
-			_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS relaxed_proxy_scopes(set_id TEXT NOT NULL REFERENCES credential_sets(id),scope TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(set_id,scope,revision)) STRICT`)
+			if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS relaxed_proxy_scopes(set_id TEXT NOT NULL REFERENCES credential_sets(id),scope TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(set_id,scope,revision)) STRICT`); err != nil {
+				return err
+			}
+			_, err := s.db.ExecContext(ctx, orgFlagsDDL)
 			return err
 		}
 		return fmt.Errorf("store: database schema version %d is newer than this binary (%d)", ver, len(migrations))

@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/envset"
@@ -251,7 +253,7 @@ func (s *Server) vaultHistory(ctx context.Context, r *http.Request, sess string)
 		}
 		for _, e := range rows {
 			switch {
-			case out.LastChanged == 0 && (e.Action == "vault_commit" || e.Action == "vault_signer_create" || e.Action == "env_commit"):
+			case out.LastChanged == 0 && (e.Action == "vault_commit" || e.Action == "vault_signer_create" || e.Action == "vault_secret_create" || e.Action == "env_commit"):
 				out.LastChanged = e.At.UnixMilli()
 			case out.LastUsed == 0 && (e.Action == "sign" || strings.HasPrefix(e.Action, "env_collect_")):
 				out.LastUsed = e.At.UnixMilli()
@@ -298,6 +300,9 @@ type vaultChoice struct {
 	Title   string `json:"set_title,omitempty"`
 	Scheme  string `json:"scheme,omitempty"`
 	Source  string `json:"source,omitempty"`
+	// secret-create, secret-convert: optional public note and link
+	Note string `json:"note,omitempty"`
+	URL  string `json:"url,omitempty"`
 	// sign-approve
 	TTL int `json:"ttl_seconds,omitempty"`
 	Max int `json:"max_signatures,omitempty"`
@@ -409,7 +414,7 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		if err = owner(t.OrgID); err != nil {
 			return "", nil, err
 		}
-		if t.Kind != "env-set" {
+		if t.Kind != "env-set" && t.Kind != "secret" {
 			return "", nil, errBad("not an env set")
 		}
 		if err = s.canWrite(ctx, q, "env-set", t.SetID, t.OrgID); err != nil {
@@ -438,6 +443,9 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		if err != nil {
 			return "", nil, errBad(err.Error())
 		}
+		if t.Kind == "secret" && len(namesAfter(t.Names, edit)) != 1 {
+			return "", nil, errBad("a secret holds exactly one value: replace it, or keep several values in an env set")
+		}
 		m = targetFields(t)
 		m["attempt_id"], m["operation"], m["changes"], m["commitment"], m["result_revision"] = c.Attempt, edit.Op, changes, p.commit, t.Revision+1
 		m["recipient"] = encodeID(p.recipient.Public())
@@ -449,7 +457,7 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		if err = owner(t.OrgID); err != nil {
 			return "", nil, err
 		}
-		if t.Kind != "env-set" {
+		if t.Kind != "env-set" && t.Kind != "secret" {
 			return "", nil, errForbidden("a signer key is never revealed")
 		}
 		if !t.AllowReveal {
@@ -540,6 +548,68 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		m["recipient"] = recipient
 		pemText, _ := sc.PublicPEM(pub)
 		facts["public_key"], facts["fingerprint"], facts["public_hex"], facts["public_pem"] = encodeID(pub), signer.Fingerprint(pub), hex.EncodeToString(pub), pemText
+	case "secret-create":
+		// A secret is created with its value in one tap: the set row, its
+		// marker and revision 1 (docs/API.md "Secrets").
+		t, err := q.VaultService(ctx, c.Service)
+		if err != nil {
+			return "", nil, err
+		}
+		if err = owner(t.OrgID); err != nil {
+			return "", nil, err
+		}
+		if !catalogueID.MatchString(c.ID) || !config.ValidName(c.Slug) || !catalogueTitle.MatchString(c.Title) || strings.TrimSpace(c.Title) != c.Title || !validSecretMeta(c.Note, c.URL) {
+			return "", nil, errBad("invalid secret")
+		}
+		if free, err := q.SetSlugFree(ctx, t.ServiceID, c.ID, c.Slug); err != nil || !free {
+			return "", nil, errConflict("a set with that name or ID exists; reload")
+		}
+		if err = s.canWrite(ctx, q, "env-set", c.ID, t.OrgID); err != nil {
+			return "", nil, err
+		}
+		t.SetID, t.SetSlug, t.SetTitle, t.Kind, t.Revision, t.Names = c.ID, c.Slug, c.Title, "secret", 0, []string{}
+		var p *vaultPending
+		if begin {
+			p, err = s.submit(sess, c, "edit", t.SetID)
+		} else if p = s.seal.vault.get(s.now(), sess, c.Attempt, false); p == nil || p.purpose != "edit" || p.target != t.SetID {
+			err = errConflict("upload attempt expired; start again")
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		edit, err := s.openEdit(p, t, c.Attempt)
+		if err != nil {
+			return "", nil, err
+		}
+		name := ""
+		if len(edit.Entries) == 1 {
+			name = edit.Entries[0].Name
+		}
+		for i := range edit.Entries {
+			edit.Entries[i].Value = ""
+		}
+		if edit.Op != "import" || name == "" || len(edit.Remove) != 0 {
+			return "", nil, errBad("a secret is one name and one value")
+		}
+		m = targetFields(t)
+		m["attempt_id"], m["env_name"], m["note"], m["url"], m["commitment"], m["result_revision"] = c.Attempt, name, c.Note, c.URL, p.commit, 1
+		m["recipient"] = encodeID(p.recipient.Public())
+	case "secret-convert":
+		t, err := q.VaultSet(ctx, c.ID)
+		if err != nil {
+			return "", nil, err
+		}
+		if err = owner(t.OrgID); err != nil {
+			return "", nil, err
+		}
+		if t.Kind != "env-set" || len(t.Names) != 1 {
+			return "", nil, errConflict("only an env set with exactly one key becomes a secret; reload")
+		}
+		if !validSecretMeta(c.Note, c.URL) {
+			return "", nil, errBad("invalid secret")
+		}
+		m = targetFields(t)
+		m["env_name"], m["note"], m["url"] = t.Names[0], c.Note, c.URL
 	case "sign-approve", "sign-deny", "sign-revoke":
 		v, host, err := q.SignRequest(ctx, c.ID, false)
 		if err != nil {
@@ -587,6 +657,43 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		facts["attempt_id"] = c.Attempt
 	}
 	return meta, facts, err
+}
+
+// namesAfter is the key list an edit leaves behind (names only).
+func namesAfter(old []string, e envset.Edit) []string {
+	m := map[string]bool{}
+	if e.Op != "import" {
+		for _, n := range old {
+			m[n] = true
+		}
+	}
+	for _, x := range e.Entries {
+		m[x.Name] = e.Op != "unset"
+	}
+	for _, n := range e.Remove {
+		m[n] = false
+	}
+	out := []string{}
+	for n, ok := range m {
+		if ok {
+			out = append(out, n)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// validSecretMeta bounds a secret's public note and link: one line of plain
+// text, and an http(s) URL with a host and nothing a page would reinterpret.
+func validSecretMeta(note, link string) bool {
+	if len(note) > 200 || !utf8.ValidString(note) || hasControl(note, false) || strings.TrimSpace(note) != note {
+		return false
+	}
+	if link == "" {
+		return true
+	}
+	u, err := url.Parse(link)
+	return err == nil && len(link) <= 300 && utf8.ValidString(link) && !hasControl(link, false) && !strings.ContainsAny(link, " \\\"<>`") && (u.Scheme == "https" || u.Scheme == "http") && u.Host != "" && u.User == nil
 }
 func signBindingEqual(a, b signer.Binding) bool {
 	x, _ := json.Marshal(a)
@@ -711,6 +818,9 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 		Max         int      `json:"max_signatures"`
 		Changes     string   `json:"changes"`
 		PublicKey   string   `json:"public_key"`
+		Note        string   `json:"note"`
+		URL         string   `json:"url"`
+		EnvName     string   `json:"env_name"`
 	}
 	if json.Unmarshal([]byte(m.Metadata), &f) != nil {
 		err = errBad("invalid vault decision")
@@ -724,6 +834,10 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 		choice.Names, choice.Recipient = f.Names, f.Recipient
 	case "signer-create":
 		choice.Service, choice.Slug, choice.Title, choice.Scheme, choice.Source = f.Service, f.Slug, f.Title, f.Scheme, f.Source
+	case "secret-create":
+		choice.Service, choice.Slug, choice.Title, choice.Note, choice.URL = f.Service, f.Slug, f.Title, f.Note, f.URL
+	case "secret-convert":
+		choice.Note, choice.URL = f.Note, f.URL
 	case "sign-approve":
 		choice.TTL, choice.Max = f.TTL, f.Max
 	}
@@ -878,6 +992,57 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 			pemText, _ := sc.PublicPEM(pub)
 			out = map[string]any{"set_id": t.SetID, "path": path, "scheme": sc.ID, "public_key": encodeID(pub), "public_hex": hex.EncodeToString(pub), "public_pem": pemText, "fingerprint": signer.Fingerprint(pub)}
 			auditObject, detail, note = "set:"+t.SetID, fmt.Sprintf("%s scheme=%s origin=%s fingerprint=%s", path, sc.ID, origin, signer.Fingerprint(pub)), fmt.Sprintf("Created signer %s (%s)", path, sc.ID)
+		case "secret-create":
+			p := s.seal.vault.get(now, sess, f.Attempt, false)
+			if p == nil {
+				return errConflict("upload attempt expired; start again")
+			}
+			t, err := q.VaultService(ctx, f.Service)
+			if err != nil {
+				return err
+			}
+			t.SetID, t.SetSlug, t.SetTitle, t.Kind, t.Note, t.URL, t.Names = m.ID, f.Slug, f.Title, "secret", f.Note, f.URL, []string{}
+			edit, err := s.openEdit(p, t, f.Attempt)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				for i := range edit.Entries {
+					edit.Entries[i].Value = ""
+				}
+			}()
+			if len(edit.Entries) != 1 || edit.Entries[0].Name != f.EnvName {
+				return errConflict("the proposal changed; review again")
+			}
+			if err = q.CreateSecret(ctx, t, now); err != nil {
+				return errConflict("a set with that name or ID exists; reload")
+			}
+			// Same storage as an env set: the set's own bucket, the value sealed
+			// to its public key (nothing is opened to create a secret).
+			row, err := s.ensureSetBucket(ctx, q, "env-set", t.SetID, t.OrgID)
+			if err != nil {
+				return err
+			}
+			sealed, err := s.sealEntries(s.sealBucket(row), t.SetID, edit.Entries)
+			if err != nil {
+				return err
+			}
+			if err = s.writeRevision(ctx, q, t.Binding(), row, sealed); err != nil {
+				return err
+			}
+			path := t.OrgSlug + "/" + t.ServiceSlug + "/" + t.SetSlug
+			out = map[string]any{"set_id": t.SetID, "path": path, "env_name": f.EnvName}
+			auditObject, detail, note = "set:"+t.SetID, fmt.Sprintf("%s revision=1 env=%s commitment=%s", path, f.EnvName, p.commit), fmt.Sprintf("Created secret %s", path)
+		case "secret-convert":
+			t, err := q.VaultSet(ctx, m.ID)
+			if err != nil {
+				return err
+			}
+			if err = q.MarkSecret(ctx, t.SetID, f.Note, f.URL, now); err != nil {
+				return errConflict("the set changed; reload")
+			}
+			path := t.OrgSlug + "/" + t.ServiceSlug + "/" + t.SetSlug
+			auditObject, detail, note = "set:"+t.SetID, fmt.Sprintf("%s revision=%d env=%s", path, t.Revision, f.EnvName), fmt.Sprintf("%s is now a secret", path)
 		case "sign-approve":
 			v, _, err := q.SignRequest(ctx, m.ID, false)
 			if err != nil {

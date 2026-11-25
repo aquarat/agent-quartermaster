@@ -145,7 +145,22 @@ func (s *Server) envRequest(ctx context.Context, q *store.Q, r *http.Request, h 
 	if !reflect.DeepEqual(b, in.Binding) || b.Revision == 0 || len(b.Names) == 0 {
 		return nil, errConflict("revision changed or empty")
 	}
-	if in.Mode != "process" && in.Mode != "file" && in.Mode != "shell" || len(in.Reason) > MaxReasonLen || strings.TrimSpace(in.Reason) == "" || hasControl(in.Reason, false) {
+	if in.Mode == "get" {
+		// `aqmas get`: one secret's value, printed by the requesting process.
+		if secret, err := q.IsSecret(ctx, b.Set); err != nil {
+			return nil, err
+		} else if !secret || len(b.Names) != 1 {
+			return nil, errBad("aqmas get delivers a single secret; this is an env set: use aqmas run (or make it a secret in the Vault)")
+		}
+		if _, deny, err := q.OrgFlags(ctx, b.Org, b.PolicyRevision); err != nil {
+			return nil, err
+		} else if deny {
+			return nil, errForbidden("the owner has turned off aqmas get for this organisation: use aqmas run PATH --why ... -- COMMAND")
+		}
+	} else if in.Mode != "process" && in.Mode != "file" && in.Mode != "shell" {
+		return nil, errBad("invalid delivery mode or reason")
+	}
+	if len(in.Reason) > MaxReasonLen || strings.TrimSpace(in.Reason) == "" || hasControl(in.Reason, false) {
 		return nil, errBad("invalid delivery mode or reason")
 	}
 	ttl := in.TTL
@@ -260,6 +275,11 @@ func (s *Server) envTicket(ctx context.Context, r *http.Request, sess string) (a
 		b, err := q.EnvBinding(ctx, host, in.Path, s.now())
 		if err != nil || b.Class != "owner-device" {
 			return errNotFound()
+		}
+		if secret, err := q.IsSecret(ctx, b.Set); err != nil {
+			return err
+		} else if secret {
+			return errBad("a secret is replaced in the Vault, not from the CLI")
 		}
 		draft = envset.Draft{Binding: b, ID: encodeID(id[:]), Operation: in.Operation, Expires: s.now().Add(5 * time.Minute).UnixMilli()}
 		return q.NewEnvTicket(ctx, sess, host, draft, ids.Hash(ticket))
@@ -473,6 +493,11 @@ func (s *Server) commitDraft(ctx context.Context, q *store.Q, x store.StagedEnv)
 	}
 	if !bytes.Equal(x.Record.Wrap, row.ID) {
 		return errConflict("the draft was sealed to another key; upload it again")
+	}
+	if secret, err := q.IsSecret(ctx, x.D.Set); err != nil {
+		return err
+	} else if secret {
+		return errConflict("a secret is replaced in the Vault, not from the CLI")
 	}
 	unset := x.D.Operation == "unset"
 	recs, err := parseRecords(x.Record.Payload, !unset)

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
@@ -18,10 +19,14 @@ import (
 // revision 0 with a signer_keys row. A previous binary therefore sees an
 // empty env set: nothing to request, deliver or check in its recovery
 // inventory. This binary refuses env use of any set that has a signer row.
+// A secret (0.10.0) is the same trick with a secret_sets row: an env set that
+// holds exactly one key, the secret's environment variable name. A previous
+// binary sees a one-key env set, which `aqmas run` delivers just the same.
 // No statement here takes a value, a private key or a DEK: only public
 // metadata and sealed records.
 func (s *Store) InitVault(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS signer_keys(set_id TEXT PRIMARY KEY REFERENCES credential_sets(id),scheme TEXT NOT NULL,public_key BLOB NOT NULL,origin TEXT NOT NULL CHECK(origin IN ('generated','imported')),created INTEGER NOT NULL,signatures INTEGER NOT NULL DEFAULT 0,blob BLOB NOT NULL UNIQUE,payload BLOB,wrap BLOB) STRICT;
+CREATE TABLE IF NOT EXISTS secret_sets(set_id TEXT PRIMARY KEY REFERENCES credential_sets(id),note TEXT NOT NULL,url TEXT NOT NULL,created INTEGER NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS org_vault(org_id TEXT PRIMARY KEY REFERENCES organisations(id),allow_reveal INTEGER NOT NULL CHECK(allow_reveal IN (0,1))) STRICT;
 CREATE TABLE IF NOT EXISTS sign_requests(id TEXT PRIMARY KEY,grant_id TEXT UNIQUE,host INTEGER NOT NULL REFERENCES hosts(id),set_id TEXT NOT NULL REFERENCES credential_sets(id),binding TEXT NOT NULL,items TEXT NOT NULL,peer TEXT NOT NULL,reason TEXT NOT NULL,ttl INTEGER NOT NULL CHECK(ttl>=0),max INTEGER NOT NULL CHECK(max>0),deadline INTEGER NOT NULL,until_ms INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL CHECK(status IN ('pending','approved','used','expired','cancelled','denied','revoked')),used INTEGER NOT NULL DEFAULT 0 CHECK(used>=0 AND used<=max)) STRICT;
 CREATE INDEX IF NOT EXISTS sign_by_host_status ON sign_requests(host,status);
@@ -55,18 +60,24 @@ type VaultTarget struct {
 	Origin          string   `json:"origin,omitempty"`
 	Created         int64    `json:"created_at,omitempty"`
 	Signatures      int      `json:"signatures"`
+	// A secret's optional note and URL (public metadata, signed at creation).
+	Note string `json:"note,omitempty"`
+	URL  string `json:"url,omitempty"`
 }
 
-const vaultCols = `o.id,o.slug,o.title,v.id,v.slug,v.title,s.id,s.slug,s.title,s.revision,v.revision,o.revision,coalesce(r.names,'[]'),coalesce((SELECT allow_reveal FROM org_vault x WHERE x.org_id=o.id),1),coalesce(k.scheme,''),k.public_key,coalesce(k.origin,''),coalesce(k.created,0),coalesce(k.signatures,0) FROM organisations o JOIN services v ON v.org_id=o.id JOIN credential_sets s ON s.service_id=v.id LEFT JOIN signer_keys k ON k.set_id=s.id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision AND r.wrap IS NOT NULL WHERE NOT o.archived AND NOT v.archived AND NOT s.archived AND v.provider='application' AND s.kind='env-set'`
+const vaultCols = `o.id,o.slug,o.title,v.id,v.slug,v.title,s.id,s.slug,s.title,s.revision,v.revision,o.revision,coalesce(r.names,'[]'),coalesce((SELECT allow_reveal FROM org_vault x WHERE x.org_id=o.id),1),coalesce(k.scheme,''),k.public_key,coalesce(k.origin,''),coalesce(k.created,0),coalesce(k.signatures,0),z.set_id IS NOT NULL,coalesce(z.note,''),coalesce(z.url,'') FROM organisations o JOIN services v ON v.org_id=o.id JOIN credential_sets s ON s.service_id=v.id LEFT JOIN signer_keys k ON k.set_id=s.id LEFT JOIN secret_sets z ON z.set_id=s.id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision AND r.wrap IS NOT NULL WHERE NOT o.archived AND NOT v.archived AND NOT s.archived AND v.provider='application' AND s.kind='env-set'`
 
 func scanVault(row interface{ Scan(...any) error }) (t VaultTarget, err error) {
 	var names string
-	if err = row.Scan(&t.OrgID, &t.OrgSlug, &t.OrgTitle, &t.ServiceID, &t.ServiceSlug, &t.ServiceTitle, &t.SetID, &t.SetSlug, &t.SetTitle, &t.Revision, &t.ServiceRevision, &t.PolicyRevision, &names, &t.AllowReveal, &t.Scheme, &t.PublicKey, &t.Origin, &t.Created, &t.Signatures); err != nil {
+	var secret bool
+	if err = row.Scan(&t.OrgID, &t.OrgSlug, &t.OrgTitle, &t.ServiceID, &t.ServiceSlug, &t.ServiceTitle, &t.SetID, &t.SetSlug, &t.SetTitle, &t.Revision, &t.ServiceRevision, &t.PolicyRevision, &names, &t.AllowReveal, &t.Scheme, &t.PublicKey, &t.Origin, &t.Created, &t.Signatures, &secret, &t.Note, &t.URL); err != nil {
 		return t, err
 	}
 	t.Kind = "env-set"
 	if t.Scheme != "" {
 		t.Kind = "signer"
+	} else if secret {
+		t.Kind = "secret"
 	}
 	return t, json.Unmarshal([]byte(names), &t.Names)
 }
@@ -94,6 +105,39 @@ func (q *Q) SignerSets(ctx context.Context) (map[string]bool, error) {
 		return err
 	})
 	return out, err
+}
+
+// SecretSets names the sets the catalogue must show as kind "secret".
+func (q *Q) SecretSets(ctx context.Context) (map[string]bool, error) {
+	out := map[string]bool{}
+	err := q.rows(ctx, `SELECT set_id FROM secret_sets`, func(rs *sql.Rows) error {
+		var id string
+		err := rs.Scan(&id)
+		out[id] = true
+		return err
+	})
+	return out, err
+}
+
+// IsSecret reports whether a set is a single-value secret.
+func (q *Q) IsSecret(ctx context.Context, set string) (bool, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, `SELECT count(*) FROM secret_sets WHERE set_id=?`, set).Scan(&n)
+	return n > 0, err
+}
+
+// CreateSecret inserts a secret's set row and its marker; the caller writes
+// revision 1 (the one sealed value) in the same transaction.
+func (q *Q) CreateSecret(ctx context.Context, t VaultTarget, now time.Time) error {
+	if err := one(q.q.ExecContext(ctx, `INSERT INTO credential_sets(id,service_id,provider,slug,title,kind,revision) VALUES(?,?,'application',?,?,'env-set',0)`, t.SetID, t.ServiceID, t.SetSlug, t.SetTitle)); err != nil {
+		return err
+	}
+	return q.MarkSecret(ctx, t.SetID, t.Note, t.URL, now)
+}
+
+// MarkSecret turns an existing one-key env set into a secret.
+func (q *Q) MarkSecret(ctx context.Context, set, note, url string, now time.Time) error {
+	return one(q.q.ExecContext(ctx, `INSERT INTO secret_sets(set_id,note,url,created) SELECT s.id,?,?,? FROM credential_sets s WHERE s.id=? AND s.kind='env-set' AND s.provider='application' AND NOT EXISTS(SELECT 1 FROM signer_keys k WHERE k.set_id=s.id)`, note, url, ms(now), set))
 }
 
 type VaultOrg struct {
@@ -277,4 +321,51 @@ func (q *Q) SetHistory(ctx context.Context, set, path string, n int) ([]api.Audi
 		return nil
 	}, set, path, n)
 	return out, err
+}
+
+// HostSet is one row of the host's own catalogue (GET /v2/catalogue).
+type HostSet struct {
+	OrgSlug, OrgTitle, ServiceSlug, ServiceTitle, Provider string
+	SetID, SetSlug, SetTitle, Kind                         string
+	Revision                                               int
+}
+
+// HostSets lists the sets of every organisation that admits the host AND lets
+// hosts list (org_flags.discovery at the organisation's current policy
+// revision). An organisation without the switch contributes nothing, exactly
+// as if the host were not admitted to it.
+func (q *Q) HostSets(ctx context.Context, host int64, now time.Time) ([]HostSet, error) {
+	out := []HostSet{}
+	err := q.rows(ctx, `SELECT o.slug,o.title,v.slug,v.title,v.provider,s.id,s.slug,s.title,s.kind,s.revision FROM org_hosts a JOIN hosts h ON h.id=a.host_id JOIN organisations o ON o.id=a.org_id JOIN org_flags f ON f.org_id=o.id AND f.revision=o.revision AND f.discovery=1 JOIN services v ON v.org_id=o.id JOIN credential_sets s ON s.service_id=v.id WHERE h.id=? AND a.active=1 AND o.archived=0 AND v.archived=0 AND s.archived=0 AND h.revoked_at IS NULL AND h.not_after>? ORDER BY o.slug,v.slug,s.slug`, func(rs *sql.Rows) error {
+		var x HostSet
+		err := rs.Scan(&x.OrgSlug, &x.OrgTitle, &x.ServiceSlug, &x.ServiceTitle, &x.Provider, &x.SetID, &x.SetSlug, &x.SetTitle, &x.Kind, &x.Revision)
+		out = append(out, x)
+		return err
+	}, host, ms(now))
+	if err != nil && strings.Contains(err.Error(), "no such table") {
+		return []HostSet{}, nil // no policy has ever turned listing on
+	}
+	return out, err
+}
+
+// HostSetDetail is what the listing says about one application set: its kind
+// and names. ok is false for a set with nothing to ask for yet.
+func (q *Q) HostSetDetail(ctx context.Context, set string) (kind string, names []string, scheme, note, url string, ok bool, err error) {
+	var raw string
+	var secret bool
+	err = q.q.QueryRowContext(ctx, `SELECT coalesce(r.names,'[]'),coalesce(k.scheme,''),k.wrap IS NOT NULL,z.set_id IS NOT NULL,coalesce(z.note,''),coalesce(z.url,'') FROM credential_sets s LEFT JOIN signer_keys k ON k.set_id=s.id LEFT JOIN secret_sets z ON z.set_id=s.id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision AND r.wrap IS NOT NULL WHERE s.id=?`, set).Scan(&raw, &scheme, &ok, &secret, &note, &url)
+	if err != nil {
+		return "", nil, "", "", "", false, notFound(err)
+	}
+	if scheme != "" {
+		return "signer", nil, scheme, "", "", ok, nil
+	}
+	if err = json.Unmarshal([]byte(raw), &names); err != nil {
+		return "", nil, "", "", "", false, err
+	}
+	kind = "env-set"
+	if secret {
+		kind = "secret"
+	}
+	return kind, names, "", note, url, len(names) > 0, nil
 }

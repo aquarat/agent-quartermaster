@@ -55,6 +55,7 @@ func (s *Server) AgentHandler() http.Handler {
 	mux.Handle("GET /v1/ssh-ca", s.requirePersonal(s.handleSSHCA))
 	mux.Handle("GET /v1/ssh-target", s.requirePersonal(s.handleResolveTarget))
 	s.bastionAgentRoutes(mux)
+	mux.Handle("GET /v2/catalogue", s.requireHost(s.handleHostCatalogue))
 	// Milestone 2 (404 when cloudflare.enabled is false).
 	mux.Handle("GET /v1/cf/catalogue", s.requirePersonal(s.handleCFCatalogue))
 	mux.Handle("GET /v1/cf/snapshots", s.requirePersonal(s.handleCFSnapshots))

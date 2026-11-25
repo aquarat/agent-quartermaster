@@ -21,6 +21,17 @@ CREATE INDEX IF NOT EXISTS env_by_host_status ON env_releases(host,status);
 CREATE TRIGGER IF NOT EXISTS env_end_admission AFTER UPDATE ON org_hosts BEGIN DELETE FROM env_drafts WHERE host=NEW.host_id AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.org_id); UPDATE env_releases SET status=CASE status WHEN 'pending' THEN 'expired' ELSE 'revoked' END WHERE status IN ('approved','pending') AND host=NEW.host_id AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.org_id);END;
 CREATE TRIGGER IF NOT EXISTS env_end_policy AFTER UPDATE ON organisations BEGIN DELETE FROM env_drafts WHERE set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.id);UPDATE env_releases SET status=CASE status WHEN 'pending' THEN 'expired' ELSE 'revoked' END WHERE status IN ('approved','pending') AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.id);END;
 CREATE TRIGGER IF NOT EXISTS env_end_revision AFTER UPDATE ON credential_sets BEGIN DELETE FROM env_drafts WHERE set_id=NEW.id;UPDATE env_releases SET status=CASE status WHEN 'pending' THEN 'expired' ELSE 'revoked' END WHERE status IN ('approved','pending') AND set_id=NEW.id;END;`)
+	if err != nil {
+		return err
+	}
+	// 0.10.0: the delivery "get" (a secret printed by `aqmas get`). The mode
+	// column's CHECK predates it and cannot be altered in place, so such a row
+	// stores mode 'process' and its real delivery here; NULL means the mode.
+	var has int
+	if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('env_releases') WHERE name='delivery'`).Scan(&has); err != nil || has > 0 {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `ALTER TABLE env_releases ADD COLUMN delivery TEXT CHECK(delivery IS NULL OR delivery='get')`)
 	return err
 }
 func (q *Q) SweepEnv(ctx context.Context, now time.Time) error {
@@ -116,7 +127,11 @@ func (q *Q) NewEnvRelease(ctx context.Context, host int64, r envset.Release) err
 	if err != nil {
 		return err
 	}
-	return one(q.q.ExecContext(ctx, `INSERT INTO env_releases(id,host,set_id,binding,mode,peer,reason,ttl,deadline,status) VALUES(?,?,?,?,?,?,?,?,?,'pending')`, r.ID, host, r.Set, string(b), r.Mode, r.Peer, r.Reason, r.TTL, r.Deadline))
+	mode, delivery := r.Mode, sql.NullString{}
+	if mode == "get" {
+		mode, delivery = "process", sql.NullString{String: "get", Valid: true}
+	}
+	return one(q.q.ExecContext(ctx, `INSERT INTO env_releases(id,host,set_id,binding,mode,delivery,peer,reason,ttl,deadline,status) VALUES(?,?,?,?,?,?,?,?,?,?,'pending')`, r.ID, host, r.Set, string(b), mode, delivery, r.Peer, r.Reason, r.TTL, r.Deadline))
 }
 func (q *Q) EnvRelease(ctx context.Context, id string, grant bool) (r envset.Release, host int64, err error) {
 	col := "id"
@@ -124,7 +139,7 @@ func (q *Q) EnvRelease(ctx context.Context, id string, grant bool) (r envset.Rel
 		col = "grant_id"
 	}
 	var b string
-	err = q.q.QueryRowContext(ctx, `SELECT id,coalesce(grant_id,''),host,binding,mode,peer,reason,ttl,deadline,until_ms,status,consumed FROM env_releases WHERE `+col+`=?`, id).Scan(&r.ID, &r.Grant, &host, &b, &r.Mode, &r.Peer, &r.Reason, &r.TTL, &r.Deadline, &r.Until, &r.Status, &r.Consumed)
+	err = q.q.QueryRowContext(ctx, `SELECT id,coalesce(grant_id,''),host,binding,coalesce(delivery,mode),peer,reason,ttl,deadline,until_ms,status,consumed FROM env_releases WHERE `+col+`=?`, id).Scan(&r.ID, &r.Grant, &host, &b, &r.Mode, &r.Peer, &r.Reason, &r.TTL, &r.Deadline, &r.Until, &r.Status, &r.Consumed)
 	if err == nil {
 		err = json.Unmarshal([]byte(b), &r.Binding)
 	}

@@ -44,11 +44,18 @@ func (s *Server) ownerCatalogue(ctx context.Context, q *store.Q, sess string, pk
 		if err != nil {
 			return c, err
 		}
+		// A secret likewise: an application set with a secret_sets row.
+		secrets, err := q.SecretSets(ctx)
+		if err != nil {
+			return c, err
+		}
 		for i := range c.Orgs {
 			for j := range c.Orgs[i].Services {
 				for k := range c.Orgs[i].Services[j].Sets {
 					if set := &c.Orgs[i].Services[j].Sets[k]; signers[set.ID] {
 						set.Kind = "signer"
+					} else if secrets[set.ID] {
+						set.Kind = "secret"
 					}
 				}
 			}

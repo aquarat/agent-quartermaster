@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"strings"
 	"time"
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
@@ -43,7 +45,27 @@ func (q *Q) GlobalOwner(ctx context.Context, sess string, signer int64, now time
 func (q *Q) OrgPolicy(ctx context.Context, org string, rev int) (api.DurationPolicy, error) {
 	var p api.DurationPolicy
 	err := q.q.QueryRowContext(ctx, `SELECT default_seconds,soft_cap,indefinite,standing_default,standing_soft_cap,standing_indefinite FROM org_policies WHERE org_id=? AND revision=?`, org, rev).Scan(&p.Default, &p.Soft, &p.Indefinite, &p.StandingDefault, &p.StandingSoft, &p.StandingIndefinite)
-	return p, notFound(err)
+	if err != nil {
+		return p, notFound(err)
+	}
+	p.Discovery, p.DenyGet, err = q.OrgFlags(ctx, org, rev)
+	return p, err
+}
+
+// orgFlagsDDL holds the per-revision policy switches added after schema 6
+// (0.10.0). It is a table of its own, not new org_policies columns: a previous
+// binary keeps writing its eight-column policy rows and simply never reads
+// this, so a policy it replaces has every switch off again.
+const orgFlagsDDL = `CREATE TABLE IF NOT EXISTS org_flags(org_id TEXT NOT NULL REFERENCES organisations(id),revision INTEGER NOT NULL CHECK(revision>0),discovery INTEGER NOT NULL CHECK(discovery IN (0,1)),deny_get INTEGER NOT NULL CHECK(deny_get IN (0,1)),PRIMARY KEY(org_id,revision)) STRICT`
+
+// OrgFlags reads an organisation's switches at one policy revision. No row
+// (or no table yet) means every switch is off.
+func (q *Q) OrgFlags(ctx context.Context, org string, rev int) (discovery, denyGet bool, err error) {
+	err = q.q.QueryRowContext(ctx, `SELECT discovery,deny_get FROM org_flags WHERE org_id=? AND revision=?`, org, rev).Scan(&discovery, &denyGet)
+	if errors.Is(err, sql.ErrNoRows) || err != nil && strings.Contains(err.Error(), "no such table") {
+		return false, false, nil
+	}
+	return discovery, denyGet, err
 }
 
 func (q *Q) ScopeRule(ctx context.Context, set, scope string, rev int) (api.CatalogueRule, error) {
@@ -117,7 +139,16 @@ func (q *Q) Catalogue(ctx context.Context, owner string, now time.Time) (api.Cat
 func (q *Q) WriteCatalogue(ctx context.Context, object, action string, c api.CatalogueChange, now time.Time) error {
 	exec := func(sql string, args ...any) error { _, err := q.q.ExecContext(ctx, sql, args...); return err }
 	putPolicy := func(rev int, p api.DurationPolicy) error {
-		return exec(`INSERT INTO org_policies VALUES(?,?,?,?,?,?,?,?)`, c.Org.ID, rev, p.Default, p.Soft, p.Indefinite, p.StandingDefault, p.StandingSoft, p.StandingIndefinite)
+		if err := exec(`INSERT INTO org_policies VALUES(?,?,?,?,?,?,?,?)`, c.Org.ID, rev, p.Default, p.Soft, p.Indefinite, p.StandingDefault, p.StandingSoft, p.StandingIndefinite); err != nil {
+			return err
+		}
+		if !p.Discovery && !p.DenyGet {
+			return nil
+		}
+		if err := exec(orgFlagsDDL); err != nil {
+			return err
+		}
+		return exec(`INSERT INTO org_flags VALUES(?,?,?,?)`, c.Org.ID, rev, p.Discovery, p.DenyGet)
 	}
 	switch object {
 	case "organisation":
