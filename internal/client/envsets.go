@@ -216,7 +216,38 @@ func (e *Env) envSlot(cfg *Config, path, mode string) (string, error) {
 	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%s", cfg.Server, cfg.ServerCASHA256, path, mode, cert)
 	return "env-" + hex.EncodeToString(h.Sum(nil)), nil
 }
+
+// EnvOptions is one delivery of an env set or a secret.
+type EnvOptions struct {
+	Path string
+	// Mode: process (run), file (checkout), shell (checkout-shell) or get
+	// (print one secret's value).
+	Mode    string
+	Why     string
+	File    string // file mode: the link to create
+	TTL     int    // seconds; 0: the organisation's default; -1: indefinite
+	Command []string
+	// EnvName renames the one variable of a secret or a one-key set (process mode).
+	EnvName string
+	// Run, when set, starts the command and returns instead of replacing this
+	// process (the MCP server). env is the child's complete environment.
+	Run func(exe string, argv, env []string) error
+}
+
+// EnvUse delivers with the classic argument list (run, checkout, checkout-shell).
 func (e *Env) EnvUse(ctx context.Context, path, mode, why, file string, ttl int, command []string) error {
+	return e.EnvDeliver(ctx, EnvOptions{Path: path, Mode: mode, Why: why, File: file, TTL: ttl, Command: command})
+}
+
+// EnvDeliver asks for one release of a set and hands it over in o.Mode.
+func (e *Env) EnvDeliver(ctx context.Context, o EnvOptions) error {
+	path, mode, why, file, ttl, command := o.Path, o.Mode, o.Why, o.File, o.TTL, o.Command
+	if o.EnvName != "" && mode != "process" {
+		return &UsageError{Msg: "--env renames the variable for aqmas run only"}
+	}
+	if o.EnvName != "" && !envset.SafeName(o.EnvName) {
+		return &UsageError{Msg: "--env: aqmas does not deliver under that name (use capital letters, digits and underscores, starting with APP_ or ending in _TOKEN, _KEY, _PASSWORD, _SECRET, _URL, _DSN, _USER, _USERNAME or _ID; never a name a shell, loader or tool reads as configuration)"}
+	}
 	cfg, c, err := e.authedClient()
 	if err != nil {
 		return err
@@ -225,8 +256,18 @@ func (e *Env) EnvUse(ctx context.Context, path, mode, why, file string, ttl int,
 	if err != nil {
 		return err
 	}
+	if (mode == "get" || o.EnvName != "") && len(b.Names) != 1 {
+		if mode == "get" {
+			return &UsageError{Msg: fmt.Sprintf("aqmas get prints one secret; %s holds %d values: use aqmas run %s --why \"...\" -- COMMAND", path, len(b.Names), path)}
+		}
+		return &UsageError{Msg: fmt.Sprintf("--env renames the variable of a secret; %s holds %d values", path, len(b.Names))}
+	}
 	var exe string
 	switch mode {
+	case "get":
+		if len(command) > 0 {
+			return &UsageError{Msg: "get takes no command; use aqmas run PATH --why \"...\" -- COMMAND"}
+		}
 	case "process":
 		if len(command) == 0 {
 			return &UsageError{Msg: "run needs -- COMMAND"}
@@ -250,12 +291,20 @@ func (e *Env) EnvUse(ctx context.Context, path, mode, why, file string, ttl int,
 		if !envset.SafeName(n) {
 			return errors.New("unsafe env name")
 		}
-		if _, ok := os.LookupEnv(n); ok && mode != "file" {
-			return fmt.Errorf("refusing to replace inherited %s", n)
+		if o.EnvName != "" {
+			n = o.EnvName
+		}
+		if _, ok := os.LookupEnv(n); ok && mode != "file" && mode != "get" {
+			return fmt.Errorf("refusing to replace inherited %s (unset it, or for a secret choose another name with --env)", n)
 		}
 	}
 	out, err := e.envRelease(ctx, c, b, mode, why, ttl)
 	if err != nil {
+		return err
+	}
+	if mode == "get" {
+		// The one value and a newline, nothing else: `$(aqmas get ...)` drops the newline.
+		_, err = io.WriteString(e.Stdout, out.Entries[0].Value+"\n")
 		return err
 	}
 	if mode == "process" {
@@ -266,7 +315,14 @@ func (e *Env) EnvUse(ctx context.Context, path, mode, why, file string, ttl int,
 			}
 		}
 		for _, x := range out.Entries {
-			env = append(env, x.Name+"="+x.Value)
+			name := x.Name
+			if o.EnvName != "" {
+				name = o.EnvName
+			}
+			env = append(env, name+"="+x.Value)
+		}
+		if o.Run != nil {
+			return o.Run(exe, command, env)
 		}
 		return syscall.Exec(exe, command, env)
 	}

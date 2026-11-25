@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"github.com/aquarat/agent-quartermaster/internal/envset"
 	"reflect"
 	"time"
@@ -27,12 +28,135 @@ CREATE TRIGGER IF NOT EXISTS env_end_revision AFTER UPDATE ON credential_sets BE
 	// 0.10.0: the delivery "get" (a secret printed by `aqmas get`). The mode
 	// column's CHECK predates it and cannot be altered in place, so such a row
 	// stores mode 'process' and its real delivery here; NULL means the mode.
-	var has int
-	if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('env_releases') WHERE name='delivery'`).Scan(&has); err != nil || has > 0 {
+	if _, err = s.db.ExecContext(ctx, envStandingDDL); err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `ALTER TABLE env_releases ADD COLUMN delivery TEXT CHECK(delivery IS NULL OR delivery='get')`)
+	// standing: the "don't ask again" rule that approved a release without a tap, if any.
+	for col, ddl := range map[string]string{"delivery": `TEXT CHECK(delivery IS NULL OR delivery='get')`, "standing": `TEXT`} {
+		var has int
+		if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('env_releases') WHERE name=?`, col).Scan(&has); err != nil {
+			return err
+		}
+		if has == 0 {
+			if _, err = s.db.ExecContext(ctx, `ALTER TABLE env_releases ADD COLUMN `+col+` `+ddl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// envStandingDDL: "don't ask again" rules for env sets and secrets, and each
+// set's ceiling for them. A rule ends with the admission, the organisation's
+// policy revision or the set's revision it was made under, exactly like the
+// releases it approves. A previous binary ignores both tables: it asks for a
+// tap every time.
+const envStandingDDL = `CREATE TABLE IF NOT EXISTS env_standing(id TEXT PRIMARY KEY,host INTEGER NOT NULL REFERENCES hosts(id),set_id TEXT NOT NULL REFERENCES credential_sets(id),binding TEXT NOT NULL,mode TEXT NOT NULL,peer TEXT NOT NULL,max_ttl INTEGER NOT NULL CHECK(max_ttl>0),created INTEGER NOT NULL,expires INTEGER NOT NULL,revoked_at INTEGER,uses INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE INDEX IF NOT EXISTS env_standing_by_host ON env_standing(host,set_id);
+CREATE TABLE IF NOT EXISTS set_standing(set_id TEXT PRIMARY KEY REFERENCES credential_sets(id),cap_seconds INTEGER NOT NULL CHECK(cap_seconds BETWEEN 0 AND 86400)) STRICT;
+CREATE TRIGGER IF NOT EXISTS env_standing_end_admission AFTER UPDATE ON org_hosts BEGIN UPDATE env_standing SET revoked_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE revoked_at IS NULL AND host=NEW.host_id AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.org_id);END;
+CREATE TRIGGER IF NOT EXISTS env_standing_end_policy AFTER UPDATE ON organisations BEGIN UPDATE env_standing SET revoked_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE revoked_at IS NULL AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.id);END;
+CREATE TRIGGER IF NOT EXISTS env_standing_end_revision AFTER UPDATE ON credential_sets BEGIN UPDATE env_standing SET revoked_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE revoked_at IS NULL AND set_id=NEW.id;END;`
+
+const envStandingCols = `id,binding,mode,peer,max_ttl,created,expires,uses FROM env_standing`
+
+func scanEnvStanding(row interface{ Scan(...any) error }) (st envset.Standing, err error) {
+	var b string
+	if err = row.Scan(&st.ID, &b, &st.Mode, &st.Peer, &st.MaxTTL, &st.Created, &st.Expires, &st.Uses); err == nil {
+		err = json.Unmarshal([]byte(b), &st.Binding)
+	}
+	return st, err
+}
+
+// NewEnvStanding records a rule under the ID of the release whose approval made it.
+func (q *Q) NewEnvStanding(ctx context.Context, host int64, st envset.Standing) error {
+	b, err := json.Marshal(st.Binding)
+	if err != nil {
+		return err
+	}
+	return one(q.q.ExecContext(ctx, `INSERT INTO env_standing(id,host,set_id,binding,mode,peer,max_ttl,created,expires) VALUES(?,?,?,?,?,?,?,?,?)`, st.ID, host, st.Set, string(b), st.Mode, st.Peer, st.MaxTTL, st.Created, st.Expires))
+}
+
+// EnvStanding loads one live rule (not revoked, not expired).
+func (q *Q) EnvStanding(ctx context.Context, id string, now time.Time) (envset.Standing, error) {
+	st, err := scanEnvStanding(q.q.QueryRowContext(ctx, `SELECT `+envStandingCols+` WHERE id=? AND revoked_at IS NULL AND expires>?`, id, ms(now)))
+	return st, notFound(err)
+}
+
+// ActiveEnvStanding lists live rules: of one host and set (a request looking
+// for a match) or, with host 0, of every host (set "" for every set).
+func (q *Q) ActiveEnvStanding(ctx context.Context, host int64, set string, now time.Time) ([]envset.Standing, error) {
+	out := []envset.Standing{}
+	err := q.rows(ctx, `SELECT `+envStandingCols+` WHERE revoked_at IS NULL AND expires>?1 AND (?2=0 OR host=?2) AND (?3='' OR set_id=?3) ORDER BY id`, func(rs *sql.Rows) error {
+		st, err := scanEnvStanding(rs)
+		out = append(out, st)
+		return err
+	}, ms(now), host, set)
+	return out, err
+}
+func (q *Q) UseEnvStanding(ctx context.Context, id string, now time.Time) error {
+	return one(q.q.ExecContext(ctx, `UPDATE env_standing SET uses=uses+1 WHERE id=? AND revoked_at IS NULL AND expires>?`, id, ms(now)))
+}
+
+// RevokeEnvStanding ends rules by ID; it reports how many were live.
+func (q *Q) RevokeEnvStanding(ctx context.Context, now time.Time, ids ...string) (int, error) {
+	n := 0
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		res, err := q.q.ExecContext(ctx, `UPDATE env_standing SET revoked_at=? WHERE id=? AND revoked_at IS NULL`, ms(now), id)
+		if err != nil {
+			return n, err
+		}
+		k, _ := res.RowsAffected()
+		n += int(k)
+	}
+	return n, nil
+}
+
+// RevokeSetStanding ends every rule of a set (its ceiling changed).
+func (q *Q) RevokeSetStanding(ctx context.Context, set string, now time.Time) error {
+	_, err := q.q.ExecContext(ctx, `UPDATE env_standing SET revoked_at=? WHERE set_id=? AND revoked_at IS NULL`, ms(now), set)
 	return err
+}
+
+// StandingCap is a set's "longest don't-ask-again" in seconds (0: off).
+func (q *Q) StandingCap(ctx context.Context, set string) (int, error) {
+	n := envset.StandingCapDefault
+	err := q.q.QueryRowContext(ctx, `SELECT cap_seconds FROM set_standing WHERE set_id=?`, set).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return envset.StandingCapDefault, nil
+	}
+	return n, err
+}
+func (q *Q) SetStandingCap(ctx context.Context, set string, seconds int) error {
+	return one(q.q.ExecContext(ctx, `INSERT INTO set_standing(set_id,cap_seconds) VALUES(?,?) ON CONFLICT(set_id) DO UPDATE SET cap_seconds=excluded.cap_seconds`, set, seconds))
+}
+
+// StandingCaps is every set's explicit ceiling (sets without a row have the default).
+func (q *Q) StandingCaps(ctx context.Context) (map[string]int, error) {
+	out := map[string]int{}
+	err := q.rows(ctx, `SELECT set_id,cap_seconds FROM set_standing`, func(rs *sql.Rows) error {
+		var id string
+		var n int
+		err := rs.Scan(&id, &n)
+		out[id] = n
+		return err
+	})
+	return out, err
+}
+
+// ApproveEnvBy approves a pending release under a standing rule.
+func (q *Q) ApproveEnvBy(ctx context.Context, id, grant, standing string, ttl int, until int64) error {
+	return one(q.q.ExecContext(ctx, `UPDATE env_releases SET status='approved',grant_id=?,ttl=?,until_ms=?,standing=? WHERE id=? AND status='pending'`, grant, ttl, until, standing, id))
+}
+
+// EnvReleaseStanding is the rule that approved a release ("" for a tap).
+func (q *Q) EnvReleaseStanding(ctx context.Context, id string) (string, error) {
+	var st sql.NullString
+	err := q.q.QueryRowContext(ctx, `SELECT standing FROM env_releases WHERE id=?`, id).Scan(&st)
+	return st.String, notFound(err)
 }
 func (q *Q) SweepEnv(ctx context.Context, now time.Time) error {
 	if _, err := q.q.ExecContext(ctx, `DELETE FROM env_drafts WHERE expires<=?`, ms(now)); err != nil {

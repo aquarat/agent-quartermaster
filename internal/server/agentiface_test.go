@@ -88,18 +88,48 @@ func (v *vaultEnv) createSecret(id, slug, title, name, value, note, link string)
 // collects it once; it returns the entries and each step's status.
 func (v *vaultEnv) ask(c *http.Client, path, mode string) (envset.Release, int) {
 	v.t.Helper()
+	return v.askTTL(c, path, mode, 600)
+}
+func (v *vaultEnv) askTTL(c *http.Client, path, mode string, ttl int) (envset.Release, int) {
+	v.t.Helper()
 	var b envset.Binding
 	mustStatus(v.t, "binding", v.host(c, "GET", "/v2/env/set?path="+path, nil, &b), 200)
 	var rel envset.Release
-	st := v.host(c, "POST", "/v2/env/requests", map[string]any{"binding": b, "mode": mode, "reason": "use the API key", "ttl_seconds": 600}, &rel)
+	st := v.host(c, "POST", "/v2/env/requests", map[string]any{"binding": b, "mode": mode, "reason": "use the API key", "ttl_seconds": ttl}, &rel)
 	return rel, st
+}
+
+// envDecide runs one env ceremony (approve, deny, revoke, standing-revoke).
+func (v *vaultEnv) envDecide(choice map[string]any) (string, int) {
+	v.t.Helper()
+	var r tapResp
+	if st := v.web("POST", "/api/ui/seal/env/challenge", choice, &r); st != 200 {
+		return "", st
+	}
+	as, pkt := v.fix.tapWith(v.t, v.s, v.auth, r)
+	return r.Canonical, v.web("POST", "/api/ui/seal/env/finish", map[string]any{"challenge_id": r.ChallengeID, "assertion": as, "open": pkt}, nil)
 }
 func (v *vaultEnv) deliver(c *http.Client, rel envset.Release) (envset.Collection, string) {
 	v.t.Helper()
-	var r tapResp
-	mustStatus(v.t, "env challenge", v.web("POST", "/api/ui/seal/env/challenge", map[string]any{"id": rel.ID, "action": "approve", "ttl_seconds": 600}, &r), 200)
-	as, pkt := v.fix.tapWith(v.t, v.s, v.auth, r)
-	mustStatus(v.t, "env approve", v.web("POST", "/api/ui/seal/env/finish", map[string]any{"challenge_id": r.ChallengeID, "assertion": as, "open": pkt}, nil), 200)
+	return v.deliverWith(c, rel, 0)
+}
+
+// relStatus is the host's own view of its release.
+func (v *vaultEnv) relStatus(c *http.Client, rel envset.Release) envset.Release {
+	v.t.Helper()
+	var got envset.Release
+	mustStatus(v.t, "release", v.host(c, "GET", "/v2/env/requests/"+rel.ID, nil, &got), 200)
+	return got
+}
+func (v *vaultEnv) deliverWith(c *http.Client, rel envset.Release, standing int) (envset.Collection, string) {
+	v.t.Helper()
+	choice := map[string]any{"id": rel.ID, "action": "approve", "ttl_seconds": 600}
+	if standing > 0 {
+		choice["standing_seconds"] = standing
+	}
+	canonical, st := v.envDecide(choice)
+	mustStatus(v.t, "env approve", st, 200)
+	r := tapResp{Canonical: canonical}
 	var got envset.Release
 	mustStatus(v.t, "release", v.host(c, "GET", "/v2/env/requests/"+rel.ID, nil, &got), 200)
 	var out envset.Collection
@@ -376,5 +406,191 @@ func TestSecretLifecycle(t *testing.T) {
 		if where := v.leaked([]byte(secret)); where != "" && where != "responses" {
 			t.Fatalf("a value reached %s in the clear", where)
 		}
+	}
+}
+
+// "Don't ask again": approving one release may create a rule that approves the
+// next matching ones without a tap. It matches the same host from the same
+// address, the same set revision and delivery mode, within the signed TTL and
+// the set's limit, while the set's bucket is open; every delivery is still its
+// own once-only, audited release.
+func TestEnvStanding(t *testing.T) {
+	v := newVault(t)
+	const value, path = "tskey-standing-sentinel-77", "client-a/paas/tailnet"
+	v.createSecret(secretID, "tailnet", "Tailnet API key", "TAILNET_API_KEY", value, "", "")
+	type state struct {
+		Releases []envset.Release  `json:"releases"`
+		Standing []envset.Standing `json:"standing"`
+		Caps     map[string]int    `json:"standing_caps"`
+	}
+	read := func() (s state) {
+		t.Helper()
+		mustStatus(t, "env state", v.web("GET", "/api/ui/seal/env/state", nil, &s), 200)
+		return s
+	}
+	pending := func(what string, rel envset.Release, st int) {
+		t.Helper()
+		mustStatus(t, what, st, 200)
+		if got := v.relStatus(v.agent, rel); got.Status != "pending" {
+			t.Fatalf("%s: approved without a tap (%s)", what, got.Status)
+		}
+		_, st = v.envDecide(map[string]any{"id": rel.ID, "action": "deny", "ttl_seconds": 0})
+		mustStatus(t, what+": deny", st, 200)
+	}
+
+	// An approval without the choice signs the text it always signed.
+	rel, st := v.ask(v.agent, path, "get")
+	mustStatus(t, "first request", st, 200)
+	if s := read(); s.Caps[secretID] != envset.StandingCapDefault || len(s.Standing) != 0 {
+		t.Fatalf("state before any rule: %+v", s)
+	}
+	if _, canonical := v.deliver(v.agent, rel); strings.Contains(canonical, "standing_seconds") {
+		t.Fatalf("a plain approval mentions standing: %s", canonical)
+	}
+	rel, st = v.ask(v.agent, path, "get")
+	pending("no rule yet", rel, st)
+
+	// Longer than the set's limit (one hour until the owner raises it): refused.
+	rel, st = v.ask(v.agent, path, "get")
+	mustStatus(t, "request", st, 200)
+	for name, choice := range map[string]map[string]any{
+		"beyond the limit":    {"id": rel.ID, "action": "approve", "ttl_seconds": 600, "standing_seconds": 7200},
+		"on a denial":         {"id": rel.ID, "action": "deny", "ttl_seconds": 0, "standing_seconds": 3600},
+		"shorter than a tick": {"id": rel.ID, "action": "approve", "ttl_seconds": 600, "standing_seconds": 5},
+	} {
+		if _, st := v.envDecide(choice); st != 400 {
+			t.Fatalf("standing %s: %d", name, st)
+		}
+	}
+	// Approve once with "don't ask again for an hour".
+	got, canonical := v.deliverWith(v.agent, rel, 3600)
+	if !strings.Contains(canonical, `"standing_seconds":3600`) || got.Entries[0].Value != value {
+		t.Fatalf("standing approval: %s", canonical)
+	}
+	s := read()
+	if len(s.Standing) != 1 || s.Standing[0].ID != rel.ID || s.Standing[0].Mode != "get" || s.Standing[0].MaxTTL != 600 || s.Standing[0].Path != path || s.Standing[0].Host != "workload" || s.Standing[0].Expires-s.Standing[0].Created != 3600_000 {
+		t.Fatalf("rule: %+v", s.Standing)
+	}
+	// The next matching request needs no tap: answered pending, approved at once,
+	// collected once, logged as an automatic approval under that rule.
+	next, st := v.ask(v.agent, path, "get")
+	mustStatus(t, "matching request", st, 200)
+	if next.Status != "pending" || next.Grant != "" {
+		t.Fatalf("the POST answer changed shape: %+v", next)
+	}
+	approved := v.relStatus(v.agent, next)
+	if approved.Status != "approved" || approved.Grant == "" || approved.TTL != 600 {
+		t.Fatalf("not approved by the rule: %+v", approved)
+	}
+	var col envset.Collection
+	mustStatus(t, "collect", v.host(v.agent, "POST", "/v2/grants/"+approved.Grant+"/collect", map[string]any{}, &col), 200)
+	if col.Entries[0].Value != value {
+		t.Fatal("the rule delivered something else")
+	}
+	mustStatus(t, "second collect", v.host(v.agent, "POST", "/v2/grants/"+approved.Grant+"/collect", map[string]any{}, nil), 409)
+	if !v.audited("env_auto_approve", path+" revision=1 mode=get standing="+rel.ID+" host=workload ttl=600") || !v.audited("env_collect_get", path) {
+		t.Fatal("automatic approval not in the log")
+	}
+	if s = read(); s.Standing[0].Uses != 1 {
+		t.Fatalf("uses: %+v", s.Standing[0])
+	}
+	// What does not match asks the owner as before.
+	other, st := v.ask(v.agent, path, "process")
+	pending("another delivery mode", other, st)
+	other, st = v.ask(v.other, path, "get")
+	mustStatus(t, "another host", st, 200)
+	if v.relStatus(v.other, other).Status != "pending" {
+		t.Fatal("another host used the rule")
+	}
+	other, st = v.askTTL(v.agent, path, "get", 3600)
+	pending("a longer TTL than the signed one", other, st)
+
+	// A closed bucket: the rule stays, but nothing is issued without a tap; the tap that
+	// reopens the bucket re-arms it.
+	v.lock()
+	closed, st := v.ask(v.agent, path, "get")
+	mustStatus(t, "request while closed", st, 200)
+	if v.relStatus(v.agent, closed).Status != "pending" || len(read().Standing) != 1 {
+		t.Fatal("a rule issued while its bucket was closed, or was lost")
+	}
+	if got, _ = v.deliver(v.agent, closed); got.Entries[0].Value != value {
+		t.Fatal("tap after close")
+	}
+	next, st = v.ask(v.agent, path, "get")
+	mustStatus(t, "after re-arming", st, 200)
+	if v.relStatus(v.agent, next).Status != "approved" {
+		t.Fatal("the rule was not re-armed by the tap that reopened the bucket")
+	}
+
+	// Revoke with a tap: the next request asks again.
+	if _, st = v.envDecide(map[string]any{"id": rel.ID, "action": "standing-revoke", "ttl_seconds": 0}); st != 200 {
+		t.Fatalf("standing revoke: %d", st)
+	}
+	if !v.audited("env_standing_revoke", rel.ID) || len(read().Standing) != 0 {
+		t.Fatal("revocation not applied or not logged")
+	}
+	if _, st = v.envDecide(map[string]any{"id": rel.ID, "action": "standing-revoke", "ttl_seconds": 0}); st != 409 {
+		t.Fatalf("revoking twice: %d", st)
+	}
+	other, st = v.ask(v.agent, path, "get")
+	pending("after revocation", other, st)
+
+	// The owner raises the set's limit; a longer rule is then possible. Changing the
+	// limit ends the rules made under the old one.
+	capChange := func(seconds int) int {
+		var r vaultReviewResp
+		st := v.web("POST", "/api/ui/seal/vault/challenge", map[string]any{"action": "standing-cap", "id": secretID, "standing_cap_seconds": seconds}, &r)
+		if st != 200 {
+			return st
+		}
+		return v.tap(r, nil)
+	}
+	if st = capChange(90000); st != 400 {
+		t.Fatalf("a limit beyond 24 h: %d", st)
+	}
+	if st = capChange(3600); st != 409 {
+		t.Fatalf("an unchanged limit: %d", st)
+	}
+	mustStatus(t, "raise the limit", capChange(21600), 200)
+	if !v.audited("vault_standing_cap", path+" standing_cap=21600 was=3600") {
+		t.Fatal("limit change not logged")
+	}
+	rel, st = v.ask(v.agent, path, "get")
+	mustStatus(t, "request", st, 200)
+	v.deliverWith(v.agent, rel, 21600)
+	// Revoking the release that created a rule ends the rule too.
+	next, _ = v.ask(v.agent, path, "get")
+	if v.relStatus(v.agent, next).Status != "approved" {
+		t.Fatal("six-hour rule not applied")
+	}
+	if _, st = v.envDecide(map[string]any{"id": rel.ID, "action": "revoke", "ttl_seconds": 0}); st != 200 || len(read().Standing) != 0 {
+		t.Fatalf("revoking the source release: %d", st)
+	}
+	// A new value (a new revision) ends the rule: the owner approved that revision.
+	rel, _ = v.ask(v.agent, path, "get")
+	v.deliverWith(v.agent, rel, 3600)
+	_, err := v.s.store.DB().Exec(`UPDATE credential_sets SET revision=revision WHERE id=?`, secretID)
+	requireNoError(t, err)
+	if len(read().Standing) != 0 {
+		t.Fatal("a rule survived a change to its set")
+	}
+	// Off for the set: no rule can be made.
+	mustStatus(t, "limit off", capChange(0), 200)
+	rel, st = v.ask(v.agent, path, "get")
+	mustStatus(t, "request", st, 200)
+	if _, st = v.envDecide(map[string]any{"id": rel.ID, "action": "approve", "ttl_seconds": 600, "standing_seconds": 3600}); st != 400 {
+		t.Fatalf("standing with the limit off: %d", st)
+	}
+	// The admission ends: so do the host's rules.
+	mustStatus(t, "limit on", capChange(3600), 200)
+	rel, _ = v.ask(v.agent, path, "get")
+	v.deliverWith(v.agent, rel, 3600)
+	if len(read().Standing) != 1 {
+		t.Fatal("no rule to end")
+	}
+	_, err = v.s.store.DB().Exec(`UPDATE org_hosts SET active=0,generation=generation+1 WHERE org_id=? AND host_id=(SELECT id FROM hosts WHERE name='workload')`, v.org)
+	requireNoError(t, err)
+	if len(read().Standing) != 0 {
+		t.Fatal("a rule survived the end of its admission")
 	}
 }

@@ -63,19 +63,21 @@ type VaultTarget struct {
 	// A secret's optional note and URL (public metadata, signed at creation).
 	Note string `json:"note,omitempty"`
 	URL  string `json:"url,omitempty"`
+	// StandingCap is the set's "longest don't-ask-again" in seconds (0: off).
+	StandingCap int `json:"standing_cap_seconds"`
 }
 
-const vaultCols = `o.id,o.slug,o.title,v.id,v.slug,v.title,s.id,s.slug,s.title,s.revision,v.revision,o.revision,coalesce(r.names,'[]'),coalesce((SELECT allow_reveal FROM org_vault x WHERE x.org_id=o.id),1),coalesce(k.scheme,''),k.public_key,coalesce(k.origin,''),coalesce(k.created,0),coalesce(k.signatures,0),z.set_id IS NOT NULL,coalesce(z.note,''),coalesce(z.url,'') FROM organisations o JOIN services v ON v.org_id=o.id JOIN credential_sets s ON s.service_id=v.id LEFT JOIN signer_keys k ON k.set_id=s.id LEFT JOIN secret_sets z ON z.set_id=s.id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision AND r.wrap IS NOT NULL WHERE NOT o.archived AND NOT v.archived AND NOT s.archived AND v.provider='application' AND s.kind='env-set'`
+const vaultCols = `o.id,o.slug,o.title,v.id,v.slug,v.title,s.id,s.slug,s.title,s.revision,v.revision,o.revision,coalesce(r.names,'[]'),coalesce((SELECT allow_reveal FROM org_vault x WHERE x.org_id=o.id),1),coalesce(k.scheme,''),k.public_key,coalesce(k.origin,''),coalesce(k.created,0),coalesce(k.signatures,0),z.set_id IS NOT NULL,coalesce(z.note,''),coalesce(z.url,''),coalesce((SELECT cap_seconds FROM set_standing c WHERE c.set_id=s.id),3600) FROM organisations o JOIN services v ON v.org_id=o.id JOIN credential_sets s ON s.service_id=v.id LEFT JOIN signer_keys k ON k.set_id=s.id LEFT JOIN secret_sets z ON z.set_id=s.id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision AND r.wrap IS NOT NULL WHERE NOT o.archived AND NOT v.archived AND NOT s.archived AND v.provider='application' AND s.kind='env-set'`
 
 func scanVault(row interface{ Scan(...any) error }) (t VaultTarget, err error) {
 	var names string
 	var secret bool
-	if err = row.Scan(&t.OrgID, &t.OrgSlug, &t.OrgTitle, &t.ServiceID, &t.ServiceSlug, &t.ServiceTitle, &t.SetID, &t.SetSlug, &t.SetTitle, &t.Revision, &t.ServiceRevision, &t.PolicyRevision, &names, &t.AllowReveal, &t.Scheme, &t.PublicKey, &t.Origin, &t.Created, &t.Signatures, &secret, &t.Note, &t.URL); err != nil {
+	if err = row.Scan(&t.OrgID, &t.OrgSlug, &t.OrgTitle, &t.ServiceID, &t.ServiceSlug, &t.ServiceTitle, &t.SetID, &t.SetSlug, &t.SetTitle, &t.Revision, &t.ServiceRevision, &t.PolicyRevision, &names, &t.AllowReveal, &t.Scheme, &t.PublicKey, &t.Origin, &t.Created, &t.Signatures, &secret, &t.Note, &t.URL, &t.StandingCap); err != nil {
 		return t, err
 	}
 	t.Kind = "env-set"
 	if t.Scheme != "" {
-		t.Kind = "signer"
+		t.Kind, t.StandingCap = "signer", 0
 	} else if secret {
 		t.Kind = "secret"
 	}

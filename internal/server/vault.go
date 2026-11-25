@@ -303,6 +303,8 @@ type vaultChoice struct {
 	// secret-create, secret-convert: optional public note and link
 	Note string `json:"note,omitempty"`
 	URL  string `json:"url,omitempty"`
+	// standing-cap: the set's "longest don't-ask-again" (0 turns it off)
+	StandingCap *int `json:"standing_cap_seconds,omitempty"`
 	// sign-approve
 	TTL int `json:"ttl_seconds,omitempty"`
 	Max int `json:"max_signatures,omitempty"`
@@ -594,6 +596,25 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		m = targetFields(t)
 		m["attempt_id"], m["env_name"], m["note"], m["url"], m["commitment"], m["result_revision"] = c.Attempt, name, c.Note, c.URL, p.commit, 1
 		m["recipient"] = encodeID(p.recipient.Public())
+	case "standing-cap":
+		t, err := q.VaultSet(ctx, c.ID)
+		if err != nil {
+			return "", nil, err
+		}
+		if err = owner(t.OrgID); err != nil {
+			return "", nil, err
+		}
+		if t.Kind != "env-set" && t.Kind != "secret" {
+			return "", nil, errBad("only env sets and secrets have a don't-ask-again limit")
+		}
+		if c.StandingCap == nil || *c.StandingCap < 0 || *c.StandingCap > envset.StandingCapMax || *c.StandingCap%60 != 0 {
+			return "", nil, errBad("the limit is between 0 (off) and 24 hours, in whole minutes")
+		}
+		if *c.StandingCap == t.StandingCap {
+			return "", nil, errConflict("the limit already has that value; reload")
+		}
+		m = targetFields(t)
+		m["old_standing_cap_seconds"], m["standing_cap_seconds"] = t.StandingCap, *c.StandingCap
 	case "secret-convert":
 		t, err := q.VaultSet(ctx, c.ID)
 		if err != nil {
@@ -821,6 +842,7 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 		Note        string   `json:"note"`
 		URL         string   `json:"url"`
 		EnvName     string   `json:"env_name"`
+		StandingCap *int     `json:"standing_cap_seconds"`
 	}
 	if json.Unmarshal([]byte(m.Metadata), &f) != nil {
 		err = errBad("invalid vault decision")
@@ -838,6 +860,8 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 		choice.Service, choice.Slug, choice.Title, choice.Note, choice.URL = f.Service, f.Slug, f.Title, f.Note, f.URL
 	case "secret-convert":
 		choice.Note, choice.URL = f.Note, f.URL
+	case "standing-cap":
+		choice.StandingCap = f.StandingCap
 	case "sign-approve":
 		choice.TTL, choice.Max = f.TTL, f.Max
 	}
@@ -1033,6 +1057,27 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 			path := t.OrgSlug + "/" + t.ServiceSlug + "/" + t.SetSlug
 			out = map[string]any{"set_id": t.SetID, "path": path, "env_name": f.EnvName}
 			auditObject, detail, note = "set:"+t.SetID, fmt.Sprintf("%s revision=1 env=%s commitment=%s", path, f.EnvName, p.commit), fmt.Sprintf("Created secret %s", path)
+		case "standing-cap":
+			t, err := q.VaultSet(ctx, m.ID)
+			if err != nil {
+				return err
+			}
+			if err = q.SetStandingCap(ctx, t.SetID, *f.StandingCap); err != nil {
+				return err
+			}
+			// The rules made under the old limit end with it.
+			rules, err := q.ActiveEnvStanding(ctx, 0, t.SetID, now)
+			if err != nil {
+				return err
+			}
+			if err = q.RevokeSetStanding(ctx, t.SetID, now); err != nil {
+				return err
+			}
+			for _, st := range rules {
+				s.seal.pool.release("envstanding:" + st.ID)
+			}
+			path := t.OrgSlug + "/" + t.ServiceSlug + "/" + t.SetSlug
+			auditObject, detail, note = "set:"+t.SetID, fmt.Sprintf("%s standing_cap=%d was=%d", path, *f.StandingCap, t.StandingCap), fmt.Sprintf("Don't-ask-again limit of %s set to %d s", path, *f.StandingCap)
 		case "secret-convert":
 			t, err := q.VaultSet(ctx, m.ID)
 			if err != nil {

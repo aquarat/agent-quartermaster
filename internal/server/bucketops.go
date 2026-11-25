@@ -700,6 +700,9 @@ func (s *Server) holdLive(ctx context.Context, q *store.Q, h bucketHold) (bool, 
 			return !gone(err), nil
 		}
 		return r.Status == "approved" && !r.Consumed && r.Until > now.UnixMilli(), nil
+	case "envstanding":
+		_, err := q.EnvStanding(ctx, id, now)
+		return err == nil || !gone(err), nil
 	case "sign":
 		r, _, err := q.SignRequest(ctx, id, false)
 		if err != nil {
@@ -752,6 +755,13 @@ func (s *Server) liveUsers(ctx context.Context, q *store.Q, row store.BucketRow)
 			if r.Set == row.Ref && r.Status == "approved" && !r.Consumed && r.Until > now.UnixMilli() {
 				out = append(out, s.envHold(r.ID, r.Until))
 			}
+		}
+		rules, err := q.ActiveEnvStanding(ctx, 0, row.Ref, now)
+		if err != nil {
+			return nil, err
+		}
+		for _, st := range rules {
+			out = append(out, envStandingHold(st))
 		}
 	case "signer":
 		rs, err := q.OwnerSignRequests(ctx)

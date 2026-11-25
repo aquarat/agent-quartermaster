@@ -82,6 +82,29 @@ type Release struct {
 	Status   string `json:"status"`
 	Consumed bool   `json:"consumed"`
 }
+
+// Standing is a "don't ask again" rule the owner made while approving one
+// release: later releases of the same set revision to the same host, from the
+// same address, in the same delivery mode and within MaxTTL are approved
+// without a tap until it expires or is revoked. It carries no value.
+type Standing struct {
+	Binding
+	ID      string `json:"id"` // the release whose approval created it
+	Mode    string `json:"mode"`
+	Peer    string `json:"address"`
+	MaxTTL  int    `json:"max_ttl_seconds"`
+	Created int64  `json:"created_at"`
+	Expires int64  `json:"expires_at"`
+	Uses    int    `json:"uses"`
+}
+
+// StandingCapDefault is a set's "longest don't-ask-again" until the owner
+// changes it; StandingCapMax is the most the owner can allow.
+const (
+	StandingCapDefault = 3600
+	StandingCapMax     = 86400
+)
+
 type Collection struct {
 	Release Release `json:"release"`
 	Entries []Entry `json:"entries"`

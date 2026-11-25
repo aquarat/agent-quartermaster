@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -24,7 +25,15 @@ import (
 
 const usage = `aqmas: request short-lived, owner-approved access through agent-quartermaster
 
+Agents: run "aqmas guide" first (how approvals work, every command with examples, what to
+do on each error). "aqmas ls" and "aqmas targets" list what this host may ask for.
+
 Usage:
+  aqmas guide [--json]        the agent guide for this version (--json: command summary)
+  aqmas ls|catalogue [--json] credential sets this host may ask for (names, never values)
+  aqmas targets [--json]      SSH targets this host may use
+      Both list only organisations whose owner turned listing on, and say so otherwise.
+  aqmas mcp                   MCP server on stdin/stdout: claude mcp add aqmas -- aqmas mcp
   aqmas enroll [--name HOST] --server URL [--ca-pin sha256:HEX] [--force] [--owner-device]
       Enroll this host once: creates a client key, waits for the owner to approve.
       --name defaults to this machine's hostname (up to the first dot, lowercased).
@@ -57,7 +66,10 @@ Usage:
       Cloudflare API access through aqmasd (aqmas cf help).
   aqmas set import PATH --from FILE | set put PATH KEY | set unset PATH KEY
       Enter the Admin upload ticket at the hidden prompt or via --ticket-fd FD.
-  aqmas run PATH --why REASON [--ttl 10m] -- COMMAND...
+  aqmas run PATH --why REASON [--ttl 10m] [--env NAME] -- COMMAND...
+      Run COMMAND with a secret or env set in its environment. --env renames a secret's variable.
+  aqmas get PATH --why REASON [--ttl 10m]
+      Print one secret's value to stdout. Prefer run: with get the value has left aqmas.
   aqmas checkout|co PATH --why REASON [--file .env]; aqmas checkin|ci PATH
   aqmas checkout-shell|cos PATH --why REASON; aqmas checkin-shell|cis PATH
   aqmas sign ORG/SERVICE/KEY --why REASON [--ttl 30m [--count N]] FILE... | - | --digest sha256:HEX
@@ -94,10 +106,42 @@ func run(args []string) int {
 	defer stop()
 
 	cmd, rest := args[0], args[1:]
-	if cmd != "upgrade" && cmd != "update" && term.IsTerminal(int(os.Stderr.Fd())) {
+	if cmd != "upgrade" && cmd != "update" && cmd != "mcp" && cmd != "guide" && term.IsTerminal(int(os.Stderr.Fd())) {
 		env.UpdateNotice(ctx)
 	}
 	switch cmd {
+	case "guide":
+		f, err := parseFlags(rest, map[string]bool{"json": false})
+		if err != nil {
+			return fail(err)
+		}
+		if len(f.pos) > 0 || f.cmd != nil {
+			return fail(&client.UsageError{Msg: "usage: aqmas guide [--json]"})
+		}
+		if f.bool["json"] {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return fail(enc.Encode(client.GuideJSON()))
+		}
+		fmt.Print(client.Guide())
+		return 0
+	case "mcp":
+		if len(rest) > 0 {
+			return fail(&client.UsageError{Msg: "usage: aqmas mcp (an MCP server on stdin/stdout; register with: claude mcp add aqmas -- aqmas mcp)"})
+		}
+		return fail(env.ServeMCP(ctx, os.Stdin, os.Stdout))
+	case "ls", "catalogue", "targets":
+		f, err := parseFlags(rest, map[string]bool{"json": false})
+		if err != nil {
+			return fail(err)
+		}
+		if len(f.pos) > 0 || f.cmd != nil {
+			return fail(&client.UsageError{Msg: "usage: aqmas " + cmd + " [--json]"})
+		}
+		if cmd == "targets" {
+			return fail(env.Targets(ctx, f.bool["json"]))
+		}
+		return fail(env.Ls(ctx, f.bool["json"]))
 	case "reap-checkouts":
 		return fail(client.ReapEnv())
 	case "_env-holder":
@@ -129,16 +173,21 @@ func run(args []string) int {
 			key = f.pos[1]
 		}
 		return fail(env.SetEdit(ctx, op, f.pos[0], key, f.str["from"], fd))
-	case "run", "checkout", "co", "checkout-shell", "cos":
-		f, err := parseFlags(rest, map[string]bool{"why": true, "ttl": true, "file": true})
+	case "run", "get", "checkout", "co", "checkout-shell", "cos":
+		f, err := parseFlags(rest, map[string]bool{"why": true, "ttl": true, "file": true, "env": true})
 		if err != nil {
 			return fail(err)
 		}
 		if len(f.pos) != 1 || cmd != "run" && len(f.cmd) > 0 {
 			return fail(&client.UsageError{Msg: "expected qualified set path"})
 		}
+		if _, given := f.str["env"]; given && (cmd != "run" || f.str["env"] == "") {
+			return fail(&client.UsageError{Msg: "--env NAME renames the variable for aqmas run"})
+		}
 		mode := "process"
-		if cmd == "co" || cmd == "checkout" {
+		if cmd == "get" {
+			mode = "get"
+		} else if cmd == "co" || cmd == "checkout" {
 			mode = "file"
 			if err := client.ReapEnv(); err != nil {
 				return fail(err)
@@ -162,7 +211,7 @@ func run(args []string) int {
 			}
 			ttl = int(d / time.Second)
 		}
-		return fail(env.EnvUse(ctx, f.pos[0], mode, f.str["why"], name, ttl, f.cmd))
+		return fail(env.EnvDeliver(ctx, client.EnvOptions{Path: f.pos[0], Mode: mode, Why: f.str["why"], File: name, TTL: ttl, Command: f.cmd, EnvName: f.str["env"]}))
 	case "signer":
 		f, err := parseFlags(rest, map[string]bool{"pem": false})
 		if err != nil {

@@ -185,14 +185,71 @@ func (s *Server) envRequest(ctx context.Context, q *store.Q, r *http.Request, h 
 	if err != nil {
 		return nil, err
 	}
-	if n >= MaxPendingPerHost {
+	out := envset.Release{Binding: b, ID: ids.New(), Mode: in.Mode, Peer: peer, Reason: in.Reason, TTL: ttl, Deadline: now.Add(secs(s.cfg.TTL.PendingExpirySeconds)).UnixMilli(), Status: "pending"}
+	// A "don't ask again" rule approves without a tap. The pending limit is
+	// about cards waiting for the owner, so it is checked only without one.
+	st, err := s.envStandingFor(ctx, q, h.ID, out)
+	if err != nil {
+		return nil, err
+	}
+	if st == nil && n >= MaxPendingPerHost {
 		return nil, &apiErr{429, "rate_limited", "too many pending requests"}
 	}
-	out := envset.Release{Binding: b, ID: ids.New(), Mode: in.Mode, Peer: peer, Reason: in.Reason, TTL: ttl, Deadline: now.Add(secs(s.cfg.TTL.PendingExpirySeconds)).UnixMilli(), Status: "pending"}
 	if err = q.NewEnvRelease(ctx, h.ID, out); err != nil {
 		return nil, err
 	}
-	return out, q.Audit(ctx, now, "host:"+h.Name, "env_request", "request:"+out.ID, b.Path+" mode="+out.Mode)
+	if err = q.Audit(ctx, now, "host:"+h.Name, "env_request", "request:"+out.ID, b.Path+" mode="+out.Mode); err != nil || st == nil {
+		return out, err
+	}
+	until := now.Add(secs(ttl)).UnixMilli()
+	if err = q.ApproveEnvBy(ctx, out.ID, ids.New(), st.ID, ttl, until); err != nil {
+		return nil, err
+	}
+	if err = q.UseEnvStanding(ctx, st.ID, now); err != nil {
+		return nil, err
+	}
+	// The release has its own hold until it is collected, as after a tap.
+	if c, _ := ctx.Value(signCallKey{}).(*signCall); c != nil {
+		row, hold := st.row, s.envHold(out.ID, until)
+		c.after = func() { s.seal.pool.hold(bucketSealID(row), hold); s.bcast.notify() }
+	}
+	// The answer is "pending" as for every new release (every CLI expects that
+	// of a request it just made); its first poll finds it approved.
+	return out, q.Audit(ctx, now, "system", "env_auto_approve", "request:"+out.ID, fmt.Sprintf("%s revision=%d mode=%s standing=%s host=%s ttl=%d from=%s", b.Path, b.Revision, out.Mode, st.ID, h.Name, ttl, peer))
+}
+
+type envRule struct {
+	envset.Standing
+	row store.BucketRow
+}
+
+// envStandingFor finds the "don't ask again" rule that approves r, or nil:
+// same enrolment and observed address, same delivery mode, the exact binding
+// the owner approved (set, revision and key names, admission, policy), a
+// finite TTL within the signed one, and the set's bucket open (a rule issues
+// without a tap only while its bucket is open, like every standing rule).
+func (s *Server) envStandingFor(ctx context.Context, q *store.Q, host int64, r envset.Release) (*envRule, error) {
+	rules, err := q.ActiveEnvStanding(ctx, host, r.Set, s.now())
+	if err != nil || len(rules) == 0 {
+		return nil, err
+	}
+	row, err := q.BucketByRef(ctx, "env-set", r.Set)
+	if err != nil || !s.seal.pool.isOpen(bucketSealID(row)) {
+		return nil, nil
+	}
+	if limit, err := q.StandingCap(ctx, r.Set); err != nil || limit == 0 {
+		return nil, err
+	}
+	for _, st := range rules {
+		if st.Mode == r.Mode && st.Peer == r.Peer && r.TTL > 0 && r.TTL <= st.MaxTTL && reflect.DeepEqual(st.Binding, r.Binding) {
+			return &envRule{st, row}, nil
+		}
+	}
+	return nil, nil
+}
+
+func envStandingHold(st envset.Standing) bucketHold {
+	return bucketHold{Kind: "standing", Ref: "envstanding:" + st.ID, Reason: "don't-ask-again rule for " + st.Host, Until: time.UnixMilli(st.Expires).UTC()}
 }
 func (s *Server) envEnd(ctx context.Context, q *store.Q, r *http.Request, h *store.Host) (any, error) {
 	grant := strings.HasSuffix(r.URL.Path, "/checkin")
@@ -289,6 +346,8 @@ func (s *Server) envTicket(ctx context.Context, r *http.Request, sess string) (a
 func (s *Server) envState(ctx context.Context, r *http.Request, sess string) (any, error) {
 	var drafts []envset.Draft
 	var releases []envset.Release
+	var standing []envset.Standing
+	caps := map[string]int{}
 	err := s.store.Tx(ctx, func(q *store.Q) error {
 		pk, err := q.SessionPasskeyID(ctx, sess)
 		if err != nil {
@@ -304,16 +363,30 @@ func (s *Server) envState(ctx context.Context, r *http.Request, sess string) (an
 		if err != nil {
 			return err
 		}
-		releases, err = q.OwnerEnvReleases(ctx)
-		return err
+		if releases, err = q.OwnerEnvReleases(ctx); err != nil {
+			return err
+		}
+		if standing, err = q.ActiveEnvStanding(ctx, 0, "", s.now()); err != nil {
+			return err
+		}
+		// What each waiting card may offer: its set's "longest don't-ask-again".
+		for _, r := range releases {
+			if caps[r.Set], err = q.StandingCap(ctx, r.Set); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
-	return map[string]any{"drafts": drafts, "releases": releases}, err
+	return map[string]any{"drafts": drafts, "releases": releases, "standing": standing, "standing_caps": caps}, err
 }
 
 type envChoice struct {
 	ID     string `json:"id"`
 	Action string `json:"action"`
 	TTL    int    `json:"ttl_seconds"`
+	// Standing ("don't ask again for ...") rides an approval; it is in the
+	// signed text only when chosen, so an approval without it reads as before.
+	Standing int `json:"standing_seconds,omitempty"`
 }
 
 func (s *Server) envReview(ctx context.Context, q *store.Q, sess string, pk int64, in envChoice) (string, error) {
@@ -323,7 +396,23 @@ func (s *Server) envReview(ctx context.Context, q *store.Q, sess string, pk int6
 	if err := q.SweepEnv(ctx, s.now()); err != nil {
 		return "", err
 	}
+	if in.Standing != 0 && in.Action != "approve" {
+		return "", errBad("unexpected standing duration")
+	}
 	switch in.Action {
+	case "standing-revoke":
+		st, err := q.EnvStanding(ctx, in.ID, s.now())
+		if err != nil {
+			return "", errConflict("that rule has ended; reload")
+		}
+		if err = q.IsOrgOwner(ctx, st.Org, sess, pk, s.now()); err != nil {
+			return "", errForbidden("organisation approval required")
+		}
+		if in.TTL != 0 {
+			return "", errBad("unexpected duration")
+		}
+		st.Uses = 0 // a use between review and tap does not change what is signed
+		return reviewJSON(st)
 	case "commit", "discard":
 		x, err := q.EnvDraft(ctx, sess, in.ID, s.now())
 		if err != nil {
@@ -358,6 +447,15 @@ func (s *Server) envReview(ctx context.Context, q *store.Q, sess string, pk int6
 				}
 			} else if in.TTL <= 0 || in.TTL > maxFinite || v.TTL > 0 && in.TTL > v.TTL {
 				return "", errBad("duration exceeds request")
+			}
+			if in.Standing != 0 {
+				limit, err := q.StandingCap(ctx, v.Set)
+				if err != nil {
+					return "", err
+				}
+				if in.Standing < 60 || in.Standing > limit || in.TTL <= 0 {
+					return "", errBad("don't-ask-again is off for this set, or longer than its limit")
+				}
 			}
 		} else if in.TTL != 0 {
 			return "", errBad("unexpected duration")
@@ -398,7 +496,19 @@ func (s *Server) envChallenge(ctx context.Context, r *http.Request, sess string)
 			if in.TTL > 0 {
 				until = s.now().Add(secs(in.TTL)).UnixMilli()
 			}
-			needs = []bucketNeed{s.need(row, s.envHold(in.ID, until))}
+			holds := []bucketHold{s.envHold(in.ID, until)}
+			if in.Standing > 0 {
+				holds = append(holds, envStandingHold(envset.Standing{ID: in.ID, Binding: v.Binding, Expires: s.now().Add(secs(in.Standing)).UnixMilli()}))
+			}
+			// A tap that opens the bucket re-arms the set's rules that were waiting for it.
+			rules, err := q.ActiveEnvStanding(ctx, 0, v.Set, s.now())
+			if err != nil {
+				return err
+			}
+			for _, st := range rules {
+				holds = append(holds, envStandingHold(st))
+			}
+			needs = []bucketNeed{s.need(row, holds...)}
 		}
 		return nil
 	})
@@ -407,6 +517,9 @@ func (s *Server) envChallenge(ctx context.Context, r *http.Request, sess string)
 	}
 	m := s.reviewFields("env", in.Action, in.ID)
 	m["metadata"], m["ttl_seconds"] = meta, in.TTL
+	if in.Standing > 0 {
+		m["standing_seconds"] = in.Standing
+	}
 	text, _ := reviewJSON(m)
 	return s.beginTap(ctx, sess, "env", in.Action, text, needs, nil)
 }
@@ -449,19 +562,42 @@ func (s *Server) envFinish(ctx context.Context, r *http.Request, sess string) (a
 			if m.TTL > 0 {
 				until = s.now().Add(secs(m.TTL))
 			}
-			err = q.DecideEnv(ctx, m.ID, "approved", ids.New(), m.TTL, until.UnixMilli())
+			if err = q.DecideEnv(ctx, m.ID, "approved", ids.New(), m.TTL, until.UnixMilli()); err == nil && m.Standing > 0 {
+				v, host, err2 := q.EnvRelease(ctx, m.ID, false)
+				if err2 != nil {
+					return err2
+				}
+				now := s.now()
+				err = q.NewEnvStanding(ctx, host, envset.Standing{Binding: v.Binding, ID: v.ID, Mode: v.Mode, Peer: v.Peer, MaxTTL: m.TTL, Created: now.UnixMilli(), Expires: now.Add(secs(m.Standing)).UnixMilli()})
+			}
+		case "standing-revoke":
+			var n int
+			if n, err = q.RevokeEnvStanding(ctx, s.now(), m.ID); err == nil && n == 0 {
+				err = errConflict("that rule has ended; reload")
+			}
+			if err == nil {
+				s.seal.pool.release("envstanding:" + m.ID)
+			}
 		case "deny":
 			err = q.DecideEnv(ctx, m.ID, "denied", "", 0, 0)
 		case "revoke":
-			err = q.DecideEnv(ctx, m.ID, "revoked", "", 0, 0)
+			// Revoking a release also ends the rule its approval created and
+			// the rule that approved it, as revoking a grant does.
+			by, err2 := q.EnvReleaseStanding(ctx, m.ID)
+			if err2 != nil {
+				return err2
+			}
+			if err = q.DecideEnv(ctx, m.ID, "revoked", "", 0, 0); err == nil {
+				_, err = q.RevokeEnvStanding(ctx, s.now(), m.ID, by)
+			}
 			if err == nil {
-				s.seal.pool.release("env:" + m.ID)
+				s.seal.pool.release("env:"+m.ID, "envstanding:"+m.ID, "envstanding:"+by)
 			}
 		}
 		if err != nil {
 			return err
 		}
-		return q.Audit(ctx, s.now(), "owner", "env_"+m.Action, "env:"+m.ID, fmt.Sprintf("passkey=%d canonical=%s", pk, c.Canonical))
+		return q.Audit(ctx, s.now(), "owner", "env_"+strings.ReplaceAll(m.Action, "-", "_"), "env:"+m.ID, fmt.Sprintf("passkey=%d canonical=%s", pk, c.Canonical))
 	})
 	if err == nil {
 		s.bcast.notify()
