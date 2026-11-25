@@ -201,6 +201,8 @@ func (s *Server) envRequest(ctx context.Context, q *store.Q, r *http.Request, h 
 	if err = q.Audit(ctx, now, "host:"+h.Name, "env_request", "request:"+out.ID, b.Path+" mode="+out.Mode); err != nil || st == nil {
 		return out, err
 	}
+	// Never longer than the owner signed: a longer request gets the signed TTL.
+	ttl = min(ttl, st.MaxTTL)
 	until := now.Add(secs(ttl)).UnixMilli()
 	if err = q.ApproveEnvBy(ctx, out.ID, ids.New(), st.ID, ttl, until); err != nil {
 		return nil, err
@@ -226,8 +228,9 @@ type envRule struct {
 // envStandingFor finds the "don't ask again" rule that approves r, or nil:
 // same enrolment and observed address, same delivery mode, the exact binding
 // the owner approved (set, revision and key names, admission, policy), a
-// finite TTL within the signed one, and the set's bucket open (a rule issues
-// without a tap only while its bucket is open, like every standing rule).
+// finite TTL (the release is capped at the signed one), and the set's bucket
+// open (a rule issues without a tap only while its bucket is open, like every
+// standing rule).
 func (s *Server) envStandingFor(ctx context.Context, q *store.Q, host int64, r envset.Release) (*envRule, error) {
 	rules, err := q.ActiveEnvStanding(ctx, host, r.Set, s.now())
 	if err != nil || len(rules) == 0 {
@@ -241,7 +244,7 @@ func (s *Server) envStandingFor(ctx context.Context, q *store.Q, host int64, r e
 		return nil, err
 	}
 	for _, st := range rules {
-		if st.Mode == r.Mode && st.Peer == r.Peer && r.TTL > 0 && r.TTL <= st.MaxTTL && reflect.DeepEqual(st.Binding, r.Binding) {
+		if st.Mode == r.Mode && st.Peer == r.Peer && r.TTL > 0 && reflect.DeepEqual(st.Binding, r.Binding) {
 			return &envRule{st, row}, nil
 		}
 	}

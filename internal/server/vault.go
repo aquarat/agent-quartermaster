@@ -1124,6 +1124,8 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 		}
 		return nil, err
 	}
+	// A new revision or a changed limit ends "don't ask again" rules: their holds go now.
+	s.reconcileHolds(ctx)
 	s.bcast.notify()
 	s.notify.Send("aqmas: vault", note+" [ref "+ref(m.ID)+"]", s.cfg.PublicBaseURL+"/")
 	return out, nil

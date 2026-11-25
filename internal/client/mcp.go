@@ -148,13 +148,25 @@ func (s *mcpServer) reply(id json.RawMessage, result any, e *mcpError) {
 	s.send(m)
 }
 
-// ServeMCP runs the MCP server until in ends or ctx is cancelled. Requests still waiting
-// for the owner are withdrawn on the way out.
+// mcpDrain is how long calls already running may finish after the input ended (a client
+// that pipes its requests in and closes the pipe still gets its answers).
+const mcpDrain = 5 * time.Second
+
+// ServeMCP runs the MCP server until in ends or ctx is cancelled. Calls that are still
+// running when the input ends get mcpDrain to finish; requests still waiting for the owner
+// after that are withdrawn on the way out.
 func (e *Env) ServeMCP(ctx context.Context, in io.Reader, out io.Writer) error {
 	s := &mcpServer{env: e, tools: mcpTools(), out: out, calls: map[string]context.CancelFunc{}}
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	defer func() {
+		idle := make(chan struct{})
+		go func() { wg.Wait(); close(idle) }()
+		select {
+		case <-idle:
+		case <-ctx.Done():
+		case <-time.After(mcpDrain):
+		}
 		cancel()
 		wg.Wait()
 	}()

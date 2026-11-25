@@ -411,8 +411,8 @@ func TestSecretLifecycle(t *testing.T) {
 
 // "Don't ask again": approving one release may create a rule that approves the
 // next matching ones without a tap. It matches the same host from the same
-// address, the same set revision and delivery mode, within the signed TTL and
-// the set's limit, while the set's bucket is open; every delivery is still its
+// address, the same set revision and delivery mode, for at most the signed TTL
+// and within the set's limit, while the set's bucket is open; every delivery is still its
 // own once-only, audited release.
 func TestEnvStanding(t *testing.T) {
 	v := newVault(t)
@@ -502,8 +502,16 @@ func TestEnvStanding(t *testing.T) {
 	if v.relStatus(v.other, other).Status != "pending" {
 		t.Fatal("another host used the rule")
 	}
+	// A longer TTL than the owner signed is not a reason to ask again: the release is
+	// capped at the signed TTL.
 	other, st = v.askTTL(v.agent, path, "get", 3600)
-	pending("a longer TTL than the signed one", other, st)
+	mustStatus(t, "a longer TTL", st, 200)
+	if got := v.relStatus(v.agent, other); got.Status != "approved" || got.TTL != 600 {
+		t.Fatalf("a longer TTL than the signed one: %s for %d s", got.Status, got.TTL)
+	}
+	// An indefinite release is never approved by a rule.
+	other, st = v.askTTL(v.agent, path, "get", -1)
+	pending("an indefinite release", other, st)
 
 	// A closed bucket: the rule stays, but nothing is issued without a tap; the tap that
 	// reopens the bucket re-arms it.

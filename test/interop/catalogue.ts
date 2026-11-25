@@ -1,5 +1,5 @@
 // Real owner-side catalogue ceremonies, using exactly the browser's verifier.
-import { admissionProposal, planString, type Catalogue } from "../../web/src/catalogue";
+import { admissionProposal, planString, policyWire, type Catalogue } from "../../web/src/catalogue";
 import type { Api } from "../../web/src/api";
 import type { Authenticator } from "../../web/src/webauthn";
 import { completeAction, prepareAction, type ActionChoice, type ActionTarget } from "../../web/src/flows";
@@ -62,6 +62,22 @@ export async function exerciseCatalogue(api: Api, auth: Authenticator, mode: str
     if (!host || host.active) throw Error("host is not listed as unadmitted");
     const p = admissionProposal(now, parent, host);
     await completeAction(api, auth, await prepareAction(api, p.target, p.choice));
+    return;
+  }
+  if (mode.startsWith("policy:")) {
+    // policy:ORG:discovery=on|off or policy:ORG:get=on|off: the switches of Settings → the
+    // organisation's policy, in the same signed replacement as the durations.
+    const [o, change] = mode.slice(7).split(":");
+    const [what, value] = change!.split("=");
+    const parent = await org(o!);
+    const next = { ...parent.policy };
+    if (what === "discovery") next.discovery = value === "on";
+    else if (what === "get") next.deny_get = value !== "on";
+    else throw Error("unknown policy switch");
+    const p = await prepare("org_policy", "replace", parent.id, { organisation: node(parent), old_policy: policyWire(parent.policy), new_policy: policyWire(next), old_rules: parent.rules, new_rules: parent.rules, result_revision: parent.revision + 1 });
+    const said = p.description.warnings.join(" ");
+    if (what === "discovery" && !said.includes(value === "on" ? "Listing ON" : "Listing OFF")) throw Error("the confirmation does not say what listing changes: " + said);
+    await completeAction(api, auth, p);
     return;
   }
   if (mode === "remove" || mode === "readmit") {

@@ -163,7 +163,20 @@ try {
     case 'recover':{const [dir,pin]=args;const post=async(path:string,token:string,body:unknown)=>{const res=await fetch('http://localhost/recovery/'+path,{unix:`${dir}/broker.sock`,method:'POST',headers:{'X-Aqmas-Recovery':token,'X-Aqmas':'1','Content-Type':'application/json',origin},body:JSON.stringify(body)});if(!res.ok)throw Error('recovery '+path+': '+res.status);return res.json()};const fresh=await softAuthenticator(origin);let step=await (await import(`${web}/src/recovery.ts`)).recoverSteps(post,readFileSync(dir+'/ticket','utf8'),'Replacement',pin,new URL(origin).hostname);while(step)step=await step.apply(fresh);auth=fresh;active='Replacement';cookie='';break;}
     case 'repair-leaf': await control('renew-leaf');break;
     case 'env-ticket':{const cat=await api.catalogue();const host=cat.organisations.find((o:any)=>o.slug==='client-a').hosts.find((h:any)=>h.active&&h.class==='owner-device');console.log((await api.envPost('ticket',{path:'client-a/paas/staging',operation:args[0],enrollment:host.enrollment})).ticket);break}
-    case 'env-decide':{const [action,mode]=args;for(let n=0;;n++){const state=await api.envState();const item=action==='commit'?state.drafts[0]:state.releases.find((r:any)=>r.mode===mode&&r.status===(action==='revoke'?'approved':'pending'));if(item){const review=await (await import(`${web}/src/envsets.ts`)).envReview(api,await api.sealStatus(),item,action,action==='approve'?300:0,new URL(origin).hostname);await review.tap(auth);break}if(n>=150)throw Error('no env decision queued');await Bun.sleep(100)}break}
+    case 'env-decide':{const [action,mode,standing]=args; // approve|deny|revoke|commit MODE [STANDING-SECONDS]: "don't ask again" rides an approval
+      for(let n=0;;n++){const state=await api.envState();const item=action==='commit'?state.drafts[0]:state.releases.find((r:any)=>r.mode===mode&&r.status===(action==='revoke'?'approved':'pending'));if(item){const env=await import(`${web}/src/envsets.ts`);if(standing&&!env.standingChoices(state.standing_caps?.[item.set]??0).includes(Number(standing)))throw Error('the card does not offer that duration');const review=await env.envReview(api,await api.sealStatus(),item,action,action==='approve'?300:0,new URL(origin).hostname,Number(standing??0));await review.tap(auth);break}if(n>=150)throw Error('no env decision queued');await Bun.sleep(100)}break}
+    case 'env-state': console.log(JSON.stringify(await api.envState()));break;
+    case 'env-standing-revoke':{const env=await import(`${web}/src/envsets.ts`);const st=(await api.envState()).standing?.[0];if(!st)throw Error('no rule to revoke');await (await env.envStandingRevoke(api,await api.sealStatus(),st,new URL(origin).hostname)).tap(auth);break}
+    case 'vault-secret': { // ORG/SERVICE/SLUG ENVNAME VALUEFILE [NOTE] [URL]: Add item → Secret, the value sealed in this process
+      const vault=await import(`${web}/src/vault.ts`);const [path,name,file,note,url]=args;const [o,sv,slug]=path!.split('/');
+      const cat=await api.catalogue();const org=cat.organisations.find((x:any)=>x.slug===o),service=org.services.find((x:any)=>x.slug===sv);
+      const parent={org_id:org.id,org_slug:org.slug,org_title:org.title,service_id:service.id,service_slug:service.slug,service_title:service.title};
+      const p=await vault.vaultSecretCreate(api,await api.sealStatus(),parent,{id:vault.newSetId(),slug,title:slug},name,readFileSync(file!,'utf8'),note??'',url??'',new URL(origin).hostname);
+      console.log(JSON.stringify(await p.tap(auth)));break;}
+    case 'vault-standing-cap': { // PATH SECONDS: the item's "longest don't ask again"
+      const vault=await import(`${web}/src/vault.ts`);const [path,seconds]=args;
+      const set=(await api.vaultState()).sets.find((s:any)=>`${s.org_slug}/${s.service_slug}/${s.set_slug}`===path);if(!set)throw Error('no set '+path);
+      await (await vault.vaultStandingCap(api,await api.sealStatus(),set,Number(seconds),new URL(origin).hostname)).tap(auth);break;}
     case 'vault-state': console.log(JSON.stringify(await api.vaultState()));break;
     case 'vault-commit': { // PATH merge|import ENVFILE [REMOVE...]: the write-only form, values sealed in this process
       const vault=await import(`${web}/src/vault.ts`);const [path,operation,file,...remove]=args;

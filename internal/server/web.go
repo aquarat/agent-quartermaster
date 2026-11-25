@@ -1006,6 +1006,7 @@ func (s *Server) decideHandler(object string) func(http.ResponseWriter, *http.Re
 				s.writeErr(w, r, err)
 				return
 			}
+			s.reconcileHolds(ctx) // a policy or admission change ends rules and releases: their holds go
 			s.bcast.notify()
 			s.notifyDecision(sg)
 			writeJSON(w, 200, api.OK{OK: true})
