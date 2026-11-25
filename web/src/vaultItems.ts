@@ -6,17 +6,18 @@ import type { Catalogue } from "./catalogue";
 import type { BucketInfo, SealView } from "./sealPanel";
 import type { VaultSet, VaultState } from "./vault";
 
-export type ItemType = "env-set" | "signer" | "cloudflare" | "ssh-ca" | "internal-ca" | "access";
+export type ItemType = "env-set" | "secret" | "signer" | "cloudflare" | "ssh-ca" | "internal-ca" | "access";
 
 export const TYPE_WORDS: Record<ItemType, { one: string; many: string }> = {
   "env-set": { one: "Env set", many: "Env sets" },
+  secret: { one: "Secret", many: "Secrets" },
   signer: { one: "Signing key", many: "Signing keys" },
   cloudflare: { one: "Cloudflare", many: "Cloudflare" },
   "ssh-ca": { one: "SSH CA", many: "SSH CAs" },
   "internal-ca": { one: "Internal CA", many: "Internal CAs" },
   access: { one: "Access rule", many: "Access rules" },
 };
-export const TYPE_ORDER: ItemType[] = ["env-set", "signer", "cloudflare", "ssh-ca", "internal-ca", "access"];
+export const TYPE_ORDER: ItemType[] = ["secret", "env-set", "signer", "cloudflare", "ssh-ca", "internal-ca", "access"];
 
 export interface VaultItem {
   /** The set id, or "b-" + a short form of the bucket id for a bucket no set stands for. */
@@ -57,6 +58,7 @@ export const bucketItemId = (id: string) => "b-" + id.replace(/[^A-Za-z0-9_-]/g,
 
 function typeOfKind(kind: string, provider: string): ItemType {
   if (kind === "signer") return "signer";
+  if (kind === "secret") return "secret";
   if (kind === "env-set") return "env-set";
   if (provider === "cloudflare" || kind.startsWith("cloudflare") || kind.startsWith("cf-")) return "cloudflare";
   return "access";
@@ -76,14 +78,14 @@ export function buildItems(vault: VaultState | undefined, cat: Catalogue | null 
     seen.add(s.set_id);
     items.push({
       id: s.set_id,
-      type: s.kind === "signer" ? "signer" : "env-set",
+      type: s.kind === "signer" ? "signer" : s.kind === "secret" ? "secret" : "env-set",
       title: s.set_title,
       path,
       orgId: s.org_id,
       orgTitle: s.org_title,
       serviceId: s.service_id,
       serviceTitle: s.service_title,
-      sub: s.kind === "signer" ? `${scheme} · ${plural(s.signatures, "signature")}` : s.names.length ? `${plural(s.names.length, "key")} · revision ${s.revision}` : "empty",
+      sub: s.kind === "signer" ? `${scheme} · ${plural(s.signatures, "signature")}` : s.kind === "secret" ? `$${s.names[0] ?? "?"} · revision ${s.revision}` : s.names.length ? `${plural(s.names.length, "key")} · revision ${s.revision}` : "empty",
       names: s.kind === "signer" ? [] : s.names,
       set: s,
       bucket: takeBucket(path),
@@ -97,7 +99,7 @@ export function buildItems(vault: VaultState | undefined, cat: Catalogue | null 
         const path = `${o.slug}/${v.slug}/${s.slug}`;
         const type = typeOfKind(s.kind, v.provider);
         // An application set the vault did not list (an older server, or one being created).
-        items.push({ id: s.id, type, title: s.title, path, orgId: o.id, orgTitle: o.title, serviceId: v.id, serviceTitle: v.title, sub: type === "env-set" ? `revision ${s.revision}` : s.kind, names: [], bucket: takeBucket(path), kind: s.kind });
+        items.push({ id: s.id, type, title: s.title, path, orgId: o.id, orgTitle: o.title, serviceId: v.id, serviceTitle: v.title, sub: type === "env-set" || type === "secret" ? `revision ${s.revision}` : s.kind, names: [], bucket: takeBucket(path), kind: s.kind });
       }
   // What is left is the broker's own (the CAs), or a set no list above named.
   for (const b of buckets) {

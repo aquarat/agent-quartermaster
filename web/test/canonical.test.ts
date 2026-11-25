@@ -130,3 +130,30 @@ describe("canonical", () => {
     expect(parseCanonical(text).key_fingerprint).toBe("a" + ls + "b");
   });
 });
+
+describe("0.10.0: the policy switches in a signed policy replacement", () => {
+  const node = { id: "a".repeat(32), slug: "client-a", title: "Client A", revision: 1 };
+  const pol = { default_seconds: 3600, soft_cap_seconds: 86400, indefinite: true, standing_default_seconds: 3600, standing_soft_cap_seconds: 86400, standing_indefinite: true };
+  const canonical = (oldPolicy: object, newPolicy: object) => {
+    const plan = JSON.stringify({ owner_id: "b".repeat(32), organisation: node, old_policy: oldPolicy, new_policy: newPolicy, old_rules: [], new_rules: [], result_revision: 2 });
+    return JSON.stringify({ action: "replace", id: node.id, issued_at: "2026-11-25T10:00:00Z", nonce: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", object: "org_policy", plan, v: 2 });
+  };
+  test("a plan without them parses and describes as before", () => {
+    const d = describeAction(parseCanonical(canonical(pol, { ...pol, default_seconds: 1800 })));
+    expect(d.warnings).toEqual(["Affected pending work expires; broker grants and standing approvals end. Issued SSH certificates can still work until expiry, and sessions can continue."]);
+    expect(d.fields.some(([k]) => k.includes("discovery"))).toBe(false);
+  });
+  test("listing and aqmas get are named in plain words, from the signed plan", () => {
+    const on = describeAction(parseCanonical(canonical(pol, { ...pol, discovery: true })));
+    expect(on.warnings.some((w) => w.startsWith("Listing ON:"))).toBe(true);
+    expect(on.fields).toContainEqual(["new_policy › discovery", "true"]);
+    const off = describeAction(parseCanonical(canonical({ ...pol, discovery: true }, { ...pol, deny_get: true })));
+    expect(off.warnings.some((w) => w.startsWith("Listing OFF:"))).toBe(true);
+    expect(off.warnings.some((w) => w.startsWith("aqmas get OFF:"))).toBe(true);
+  });
+  test("a switch out of order, or an unknown one, is refused", () => {
+    expect(() => parseCanonical(canonical(pol, { discovery: true, ...pol }))).toThrow();
+    expect(() => parseCanonical(canonical(pol, { ...pol, deny_get: true, discovery: true }))).toThrow();
+    expect(() => parseCanonical(canonical(pol, { ...pol, list_values: true }))).toThrow();
+  });
+});

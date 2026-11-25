@@ -12,8 +12,15 @@ import {
   type Edit,
   type Entry,
   type Scheme,
+  type SecretResult,
   type SignRequest,
   type SignerResult,
+  STANDING_STEPS,
+  secretMetaProblem,
+  standingCap,
+  vaultSecretConvert,
+  vaultSecretCreate,
+  vaultStandingCap,
   type VaultOrg,
   type VaultSet,
   type VaultState,
@@ -427,49 +434,7 @@ export class VaultForms {
 
     // Existing keys: names only. Their values are never fetched to draw this list.
     const canReveal = set.allow_reveal;
-    const hide = () => {
-      for (const pre of revealBox.querySelectorAll("pre")) pre.textContent = "";
-      replace(revealBox);
-      window.clearInterval(timer);
-    };
-    let timer = 0;
-    const reveal = (names: string[]) =>
-      ceremony<Entry[]>(
-        slot,
-        this.host.auth,
-        "Reveal with passkey",
-        "approve",
-        () => vaultReveal(this.host.api, this.seal!, set, names, location.hostname),
-        () => [h("p", null, "Show ", h("span", { class: "mono" }, vt(names.join(", "))), " on this page for ", String(REVEAL_SECONDS), " seconds. aqmas encrypts the answer to a key that exists only in this tab, and logs which keys were shown.")],
-        (entries) => {
-          hide();
-          const until = Date.now() + REVEAL_SECONDS * 1000;
-          const left = h("strong", null, String(REVEAL_SECONDS));
-          let shown: Entry[] | null = entries;
-          replace(
-            revealBox,
-            h("div", { class: "revealed-head" }, h("span", null, "Hidden again in ", left, " s"), btn("Hide now", "small", hide)),
-            entries.map((e, i) => h("div", { class: "revealed-item" }, h("div", { class: "revealed-name" }, h("span", { class: "mono" }, vt(e.name)), copyButton(() => shown?.[i]?.value ?? "")), h("pre", { class: "mono revealed-value", tabindex: "0" }, e.value))),
-          );
-          timer = window.setInterval(() => {
-            const s = Math.ceil((until - Date.now()) / 1000);
-            left.textContent = String(Math.max(0, s));
-            if (s <= 0 || !revealBox.isConnected) {
-              shown = null;
-              hide();
-            }
-          }, 500);
-          // A background tab's timers are throttled: check the deadline the moment it is seen again.
-          const seen = () => {
-            if (Date.now() >= until) {
-              shown = null;
-              hide();
-            }
-          };
-          document.addEventListener("visibilitychange", seen);
-          this.forget.push(() => (document.removeEventListener("visibilitychange", seen), (shown = null), hide()));
-        },
-      );
+    const reveal = this.revealer(set, slot, revealBox);
     const existing = h("ul", { class: "vault-keys" });
     for (const name of set.names) {
       const rm = btn("Remove", "small", () => {
@@ -596,6 +561,256 @@ export class VaultForms {
     ]);
     refresh();
     return card;
+  }
+
+  // ---- "don't ask again" limit, secrets ----
+
+  /** The set's "longest don't-ask-again": what one approval may cover, changed with a tap. */
+  standingLine(set: VaultSet): HTMLElement {
+    const slot = h("div", { class: "vault-slot" });
+    const now = standingCap(set);
+    const words = (s: number) => (s === 0 ? "Off" : s % 3600 === 0 ? `${s / 3600} hour${s === 3600 ? "" : "s"}` : `${Math.round(s / 60)} minutes`);
+    const pick = h("select", { class: "text", id: `standing-cap-${set.set_id}`, "aria-label": "Longest don't ask again" });
+    for (const s of [...new Set([0, ...STANDING_STEPS, now])].sort((a, b) => a - b)) pick.append(h("option", { value: String(s) }, words(s)));
+    pick.value = String(now);
+    const go = btn("Change…", "small", () => {
+      const next = Number(pick.value);
+      ceremony(
+        slot,
+        this.host.auth,
+        "Change with passkey",
+        next > now ? "approve" : "deny",
+        () => vaultStandingCap(this.host.api, this.seal!, set, next, location.hostname),
+        () => [
+          h(
+            "p",
+            null,
+            next === 0
+              ? "Every request for this item will ask you. "
+              : `When you approve a request for this item you may choose “don't ask again” for up to ${words(next).toLowerCase()}: the same host then gets it again without asking you until that time is over. `,
+            "Rules made under the old limit end now.",
+          ),
+        ],
+        () => this.host.changed(),
+        undefined,
+        box,
+      );
+    });
+    go.disabled = true;
+    pick.addEventListener("change", () => (go.disabled = Number(pick.value) === now));
+    const box = h(
+      "div",
+      { class: "vault-policy-box vault-standing" },
+      h("p", { class: "vault-policy" }, h("label", { for: pick.id }, "Longest “don't ask again” for this item: "), pick, " ", go),
+      h("p", { class: "hint muted" }, "How long one approval may cover later requests from the same host for the same value. Keep it short or off for anything that would hurt if a host misused it; a low-risk key can have up to 24 hours. You still choose it on each approval; nothing is automatic until you do."),
+      slot,
+    );
+    return box;
+  }
+
+  /** "Convert to secret" for an env set with exactly one key. */
+  convertLine(set: VaultSet): HTMLElement | null {
+    if (set.kind !== "env-set" || set.names.length !== 1) return null;
+    const slot = h("div", { class: "vault-slot" });
+    const name = set.names[0]!;
+    const b = btn("Convert to secret…", "small", () =>
+      ceremony(
+        slot,
+        this.host.auth,
+        "Convert with passkey",
+        "approve",
+        () => vaultSecretConvert(this.host.api, this.seal!, set, "", "", location.hostname),
+        () => [h("p", null, "This env set has one key, ", h("span", { class: "mono" }, vt(name)), ". As a secret it is shown as a single value, and hosts can also ask for it with aqmas get. The stored value and the path stay as they are.")],
+        () => this.host.changed(),
+      ),
+    );
+    return h("div", { class: "vault-policy-box vault-convert" }, h("p", { class: "vault-policy" }, h("span", null, "One key only: this could be a secret. "), b), slot);
+  }
+
+  /** Reveal for a set's keys: the confirmation, the 60 seconds on screen, the clean-up. */
+  private revealer(set: VaultSet, slot: HTMLElement, revealBox: HTMLElement): (names: string[]) => void {
+    let timer = 0;
+    const hide = () => {
+      for (const pre of revealBox.querySelectorAll("pre")) pre.textContent = "";
+      replace(revealBox);
+      window.clearInterval(timer);
+    };
+    return (names: string[]) =>
+      ceremony<Entry[]>(
+        slot,
+        this.host.auth,
+        "Reveal with passkey",
+        "approve",
+        () => vaultReveal(this.host.api, this.seal!, set, names, location.hostname),
+        () => [h("p", null, "Show ", h("span", { class: "mono" }, vt(names.join(", "))), " on this page for ", String(REVEAL_SECONDS), " seconds. aqmas encrypts the answer to a key that exists only in this tab, and logs which keys were shown.")],
+        (entries) => {
+          hide();
+          const until = Date.now() + REVEAL_SECONDS * 1000;
+          const left = h("strong", null, String(REVEAL_SECONDS));
+          let shown: Entry[] | null = entries;
+          replace(
+            revealBox,
+            h("div", { class: "revealed-head" }, h("span", null, "Hidden again in ", left, " s"), btn("Hide now", "small", hide)),
+            entries.map((e, i) => h("div", { class: "revealed-item" }, h("div", { class: "revealed-name" }, h("span", { class: "mono" }, vt(e.name)), copyButton(() => shown?.[i]?.value ?? "")), h("pre", { class: "mono revealed-value", tabindex: "0" }, e.value))),
+          );
+          timer = window.setInterval(() => {
+            const s = Math.ceil((until - Date.now()) / 1000);
+            left.textContent = String(Math.max(0, s));
+            if (s <= 0 || !revealBox.isConnected) {
+              shown = null;
+              hide();
+            }
+          }, 500);
+          // A background tab's timers are throttled: check the deadline the moment it is seen again.
+          const seen = () => {
+            if (Date.now() >= until) {
+              shown = null;
+              hide();
+            }
+          };
+          document.addEventListener("visibilitychange", seen);
+          this.forget.push(() => (document.removeEventListener("visibilitychange", seen), (shown = null), hide()));
+        },
+      );
+  }
+
+  /** A secret: one value under one variable name. Reveal with its own tap; replace write-only. */
+  secretView(set: VaultSet): HTMLElement {
+    const name = set.names[0] ?? "";
+    const card = h("article", { class: "card vault-editor vault-secret" });
+    const slot = h("div", { class: "vault-slot" });
+    const revealBox = h("div", { class: "vault-revealed" });
+    const reveal = this.revealer(set, slot, revealBox);
+    const value = h("textarea", { class: "mono kv-value", id: `secret-new-${set.set_id}`, placeholder: "new value", autocomplete: "off", spellcheck: "false", "aria-label": "New value" });
+    value.rows = 2;
+    const error = h("p", { class: "error", role: "alert" });
+    this.forget.push(() => (value.value = ""));
+    const save = btn("Review and replace…", "approve", () => {
+      const edit: Edit = { operation: "import", entries: [{ name, value: value.value }], remove: [] };
+      error.textContent = "";
+      try {
+        validateEntries(edit.entries);
+      } catch {
+        error.textContent = "Too long (8192 bytes at most) or not text.";
+        return;
+      }
+      save.disabled = true;
+      ceremony(
+        slot,
+        this.host.auth,
+        "Replace with passkey",
+        "approve",
+        () => vaultCommit(this.host.api, this.seal!, set, edit, location.hostname),
+        () => [h("p", null, "Replace the value of ", h("span", { class: "mono" }, vt(name)), ": revision ", String(set.revision), " → ", String(set.revision + 1), ". Hosts holding a release of the old value lose it, and “don't ask again” rules for it end.")],
+        () => {
+          value.value = "";
+          edit.entries[0]!.value = "";
+          this.host.changed();
+        },
+        () => (save.disabled = value.value === ""),
+        card,
+      );
+    });
+    save.disabled = true;
+    value.addEventListener("input", () => (save.disabled = value.value === ""));
+    let link: HTMLElement | null = null;
+    if (set.url && /^https?:\/\//.test(set.url)) {
+      const a = h("a", null, vt(set.url));
+      a.href = set.url;
+      a.rel = "noreferrer noopener";
+      a.target = "_blank";
+      link = a;
+    }
+    append(card, [
+      scopeHeading(set.org_title, set.service_title, set.set_title),
+      h("p", { class: "muted" }, h("span", { class: "mono" }, vt(pathOf(set))), " · secret · revision ", String(set.revision)),
+      h(
+        "dl",
+        { class: "facts vault-secret-facts" },
+        h("dt", null, "Delivered as"),
+        h("dd", null, h("span", { class: "mono key-name" }, vt(name)), h("span", { class: "muted" }, " (environment variable; a host may choose another with --env)")),
+        h("dt", null, "Value"),
+        h("dd", null, h("span", { class: "muted key-dots", "aria-label": "value hidden" }, "••••••"), " ", set.allow_reveal ? btn("Reveal", "small", () => reveal([name])) : h("span", { class: "hint muted" }, "Reveal is off for this organisation.")),
+        set.note ? [h("dt", null, "Note"), h("dd", null, h("bdi", null, vt(set.note)))] : null,
+        link ? [h("dt", null, "Link"), h("dd", null, link)] : null,
+      ),
+      revealBox,
+      h("h4", null, "Replace the value"),
+      h("p", { class: "hint muted" }, "Write-only: what you type is encrypted in this tab for aqmas's sealed store before it is sent; the old value is never loaded into this form."),
+      h("div", { class: "field" }, h("label", { for: value.id }, "New value"), value),
+      error,
+      h("div", { class: "actions" }, save),
+      slot,
+    ]);
+    return card;
+  }
+
+  /** The new-secret form for one service. `created` gets the new set's id. */
+  newSecret({ org, service }: Place, created?: (setId: string) => void, frozen?: HTMLElement): HTMLElement {
+    const field = (id: string, placeholder: string, max: string, cls = "text") => h("input", { type: "text", class: cls, id, maxlength: max, placeholder, autocomplete: "off", spellcheck: "false" });
+    const title = field("sec-title", "Tailnet API key", "64");
+    const slug = field("sec-slug", "tailnet-api-key", "63", "text mono");
+    const name = field("sec-env", "TAILNET_API_KEY", "64", "text mono");
+    const note = field("sec-note", "what it is for, where it was made", "200");
+    const url = field("sec-url", "https://example.com/admin/keys", "300");
+    const value = h("textarea", { class: "mono kv-value", id: "sec-value", placeholder: "the value", autocomplete: "off", spellcheck: "false" });
+    value.rows = 2;
+    const slot = h("div", { class: "vault-slot" });
+    const root = h("div", { class: "card vault-new-secret" });
+    const error = h("p", { class: "error", role: "alert" });
+    this.forget.push(() => (value.value = ""));
+    const parent = { org_id: org.id, org_slug: org.slug, org_title: org.title, service_id: service.id, service_slug: service.slug, service_title: service.title };
+    const suggest = (t: string) => t.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").replace(/^([0-9])/, "K$1").slice(0, 64);
+    title.addEventListener("input", () => {
+      if (!slug.dataset["typed"]) slug.value = slugify(title.value);
+      if (!name.dataset["typed"]) name.value = suggest(title.value);
+    });
+    slug.addEventListener("input", () => (slug.dataset["typed"] = slug.value ? "1" : ""));
+    name.addEventListener("input", () => (name.dataset["typed"] = name.value ? "1" : ""));
+    const go = btn("Review…", "approve", () => {
+      const t = title.value.trim();
+      const problem = !SLUG_RE.test(slug.value) || !TITLE_RE.test(t) ? "Slug: lower-case letters, digits and dashes. Name: letters, digits, spaces, dot, dash, underscore." : (nameProblem(name.value) ?? (value.value === "" ? "Type or paste the value." : secretMetaProblem(note.value, url.value)));
+      if (problem) {
+        error.textContent = (problem.startsWith("Slug") || problem.startsWith("Type") || problem.startsWith("Note") || problem.startsWith("Link") ? "" : "Variable name: ") + problem;
+        return;
+      }
+      error.textContent = "";
+      const set = { id: newSetId(), slug: slug.value, title: t };
+      const chosen = { name: name.value, value: value.value, note: note.value, url: url.value };
+      ceremony<SecretResult>(
+        slot,
+        this.host.auth,
+        "Create with passkey",
+        "approve",
+        async () => {
+          const p = await vaultSecretCreate(this.host.api, this.seal!, parent, set, chosen.name, chosen.value, chosen.note, chosen.url, location.hostname);
+          chosen.value = "";
+          return p;
+        },
+        () => [
+          scopeHeading(org.title, service.title, set.title),
+          h("p", null, "One value, stored in the sealed store and delivered to a command as ", h("span", { class: "mono" }, vt(chosen.name)), ". The value was encrypted in this tab; it is not shown again without a Reveal tap."),
+        ],
+        (out) => {
+          value.value = title.value = slug.value = name.value = note.value = url.value = "";
+          created?.(out.set_id);
+          this.host.changed();
+        },
+        undefined,
+        frozen ?? root,
+      );
+    });
+    append(root, [
+      h("h3", null, "New secret in ", h("bdi", null, vt(org.title)), " › ", h("bdi", null, vt(service.title))),
+      h("p", { class: "hint muted" }, "A secret is a single value, such as one API key: a host runs a command with it in one environment variable (aqmas run), or asks for the value itself (aqmas get). Several related values belong in an env set."),
+      h("div", { class: "vault-selects" }, h("div", { class: "field" }, h("label", { for: "sec-title" }, "Name"), title), h("div", { class: "field" }, h("label", { for: "sec-slug" }, "Slug (in the path agents use)"), slug), h("div", { class: "field" }, h("label", { for: "sec-env" }, "Environment variable"), name)),
+      h("div", { class: "field" }, h("label", { for: "sec-value" }, "Value (write-only)"), value, h("p", { class: "hint muted" }, "Encrypted in this tab for the sealed store before it is sent.")),
+      h("div", { class: "vault-selects" }, h("div", { class: "field" }, h("label", { for: "sec-note" }, "Note (optional, not secret)"), note), h("div", { class: "field" }, h("label", { for: "sec-url" }, "Link (optional), e.g. where the key is managed"), url)),
+      error,
+      h("div", { class: "actions" }, go),
+      slot,
+    ]);
+    return root;
   }
 
   // ---- signer sets ----

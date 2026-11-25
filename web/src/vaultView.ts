@@ -247,12 +247,13 @@ export class VaultView {
     if (mk !== this.keys.main) {
       this.keys.main = mk;
       this.forms.clearSecrets();
-      replace(this.main, it.set ? (it.set.kind === "signer" ? this.forms.signerView(it.set) : this.forms.editor(it.set)) : this.infoCard(it));
+      replace(this.main, it.set ? (it.set.kind === "signer" ? this.forms.signerView(it.set) : it.set.kind === "secret" ? this.forms.secretView(it.set) : this.forms.editor(it.set)) : this.infoCard(it));
     }
     this.loadHistory(it);
     const mine = it.set ? this.state!.requests.filter((r) => r.set === it.id) : [];
     const who = requesters(it, this.catalogue);
-    const ek = JSON.stringify([it.id, who, mine, this.history?.id === it.id ? this.history.data : null, org, it.type, this.seal!.epoch, !!this.catalogue]);
+    // The set itself is part of the key: "More" holds forms built from its revision and limit.
+    const ek = JSON.stringify([it.id, it.set, who, mine, this.history?.id === it.id ? this.history.data : null, org, it.type, this.seal!.epoch, !!this.catalogue]);
     // A signing card waiting for its tap stays as it is.
     // (the selection has not changed here: a new selection emptied the pane above). A CLI
     // ticket on show stays too, and "More" stays open across a redraw.
@@ -291,6 +292,7 @@ export class VaultView {
       cloudflare: b ? "The parent Cloudflare credential the broker proxies with and mints child tokens from. It is never delivered to a host; a Cloudflare approval opens its bucket." : "What admitted hosts may ask of Cloudflare through this broker. The scopes and their limits come from the bastion's configuration.",
       access: "An access rule: something admitted hosts may ask for (for example an SSH certificate for one target). Nothing secret is stored under it.",
       "env-set": "An env set this page cannot edit (this server does not list its keys).",
+      secret: "A secret this page cannot edit (this server does not list it).",
       signer: "A signing key this page cannot describe (this server does not list it).",
     };
     const link = (text: string, href: string) => {
@@ -321,15 +323,18 @@ export class VaultView {
     const hosts = h("a", null, "Hosts");
     hosts.href = "#/hosts";
     if (mine.length) out.push(h("div", { class: "vault-requests" }, h("h4", null, "Signing requests and grants for this key"), signCards(this.host, this.seal!, { ...this.state!, requests: mine })));
-    if (it.set?.kind === "env-set") {
+    if (it.set?.kind === "env-set" || it.set?.kind === "secret") {
       const cmd = `aqmas run ${it.path} --why "…" -- COMMAND`;
+      const get = `aqmas get ${it.path} --why "…"`;
+      const secret = it.set.kind === "secret";
       out.push(
         h(
           "article",
           { class: "card vault-use" },
           h("h4", null, "Use it on a host"),
-          h("p", { class: "hint muted" }, "An admitted host asks; you approve on the Approvals tab; the command gets the values as environment variables."),
+          h("p", { class: "hint muted" }, secret ? ["An admitted host asks; you approve on the Approvals tab; the command gets the value as ", h("span", { class: "mono" }, vt(it.names[0] ?? "")), "."] : "An admitted host asks; you approve on the Approvals tab; the command gets the values as environment variables."),
           h("div", { class: "command" }, h("pre", null, h("code", null, cmd)), copyButton(() => cmd)),
+          secret ? [h("p", { class: "hint muted" }, "Or the value itself on stdout, for a tool that cannot read its environment. The approval card says that the value leaves aqmas; you can turn this off per organisation in Settings."), h("div", { class: "command" }, h("pre", null, h("code", null, get)), copyButton(() => get))] : null,
         ),
       );
     }
@@ -376,13 +381,14 @@ export class VaultView {
     const org = this.state!.organisations.find((o) => o.id === it.orgId);
     if (it.set && org) {
       const more: Child[] = [this.forms.policyLine(org)];
+      if (it.set.kind !== "signer") more.push(this.forms.standingLine(it.set), this.forms.convertLine(it.set));
       // One-use tickets for `aqmas set import|put|unset` from an owner device (docs/API.md).
       const o = this.catalogue?.organisations.find((x) => x.id === it.orgId);
       const svc = o?.services.find((v) => v.id === it.serviceId);
       const set = svc?.sets.find((s) => s.id === it.id);
       if (it.set.kind === "env-set" && o && svc && set && o.hosts.some((x) => x.active && x.class === "owner-device"))
         more.push(h("h4", null, "Edit from your own machine instead"), h("p", { class: "hint muted" }, "A one-use ticket lets ", h("span", { class: "mono" }, "aqmas set import|put|unset"), " on an owner device stage the change; you then approve it on the Approvals tab."), envPanel(this.host.api, this.host.auth, this.seal!, { drafts: [], releases: [] }, { owner_id: this.catalogue!.owner_id, organisations: [{ ...o, services: [{ ...svc, sets: [set] }] }] }, () => this.host.changed()));
-      out.push(h("details", { class: "card vault-more" }, h("summary", null, "More: reveal policy", more.length > 1 ? ", CLI tickets" : ""), more));
+      out.push(h("details", { class: "card vault-more" }, h("summary", null, "More: reveal policy", it.set.kind !== "signer" ? ", don't ask again" : "", it.set.kind === "env-set" ? ", CLI tickets" : ""), more));
     }
     return out;
   }
@@ -411,7 +417,7 @@ export class VaultView {
  * when the broker reports the new row. */
 class AddForm {
   readonly el = h("article", { class: "card vault-add-form" });
-  private type: "env-set" | "signer" = "env-set";
+  private type: "env-set" | "secret" | "signer" = "env-set";
   private org = h("select", { class: "text", id: "add-org" });
   private service = h("select", { class: "text", id: "add-service" });
   private newOrg = this.node("add-org-new", "Client A");
@@ -427,7 +433,7 @@ class AddForm {
 
   constructor(private view: VaultView) {
     const { catalogue, filter } = view.ctx();
-    const radio = (value: "env-set" | "signer", title: string, text: string) => {
+    const radio = (value: "env-set" | "secret" | "signer", title: string, text: string) => {
       const el = h("input", { type: "radio", name: "add-type", id: "add-type-" + value });
       el.checked = this.type === value;
       el.addEventListener("change", () => {
@@ -452,7 +458,8 @@ class AddForm {
       h(
         "div",
         { class: "type-cards", role: "radiogroup", "aria-label": "Type" },
-        radio("env-set", "Env set", "API keys, tokens and other values a command gets as environment variables. Type them or import a .env file."),
+        radio("secret", "Secret (single value)", "One API key, token or password, delivered to a command as one environment variable."),
+        radio("env-set", "Env set", "Several values a command gets as environment variables. Type them or import a .env file."),
         radio("signer", "Signing key", "A private key that never leaves the broker: hosts send digests and get signatures back."),
       ),
       h("p", { class: "hint muted" }, "SSH access and Cloudflare scopes are not added here: they come from the bastion's configuration (Settings → Setup)."),
@@ -528,7 +535,8 @@ class AddForm {
     const service = org?.services.find((v) => v.id === this.service.value);
     this.orgNew.hidden = this.org.value !== NEW;
     this.serviceNew.hidden = this.service.value !== NEW;
-    const signer = this.type === "signer";
+    // A signing key and a secret bring their own form (name, slug and what is specific to them).
+    const signer = this.type !== "env-set";
     this.setBox.hidden = signer;
     this.el.querySelector<HTMLElement>(".add-name-h")!.hidden = signer;
     const scope = org ? seal.scopes?.find((s) => s.scope === org.id) : undefined;
@@ -544,7 +552,7 @@ class AddForm {
     if (!org) stages.push({ id: "org", label: ["Create the organisation ", h("bdi", null, vt(orgTitle || "…"))], done: false });
     if (needKey) stages.push({ id: "key", label: ["Create its encryption key (three taps: create, enrol this passkey, test)"], done: false });
     if (!service) stages.push({ id: "service", label: ["Create the service ", h("bdi", null, vt(serviceTitle || "…"))], done: false });
-    stages.push({ id: "set", label: signer ? "Create the signing key" : ["Create the empty env set ", h("bdi", null, vt(this.set.title.value || "…")), ", then add its values"], done: false });
+    stages.push({ id: "set", label: this.type === "signer" ? "Create the signing key" : this.type === "secret" ? "Create the secret with its value" : ["Create the empty env set ", h("bdi", null, vt(this.set.title.value || "…")), ", then add its values"], done: false });
     const stage = stages[0]!.id;
     const key = JSON.stringify([stage, this.type, org?.id, service?.id, stages.length, seal.epoch]);
     replace(this.steps, stages.length > 1 ? stages.map((s, i) => h("li", { class: i === 0 ? "now" : "" }, s.label)) : null);
@@ -606,7 +614,8 @@ class AddForm {
       case "service":
         return replace(this.action, h("div", { class: "actions start" }, btn("Create service…", "approve", () => propose("service", this.newService, "Service"))));
       case "set":
-        if (signer) return replace(this.action, forms.newSigner({ org: org!, service: service! }, (id) => (location.hash = vaultHash(id)), this.el));
+        if (this.type === "signer") return replace(this.action, forms.newSigner({ org: org!, service: service! }, (id) => (location.hash = vaultHash(id)), this.el));
+        if (this.type === "secret") return replace(this.action, forms.newSecret({ org: org!, service: service! }, (id) => (location.hash = vaultHash(id)), this.el));
         return replace(this.action, h("div", { class: "actions start" }, btn("Create env set…", "approve", () => propose("credential_set", this.set, "Item"))));
     }
   }

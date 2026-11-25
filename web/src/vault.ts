@@ -37,10 +37,16 @@ export interface VaultSet {
   set_id: string;
   set_slug: string;
   set_title: string;
-  kind: "env-set" | "signer";
+  /** A secret is one value: `names` holds its one environment variable name. */
+  kind: "env-set" | "signer" | "secret";
   revision: number;
   names: string[];
   allow_reveal: boolean;
+  /** A secret's optional public note and link. */
+  note?: string;
+  url?: string;
+  /** The set's "longest don't-ask-again" in seconds (0: off; absent on an older broker). */
+  standing_cap_seconds?: number;
   scheme?: string;
   origin?: string;
   created_at?: number;
@@ -406,7 +412,7 @@ async function upload(api: Api, v: SealView, purpose: "edit" | "signer-import", 
 
 /** The write-only form: seal the edit, then one tap over its commitment and key changes. */
 export async function vaultCommit(api: Api, v: SealView, set: VaultSet, edit: Edit, rp: string) {
-  if (set.kind !== "env-set") throw Error("Not an env set");
+  if (set.kind !== "env-set" && set.kind !== "secret") throw Error("Not an env set");
   const salt = crypto.getRandomValues(new Uint8Array(32));
   const changes = editChanges(edit, set.names);
   const commitment = await editCommitment({ ...edit, salt }, { org: set.org_id, service: set.service_id, set: set.set_id, revision: set.revision });
@@ -426,7 +432,7 @@ export async function vaultCommit(api: Api, v: SealView, set: VaultSet, edit: Ed
 /** Reveal: a key pair made here for this one reveal; the broker re-encrypts to it after a
  * fresh tap; only this page can open the answer. */
 export async function vaultReveal(api: Api, v: SealView, set: VaultSet, names: string[], rp: string) {
-  if (set.kind !== "env-set") throw Error("A signer key is never revealed");
+  if (set.kind !== "env-set" && set.kind !== "secret") throw Error("A signer key is never revealed");
   const sorted = [...new Set(names)].sort();
   if (!sorted.length || sorted.length !== names.length || sorted.some((n) => !set.names.includes(n))) throw Error("Choose keys of this set, each once");
   const { install, epoch } = sealBinding(v);
@@ -462,6 +468,80 @@ export async function vaultPolicy(api: Api, v: SealView, org: VaultOrg, allowRev
   if (org.allow_reveal === allowReveal) throw Error("The policy already has that value");
   const r = await review(api, v, "policy", org.id, { allow_reveal: allowReveal }, () => ({ org_id: org.id, org_slug: org.slug, org_title: org.title, old_allow_reveal: org.allow_reveal, allow_reveal: allowReveal }), rp);
   return { detail: `${allowReveal ? "Allow" : "Stop allowing"} value reveal for ${org.slug}`, tap: (auth: Authenticator) => r.finish<unknown>(auth) };
+}
+
+/** The steps of "don't ask again" the pages offer, in seconds. */
+export const STANDING_STEPS = [3600, 21600, 86400] as const;
+export const STANDING_CAP_DEFAULT = 3600;
+export const standingCap = (s: { standing_cap_seconds?: number }) => s.standing_cap_seconds ?? STANDING_CAP_DEFAULT;
+
+/** The set's "longest don't-ask-again": how long one approval may cover later requests. */
+export async function vaultStandingCap(api: Api, v: SealView, set: VaultSet, seconds: number, rp: string) {
+  if (set.kind === "signer") throw Error("A signing key has signing grants instead");
+  if (!Number.isSafeInteger(seconds) || seconds < 0 || seconds > 86400 || seconds % 60 !== 0) throw Error("Choose off, or up to 24 hours");
+  if (seconds === standingCap(set)) throw Error("The limit already has that value");
+  const r = await review(api, v, "standing-cap", set.set_id, { standing_cap_seconds: seconds }, () => ({ ...targetFields(set), old_standing_cap_seconds: standingCap(set), standing_cap_seconds: seconds }), rp);
+  return { detail: `Longest "don't ask again" for ${pathOf(set)}: ${seconds === 0 ? "off" : seconds + " seconds"}`, tap: (auth: Authenticator) => r.finish<unknown>(auth) };
+}
+
+export interface SecretResult {
+  set_id: string;
+  path: string;
+  env_name: string;
+}
+export const NOTE_MAX = 200;
+/** A secret's optional note and link, as the broker bounds them (null = fine). */
+export function secretMetaProblem(note: string, url: string): string | null {
+  if (note.length > NOTE_MAX || note.trim() !== note || /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/.test(note)) return "Note: one line of plain text, at most 200 characters.";
+  if (url === "") return null;
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return "Link: a full https:// address.";
+  }
+  if (url.length > 300 || /[\s\\"<>`\u0000-\u001f\u007f-\u009f]/.test(url) || (u.protocol !== "https:" && u.protocol !== "http:") || !u.host || u.username || u.password) return "Link: a plain https:// address without spaces or a password.";
+  return null;
+}
+
+/** A secret: one value under one environment variable name, created with its value in one
+ * tap. It is stored like a one-key env set (its own bucket, sealed in this tab first). */
+export async function vaultSecretCreate(api: Api, v: SealView, parent: SignerParent, set: { id: string; slug: string; title: string }, name: string, value: string, note: string, url: string, rp: string) {
+  if (!/^[0-9a-f]{32}$/.test(set.id)) throw Error("Invalid set ID");
+  const p = nameProblem(name) ?? secretMetaProblem(note, url);
+  if (p) throw Error(p);
+  if (value === "") throw Error("Type or paste the value");
+  const edit: Edit = { operation: "import", entries: [{ name, value }], remove: [] };
+  validateEntries(edit.entries);
+  const salt = crypto.getRandomValues(new Uint8Array(32));
+  const commitment = await editCommitment({ ...edit, salt }, { org: parent.org_id, service: parent.service_id, set: set.id, revision: 0 });
+  const { sent, recipient } = await upload(api, v, "edit", set.id, utf8.encode(JSON.stringify({ operation: "import", salt: stdB64(salt), entries: [{ name, value }] })));
+  const r = await review(
+    api,
+    v,
+    "secret-create",
+    set.id,
+    { service_id: parent.service_id, set_slug: set.slug, set_title: set.title, note, url, ...sent, commitment },
+    () => ({ org_id: parent.org_id, org_slug: parent.org_slug, org_title: parent.org_title, service_id: parent.service_id, service_slug: parent.service_slug, service_title: parent.service_title, set_id: set.id, set_slug: set.slug, set_title: set.title, kind: "secret", revision: 0, attempt_id: sent.attempt_id, env_name: name, note, url, commitment, result_revision: 1, recipient }),
+    rp,
+  );
+  return {
+    detail: `Create secret ${parent.org_slug}/${parent.service_slug}/${set.slug}, delivered as ${name}`,
+    async tap(auth: Authenticator): Promise<SecretResult> {
+      const out = await r.finish<SecretResult>(auth);
+      if (out.set_id !== set.id || out.env_name !== name) throw Error("The created secret differs from the one you approved");
+      return out;
+    },
+  };
+}
+
+/** An env set with exactly one key becomes a secret (same stored value, same revision). */
+export async function vaultSecretConvert(api: Api, v: SealView, set: VaultSet, note: string, url: string, rp: string) {
+  if (set.kind !== "env-set" || set.names.length !== 1) throw Error("Only an env set with exactly one key becomes a secret");
+  const p = secretMetaProblem(note, url);
+  if (p) throw Error(p);
+  const r = await review(api, v, "secret-convert", set.set_id, { note, url }, () => ({ ...targetFields(set), env_name: set.names[0]!, note, url }), rp);
+  return { detail: `${pathOf(set)} becomes a secret delivered as ${set.names[0]}`, tap: (auth: Authenticator) => r.finish<unknown>(auth) };
 }
 
 export interface SignerParent {

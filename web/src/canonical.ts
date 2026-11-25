@@ -569,9 +569,20 @@ function who(c: Canonical): Part[] {
   return [{ value: c.login_user ?? "?" }, "@", { value: c.target ?? "?" }];
 }
 
+/** What a policy replacement changes about listing and `aqmas get`, from the signed plan. */
+function policySwitchNotes(p: { old_policy?: Record<string, unknown>; new_policy?: Record<string, unknown> }): string[] {
+  const was = p.old_policy ?? {}, now = p.new_policy ?? {};
+  const out: string[] = [];
+  if (!!was["discovery"] !== !!now["discovery"])
+    out.push(now["discovery"] ? "Listing ON: every host admitted to this organisation can list the names of its items, their key names and its SSH targets. Values are never listed." : "Listing OFF: admitted hosts can no longer list what this organisation holds.");
+  if (!!was["deny_get"] !== !!now["deny_get"])
+    out.push(now["deny_get"] ? "aqmas get OFF: this organisation's secrets are only delivered into a command's environment (aqmas run)." : "aqmas get ON: a host may ask for a secret's value itself; each request still needs your approval.");
+  return out;
+}
+
 /** Describe the canonical action in plain words. Built only from canonical's own fields. */
 export function describe(c: Canonical): Description {
-  if(Object.hasOwn(catalogueVerbs,c.object)){const p=JSON.parse(String(c.plan));const headline=`${p.organisation.title}: ${c.action} ${c.object.replace('_',' ')}.`;return {headline,headlineParts:[{value:p.organisation.title},`: ${c.action} ${c.object.replace('_',' ')}.`],warnings:c.object==='org_policy'||c.action==='remove'?['Affected pending work expires; broker grants and standing approvals end. Issued SSH certificates can still work until expiry, and sessions can continue.']:[],fields:catalogueRows(String(c.plan),c.object)};}
+  if(Object.hasOwn(catalogueVerbs,c.object)){const p=JSON.parse(String(c.plan));const headline=`${p.organisation.title}: ${c.action} ${c.object.replace('_',' ')}.`;return {headline,headlineParts:[{value:p.organisation.title},`: ${c.action} ${c.object.replace('_',' ')}.`],warnings:[...(c.object==='org_policy'||c.action==='remove'?['Affected pending work expires; broker grants and standing approvals end. Issued SSH certificates can still work until expiry, and sessions can continue.']:[]),...(c.object==='org_policy'?policySwitchNotes(p):[])],fields:catalogueRows(String(c.plan),c.object)};}
   if(c.object==='migration'){const headline='personal: activate organisation admissions and retire previous authority.';return {headline,headlineParts:[headline],warnings:['Pending requests expire; standing approvals and broker grants end. Issued SSH certificates and unverified children can still work until their original expiry.'],fields:[['Recovery SHA-256',String(c.recovery_sha256)],...planRows(String(c.plan),c.id)]};}
   if(c.v===2){const d=describe({...c,v:1});const path=[c.org_title,c.service_title,c.set_title].map(String).join(' › ');d.headline=`${path}: ${d.headline}`;d.headlineParts=[{value:path},': ',...d.headlineParts];if(c.indefinite||c.standing_indefinite)d.warnings.push(`INDEFINITE ${c.indefinite?'grant':'standing approval'} — active until revoked.`);if(Number(c.standing_seconds)>0)d.warnings.push(`Also auto-approve matching requests for ${duration(Number(c.standing_seconds))}.`);if(c.beyond_soft_cap||c.standing_beyond_soft_cap)d.warnings.push('Beyond soft cap: check the duration before approving.');d.fields=fieldList(c);return d;}
   if (c.kind === "cloudflare" && CF_KEYS[c.object]) return describeCloudflare(c);

@@ -9,7 +9,26 @@ export type Policy = {
   standing_default_seconds: number;
   standing_soft_cap_seconds: number;
   standing_indefinite: boolean;
+  /** "Hosts may list what they can ask for" (absent = off). */
+  discovery?: boolean;
+  /** `aqmas get` turned off for the organisation's secrets (absent = allowed). */
+  deny_get?: boolean;
 };
+/** The policy as the broker serialises it: the six fields in order, then each switch only
+ * while it is on. A policy that uses neither switch has the wire shape it always had. */
+export function policyWire(p: Policy): Policy {
+  const out: Policy = {
+    default_seconds: p.default_seconds,
+    soft_cap_seconds: p.soft_cap_seconds,
+    indefinite: p.indefinite,
+    standing_default_seconds: p.standing_default_seconds,
+    standing_soft_cap_seconds: p.standing_soft_cap_seconds,
+    standing_indefinite: p.standing_indefinite,
+  };
+  if (p.discovery) out.discovery = true;
+  if (p.deny_get) out.deny_get = true;
+  return out;
+}
 type Rule = { set_id: string; scope: string; auto: boolean; standing: boolean; relax_proxy_duration: boolean };
 export type CatHost = {
   row_id: number;
@@ -62,7 +81,8 @@ export function proposeCreate(cat: Catalogue, sign: Sign, kind: "organisation" |
   );
 }
 
-const POLICY_WORDS: Record<keyof Policy, string> = {
+type Duration = Exclude<keyof Policy, "discovery" | "deny_get">;
+const POLICY_WORDS: Record<Duration, string> = {
   default_seconds: "Grant: default duration (seconds)",
   soft_cap_seconds: "Grant: longest duration (seconds)",
   indefinite: "Grant: offer “until revoked”",
@@ -88,7 +108,7 @@ export function policyForm(cat: Catalogue, o: Org, sign: Sign): HTMLElement {
     h(
       "div",
       { class: "policy-fields" },
-      (Object.keys(POLICY_WORDS) as (keyof Policy)[]).map((key) => {
+      (Object.keys(POLICY_WORDS) as Duration[]).map((key) => {
         const v = next[key];
         const field = h("input", { type: typeof v === "boolean" ? "checkbox" : "number", class: typeof v === "boolean" ? undefined : "text num" });
         if (typeof v === "boolean") {
@@ -101,6 +121,28 @@ export function policyForm(cat: Catalogue, o: Org, sign: Sign): HTMLElement {
         return h("label", { class: "policy-num" }, POLICY_WORDS[key], " ", field);
       }),
     ),
+    (() => {
+      // What admitted hosts may learn and do by themselves. Both are part of the same signed
+      // policy replacement as the durations above.
+      const list = h("input", { type: "checkbox", id: `pol-discovery-${o.id}` });
+      list.checked = !!next.discovery;
+      list.onchange = () => (next.discovery = list.checked);
+      const get = h("input", { type: "checkbox", id: `pol-get-${o.id}` });
+      get.checked = !next.deny_get;
+      get.onchange = () => (next.deny_get = !get.checked);
+      return h(
+        "div",
+        { class: "policy-switches" },
+        h("label", { class: "check", for: list.id }, list, " Hosts may list what they can ask for"),
+        h(
+          "p",
+          { class: "hint muted" },
+          "On: every host admitted to this organisation can list the names of its items, the key names of env sets, the variable names of secrets and its SSH targets (aqmas ls, aqmas targets, the MCP tools). Values are never listed. Off (the default): a host has to be told each path; it cannot tell an item it was not told about from one that does not exist.",
+        ),
+        h("label", { class: "check", for: get.id }, get, " Hosts may ask for a secret's value itself (aqmas get)"),
+        h("p", { class: "hint muted" }, "Off: secrets of this organisation are only delivered into a command's environment (aqmas run). Each request still needs your approval either way."),
+      );
+    })(),
     rules.length ? h("p", { class: "muted" }, "Relaxing applies only to the selected proxy scope. cf.admin: at most 1 h; cf.read.private: at most 2 h. Configured scope ceilings still apply.") : null,
     ...rules.map((r) =>
       h(
@@ -122,7 +164,7 @@ export function policyForm(cat: Catalogue, o: Org, sign: Sign): HTMLElement {
       "div",
       { class: "actions start" },
       btn("Review policy replacement…", () =>
-        propose(cat, sign, "org_policy", "replace", o.id, { organisation: node(o), old_policy: o.policy, new_policy: next, old_rules: o.rules, new_rules: rules, result_revision: o.revision + 1 }),
+        propose(cat, sign, "org_policy", "replace", o.id, { organisation: node(o), old_policy: policyWire(o.policy), new_policy: policyWire(next), old_rules: o.rules, new_rules: rules, result_revision: o.revision + 1 }),
       ),
     ),
   );

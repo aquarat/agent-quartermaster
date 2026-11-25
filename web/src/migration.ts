@@ -18,7 +18,7 @@ export function planRows(text:string,id:string):Array<[string,string]>{
  return typedRows(text,plan);
 }
 const node={id:'s',slug:'s',title:'s',revision:'n'};
-const pol={default_seconds:'n',soft_cap_seconds:'n',indefinite:'b',standing_default_seconds:'n',standing_soft_cap_seconds:'n',standing_indefinite:'b'};
+const pol={default_seconds:'n',soft_cap_seconds:'n',indefinite:'b',standing_default_seconds:'n',standing_soft_cap_seconds:'n',standing_indefinite:'b','discovery?':'b','deny_get?':'b'};
 defs.adminService={...node,provider:'s',sets:'[adminSet]'};defs.adminSet={...node,kind:'s',archived:'b'};
 defs.rule={set_id:'s',scope:'s',auto:'b',standing:'b',relax_proxy_duration:'b'};
 defs.auto={set_id:'s',scope:'s',mode:'s',restrictions:'s',max_seconds:'n'};

@@ -96,6 +96,78 @@ export class MockVault {
   private history = new Map<string, { at: string; actor: string; action: string; object: string; detail: string }[]>();
   private values = new Map<string, Map<string, string>>();
   private attempts = new Map<string, Attempt>();
+  /** Per organisation: the policy and its revision, once a replacement was applied. */
+  private policies = new Map<string, { policy: Record<string, unknown>; revision: number }>();
+  /** Per set: an explicit "longest don't-ask-again" (the default is one hour). */
+  private caps = new Map<string, number>();
+  /** Env and secret releases hosts asked for, and the "don't ask again" rules. */
+  releases: Record<string, unknown>[] = [];
+  standing: Record<string, unknown>[] = [];
+
+  /** A host asks for a set (as `aqmas run` or `aqmas get` would): a pending release. */
+  addRelease(path: string, mode: string, host = "build-1", reason = "list devices for the inventory report"): string {
+    const s = this.sets.find((x) => `${x.org_slug}/${x.service_slug}/${x.set_slug}` === path);
+    if (!s) throw new Error("no set " + path);
+    const hst = this.hosts.find((x) => x.name === host)!;
+    const id = "01MOCKENVREQ" + String(this.releases.length + 2).padStart(4, "0") + b64url(randomBytes(6)).replace(/[^A-Za-z0-9]/g, "X").toUpperCase();
+    // Key order is the broker's (envset.Release): it is what the page signs over.
+    this.releases.push({
+      path, title: `${s.org_title} / ${s.service_title} / ${s.set_title}`, org: s.org_id, service: s.service_id, set: s.set_id, revision: s.revision, service_revision: 1, policy_revision: this.policies.get(s.org_id)?.revision ?? 1, admission_generation: 1,
+      enrollment: hst.enrollment, host, class: hst.class, names: [...s.names], default_seconds: 3600, soft_cap_seconds: 86400, offers_indefinite: true,
+      id, grant_id: "", mode, address: hst.address, reason, ttl_seconds: 600, deadline: Date.now() + 540_000, not_after: 0, status: "pending", consumed: false,
+    });
+    return id;
+  }
+  private cap(set: string): number {
+    return this.caps.get(set) ?? 3600;
+  }
+  private envMeta(c: Record<string, unknown>): string {
+    const fail = this.deps.fail;
+    const ttl = Number(c.ttl_seconds ?? 0), standing = Number(c.standing_seconds ?? 0);
+    if (c.action === "standing-revoke") {
+      const st = this.standing.find((x) => x.id === c.id) ?? fail(409, "conflict", "that rule has ended; reload");
+      return JSON.stringify({ ...st, uses: 0 });
+    }
+    const r = this.releases.find((x) => x.id === c.id) ?? fail(404, "not_found", "not found");
+    if (standing !== 0 && c.action !== "approve") fail(400, "bad_request", "unexpected standing duration");
+    if ((c.action === "revoke") !== (r.status === "approved") || (c.action !== "revoke" && r.status !== "pending")) fail(409, "conflict", "decision no longer available");
+    if (c.action === "approve") {
+      if (ttl <= 0 || ttl > (r.ttl_seconds as number)) fail(400, "bad_request", "duration exceeds request");
+      if (standing !== 0 && (standing < 60 || standing > this.cap(r.set as string))) fail(400, "bad_request", "don't-ask-again is off for this set, or longer than its limit");
+    } else if (ttl !== 0) fail(400, "bad_request", "unexpected duration");
+    return JSON.stringify({ ...r, reason: "" });
+  }
+  private async env(req: Request, verb: string, body: Record<string, unknown>, session: string | undefined): Promise<unknown> {
+    const fail = this.deps.fail;
+    if (verb === "challenge") {
+      const standing = Number(body.standing_seconds ?? 0);
+      const canonical: Record<string, unknown> = { v: 3, object: "env", action: body.action, id: body.id, installation: this.installation, epoch: this.epoch, issued_at: nowISO(), nonce: b64url(randomBytes(32)), metadata: this.envMeta(body), ttl_seconds: Number(body.ttl_seconds ?? 0) };
+      if (standing > 0) canonical.standing_seconds = standing;
+      const text = canonicalJSON(canonical);
+      const ch = this.deps.issue(text, { ...canonical, text }, session);
+      return { canonical: text, challenge_id: ch.id, public_key: this.deps.requestOptions(req, ch.challenge) };
+    }
+    if (verb !== "finish") return fail(404, "not_found", "not found");
+    const c = this.buckets?.enabled ? (await this.buckets.finish(body, session)).canonical : this.deps.redeem(body.challenge_id, body.assertion, session);
+    if (c.object !== "env") fail(409, "conflict", "wrong ceremony");
+    if (this.envMeta(c) !== c.metadata) fail(409, "conflict", "env proposal changed; review again");
+    if (c.action === "standing-revoke") this.standing = this.standing.filter((x) => x.id !== c.id);
+    else {
+      const r = this.releases.find((x) => x.id === c.id)!;
+      if (c.action === "approve") {
+        Object.assign(r, { status: "approved", grant_id: "01MOCKGRANT" + String(r.id).slice(-6), ttl_seconds: c.ttl_seconds, not_after: Date.now() + Number(c.ttl_seconds) * 1000 });
+        if (Number(c.standing_seconds ?? 0) > 0) {
+          const { grant_id: _g, reason: _r, ttl_seconds: _t, deadline: _d, not_after: _n, status: _s, consumed: _c, id, mode, address, ...binding } = r;
+          this.standing.push({ ...binding, id, mode, address, max_ttl_seconds: c.ttl_seconds, created_at: Date.now(), expires_at: Date.now() + Number(c.standing_seconds) * 1000, uses: 0 });
+        }
+      } else {
+        r.status = c.action === "deny" ? "denied" : "revoked";
+        this.standing = this.standing.filter((x) => x.id !== c.id);
+      }
+    }
+    this.deps.audit("env_" + String(c.action).replace("-", "_"), "env:" + c.id, c.standing_seconds ? `standing=${c.standing_seconds}` : "");
+    return { ok: true };
+  }
 
   constructor(private deps: VaultDeps) {
     this.seed();
@@ -166,8 +238,8 @@ export class MockVault {
     return {
       owner_id: id32("owner"),
       organisations: this.orgs.map((o) => ({
-        id: o.id, slug: o.slug, title: o.title, revision: 1,
-        policy: { default_seconds: 3600, soft_cap_seconds: 86400, indefinite: true, standing_default_seconds: 3600, standing_soft_cap_seconds: 86400, standing_indefinite: true },
+        id: o.id, slug: o.slug, title: o.title, revision: this.policies.get(o.id)?.revision ?? 1,
+        policy: this.policies.get(o.id)?.policy ?? { default_seconds: 3600, soft_cap_seconds: 86400, indefinite: true, standing_default_seconds: 3600, standing_soft_cap_seconds: 86400, standing_indefinite: true },
         rules: [],
         services: this.services.filter((v) => v.org_id === o.id).map((v) => ({
           id: v.id, slug: v.slug, title: v.title, revision: 1, provider: "application",
@@ -198,7 +270,7 @@ export class MockVault {
   private change(object: string, action: string, id: string, planText: unknown, apply: boolean): void {
     const fail = this.deps.fail, bad = () => fail(409, "conflict", "catalogue or admission changed; reload and review again");
     if (typeof planText !== "string") return fail(400, "bad_request", "invalid catalogue proposal");
-    const c = JSON.parse(planText) as { organisation: { id: string; slug: string; title: string; revision: number }; service?: { id: string; slug: string; title: string; revision: number }; set?: { id: string; slug: string; title: string; revision: number }; host?: { enrollment: string } };
+    const c = JSON.parse(planText) as { old_policy?: Record<string, unknown>; new_policy?: Record<string, unknown>; result_revision?: number; organisation: { id: string; slug: string; title: string; revision: number }; service?: { id: string; slug: string; title: string; revision: number }; set?: { id: string; slug: string; title: string; revision: number }; host?: { enrollment: string } };
     const fresh = (n: { id: string; slug: string; title: string; revision: number } | undefined, taken: { id: string; slug: string }[]) => !!n && n.id === id && /^[0-9a-f]{32}$/.test(n.id) && /^[a-z0-9][a-z0-9-]{0,62}$/.test(n.slug) && /^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,63}$/.test(n.title) && !taken.some((t) => t.id === n.id || t.slug === n.slug);
     const cat = this.catalogue();
     const org = cat.organisations.find((o) => o.id === c.organisation?.id);
@@ -226,12 +298,22 @@ export class MockVault {
       const cur = hst?.orgs.get(org.id) ?? { active: false, generation: 0 };
       if (!hst || cur.active !== (action === "remove")) return bad();
       if (apply) hst.orgs.set(org.id, { active: action === "admit", generation: cur.generation + 1 });
+    } else if (object === "org_policy" && action === "replace") {
+      // The whole policy is replaced; the plan names the old one exactly.
+      if (id !== org.id || !c.new_policy || JSON.stringify(c.old_policy) !== JSON.stringify(org.policy) || c.organisation.revision !== org.revision || c.result_revision !== org.revision + 1) return bad();
+      for (const k of ["discovery", "deny_get"]) if (Object.hasOwn(c.new_policy, k) && c.new_policy[k] !== true) return bad(); // omitted while off
+      if (apply) {
+        this.policies.set(org.id, { policy: c.new_policy, revision: org.revision + 1 });
+        // As on the broker: a policy replacement ends the organisation's pending work and rules.
+        this.standing = this.standing.filter((x) => x.org !== org.id);
+        for (const r of this.releases) if (r.org === org.id && (r.status === "pending" || r.status === "approved")) r.status = r.status === "pending" ? "expired" : "revoked";
+      }
     } else return fail(400, "bad_request", "unsupported catalogue change in the mock");
     if (apply) this.deps.audit(`${object}_${action}`, `${object}:${id}`, "change=" + planText);
   }
 
   private state() {
-    return { schemes: SCHEMES, organisations: this.orgs, sets: this.sets.map((s) => ({ ...s, allow_reveal: this.orgs.find((o) => o.id === s.org_id)!.allow_reveal })), requests: this.requests.filter((r) => r.status === "pending" || r.status === "approved") };
+    return { schemes: SCHEMES, organisations: this.orgs, sets: this.sets.map((s) => ({ ...s, allow_reveal: this.orgs.find((o) => o.id === s.org_id)!.allow_reveal, standing_cap_seconds: s.kind === "signer" ? 0 : this.cap(s.set_id) })), requests: this.requests.filter((r) => r.status === "pending" || r.status === "approved") };
   }
   private target(s: VaultSet) {
     return { org_id: s.org_id, org_slug: s.org_slug, org_title: s.org_title, service_id: s.service_id, service_slug: s.service_slug, service_title: s.service_title, set_id: s.set_id, set_slug: s.set_slug, set_title: s.set_title, kind: s.kind, revision: s.revision };
@@ -271,7 +353,7 @@ export class MockVault {
       }
       case "commit": {
         const s = setOf(c.id);
-        if (s.kind !== "env-set") fail(400, "bad_request", "not an env set");
+        if (s.kind !== "env-set" && s.kind !== "secret") fail(400, "bad_request", "not an env set");
         const a = begin ? this.submit(session, c, "edit", s.set_id) : this.live(session, c.attempt_id);
         if (a.purpose !== "edit" || a.target !== s.set_id) fail(409, "conflict", "upload attempt expired; start again");
         const edit = JSON.parse((await this.open(a, "edit", c.attempt_id as string, s.set_id)).toString("utf8")) as Edit & { salt: string };
@@ -285,6 +367,12 @@ export class MockVault {
           fail(400, "bad_request", (err as Error).message);
         }
         if (commitment !== a.commitment) fail(400, "bad_request", "invalid edit commitment");
+        if (s.kind === "secret") {
+          const after = new Set(e.operation === "import" ? [] : s.names);
+          for (const x of e.entries) after.add(x.name);
+          for (const n of e.remove) after.delete(n);
+          if (after.size !== 1) fail(400, "bad_request", "a secret holds exactly one value: replace it, or keep several values in an env set");
+        }
         facts.attempt_id = c.attempt_id;
         facts.edit = e; // mock-internal, removed before the response
         return { meta: { ...this.target(s), attempt_id: c.attempt_id, operation: e.operation, changes, commitment, result_revision: s.revision + 1, recipient: a.recipient ?? "" }, facts };
@@ -292,7 +380,7 @@ export class MockVault {
       case "reveal": {
         const s = setOf(c.id);
         const o = this.orgs.find((x) => x.id === s.org_id)!;
-        if (s.kind !== "env-set") fail(403, "forbidden", "a signer key is never revealed");
+        if (s.kind !== "env-set" && s.kind !== "secret") fail(403, "forbidden", "a signer key is never revealed");
         if (!o.allow_reveal) fail(403, "forbidden", "this organisation does not allow reveal");
         const names = c.names as string[];
         if (!Array.isArray(names) || !names.length || names.some((n, i) => !s.names.includes(n) || (i > 0 && names[i - 1]! >= n))) fail(400, "bad_request", "name the keys to reveal, sorted, each once");
@@ -335,6 +423,41 @@ export class MockVault {
           facts,
         };
       }
+      case "secret-create": {
+        const svc = this.services.find((v) => v.id === c.service_id) ?? fail(404, "not_found", "not found");
+        const po = this.orgs.find((o) => o.id === svc.org_id)!;
+        if (typeof c.id !== "string" || !/^[0-9a-f]{32}$/.test(c.id) || typeof c.set_slug !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(c.set_slug) || typeof c.set_title !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,63}$/.test(c.set_title) || typeof c.note !== "string" || typeof c.url !== "string" || (c.url !== "" && !/^https?:\/\/[^\s"<>`\\]+$/.test(c.url))) return fail(400, "bad_request", "invalid secret");
+        if (this.sets.some((s) => s.set_id === c.id || (s.service_id === svc.id && s.set_slug === c.set_slug))) fail(409, "conflict", "a set with that name or ID exists; reload");
+        const a = begin ? this.submit(session, c, "edit", c.id) : this.live(session, c.attempt_id);
+        if (a.purpose !== "edit" || a.target !== c.id) fail(409, "conflict", "upload attempt expired; start again");
+        const edit = JSON.parse((await this.open(a, "edit", c.attempt_id as string, c.id)).toString("utf8")) as Edit & { salt: string };
+        const e = { operation: edit.operation, entries: edit.entries ?? [], remove: edit.remove ?? [], salt: new Uint8Array(Buffer.from(edit.salt, "base64")) };
+        if (e.operation !== "import" || e.entries.length !== 1 || e.remove.length) fail(400, "bad_request", "a secret is one name and one value");
+        let commitment = "";
+        try {
+          commitment = await editCommitment(e, { org: po.id, service: svc.id, set: c.id, revision: 0 });
+        } catch (err) {
+          fail(400, "bad_request", (err as Error).message);
+        }
+        if (commitment !== a.commitment) fail(400, "bad_request", "invalid edit commitment");
+        facts.attempt_id = c.attempt_id;
+        facts.edit = e; // mock-internal, removed before the response
+        return { meta: { org_id: po.id, org_slug: po.slug, org_title: po.title, service_id: svc.id, service_slug: svc.slug, service_title: svc.title, set_id: c.id, set_slug: c.set_slug, set_title: c.set_title, kind: "secret", revision: 0, attempt_id: c.attempt_id, env_name: e.entries[0]!.name, note: c.note, url: c.url, commitment, result_revision: 1, recipient: a.recipient ?? "" }, facts };
+      }
+      case "secret-convert": {
+        const s = setOf(c.id);
+        if (s.kind !== "env-set" || s.names.length !== 1) fail(409, "conflict", "only an env set with exactly one key becomes a secret; reload");
+        if (typeof c.note !== "string" || typeof c.url !== "string") fail(400, "bad_request", "invalid secret");
+        return { meta: { ...this.target(s), env_name: s.names[0], note: c.note, url: c.url }, facts };
+      }
+      case "standing-cap": {
+        const s = setOf(c.id);
+        const n = c.standing_cap_seconds;
+        if (s.kind === "signer") fail(400, "bad_request", "only env sets and secrets have a don't-ask-again limit");
+        if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0 || n > 86400 || n % 60 !== 0) return fail(400, "bad_request", "the limit is between 0 (off) and 24 hours, in whole minutes");
+        if (n === this.cap(s.set_id)) fail(409, "conflict", "the limit already has that value; reload");
+        return { meta: { ...this.target(s), old_standing_cap_seconds: this.cap(s.set_id), standing_cap_seconds: n }, facts };
+      }
       case "sign-approve":
       case "sign-deny":
       case "sign-revoke": {
@@ -372,7 +495,12 @@ export class MockVault {
   async handle(req: Request, url: URL, body: Record<string, unknown>, session: string | undefined): Promise<unknown> {
     if (!this.enabled) return undefined;
     const p = url.pathname, post = req.method === "POST", fail = this.deps.fail;
-    if (p === "/api/ui/seal/env/state" && !post) return { drafts: [], releases: [] };
+    if (p === "/api/ui/seal/env/state" && !post) {
+      const live = this.releases.filter((r) => r.status === "pending" || r.status === "approved");
+      this.standing = this.standing.filter((x) => (x.expires_at as number) > Date.now());
+      return { drafts: [], releases: live, standing: this.standing, standing_caps: Object.fromEntries(live.map((r) => [r.set, this.cap(r.set as string)])) };
+    }
+    if ((p === "/api/ui/seal/env/challenge" || p === "/api/ui/seal/env/finish") && post) return this.env(req, p.slice("/api/ui/seal/env/".length), body, session);
     if (p === "/api/ui/catalogue" && !post) return this.catalogue();
     const cm = p.match(/^\/api\/ui\/catalogue\/([a-z_]+)\/([^/]+)\/(challenge|decide)$/);
     if (cm && post) {
@@ -393,7 +521,7 @@ export class MockVault {
       const set = this.sets.find((x) => x.set_id === url.searchParams.get("set")) ?? fail(404, "not_found", "not found");
       const entries = this.history.get(set.set_id) ?? [];
       const at = (re: RegExp) => Date.parse(entries.find((e) => re.test(e.action))?.at ?? "") || 0;
-      return { entries: entries.slice(0, 20), last_changed_at: at(/^(vault_commit|vault_signer_create|env_commit)$/), last_used_at: at(/^(sign|env_collect_.*)$/) };
+      return { entries: entries.slice(0, 20), last_changed_at: at(/^(vault_commit|vault_signer_create|vault_secret_create|env_commit)$/), last_used_at: at(/^(sign|env_collect_.*)$/) };
     }
     if (!p.startsWith("/api/ui/seal/vault/")) return undefined;
     const verb = p.slice("/api/ui/seal/vault/".length);
@@ -425,7 +553,7 @@ export class MockVault {
       const c = this.buckets?.enabled ? (await this.buckets.finish(body, session)).canonical : this.deps.redeem(body.challenge_id, body.assertion, session);
       if (c.object !== "vault") fail(409, "conflict", "wrong ceremony");
       const signed = JSON.parse(c.metadata as string) as Record<string, unknown>;
-      const choice: Record<string, unknown> = { action: c.action, id: c.id, attempt_id: signed.attempt_id, names: signed.names, recipient: signed.recipient, allow_reveal: signed.allow_reveal, service_id: signed.service_id, set_slug: signed.set_slug, set_title: signed.set_title, scheme: signed.scheme, source: signed.source, ttl_seconds: signed.ttl_seconds, max_signatures: signed.max_signatures };
+      const choice: Record<string, unknown> = { action: c.action, id: c.id, attempt_id: signed.attempt_id, names: signed.names, recipient: signed.recipient, allow_reveal: signed.allow_reveal, service_id: signed.service_id, set_slug: signed.set_slug, set_title: signed.set_title, scheme: signed.scheme, source: signed.source, ttl_seconds: signed.ttl_seconds, max_signatures: signed.max_signatures, note: signed.note, url: signed.url, standing_cap_seconds: signed.standing_cap_seconds };
       let reviewed: Awaited<ReturnType<MockVault["review"]>>;
       try {
         reviewed = await this.review(session, choice, false);
@@ -461,6 +589,28 @@ export class MockVault {
           const ct = await sender.seal(ab(plain), ab(tuple("hpke-vault-aad", sha256(c.text as string), Buffer.from(this.epoch, "base64url"), utf8(s.set_id))));
           this.note(s.set_id, "vault_reveal", `${s.org_slug}/${s.service_slug}/${s.set_slug} revision=${s.revision} names=${names.join(",")}`);
           return { enc: b64url(new Uint8Array(sender.enc)), ciphertext: b64url(new Uint8Array(ct)) };
+        }
+        case "secret-create": {
+          const m = reviewed.meta as Record<string, string>;
+          const edit = reviewed.facts.edit as Edit;
+          const s: VaultSet = { org_id: m.org_id!, org_slug: m.org_slug!, org_title: m.org_title!, service_id: m.service_id!, service_slug: m.service_slug!, service_title: m.service_title!, set_id: m.set_id!, set_slug: m.set_slug!, set_title: m.set_title!, kind: "secret", revision: 1, names: [edit.entries[0]!.name], allow_reveal: true, signatures: 0, ...(m.note ? { note: m.note } : {}), ...(m.url ? { url: m.url } : {}) };
+          this.sets.push(s);
+          this.values.set(s.set_id, new Map([[edit.entries[0]!.name, edit.entries[0]!.value]]));
+          this.note(s.set_id, "vault_secret_create", `${s.org_slug}/${s.service_slug}/${s.set_slug} revision=1 env=${s.names[0]}`);
+          return { set_id: s.set_id, path: `${s.org_slug}/${s.service_slug}/${s.set_slug}`, env_name: s.names[0] };
+        }
+        case "secret-convert": {
+          const s = this.sets.find((x) => x.set_id === c.id)!;
+          Object.assign(s, { kind: "secret", ...(signed.note ? { note: signed.note } : {}), ...(signed.url ? { url: signed.url } : {}) });
+          this.note(s.set_id, "vault_secret_convert", `${s.org_slug}/${s.service_slug}/${s.set_slug} revision=${s.revision} env=${s.names[0]}`);
+          return { ok: true };
+        }
+        case "standing-cap": {
+          const s = this.sets.find((x) => x.set_id === c.id)!;
+          this.caps.set(s.set_id, signed.standing_cap_seconds as number);
+          this.standing = this.standing.filter((x) => x.set !== s.set_id);
+          this.note(s.set_id, "vault_standing_cap", `${s.org_slug}/${s.service_slug}/${s.set_slug} standing_cap=${signed.standing_cap_seconds}`);
+          return { ok: true };
         }
         case "signer-create": {
           const m = reviewed.meta as Record<string, string>;

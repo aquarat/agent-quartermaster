@@ -123,6 +123,7 @@ export function navIcon(name: string): SVGSVGElement {
 /** Vault item types: each also has its words next to it. */
 const ITEM_GLYPHS: Record<string, Shape[]> = {
   "env-set": [{ r: [4, 3, 16, 18, 2] }, { d: "M8 8h8M8 12h8M8 16h5" }],
+  secret: [{ r: [3, 8, 18, 8, 2.5] }, { d: "M8 12h.01M12 12h.01M16 12h.01" }],
   signer: [{ d: "M4 20h4L19 9l-4-4L4 16z" }, { d: "M13.5 6.5l4 4" }, { d: "M12 20h8" }],
   cloudflare: PASSKEY_GLYPHS["apple"]!,
   "ssh-ca": [{ r: [3, 5, 18, 14, 2] }, { d: "M7 10l3 2-3 2M12 14h4" }],

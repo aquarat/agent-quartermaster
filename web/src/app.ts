@@ -750,7 +750,7 @@ export class App {
     }
     {
       // Env releases hosts asked for and edits staged from the CLI: approve, deny, revoke, commit.
-      const e = this.envState, n = (e?.releases.length ?? 0) + (e?.drafts.length ?? 0);
+      const e = this.envState, n = (e?.releases.length ?? 0) + (e?.drafts.length ?? 0) + (e?.standing?.length ?? 0);
       this.section("env", [e, this.seal?.mode], () => (e && this.seal ? [envPanel(this.api, this.auth, this.seal, e, null, () => this.changed())] : []), n === 0, touching || !!this.root.querySelector("#sec-env [role=status] button"), n);
     }
     this.section("enroll", enrolls, () => enrolls.map((p) => this.enrollCard(p)), enrolls.length === 0, touching);
