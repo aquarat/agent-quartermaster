@@ -93,8 +93,9 @@ agent_iface_scenario() {
   if "$AQMAS" get "$path" --why 'interop: get is off' </dev/null >/dev/null 2>"$T/iface-get3.err"; then fail 'aqmas get while turned off'; fi
   grep -q 'turned off aqmas get' "$T/iface-get3.err" || fail "get while off: $(cat "$T/iface-get3.err")"
   "$AQMAS" run "$path" --why 'interop: run while get is off' -- true </dev/null >"$T/iface-run3.out" 2>"$T/iface-run3.err" & pid=$!
-  owner env-decide approve process; wait "$pid" || fail 'aqmas run while get is off'
-  nothing_open 'after the secret scenario'
+  # This approval leaves a rule behind on purpose: recovery (later in run.sh) must end it.
+  owner env-decide approve process 3600; wait "$pid" || fail 'aqmas run while get is off'
+  owner env-state | bun -e 'if((await Bun.stdin.json()).standing.length!==1)process.exit(1)' || fail 'no rule left for the recovery check'
 
   # The value is in no log, output or database page outside its sealed record.
   if grep -aFl "$value" "$T/data/aqmas.db" "$T/data/aqmas.db-wal" "$T"/iface-*.out "$T"/iface-*.err "$T"/seal-*.log "$w/ls.json" "$w/secret.json" 2>/dev/null; then fail 'the secret value leaked'; fi

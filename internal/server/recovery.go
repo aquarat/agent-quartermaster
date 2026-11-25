@@ -482,6 +482,17 @@ func (f *recoveryFlow) commit(ctx context.Context, text string, assertion []byte
 				return err
 			}
 		}
+		// "Don't ask again" rules end with everything else the lost passkeys
+		// approved (the table exists once a 0.10.0 broker has served this store).
+		var rules int
+		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='env_standing'`).Scan(&rules); err != nil {
+			return err
+		}
+		if rules > 0 {
+			if _, err = tx.ExecContext(ctx, `UPDATE env_standing SET revoked_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE revoked_at IS NULL`); err != nil {
+				return err
+			}
+		}
 		// Rekey every scope (§10): the retired passkeys' wraps, and copies of
 		// them in old backups, open only the old scope keys. Every bucket gets
 		// a new key pair under the new scope key and every record is
