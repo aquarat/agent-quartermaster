@@ -53,10 +53,17 @@ Enumerated from v0.4.1 (`seal.Object` roles, `env_revisions`, `env_drafts`, `sig
 | Env set values (current revision) | MK-DEK record | bucket per env set, one record per entry | the set's organisation |
 | Env drafts (CLI upload) | MK-DEK record | entries sealed to the set's bucket at upload | the set's organisation |
 | Signer private key | MK-DEK record | bucket per signer set | the set's organisation |
+| SSH key private key (0.11.0) | — | bucket per SSH key (kind `signer`: an SSH key is a signer whose scheme signs SSH logins only, [SSH-KEYS.md](SSH-KEYS.md)) | the key's organisation |
 | Approval-notice ntfy topic URL | MK record `ntfy-topic` | **not sealed**, §9 | — |
 
 Older env revisions were already erased by v0.4.1 (`ReplaceEnv` nulls them) and open drafts
 expire in five minutes; migration drops both.
+
+A deleted Vault item (0.11.0) keeps its bucket and records while it is in the bin, closed
+and unreachable by any approval; in Security → Buckets its label reads
+`(deleted) org/service/set`. Rekey and recovery treat it like every other bucket, so a
+restore finds it intact. Purging it, by a tap or by the broker seven days after the delete,
+deletes the records and the bucket row with its wrap ([SSH-KEYS.md](SSH-KEYS.md#deleting-vault-items)).
 
 ## 3. Construction
 

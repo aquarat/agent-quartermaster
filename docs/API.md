@@ -67,6 +67,9 @@ the route answers `not_found`.
         "names": ["APP_SECRET", "DATABASE_URL"], "approval": "owner", "use": "..."},
        {"path": "acme/releases/firmware-key", "kind": "signer", "title": "Firmware key",
         "scheme": "ed25519", "approval": "owner", "use": "aqmas sign ..."},
+       {"path": "acme/forge/deploy-key", "kind": "ssh-key", "title": "Deploy key",
+        "scheme": "ssh-ed25519", "public_key": "ssh-ed25519 AAAA... aqmas:acme/forge/deploy-key",
+        "approval": "owner", "use": "aqmas ssh-agent acme/forge/deploy-key --why \"...\" -- COMMAND ..."},
        {"path": "personal/dns-cdn/proxy", "kind": "cloudflare-proxy", "title": "...",
         "approval": "per-scope", "use": "aqmas cf scopes"}],
      "targets": [
@@ -76,8 +79,10 @@ the route answers `not_found`.
 
 `discovery` is false, and both lists empty, when no organisation that admits the host
 allows listing. Names only: an env set's key names, a secret's variable name, a signer's
-scheme, a target's address, port and login users. No value, no key, nothing about other
-hosts. A set with nothing stored yet is left out, and `discovery` is true with empty
+scheme, an SSH key's type and public `authorized_keys` line (`public_key`; `handout` is
+present and true when the owner allows `aqmas ssh-key` for it), a target's address, port and
+login users. No value, no private key, nothing about other hosts. An item in the Vault's
+bin is not listed and its path answers `not_found`, exactly like a path that never existed. A set with nothing stored yet is left out, and `discovery` is true with empty
 lists when listing is on but there is nothing to list. `approval` is `owner` (a passkey tap for
 every request, unless a "don't ask again" rule the owner made covers it), `owner-or-standing`
 (SSH: a tap unless an auto-approval the owner made covers this host, target and user;
@@ -339,6 +344,11 @@ flagged).
   (delivery mode `get`, "Env sets" below). Refused for a set with several keys before any
   request is made, and by the broker for a set that is not a secret or when the
   organisation's policy has `deny_get`.
+* `aqmas ssh-agent PATH --why R [--ttl 10m] [--count N] -- COMMAND` runs COMMAND with
+  `SSH_AUTH_SOCK` set to a private agent socket that offers one SSH key held by aqmas, and
+  `aqmas ssh-key PATH --public | --why R [--out FILE] [--force]` prints its public line or,
+  where the owner allows hand-out, writes the private key to a file ("SSH keys" under
+  "Vault" below; [SSH-KEYS.md](SSH-KEYS.md)).
 * `aqmas mcp` serves the Model Context Protocol on stdin/stdout: JSON-RPC 2.0, one message
   per line, protocol versions `2025-06-18`, `2025-03-26` and `2024-11-05` (the client's is
   echoed when known). Implemented: `initialize`, `notifications/initialized`, `ping`,
@@ -355,14 +365,16 @@ flagged).
   | `aqmas_list_credentials`, `aqmas_list_targets` | none: `GET /v2/catalogue`; with listing off the result is the sentence "discovery is disabled by the owner ..." (not an error) | no |
   | `aqmas_run` | `path, why, command[]`, optional `env, cwd, ttl_seconds, timeout_seconds, approval_timeout_seconds` | yes |
   | `aqmas_sign` | `path, why`, `files[]` or `digest`, optional `force, approval_timeout_seconds` | yes |
+  | `aqmas_with_ssh_key` | `path, why, command[]`, optional `cwd, ttl_seconds, count, timeout_seconds, approval_timeout_seconds`: the command runs with the agent socket of `aqmas ssh-agent` | unless a login grant for the key is still open |
   | `aqmas_ssh_exec` | `target, why, command`, optional `ttl_seconds, timeout_seconds, approval_timeout_seconds` | unless a cached certificate or auto-approval covers it |
 
   A tool that needs the owner blocks until the decision or `approval_timeout_seconds`
   (default 600, at most 3600), then withdraws the request; its description says so. Results
   are one text item; a failure has `isError: true`, the CLI's message, `exit code: N` and
   what to do. `aqmas_run` and `aqmas_ssh_exec` return `{exit_code, stdout, stderr,
-  truncated?, timed_out?, note}` with each stream cut at 64 KiB. **No tool returns a
-  secret's value** (there is no `get` tool); the output of a command is returned as printed,
+  truncated?, timed_out?, note}` with each stream cut at 64 KiB, as does
+  `aqmas_with_ssh_key`. **No tool returns a secret's value or a private key** (there is no
+  `get` tool and no hand-out tool); the output of a command is returned as printed,
   so a command that prints the secret puts it in the result, and the result says so.
 
 ### Organisation cutover and canonical v2
@@ -1207,23 +1219,25 @@ has no extensions. When it carries extensions, audit records that the opener
 was verified live; the assertion cannot later be independently reverified
 from the audit alone. No PRF/KEK or decrypted finish packet is persisted.
 
-# Vault: web form, reveal and signer sets
+# Vault: web form, reveal, signer sets, SSH keys and the bin
 
 Sealed, organisation-scoped installations only. The owner's **Vault** tab
 talks to five session-only routes under `/api/ui/seal/vault/`; agents ask
-for signatures under `/v2/sign/`. [SIGNING.md](SIGNING.md) is the guide; this
+for signatures under `/v2/sign/` and for SSH keys under `/v2/ssh/`.
+[SIGNING.md](SIGNING.md) and [SSH-KEYS.md](SSH-KEYS.md) are the guides; this
 section is the wire contract.
 
 `GET /api/ui/seal/vault/history?set=SET_ID` (owner session, read-only) returns
 `{entries, last_changed_at, last_used_at}` for one application set: its newest
 20 audit rows (`{at, actor, action, object, detail}`, as in `/api/ui/state`
 `recent`) and, in Unix milliseconds, when it last changed (`vault_commit`,
-`vault_signer_create`, `vault_secret_create`, `env_commit`) and was last used (`env_collect_*`,
-`sign`); 0 when no such row is among the newest 200 about the set. The rows are
+`vault_signer_create`, `vault_ssh_key_create`, `vault_secret_create`, `vault_restore`,
+`env_commit`) and was last used (`env_collect_*`, `sign`, `ssh_key_collect`); 0 when no
+such row is among the newest 200 about the set. The rows are
 the owner's actions on the set (`object` `set:ID`), what admitted hosts asked
 for and collected (their `detail` begins with the set's path) and the owner's
 decisions on those. It carries no value, changes nothing and nothing is decided
-from it; an unknown or archived set is 404.
+from it; an unknown, archived or binned set is 404.
 
 ## Transport encryption
 
@@ -1254,14 +1268,22 @@ response cannot be replayed into a later ceremony. Vectors:
 
 ## Routes
 
-* `GET state` → `{schemes, organisations:[{id,slug,title,allow_reveal}], sets, requests}`.
+* `GET state` → `{schemes, ssh_key_types, organisations:[{id,slug,title,allow_reveal}], sets,
+  deleted, bin_seconds, requests}`. `schemes` are the signer schemes (never the SSH ones);
+  `ssh_key_types` are `{id, title, algorithm}` for `ssh-ed25519` and `ssh-ecdsa-p256`;
+  `deleted` is the bin and `bin_seconds` (604800) how long an item stays in it (both under
+  "Delete, restore and purge" below).
   A set carries `org_id, org_slug, org_title, service_id, service_slug,
-  service_title, set_id, set_slug, set_title, kind ("env-set" | "secret" | "signer"),
+  service_title, set_id, set_slug, set_title, kind ("env-set" | "secret" | "signer" | "ssh-key"),
   revision, names, allow_reveal, standing_cap_seconds` (the set's longest "don't ask
   again"; 0 for a signer), for a secret optionally `note, url`, and, for a signer, `scheme, origin, created_at,
   signatures, public_key, public_hex, public_pem, fingerprint` (SHA-256 of the
-  raw public key). `requests` are pending signing requests and live signing
-  grants (below). Metadata only; needs no open bucket.
+  raw public key), and, for an SSH key, `scheme` (the key type), `origin, created_at,
+  signatures` (logins signed), `public_key` (the raw key, base64url), `authorized_key`
+  (`ssh-ed25519 AAAA... comment`), `fingerprint` (`SHA256:...` as `ssh-keygen -lf` prints
+  it), `comment` and `handout`. `requests` are pending signing requests and live signing
+  grants (below); one for an SSH key carries `use` (`ssh-agent` or `ssh-handout`) and no
+  items. Metadata only; needs no open bucket.
 * `POST attempt` `{}` → `{attempt_id, recipient, expires_at}`.
 * `POST challenge` with a choice (below) → `{canonical, challenge_id, public_key, facts, open?}`.
 * `POST finish` `{challenge_id, assertion, open?}` → the action's result.
@@ -1289,11 +1311,17 @@ set_title, kind, revision`.
 | `secret-create`, new set ID (32 lower-case hex) | `service_id, set_slug, set_title, note, url, attempt_id, enc, ciphertext, commitment` | target fields of the new set (`kind` `secret`, `revision` 0), `attempt_id, recipient, env_name, note, url, commitment, result_revision` (1) | `{set_id, path, env_name}`; the set, its marker and revision 1 |
 | `secret-convert`, set ID | `note, url` | target fields (`kind` `env-set`), `env_name, note, url` | `{ok}`; the same set and revision, now a secret |
 | `standing-cap`, set ID | `standing_cap_seconds` (0 to 86400, whole minutes) | target fields, `old_standing_cap_seconds, standing_cap_seconds` | `{ok}`; the set's live "don't ask again" rules end |
-| `sign-approve`, `sign-deny`, `sign-revoke`; request ID | approve: `ttl_seconds, max_signatures` | target fields, `request_id, host, enrollment, address, scheme, fingerprint, items` (each `name, size, sha256` and, for a SHA-512 scheme, `sha512`), `requested_ttl_seconds, requested_max_signatures, ttl_seconds, max_signatures, admission_generation, policy_revision, service_revision, soft_cap_seconds, beyond_soft_cap` | `{ok}` |
+| `sign-approve`, `sign-deny`, `sign-revoke`; request ID | approve: `ttl_seconds, max_signatures` | target fields, `request_id, host, enrollment, address, scheme, fingerprint, items` (each `name, size, sha256` and, for a SHA-512 scheme, `sha512`), `requested_ttl_seconds, requested_max_signatures, ttl_seconds, max_signatures, admission_generation, policy_revision, service_revision, soft_cap_seconds, beyond_soft_cap`; for a request about an SSH key also `use`, with `fingerprint` in the `SHA256:...` form and `items` `[]` | `{ok}` |
+| `ssh-key-create`, new set ID (32 lower-case hex) | `service_id, set_slug, set_title, scheme` (`ssh-ed25519` or `ssh-ecdsa-p256`), `source` (`generate` or `import`), `comment, handout`; for import also `attempt_id, enc, ciphertext` | target fields of the new set (`kind` `ssh-key`, `revision` 0), `scheme, source, attempt_id, recipient` (empty for a generated key), `public_key, fingerprint, authorized_key, comment, handout, result_revision` (0) | `{set_id, path, scheme, public_key, fingerprint, authorized_key, comment, handout}` |
+| `ssh-key-handout`, set ID | `handout` (must differ from the current value) | target fields, `fingerprint, old_handout, handout` | `{ok}`; turning it off ends hand-out requests that are waiting or approved and not collected |
+| `delete`, set ID | `revision` (the one the page showed; another is 409) | target fields, `path` (`org/service/set`), `fingerprint` (the key's for a signer or SSH key, else `""`), `bin_seconds` (604800) | `{ok, purge_at, ended: {grants, standing, releases, pending}}` |
+| `restore`, set ID of a binned item | none | the binned item's target fields (with the slug it had), `path, deleted_at` | `{ok, path}`; 409 while a live item has the path, or once the seven days are over |
+| `purge`, set ID of a binned item | none | the binned item's target fields, `path, deleted_at, digest` | `{ok}` |
 
 `facts` are unsigned conveniences: `attempt_id` (the broker allocates one for
 a generated key) and, for `signer-create`, `public_key, public_hex, public_pem,
-fingerprint`. The page copies `attempt_id`, `public_key` and `fingerprint`
+fingerprint`; for `ssh-key-create`, `public_key, fingerprint, authorized_key`, which the
+page recomputes from the raw public key, the key type and the comment before it shows them. The page copies `attempt_id`, `public_key` and `fingerprint`
 into its expected metadata, shows the public key from the canonical, and for
 an import the owner compares it with the public half they already know.
 
@@ -1341,6 +1369,55 @@ or OpenSSH PEM, unencrypted). It is sealed to the signer's own bucket under
 role `signer-key`; `sign-approve` opens that bucket until the grant is used up,
 expires or is revoked. No route returns it; there is no export.
 
+**SSH key (0.11.0).** An SSH key pair as a Vault item, for hosts and forges that take a
+plain public key. It is **stored as a signer**: a `signer_keys` row whose scheme is
+`ssh-ed25519` or `ssh-ecdsa-p256`, the private key sealed to the item's own bucket (kind
+`signer`, role `signer-key`), plus a row in `ssh_keys(set_id, comment, handout, created)`.
+An earlier binary sees a signer with a scheme it does not know and signs nothing with it.
+The schemes sign exactly one thing, the data of an SSH public-key user authentication
+request (RFC 4252 section 7, and OpenSSH's `publickey-hostbound-v00@openssh.com` form):
+session identifier, `SSH_MSG_USERAUTH_REQUEST`, user, `ssh-connection`, the method, `TRUE`,
+the algorithm and **this key's** public blob, with nothing after it. Anything else (an
+`SSHSIG` blob, a certificate, arbitrary bytes, a login request for another key) is 400, so
+the key is not a signing oracle; `POST /v2/sign/requests` for such a key is 400 and names
+`aqmas ssh-agent`. The key is generated by the broker or parsed from the sealed import
+packet (`{"private_key": text}`, purpose `signer-import`: an unencrypted OpenSSH, PKCS#8 or
+SEC1 PEM, or a hex seed). `comment` is 1 to 100 printable ASCII characters without a space
+at either end and is the third field of the public line; the page proposes
+`aqmas:ORG/SERVICE/NAME`. `handout` is the item's "May be handed out" setting, off unless
+chosen, changed only by `ssh-key-handout`. There is no reveal and no export; rotation is a
+new key, the new public line on the server or forge, then deleting the old item.
+
+**Delete, restore and purge (0.11.0).** `delete` works on an env set, a secret, a signer
+and an SSH key (SSH targets and Cloudflare sets are configuration and have no delete
+here). One tap over the path, kind and current revision moves the item to the bin:
+
+* its `credential_sets` row is archived and renamed to a tombstone slug
+  (`zz-deleted-` + 12 characters of the set ID + `-` + the slug), so the path is free at
+  once, and a `deleted_sets(set_id, slug, kind, deleted_at, purge_at, passkey, deleted_by,
+  digest)` row keeps what it was called, who deleted it and when;
+* every route that resolves a path or lists sets skips it: hosts get the uniform
+  `not_found` for the path and for every request or grant about it;
+* in the same transaction everything that could still use it ends: pending requests and
+  uncollected releases (`expired`, `revoked`), signing and SSH login grants, hand-out
+  grants and "don't ask again" rules. `ended` counts them; the item's bucket closes.
+
+`deleted` in `state` lists the bin: the target fields with the original slug, `names`,
+`deleted_at, purge_at, deleted_by` (the passkey's nickname), `digest`, for a key `scheme,
+fingerprint` (and `authorized_key`), and `path_taken`. `restore` puts the item back exactly
+as it was (same ID, revision, sealed records and bucket); nothing that ended comes back, so
+the next request asks the owner again. It is refused while a live item has the path.
+`purge` and the broker's own sweep, seven days after the delete (`purge_at`; no tap, no
+open bucket, no key), delete every sealed record of the item (all revisions, drafts, the key
+record), its bucket row with the wrap of the bucket key, its requests, releases and rules,
+and the set row. The store runs `secure_delete` and the WAL is truncated afterwards. The
+audit log keeps `vault_delete`, `vault_restore` and `vault_purge` (actor `owner`, or
+`system` with a detail that starts `auto`) with path, kind, who, when and `digest`: the
+SHA-256 over the set ID, kind, revision and the current sealed record (ciphertext), never a
+value. A copy of the store made before the purge (a backup, a snapshot) still holds the
+sealed records and the bucket wrap, readable only with a passkey or recovery key of the
+scope: purging does not reach into backups.
+
 **Dotenv import** (browser and `aqmas set import`): `NAME=value` lines, blank
 lines and `#` comment lines. A value is bare (no quote, backslash, `$`,
 backtick, `#` or surrounding space), single-quoted (literal, may span lines)
@@ -1382,6 +1459,39 @@ read as LF. Errors name the line, never its content. Vectors:
 
 A key has one scheme for life, fixed in the signed `signer-create` and inside
 its sealed record.
+
+## SSH keys (agent API, client certificate required)
+
+* `GET /v2/ssh/key?path=org/service/key` → `{binding, authorized_key, fingerprint, comment,
+  handout}`; `binding` is the signing binding above with the SSH key type as `scheme`.
+  Admitted hosts only; a path that is not an SSH key is 404.
+* `POST /v2/ssh/requests` `{binding, reason, use, ttl_seconds, max_signatures}` → the pending
+  request (a signing request with `use` and no items). `use` `ssh-agent` asks for a login
+  grant: `ttl_seconds` 60 to 86400, `max_signatures` logins (default 20, at most 1000);
+  never single-use. `use` `ssh-handout` asks for one delivery of the private key
+  (`ttl_seconds` 0, one use, collected within ten minutes of approval) and is 403 unless the
+  key's `handout` is on. The limits of signing requests apply (pending per host, 30 an hour).
+* The request and grant are read, cancelled and ended through `/v2/sign/requests/{id}`,
+  `.../cancel`, `/v2/sign/grants/{id}` and `.../end`.
+* `POST /v2/sign/grants/{id}/sign` `{items}` signs logins under an `ssh-agent` grant: each
+  item is `{name, size, sha256, message}` with the login request data as `message`. The
+  broker parses it, refuses anything that is not a login request for this key, signs, checks
+  the signature and audits `sign` with `use=ssh-agent`, the remote `user`, the session
+  identifier's SHA-256 and, when the request was host-bound, the server host key's
+  fingerprint. Signatures are 64 raw bytes (Ed25519) or ASN.1 DER (ECDSA); the CLI wraps
+  them in the SSH signature format.
+* `POST /v2/ssh/grants/{id}/key` `{}` → `{request, private_key, authorized_key}`: the
+  OpenSSH private key file, once, under an approved `ssh-handout` grant, to the host and
+  address that asked, while `handout` is still on. Audited as `ssh_key_collect` (path, type,
+  fingerprint, enrolment, address). 423 `locked` does not spend the grant. This is the only
+  route that returns a private key.
+
+`aqmas ssh-agent` creates a directory (0700) with a socket (0600) under `XDG_RUNTIME_DIR`
+or the temporary directory, serves the SSH agent protocol on it with exactly one identity,
+answers `SSH_AGENTC_SIGN_REQUEST` for that identity by checking the data is a login request
+and forwarding it, and answers every other request (add, remove, lock, unlock, extensions)
+with a failure. The socket and its directory are removed when the command ends. The grant
+is remembered per key in the CLI's configuration directory like a signing grant.
 
 # Bastion access
 

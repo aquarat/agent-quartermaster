@@ -19,7 +19,7 @@ bastion host; hosts enroll with the `aqmas` CLI.
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 The approval page has seven tabs: **Approvals** for daily work, **Vault** for the credentials
-(a searchable list of secrets, env sets, signing keys and what the broker holds; Add item;
+(a searchable list of secrets, env sets, signing keys, SSH keys and what the broker holds; Add item, Delete;
 Reveal after a tap), **Hosts**, **Activity**, **Security** (passkeys, open buckets, recovery key), **Settings**
 (Setup, upgrades, policies) and **Help** for enrollment and command examples using the running
 server’s URL and CA pin. The review behind this layout is [docs/UI-REVIEW.md](docs/UI-REVIEW.md).
@@ -59,10 +59,11 @@ programs. Point an agent's notes or knowledge base at that command instead of co
   "Hosts may list what they can ask for" under Settings, off by default; while it is off a
   host has to be told each path.
 - **MCP.** `aqmas mcp` is an MCP server on stdin/stdout with the same abilities as tools
-  (guide, status, the two lists, run a command with a secret, sign, run a command over SSH).
+  (guide, status, the two lists, run a command with a secret, sign, run a command with an
+  SSH key, run a command over SSH).
   Register it with `claude mcp add aqmas -- aqmas mcp`, or
   `{"mcpServers": {"aqmas": {"command": "aqmas", "args": ["mcp"]}}}`. Tools that need the
-  owner block until the owner decides; no tool returns a secret's value.
+  owner block until the owner decides; no tool returns a secret's value or a private key.
 - **Secrets.** Vault → Add item → Secret holds one value (an API key, say) with the
   environment variable it is delivered as: `aqmas run ORG/SERVICE/SECRET --why "..." --
   COMMAND`, or `aqmas get` for the value itself.
@@ -71,6 +72,15 @@ programs. Point an agent's notes or knowledge base at that command instead of co
   the same machine then gets the same value again without another tap. Every delivery is
   still logged, and the rule ends when the value, the policy or the admission changes, or
   when the owner revokes it.
+- **SSH keys.** Vault → Add item → SSH key holds a key pair for a forge or a server that
+  takes a plain public key (a deploy key, an `authorized_keys` line). The page shows the
+  public line to paste there. `aqmas ssh-agent ORG/SERVICE/KEY --why "..." -- git clone
+  ssh://git@forge.example.com/...` runs a command with a private agent socket for that one
+  key: one approval covers the logins within a time-boxed grant and the key never leaves
+  aqmas. Handing the key file out (`aqmas ssh-key`) is a per-key setting, off by default,
+  with a red card each time.
+- **Delete.** An env set, secret, signing key or SSH key is deleted with one tap: unusable
+  at once, restorable from Vault → Deleted for seven days, then destroyed.
 
 ## Documentation
 
@@ -81,6 +91,8 @@ programs. Point an agent's notes or knowledge base at that command instead of co
   [docs/SIGNING.md](docs/SIGNING.md). Signing keys should not leave aqmas where a signer
   scheme exists: agents call `aqmas sign ORG/SERVICE/KEY --why "..." FILE`; `aqmas run`
   remains for the cases where that is not possible.
+- SSH key pairs in the Vault, and deleting Vault items (the seven-day bin, what a backup
+  still contains): [docs/SSH-KEYS.md](docs/SSH-KEYS.md)
 - Host and Forgejo trust: [docs/HOSTS.md](docs/HOSTS.md)
 - Cloudflare (milestone 2): [docs/CLOUDFLARE.md](docs/CLOUDFLARE.md)
 - Setup from the approval page (organisations cutover, sealing, self-update, upgrades) and the root maintenance runner: [docs/SETUP.md](docs/SETUP.md)

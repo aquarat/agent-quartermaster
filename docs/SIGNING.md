@@ -58,7 +58,10 @@ shows the new key as a Vault item: the public key (hex, PEM) and its
 fingerprint with copy buttons, the hosts that may ask for signatures, its
 pending requests and live grants, and its recent history. Give
 those to whoever verifies. There is no reveal and no export for a signer: to
-move a key elsewhere, import the copy you kept, or make a new key.
+move a key elsewhere, import the copy you kept, or make a new key. **Delete**
+on the item page moves it to the Vault's bin: it signs nothing from that
+moment, its grants end, and it can be restored for seven days before it is
+destroyed ([SSH-KEYS.md](SSH-KEYS.md#deleting-vault-items) describes the bin).
 
 **The approval card** shows organisation › service › key, the scheme and what
 exactly it signs, the requesting host and address, and for each artifact its
@@ -111,8 +114,14 @@ needs a mode that takes the signature from a command instead.
 **Adding a scheme** is one entry in `internal/signer/signer.go` (key type,
 what the broker needs, sign and verify functions), a known-answer test, and a
 row here. The CLI, the card and the audit record follow the registry. Formats
-that wrap a signature in a container (minisign, SSH signatures, secure-boot
-signature blocks) are not built in yet.
+that wrap a signature in a container (minisign, `ssh-keygen -Y sign` signatures,
+secure-boot signature blocks) are not built in yet.
+
+**SSH logins are not signing.** An SSH key pair for a forge or a server is its
+own kind of Vault item with its own commands ([SSH-KEYS.md](SSH-KEYS.md)). It
+uses this machinery (the key sealed in its own bucket, time-boxed grants), but
+its schemes sign SSH login requests and nothing else, are not offered for a
+signer, and `aqmas sign` refuses such a key.
 
 ## What this does and does not protect
 
