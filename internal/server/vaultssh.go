@@ -102,6 +102,9 @@ func (s *Server) reviewSSHKeyCreate(ctx context.Context, q *store.Q, sess string
 		return nil, errBad("invalid SSH key")
 	}
 	m := targetFields(t)
+	if err = s.oneFamilyKey(ctx, q, pub, true); err != nil {
+		return nil, err
+	}
 	m["scheme"], m["source"], m["attempt_id"], m["recipient"], m["result_revision"] = sc.ID, c.Source, c.Attempt, recipient, 0
 	m["public_key"], m["fingerprint"], m["authorized_key"], m["comment"], m["handout"] = encodeID(pub), setFingerprint(t), line, c.Comment, *c.Handout
 	facts["public_key"], facts["fingerprint"], facts["authorized_key"] = m["public_key"], m["fingerprint"], line
@@ -155,6 +158,26 @@ func (s *Server) applySSHKeyCreate(ctx context.Context, q *store.Q, sess, id, se
 	v := setView(t)
 	out = map[string]any{"set_id": t.SetID, "path": t.Path(), "scheme": sc.ID, "public_key": v.PublicKey, "fingerprint": v.Fingerprint, "authorized_key": v.AuthorizedKey, "comment": comment, "handout": handout}
 	return out, "set:" + t.SetID, fmt.Sprintf("%s scheme=%s origin=%s handout=%t fingerprint=%s", t.Path(), sc.ID, origin, handout, v.Fingerprint), fmt.Sprintf("Created SSH key %s (%s)", t.Path(), sc.ID), nil
+}
+
+// oneFamilyKey refuses a key that the broker already holds in the other
+// family: the same private key as a signing key and as an SSH key would let
+// an ordinary signing grant produce SSH logins (or the reverse). Items in the
+// bin count.
+func (s *Server) oneFamilyKey(ctx context.Context, q *store.Q, pub []byte, ssh bool) error {
+	schemes, err := q.SchemesOfKey(ctx, pub)
+	if err != nil {
+		return err
+	}
+	for _, id := range schemes {
+		if signer.IsSSH(id) != ssh {
+			if ssh {
+				return errConflict("aqmas already holds this key as a signing key: an SSH key must be a key of its own")
+			}
+			return errConflict("aqmas already holds this key as an SSH key: a signing key must be a key of its own")
+		}
+	}
+	return nil
 }
 
 // ---- agent side ----

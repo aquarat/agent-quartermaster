@@ -127,29 +127,29 @@ func (s *Server) purgeDue(ctx context.Context) {
 	}
 	now := s.now()
 	var evict []seal.ID
+	ids, err := s.store.Q().DuePurges(ctx, now)
+	if err != nil {
+		s.log.Warn("vault: purging the bin failed", "error", err)
+		return
+	}
 	n := 0
-	err := s.store.Tx(ctx, func(q *store.Q) error {
-		evict, n = nil, 0
-		ids, err := q.DuePurges(ctx, now)
-		if err != nil {
-			return err
-		}
-		for _, id := range ids {
+	// One transaction an item: a row that cannot be purged does not hold up the rest.
+	for _, id := range ids {
+		var buckets []seal.ID
+		err := s.store.Tx(ctx, func(q *store.Q) error {
 			p, err := q.PurgeSet(ctx, id)
 			if err != nil {
 				return err
 			}
-			evict = append(evict, sealIDs(p.Buckets)...)
-			n++
-			if err = q.Audit(ctx, now, "system", "vault_purge", "set:"+id, "auto "+purgeDetail(p)); err != nil {
-				return err
-			}
+			buckets = sealIDs(p.Buckets)
+			return q.Audit(ctx, now, "system", "vault_purge", "set:"+id, "auto "+purgeDetail(p))
+		})
+		if err != nil {
+			s.log.Warn("vault: could not purge a binned item", "set", id, "error", err)
+			continue
 		}
-		return nil
-	})
-	if err != nil {
-		s.log.Warn("vault: purging the bin failed", "error", err)
-		return
+		evict = append(evict, buckets...)
+		n++
 	}
 	if n == 0 {
 		return

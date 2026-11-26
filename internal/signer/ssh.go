@@ -252,6 +252,10 @@ func ParseUserAuth(msg []byte) (UserAuth, error) {
 		if u.HostKey, rest, ok = sshString(rest); !ok || len(u.HostKey) == 0 {
 			return u, errNotUserAuth
 		}
+		// A real host key, not a container for other bytes.
+		if _, err := ssh.ParsePublicKey(u.HostKey); err != nil {
+			return u, errNotUserAuth
+		}
 	}
 	if len(rest) != 0 {
 		return u, errNotUserAuth

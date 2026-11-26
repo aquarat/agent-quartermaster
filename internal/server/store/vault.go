@@ -228,6 +228,19 @@ func (q *Q) SignerCipher(ctx context.Context, set string) (rec CipherRecord, err
 	return rec, notFound(err)
 }
 
+// SchemesOfKey lists the schemes under which this public key is already
+// held, by live and binned items alike.
+func (q *Q) SchemesOfKey(ctx context.Context, pub []byte) ([]string, error) {
+	var out []string
+	err := q.rows(ctx, `SELECT scheme FROM signer_keys WHERE public_key=?`, func(rs *sql.Rows) error {
+		var s string
+		err := rs.Scan(&s)
+		out = append(out, s)
+		return err
+	}, pub)
+	return out, err
+}
+
 // SSHKeySets names the sets the catalogue must show as kind "ssh-key".
 func (q *Q) SSHKeySets(ctx context.Context) (map[string]bool, error) {
 	out := map[string]bool{}

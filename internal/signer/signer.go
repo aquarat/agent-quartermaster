@@ -183,6 +183,16 @@ func (s Scheme) Sign(priv []byte, it Item) ([]byte, error) {
 	if len(priv) != 32 {
 		return nil, errors.New("invalid signer key")
 	}
+	if s.SSH {
+		// Only a login request for this very key, whoever the caller is.
+		pub, err := s.Public(priv)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = s.SSHLogin(pub, it); err != nil {
+			return nil, err
+		}
+	}
 	return s.sign(priv, it)
 }
 func (s Scheme) Verify(pub []byte, it Item, sig []byte) bool {

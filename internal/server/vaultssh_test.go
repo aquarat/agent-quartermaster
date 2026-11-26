@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -206,6 +208,20 @@ func TestSSHKeyCreate(t *testing.T) {
 	}
 	if where := v.leaked(priv); where != "" {
 		t.Fatalf("the pasted private key appears in %s", where)
+	}
+	// One private key is a signing key or an SSH key, never both: a signing grant
+	// must not be a way to SSH logins.
+	seed := bytes.Repeat([]byte{0x42}, 32)
+	edFile, err := signer.OpenSSHPrivate(signer.SSHEd25519, seed, "x")
+	requireNoError(t, err)
+	v.createSigner("dddddddddddddddddddddddddddddd01", "plain-key", "ed25519", hex.EncodeToString(seed))
+	if _, _, st := v.sshKeyChallenge("5555555555555555555555555555555d", "same-key", signer.SSHEd25519, "x", false, string(edFile)); st != 409 {
+		t.Fatalf("a signing key pasted as an SSH key: %d", st)
+	}
+	plain, _ := json.Marshal(map[string]string{"private_key": string(file)})
+	a, e, c := v.sealUpload("signer-import", "dddddddddddddddddddddddddddddd02", plain)
+	if st := v.web("POST", "/api/ui/seal/vault/challenge", map[string]any{"action": "signer-create", "id": "dddddddddddddddddddddddddddddd02", "service_id": v.service, "set_slug": "same-ec", "set_title": "Release key", "scheme": "ecdsa-p256-sha256", "source": "import", "attempt_id": a, "enc": e, "ciphertext": c}, nil); st != 409 {
+		t.Fatalf("an SSH key pasted as a signing key: %d", st)
 	}
 	if _, _, st := v.sshKeyChallenge("5555555555555555555555555555555c", "deploy-key", signer.SSHEd25519, "x", false, ""); st != 409 {
 		t.Fatalf("a second key with the same name: %d", st)

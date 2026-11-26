@@ -176,6 +176,7 @@ func TestSSHSignsLoginRequestsOnly(t *testing.T) {
 			"rsa algo":         userAuth(session, "git", "ssh-connection", "publickey", "rsa-sha2-256", blob, nil),
 			"garbage key":      userAuth(session, "git", "ssh-connection", "publickey", algo, []byte("not a key"), nil),
 			"bound, no key":    userAuth(session, "git", "ssh-connection", "publickey-hostbound-v00@openssh.com", algo, blob, nil),
+			"bound, not a key": userAuth(session, "git", "ssh-connection", "publickey-hostbound-v00@openssh.com", algo, blob, []byte("arbitrary bytes to sign")),
 			"plain, extra key": userAuth(session, "git", "ssh-connection", "publickey", algo, blob, other.Marshal()),
 		} {
 			it := SSHItem(data)
@@ -192,8 +193,8 @@ func TestSSHSignsLoginRequestsOnly(t *testing.T) {
 		if _, err := sc.SSHLogin(pub, foreign); err == nil {
 			t.Fatal("a login request for another key was accepted")
 		}
-		if s2, err := sc.Sign(priv, foreign); err == nil && sc.Verify(pub, foreign, s2) {
-			t.Fatal("Verify accepted a login request for another key")
+		if _, err := sc.Sign(priv, foreign); err == nil {
+			t.Fatal("signed a login request for another key")
 		}
 	}
 	// A signer key's scheme has no SSH form.

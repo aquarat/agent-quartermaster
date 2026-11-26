@@ -252,6 +252,19 @@ to re-check after a rollback (and again after returning to 0.10.0):
 - **Secrets** are one-key env sets to an earlier binary: `aqmas run` works, `aqmas get`
   does not exist, and its Vault shows them as env sets (do not add a second key there).
 
+**Rolling back from 0.11.0 to an earlier release.** Again only tables and one nullable
+column were added (`ssh_keys`, `deleted_sets`, `sign_requests.use`), so an earlier binary
+starts and serves:
+
+- **SSH keys** are signers with a scheme an earlier binary does not know: its Vault lists
+  them as signing keys, and it signs nothing with them and hands nothing out. Hosts get
+  them back when 0.11.0 runs again.
+- **Deleted items** stay deleted: a binned item is an archived set, which every earlier
+  release already hides from hosts and from the Vault. An earlier binary has no Deleted
+  list, cannot restore, and does not purge: the seven days keep running, and the purge
+  happens on the first sweep after 0.11.0 is back. Until then the item's bucket shows in
+  Security → Buckets under a name that starts with `zz-deleted-`.
+
 ### Trust limits
 
 **Organisation inventory and rollback:** The read-only `organisations-plan` preview

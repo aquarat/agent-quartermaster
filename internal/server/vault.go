@@ -576,6 +576,9 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		default:
 			return "", nil, errBad("choose generate or import")
 		}
+		if err = s.oneFamilyKey(ctx, q, pub, false); err != nil {
+			return "", nil, err
+		}
 		m = targetFields(t)
 		m["scheme"], m["source"], m["attempt_id"], m["public_key"], m["fingerprint"], m["result_revision"] = sc.ID, c.Source, c.Attempt, encodeID(pub), signer.Fingerprint(pub), 0
 		m["recipient"] = recipient
@@ -1225,6 +1228,9 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 				return err
 			}
 			if err = q.RestoreSet(ctx, d.SetID); err != nil {
+				if !errors.Is(err, store.ErrConflict) {
+					return err
+				}
 				return errConflict("an item named " + d.Path() + " exists now: delete or rename that one first, then restore")
 			}
 			out = map[string]any{"ok": true, "path": d.Path()}
