@@ -49,10 +49,17 @@ func (s *Server) ownerCatalogue(ctx context.Context, q *store.Q, sess string, pk
 		if err != nil {
 			return c, err
 		}
+		// An SSH key: a signer row with an ssh_keys row.
+		sshKeys, err := q.SSHKeySets(ctx)
+		if err != nil {
+			return c, err
+		}
 		for i := range c.Orgs {
 			for j := range c.Orgs[i].Services {
 				for k := range c.Orgs[i].Services[j].Sets {
-					if set := &c.Orgs[i].Services[j].Sets[k]; signers[set.ID] {
+					if set := &c.Orgs[i].Services[j].Sets[k]; sshKeys[set.ID] {
+						set.Kind = "ssh-key"
+					} else if signers[set.ID] {
 						set.Kind = "signer"
 					} else if secrets[set.ID] {
 						set.Kind = "secret"

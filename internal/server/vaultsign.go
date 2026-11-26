@@ -22,45 +22,53 @@ import (
 // broker signs inside a lease on the sealed store and returns signatures. No
 // route in this file, or anywhere else, returns a signer's private key.
 
+// signRoute serves one signing or SSH key route for an admitted host: the
+// body is read before any transaction, the handler runs in one, and a
+// notification it left in the call runs after commit.
+func (s *Server) signRoute(m *http.ServeMux, pattern string, f func(context.Context, *store.Q, *http.Request, *store.Host) (any, error)) {
+	m.Handle(pattern, s.requireHost(func(w http.ResponseWriter, r *http.Request, h *store.Host) {
+		if err := s.bucketsReady(); err != nil {
+			s.writeErr(w, r, s.hostNotFound(r.Context(), h, err))
+			return
+		}
+		call := &signCall{}
+		if r.Method == http.MethodPost { // no network read inside a lease or transaction
+			var err error
+			if call.body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody)); err != nil {
+				s.writeErr(w, r, errBad("body too large or unreadable"))
+				return
+			}
+		}
+		ctx := r.Context()
+		var out any
+		err := s.store.Tx(ctx, func(q *store.Q) error {
+			if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
+				return err
+			}
+			if err := q.SweepSign(ctx, s.now()); err != nil {
+				return err
+			}
+			var err error
+			out, err = f(context.WithValue(ctx, signCallKey{}, call), q, r, h)
+			return err
+		})
+		if err != nil {
+			s.writeErr(w, r, s.hostNotFound(ctx, h, err))
+			return
+		}
+		if call.after != nil {
+			call.after()
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, 200, out)
+	}))
+}
+
 func (s *Server) signAgentRoutes(m *http.ServeMux) {
 	route := func(pattern string, f func(context.Context, *store.Q, *http.Request, *store.Host) (any, error)) {
-		m.Handle(pattern, s.requireHost(func(w http.ResponseWriter, r *http.Request, h *store.Host) {
-			if err := s.bucketsReady(); err != nil {
-				s.writeErr(w, r, s.hostNotFound(r.Context(), h, err))
-				return
-			}
-			call := &signCall{}
-			if r.Method == http.MethodPost { // no network read inside a lease or transaction
-				var err error
-				if call.body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody)); err != nil {
-					s.writeErr(w, r, errBad("body too large or unreadable"))
-					return
-				}
-			}
-			ctx := r.Context()
-			var out any
-			err := s.store.Tx(ctx, func(q *store.Q) error {
-				if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
-					return err
-				}
-				if err := q.SweepSign(ctx, s.now()); err != nil {
-					return err
-				}
-				var err error
-				out, err = f(context.WithValue(ctx, signCallKey{}, call), q, r, h)
-				return err
-			})
-			if err != nil {
-				s.writeErr(w, r, s.hostNotFound(ctx, h, err))
-				return
-			}
-			if call.after != nil {
-				call.after()
-			}
-			w.Header().Set("Cache-Control", "no-store")
-			writeJSON(w, 200, out)
-		}))
+		s.signRoute(m, pattern, f)
 	}
+	s.sshAgentRoutes(m)
 	route("GET /v2/sign/key", func(ctx context.Context, q *store.Q, r *http.Request, h *store.Host) (any, error) {
 		return q.SignBinding(ctx, h.ID, r.URL.Query().Get("path"), s.now())
 	})
@@ -139,6 +147,9 @@ func (s *Server) signRequest(ctx context.Context, q *store.Q, r *http.Request, h
 	sc, ok := signer.Lookup(b.Scheme)
 	if !ok {
 		return nil, errConflict("this broker does not know the signer's scheme")
+	}
+	if sc.SSH {
+		return nil, errBad("this is an SSH key, not a signing key: use `aqmas ssh-agent " + b.Path + " --why ... -- COMMAND`")
 	}
 	if err = checkItems(sc, in.Items); err != nil {
 		return nil, err
@@ -238,8 +249,22 @@ func (s *Server) signWith(ctx context.Context, q *store.Q, r *http.Request, h *s
 	if !ok {
 		return nil, errConflict("unknown signing scheme")
 	}
+	// An SSH key signs under a login grant only; a hand-out grant signs nothing,
+	// and a signing key never answers an SSH login.
+	if sc.SSH != (v.Use == signer.UseSSHAgent) || v.Use == signer.UseSSHHandout {
+		return nil, errConflict("this grant does not sign")
+	}
 	if err = checkItems(sc, in.Items); err != nil {
 		return nil, err
+	}
+	logins := make([]signer.UserAuth, len(in.Items))
+	if sc.SSH {
+		// Only SSH login requests for exactly this key: never arbitrary data.
+		for i, it := range in.Items {
+			if logins[i], err = sc.SSHLogin(v.PublicKey, it); err != nil {
+				return nil, errBad(err.Error())
+			}
+		}
 	}
 	if v.TTL == 0 {
 		a, _ := json.Marshal(in.Items)
@@ -251,7 +276,7 @@ func (s *Server) signWith(ctx context.Context, q *store.Q, r *http.Request, h *s
 		return nil, errConflict("grant has too few signatures left")
 	}
 	t, err := q.VaultSet(ctx, v.Set)
-	if err != nil || t.Kind != "signer" || t.Scheme != v.Scheme || string(t.PublicKey) != string(v.PublicKey) {
+	if err != nil || t.Kind != "signer" && t.Kind != "ssh-key" || (t.Kind == "ssh-key") != sc.SSH || t.Scheme != v.Scheme || string(t.PublicKey) != string(v.PublicKey) {
 		return nil, errConflict("signer no longer available")
 	}
 	rec, err := q.SignerCipher(ctx, v.Set)
@@ -288,8 +313,15 @@ func (s *Server) signWith(ctx context.Context, q *store.Q, r *http.Request, h *s
 	if err != nil {
 		return nil, err
 	}
-	for _, it := range in.Items {
-		if err = q.Audit(ctx, now, "host:"+h.Name, "sign", "grant:"+v.Grant, fmt.Sprintf("%s scheme=%s sha256=%s sha512=%s size=%d name=%q enrollment=%s address=%s", v.Path, v.Scheme, it.SHA256, it.SHA512, it.Size, it.Name, v.Enrollment, v.Peer)); err != nil {
+	for i, it := range in.Items {
+		detail := fmt.Sprintf("%s scheme=%s sha256=%s sha512=%s size=%d name=%q enrollment=%s address=%s", v.Path, v.Scheme, it.SHA256, it.SHA512, it.Size, it.Name, v.Enrollment, v.Peer)
+		if sc.SSH {
+			// What the login was for, as the SSH client stated it: the remote
+			// account, the session (by digest) and, when bound, the server's host key.
+			u := logins[i]
+			detail = fmt.Sprintf("%s scheme=%s use=%s user=%q session=%s hostkey=%s sha256=%s enrollment=%s address=%s", v.Path, v.Scheme, v.Use, u.User, u.SessionDigest(), u.HostKeyFingerprint(), it.SHA256, v.Enrollment, v.Peer)
+		}
+		if err = q.Audit(ctx, now, "host:"+h.Name, "sign", "grant:"+v.Grant, detail); err != nil {
 			return nil, err
 		}
 	}

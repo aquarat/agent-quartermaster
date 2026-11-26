@@ -185,15 +185,39 @@ type vaultSetView struct {
 	PublicHex   string `json:"public_hex,omitempty"`
 	PublicPEM   string `json:"public_pem,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"`
+	// An SSH key's public line ("ssh-ed25519 AAAA... comment").
+	AuthorizedKey string `json:"authorized_key,omitempty"`
+}
+
+// setView adds the public key forms the Vault shows: hex, PEM and a SHA-256
+// fingerprint for a signer; the authorized_keys line and the OpenSSH
+// fingerprint for an SSH key.
+func setView(t store.VaultTarget) vaultSetView {
+	v := vaultSetView{VaultTarget: t}
+	switch t.Kind {
+	case "signer":
+		sc, _ := signer.Lookup(t.Scheme)
+		v.PublicKey, v.PublicHex, v.Fingerprint = encodeID(t.PublicKey), hex.EncodeToString(t.PublicKey), signer.Fingerprint(t.PublicKey)
+		v.PublicPEM, _ = sc.PublicPEM(t.PublicKey)
+	case "ssh-key":
+		v.PublicKey, v.Fingerprint = encodeID(t.PublicKey), setFingerprint(t)
+		v.AuthorizedKey, _ = signer.AuthorizedKey(t.Scheme, t.PublicKey, t.Comment)
+	}
+	return v
 }
 
 func (s *Server) vaultState(ctx context.Context, r *http.Request, sess string) (any, error) {
 	out := struct {
-		Schemes  []signer.Scheme  `json:"schemes"`
-		Orgs     []store.VaultOrg `json:"organisations"`
-		Sets     []vaultSetView   `json:"sets"`
-		Requests []signer.Request `json:"requests"`
-	}{Schemes: signer.All(), Sets: []vaultSetView{}}
+		Schemes  []signer.Scheme     `json:"schemes"`
+		SSHTypes []signer.SSHKeyType `json:"ssh_key_types"`
+		Orgs     []store.VaultOrg    `json:"organisations"`
+		Sets     []vaultSetView      `json:"sets"`
+		Deleted  []deletedView       `json:"deleted"`
+		Bin      int                 `json:"bin_seconds"`
+		Requests []signer.Request    `json:"requests"`
+	}{Schemes: signer.All(), SSHTypes: signer.SSHKeyTypes(), Sets: []vaultSetView{}, Deleted: []deletedView{}, Bin: int(store.BinTTL / time.Second)}
+	// The bin never shows an item whose seven days are over.
+	s.purgeDue(ctx)
 	err := s.store.Tx(ctx, func(q *store.Q) error {
 		if _, err := s.vaultOwner(ctx, q, sess); err != nil {
 			return err
@@ -213,13 +237,14 @@ func (s *Server) vaultState(ctx context.Context, r *http.Request, sess string) (
 			return err
 		}
 		for _, t := range sets {
-			v := vaultSetView{VaultTarget: t}
-			if t.Kind == "signer" {
-				sc, _ := signer.Lookup(t.Scheme)
-				v.PublicKey, v.PublicHex, v.Fingerprint = encodeID(t.PublicKey), hex.EncodeToString(t.PublicKey), signer.Fingerprint(t.PublicKey)
-				v.PublicPEM, _ = sc.PublicPEM(t.PublicKey)
-			}
-			out.Sets = append(out.Sets, v)
+			out.Sets = append(out.Sets, setView(t))
+		}
+		binned, err := q.DeletedSets(ctx)
+		if err != nil {
+			return err
+		}
+		for _, d := range binned {
+			out.Deleted = append(out.Deleted, newDeletedView(d))
 		}
 		out.Requests, err = q.OwnerSignRequests(ctx)
 		return err
@@ -253,9 +278,9 @@ func (s *Server) vaultHistory(ctx context.Context, r *http.Request, sess string)
 		}
 		for _, e := range rows {
 			switch {
-			case out.LastChanged == 0 && (e.Action == "vault_commit" || e.Action == "vault_signer_create" || e.Action == "vault_secret_create" || e.Action == "env_commit"):
+			case out.LastChanged == 0 && (e.Action == "vault_commit" || e.Action == "vault_signer_create" || e.Action == "vault_ssh_key_create" || e.Action == "vault_secret_create" || e.Action == "vault_restore" || e.Action == "env_commit"):
 				out.LastChanged = e.At.UnixMilli()
-			case out.LastUsed == 0 && (e.Action == "sign" || strings.HasPrefix(e.Action, "env_collect_")):
+			case out.LastUsed == 0 && (e.Action == "sign" || e.Action == "ssh_key_collect" || strings.HasPrefix(e.Action, "env_collect_")):
 				out.LastUsed = e.At.UnixMilli()
 			}
 		}
@@ -308,6 +333,12 @@ type vaultChoice struct {
 	// sign-approve
 	TTL int `json:"ttl_seconds,omitempty"`
 	Max int `json:"max_signatures,omitempty"`
+	// ssh-key-create: the key's comment; ssh-key-create and ssh-key-handout:
+	// whether the private key may be handed out
+	Comment string `json:"comment,omitempty"`
+	Handout *bool  `json:"handout,omitempty"`
+	// delete: the revision the owner was shown
+	Revision *int `json:"revision,omitempty"`
 }
 
 func targetFields(t store.VaultTarget) map[string]any {
@@ -493,7 +524,7 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 			return "", nil, err
 		}
 		sc, ok := signer.Lookup(c.Scheme)
-		if !ok || !catalogueID.MatchString(c.ID) || !config.ValidName(c.Slug) || !catalogueTitle.MatchString(c.Title) || strings.TrimSpace(c.Title) != c.Title {
+		if !ok || sc.SSH || !catalogueID.MatchString(c.ID) || !config.ValidName(c.Slug) || !catalogueTitle.MatchString(c.Title) || strings.TrimSpace(c.Title) != c.Title {
 			return "", nil, errBad("invalid signer set")
 		}
 		if free, err := q.SetSlugFree(ctx, t.ServiceID, c.ID, c.Slug); err != nil || !free {
@@ -631,6 +662,62 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		}
 		m = targetFields(t)
 		m["env_name"], m["note"], m["url"] = t.Names[0], c.Note, c.URL
+	case "ssh-key-create":
+		if m, err = s.reviewSSHKeyCreate(ctx, q, sess, owner, &c, facts, begin); err != nil {
+			return "", nil, err
+		}
+	case "ssh-key-handout":
+		t, err := q.VaultSet(ctx, c.ID)
+		if err != nil {
+			return "", nil, err
+		}
+		if err = owner(t.OrgID); err != nil {
+			return "", nil, err
+		}
+		if t.Kind != "ssh-key" {
+			return "", nil, errBad("only an SSH key has a hand-out setting")
+		}
+		if c.Handout == nil || *c.Handout == t.Handout {
+			return "", nil, errConflict("the setting already has that value; reload")
+		}
+		m = targetFields(t)
+		m["fingerprint"], m["old_handout"], m["handout"] = setFingerprint(t), t.Handout, *c.Handout
+	case "delete":
+		t, err := q.VaultSet(ctx, c.ID)
+		if err != nil {
+			return "", nil, err
+		}
+		if err = owner(t.OrgID); err != nil {
+			return "", nil, err
+		}
+		if c.Revision == nil {
+			return "", nil, errBad("name the revision you are deleting")
+		}
+		if *c.Revision != t.Revision {
+			return "", nil, errConflict("the item changed since you opened it; reload and review again")
+		}
+		m = targetFields(t)
+		m["path"], m["fingerprint"], m["bin_seconds"] = t.Path(), setFingerprint(t), int(store.BinTTL/time.Second)
+	case "restore", "purge":
+		d, err := q.DeletedSet(ctx, c.ID)
+		if err != nil {
+			return "", nil, err
+		}
+		if err = owner(d.OrgID); err != nil {
+			return "", nil, err
+		}
+		m = targetFields(d.VaultTarget)
+		m["path"], m["deleted_at"] = d.Path(), d.DeletedAt
+		if c.Action == "purge" {
+			m["digest"] = d.Digest
+			break
+		}
+		if d.PurgeAt <= s.now().UnixMilli() {
+			return "", nil, errConflict("the seven days are over: this item is being purged")
+		}
+		if d.PathTaken {
+			return "", nil, errConflict("an item named " + d.Path() + " exists now: delete or rename that one first, then restore")
+		}
 	case "sign-approve", "sign-deny", "sign-revoke":
 		v, host, err := q.SignRequest(ctx, c.ID, false)
 		if err != nil {
@@ -643,7 +730,7 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 			return "", nil, errConflict("decision no longer available")
 		}
 		t, err := q.VaultSet(ctx, v.Set)
-		if err != nil || t.Kind != "signer" {
+		if err != nil || t.Kind != "signer" && t.Kind != "ssh-key" || (t.Kind == "ssh-key") != (v.Use != "") {
 			return "", nil, errConflict("signer no longer available")
 		}
 		if c.Action == "sign-approve" {
@@ -653,6 +740,16 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 			}
 			single := c.TTL == 0 && c.Max == len(v.Items)
 			timed := v.TTL > 0 && c.TTL > 0 && c.TTL <= v.TTL && c.Max >= 1 && c.Max <= v.Max
+			switch v.Use {
+			case signer.UseSSHAgent: // logins are always a time-boxed grant
+				single = false
+				timed = timed && c.TTL >= signer.MinGrantSeconds
+			case signer.UseSSHHandout: // one delivery of the key, nothing else
+				single, timed = c.TTL == 0 && c.Max == 1, false
+				if !t.Handout {
+					return "", nil, errConflict("this key may no longer be handed out; deny the request")
+				}
+			}
 			if !single && !timed {
 				return "", nil, errBad("duration or count exceeds the request")
 			}
@@ -668,6 +765,9 @@ func (s *Server) vaultReview(ctx context.Context, q *store.Q, sess string, pk in
 		}
 		m = targetFields(t)
 		m["request_id"], m["host"], m["enrollment"], m["address"], m["scheme"], m["fingerprint"], m["items"] = v.ID, v.Host, v.Enrollment, v.Peer, v.Scheme, signer.Fingerprint(v.PublicKey), items
+		if v.Use != "" { // an SSH key: what the request is for, and the fingerprint as SSH shows it
+			m["use"], m["fingerprint"] = v.Use, setFingerprint(t)
+		}
 		m["requested_ttl_seconds"], m["requested_max_signatures"], m["ttl_seconds"], m["max_signatures"] = v.TTL, v.Max, c.TTL, c.Max
 		m["admission_generation"], m["policy_revision"], m["service_revision"], m["soft_cap_seconds"], m["beyond_soft_cap"] = v.Generation, v.PolicyRevision, v.ServiceRevision, v.Soft, c.TTL > v.Soft
 	default:
@@ -843,6 +943,9 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 		URL         string   `json:"url"`
 		EnvName     string   `json:"env_name"`
 		StandingCap *int     `json:"standing_cap_seconds"`
+		Comment     string   `json:"comment"`
+		Handout     *bool    `json:"handout"`
+		Revision    *int     `json:"revision"`
 	}
 	if json.Unmarshal([]byte(m.Metadata), &f) != nil {
 		err = errBad("invalid vault decision")
@@ -864,8 +967,15 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 		choice.StandingCap = f.StandingCap
 	case "sign-approve":
 		choice.TTL, choice.Max = f.TTL, f.Max
+	case "ssh-key-create":
+		choice.Service, choice.Slug, choice.Title, choice.Scheme, choice.Source, choice.Comment, choice.Handout = f.Service, f.Slug, f.Title, f.Scheme, f.Source, f.Comment, f.Handout
+	case "ssh-key-handout":
+		choice.Handout = f.Handout
+	case "delete":
+		choice.Revision = f.Revision
 	}
 	var out any = api.OK{OK: true}
+	var evict []seal.ID // buckets of a deleted or purged item: closed after commit
 	var note, auditObject, detail string
 	defer func() {
 		if f.Attempt != "" { // spent whether or not the decision applied
@@ -1092,6 +1202,40 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 			}
 			path := t.OrgSlug + "/" + t.ServiceSlug + "/" + t.SetSlug
 			auditObject, detail, note = "set:"+t.SetID, fmt.Sprintf("%s revision=%d env=%s", path, t.Revision, f.EnvName), fmt.Sprintf("%s is now a secret", path)
+		case "ssh-key-create":
+			if out, auditObject, detail, note, err = s.applySSHKeyCreate(ctx, q, sess, m.ID, f.Service, f.Slug, f.Title, f.Scheme, f.Source, f.Attempt, f.PublicKey, f.Comment, f.Handout != nil && *f.Handout, now); err != nil {
+				return err
+			}
+		case "ssh-key-handout":
+			t, err := q.VaultSet(ctx, m.ID)
+			if err != nil {
+				return err
+			}
+			if err = q.SetSSHHandout(ctx, t.SetID, *f.Handout); err != nil {
+				return err
+			}
+			auditObject, detail, note = "set:"+t.SetID, fmt.Sprintf("%s handout=%t was=%t fingerprint=%s", t.Path(), *f.Handout, t.Handout, setFingerprint(t)), fmt.Sprintf("Hand-out of SSH key %s set to %t", t.Path(), *f.Handout)
+		case "delete":
+			if out, auditObject, detail, note, evict, err = s.applyDelete(ctx, q, pk, m.ID, now); err != nil {
+				return err
+			}
+		case "restore":
+			d, err := q.DeletedSet(ctx, m.ID)
+			if err != nil {
+				return err
+			}
+			if err = q.RestoreSet(ctx, d.SetID); err != nil {
+				return errConflict("an item named " + d.Path() + " exists now: delete or rename that one first, then restore")
+			}
+			out = map[string]any{"ok": true, "path": d.Path()}
+			auditObject, detail, note = "set:"+d.SetID, fmt.Sprintf("%s kind=%s revision=%d deleted_at=%d digest=%s", d.Path(), d.Kind, d.Revision, d.DeletedAt, d.Digest), fmt.Sprintf("Restored %s from the bin", d.Path())
+		case "purge":
+			p, err := q.PurgeSet(ctx, m.ID)
+			if err != nil {
+				return err
+			}
+			evict = sealIDs(p.Buckets)
+			auditObject, detail, note = "set:"+m.ID, purgeDetail(p), fmt.Sprintf("Purged %s for good", p.Path)
 		case "sign-approve":
 			v, _, err := q.SignRequest(ctx, m.ID, false)
 			if err != nil {
@@ -1105,6 +1249,12 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 				return err
 			}
 			auditObject, detail, note = "request:"+m.ID, fmt.Sprintf("%s host=%s ttl=%d max=%d items=%s", v.Path, v.Host, f.TTL, f.Max, itemDigests(v.Items)), fmt.Sprintf("Approved signing with %s for %s", v.Path, v.Host)
+			switch v.Use {
+			case signer.UseSSHAgent:
+				detail, note = fmt.Sprintf("%s host=%s use=%s ttl=%d max=%d", v.Path, v.Host, v.Use, f.TTL, f.Max), fmt.Sprintf("Approved SSH logins with %s for %s", v.Path, v.Host)
+			case signer.UseSSHHandout:
+				detail, note = fmt.Sprintf("%s host=%s use=%s", v.Path, v.Host, v.Use), fmt.Sprintf("Approved handing out the private SSH key %s to %s", v.Path, v.Host)
+			}
 		case "sign-deny", "sign-revoke":
 			v, _, err := q.SignRequest(ctx, m.ID, false)
 			if err != nil {
@@ -1119,6 +1269,9 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 			}
 			s.seal.pool.release("sign:" + m.ID)
 			auditObject, detail, note = "request:"+m.ID, v.Path+" host="+v.Host, fmt.Sprintf("Signing with %s for %s: %s", v.Path, v.Host, status)
+			if v.Use != "" {
+				detail, note = v.Path+" host="+v.Host+" use="+v.Use, fmt.Sprintf("SSH key %s for %s: %s", v.Path, v.Host, status)
+			}
 		}
 		return q.Audit(ctx, now, "owner", "vault_"+strings.ReplaceAll(m.Action, "-", "_"), auditObject, fmt.Sprintf("passkey=%d nonce=%s %s", pk, canonNonce(c.Canonical), detail))
 	})
@@ -1127,6 +1280,15 @@ func (s *Server) vaultFinish(ctx context.Context, r *http.Request, sess string) 
 			err = errConflict("the set changed; reload and review again")
 		}
 		return nil, err
+	}
+	if len(evict) > 0 {
+		// A deleted item's bucket closes at once; a purged one has no bucket any more.
+		s.seal.pool.evict(evict...)
+		if m.Action == "purge" {
+			if err := s.store.CheckpointWAL(ctx); err != nil {
+				s.log.Warn("vault: could not truncate the WAL after a purge", "error", err)
+			}
+		}
 	}
 	// A new revision or a changed limit ends "don't ask again" rules: their holds go now.
 	s.reconcileHolds(ctx)

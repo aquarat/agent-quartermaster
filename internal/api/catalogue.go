@@ -105,7 +105,7 @@ type HostCatalogue struct {
 // HostCredential is one credential set the host may request.
 type HostCredential struct {
 	Path  string `json:"path"`
-	Kind  string `json:"kind"` // env-set | secret | signer | cloudflare-proxy | cloudflare-mint
+	Kind  string `json:"kind"` // env-set | secret | signer | ssh-key | cloudflare-proxy | cloudflare-mint
 	Title string `json:"title"`
 	// Names are an env set's key names; Env is a secret's variable name.
 	Names  []string `json:"names,omitempty"`
@@ -113,6 +113,11 @@ type HostCredential struct {
 	Note   string   `json:"note,omitempty"`
 	URL    string   `json:"url,omitempty"`
 	Scheme string   `json:"scheme,omitempty"`
+	// PublicKey is an SSH key's public line ("ssh-ed25519 AAAA... comment"), to
+	// put in authorized_keys or a forge's key form. Handout: the owner allows
+	// `aqmas ssh-key` to deliver the private key.
+	PublicKey string `json:"public_key,omitempty"`
+	Handout   bool   `json:"handout,omitempty"`
 	// Approval: "owner" (a passkey tap for every request) or "per-scope"
 	// (Cloudflare: some scopes are approved by policy, see `aqmas cf scopes`).
 	Approval string `json:"approval"`

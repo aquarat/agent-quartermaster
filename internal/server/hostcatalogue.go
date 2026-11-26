@@ -5,6 +5,7 @@ import (
 
 	"github.com/aquarat/agent-quartermaster/internal/api"
 	"github.com/aquarat/agent-quartermaster/internal/server/store"
+	"github.com/aquarat/agent-quartermaster/internal/signer"
 )
 
 // handleHostCatalogue is GET /v2/catalogue (docs/API.md "Discovery"): what
@@ -64,21 +65,28 @@ func (s *Server) handleHostCatalogue(w http.ResponseWriter, r *http.Request, h *
 				if !vault {
 					continue
 				}
-				kind, names, scheme, note, link, ok, err := q.HostSetDetail(ctx, x.SetID)
+				d, err := q.HostSetDetail(ctx, x.SetID)
 				if err != nil {
 					return err
 				}
-				if !ok { // nothing stored yet: nothing to ask for
+				if !d.OK { // nothing stored yet: nothing to ask for
 					continue
 				}
-				c := api.HostCredential{Path: path, Kind: kind, Title: x.SetTitle, Approval: "owner"}
-				switch kind {
+				c := api.HostCredential{Path: path, Kind: d.Kind, Title: x.SetTitle, Approval: "owner"}
+				switch d.Kind {
 				case "signer":
-					c.Scheme, c.Use = scheme, "aqmas sign "+path+" --why \"...\" FILE"
+					c.Scheme, c.Use = d.Scheme, "aqmas sign "+path+" --why \"...\" FILE"
+				case "ssh-key":
+					// The public line is public: it is what the owner put on the forge or server.
+					c.Scheme, c.Handout = d.Scheme, d.Handout
+					if c.PublicKey, err = signer.AuthorizedKey(d.Scheme, d.PublicKey, d.Comment); err != nil {
+						continue
+					}
+					c.Use = "aqmas ssh-agent " + path + " --why \"...\" -- COMMAND (git, ssh, scp, rsync)"
 				case "secret":
-					c.Env, c.Note, c.URL, c.Use = names[0], note, link, "aqmas run "+path+" --why \"...\" -- COMMAND"
+					c.Env, c.Note, c.URL, c.Use = d.Names[0], d.Note, d.URL, "aqmas run "+path+" --why \"...\" -- COMMAND"
 				default:
-					c.Names, c.Use = names, "aqmas run "+path+" --why \"...\" -- COMMAND"
+					c.Names, c.Use = d.Names, "aqmas run "+path+" --why \"...\" -- COMMAND"
 				}
 				out.Credentials = append(out.Credentials, c)
 			}

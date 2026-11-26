@@ -392,6 +392,7 @@ func (s *Server) sweeper(ctx context.Context) {
 				if err := s.store.Q().SweepEnv(ctx, s.now()); err != nil {
 					s.log.Warn("env expiry sweep failed")
 				}
+				s.purgeDue(ctx) // binned Vault items whose seven days are over
 				s.reconcileHolds(ctx)
 			}
 			n, err := s.store.Q().ExpireStale(ctx, s.now())

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"time"
@@ -22,6 +23,14 @@ import (
 // A secret (0.10.0) is the same trick with a secret_sets row: an env set that
 // holds exactly one key, the secret's environment variable name. A previous
 // binary sees a one-key env set, which `aqmas run` delivers just the same.
+// An SSH key (0.11.0) is a signer whose scheme is one of the SSH ones, with an
+// ssh_keys row for its comment and its "may be handed out" switch. A previous
+// binary sees a signer with a scheme it does not know and signs nothing with it.
+// A deleted item (0.11.0) stays a credential_sets row, archived and under a
+// tombstone slug so its path is free, with a deleted_sets row that keeps the
+// original slug until it is restored or purged. Every query that resolves a
+// path or lists sets already skips archived rows, in this binary and in
+// earlier ones.
 // No statement here takes a value, a private key or a DEK: only public
 // metadata and sealed records.
 func (s *Store) InitVault(ctx context.Context) error {
@@ -33,7 +42,21 @@ CREATE INDEX IF NOT EXISTS sign_by_host_status ON sign_requests(host,status);
 CREATE TRIGGER IF NOT EXISTS sign_end_admission AFTER UPDATE ON org_hosts BEGIN UPDATE sign_requests SET status=CASE status WHEN 'pending' THEN 'expired' ELSE 'revoked' END WHERE status IN ('approved','pending') AND host=NEW.host_id AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.org_id);END;
 CREATE TRIGGER IF NOT EXISTS sign_end_policy AFTER UPDATE ON organisations BEGIN UPDATE sign_requests SET status=CASE status WHEN 'pending' THEN 'expired' ELSE 'revoked' END WHERE status IN ('approved','pending') AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.id);END;
 CREATE TRIGGER IF NOT EXISTS sign_end_set AFTER UPDATE ON credential_sets BEGIN UPDATE sign_requests SET status=CASE status WHEN 'pending' THEN 'expired' ELSE 'revoked' END WHERE status IN ('approved','pending') AND set_id=NEW.id;END;
-CREATE TRIGGER IF NOT EXISTS signer_key_immutable BEFORE UPDATE OF set_id,scheme,public_key,origin,blob ON signer_keys BEGIN SELECT RAISE(ABORT,'immutable signer key'); END;`)
+CREATE TRIGGER IF NOT EXISTS signer_key_immutable BEFORE UPDATE OF set_id,scheme,public_key,origin,blob ON signer_keys BEGIN SELECT RAISE(ABORT,'immutable signer key'); END;
+CREATE TABLE IF NOT EXISTS ssh_keys(set_id TEXT PRIMARY KEY REFERENCES credential_sets(id),comment TEXT NOT NULL,handout INTEGER NOT NULL CHECK(handout IN (0,1)),created INTEGER NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS deleted_sets(set_id TEXT PRIMARY KEY REFERENCES credential_sets(id),slug TEXT NOT NULL,kind TEXT NOT NULL,deleted_at INTEGER NOT NULL,purge_at INTEGER NOT NULL,passkey INTEGER NOT NULL,deleted_by TEXT NOT NULL,digest TEXT NOT NULL) STRICT;`)
+	if err != nil {
+		return err
+	}
+	// 0.11.0: what an SSH key's request is for ('ssh-agent' or 'ssh-handout');
+	// NULL is ordinary signing, which is all an earlier binary ever wrote.
+	var has int
+	if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('sign_requests') WHERE name='use'`).Scan(&has); err != nil {
+		return err
+	}
+	if has == 0 {
+		_, err = s.db.ExecContext(ctx, `ALTER TABLE sign_requests ADD COLUMN use TEXT CHECK(use IS NULL OR use IN ('ssh-agent','ssh-handout'))`)
+	}
 	return err
 }
 
@@ -65,19 +88,36 @@ type VaultTarget struct {
 	URL  string `json:"url,omitempty"`
 	// StandingCap is the set's "longest don't-ask-again" in seconds (0: off).
 	StandingCap int `json:"standing_cap_seconds"`
+	// An SSH key's comment and whether its private key may be handed out.
+	Comment string `json:"comment,omitempty"`
+	Handout bool   `json:"handout,omitempty"`
 }
 
-const vaultCols = `o.id,o.slug,o.title,v.id,v.slug,v.title,s.id,s.slug,s.title,s.revision,v.revision,o.revision,coalesce(r.names,'[]'),coalesce((SELECT allow_reveal FROM org_vault x WHERE x.org_id=o.id),1),coalesce(k.scheme,''),k.public_key,coalesce(k.origin,''),coalesce(k.created,0),coalesce(k.signatures,0),z.set_id IS NOT NULL,coalesce(z.note,''),coalesce(z.url,''),coalesce((SELECT cap_seconds FROM set_standing c WHERE c.set_id=s.id),3600) FROM organisations o JOIN services v ON v.org_id=o.id JOIN credential_sets s ON s.service_id=v.id LEFT JOIN signer_keys k ON k.set_id=s.id LEFT JOIN secret_sets z ON z.set_id=s.id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision AND r.wrap IS NOT NULL WHERE NOT o.archived AND NOT v.archived AND NOT s.archived AND v.provider='application' AND s.kind='env-set'`
+// Path is the item's organisation/service/set path.
+func (t VaultTarget) Path() string { return t.OrgSlug + "/" + t.ServiceSlug + "/" + t.SetSlug }
+
+// vaultCols selects one application set. A binned set is read with the slug it
+// had (deleted_sets keeps it; the row itself carries a tombstone slug).
+const vaultCols = `o.id,o.slug,o.title,v.id,v.slug,v.title,s.id,coalesce(d.slug,s.slug),s.title,s.revision,v.revision,o.revision,coalesce(r.names,'[]'),coalesce((SELECT allow_reveal FROM org_vault x WHERE x.org_id=o.id),1),coalesce(k.scheme,''),k.public_key,coalesce(k.origin,''),coalesce(k.created,0),coalesce(k.signatures,0),z.set_id IS NOT NULL,coalesce(z.note,''),coalesce(z.url,''),coalesce((SELECT cap_seconds FROM set_standing c WHERE c.set_id=s.id),3600),y.set_id IS NOT NULL,coalesce(y.comment,''),coalesce(y.handout,0) FROM organisations o JOIN services v ON v.org_id=o.id JOIN credential_sets s ON s.service_id=v.id LEFT JOIN signer_keys k ON k.set_id=s.id LEFT JOIN secret_sets z ON z.set_id=s.id LEFT JOIN ssh_keys y ON y.set_id=s.id LEFT JOIN deleted_sets d ON d.set_id=s.id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision AND r.wrap IS NOT NULL WHERE NOT o.archived AND NOT v.archived AND v.provider='application' AND s.kind='env-set'`
+
+// vaultLive and vaultBinned complete vaultCols: the sets in use, and the bin.
+const (
+	vaultLive   = vaultCols + ` AND NOT s.archived`
+	vaultBinned = vaultCols + ` AND s.archived AND d.set_id IS NOT NULL`
+)
 
 func scanVault(row interface{ Scan(...any) error }) (t VaultTarget, err error) {
 	var names string
-	var secret bool
-	if err = row.Scan(&t.OrgID, &t.OrgSlug, &t.OrgTitle, &t.ServiceID, &t.ServiceSlug, &t.ServiceTitle, &t.SetID, &t.SetSlug, &t.SetTitle, &t.Revision, &t.ServiceRevision, &t.PolicyRevision, &names, &t.AllowReveal, &t.Scheme, &t.PublicKey, &t.Origin, &t.Created, &t.Signatures, &secret, &t.Note, &t.URL, &t.StandingCap); err != nil {
+	var secret, sshKey bool
+	if err = row.Scan(&t.OrgID, &t.OrgSlug, &t.OrgTitle, &t.ServiceID, &t.ServiceSlug, &t.ServiceTitle, &t.SetID, &t.SetSlug, &t.SetTitle, &t.Revision, &t.ServiceRevision, &t.PolicyRevision, &names, &t.AllowReveal, &t.Scheme, &t.PublicKey, &t.Origin, &t.Created, &t.Signatures, &secret, &t.Note, &t.URL, &t.StandingCap, &sshKey, &t.Comment, &t.Handout); err != nil {
 		return t, err
 	}
 	t.Kind = "env-set"
 	if t.Scheme != "" {
 		t.Kind, t.StandingCap = "signer", 0
+		if sshKey {
+			t.Kind = "ssh-key"
+		}
 	} else if secret {
 		t.Kind = "secret"
 	}
@@ -85,7 +125,7 @@ func scanVault(row interface{ Scan(...any) error }) (t VaultTarget, err error) {
 }
 func (q *Q) VaultSets(ctx context.Context) ([]VaultTarget, error) {
 	out := []VaultTarget{}
-	err := q.rows(ctx, `SELECT `+vaultCols+` ORDER BY o.slug,v.slug,s.slug`, func(rs *sql.Rows) error {
+	err := q.rows(ctx, `SELECT `+vaultLive+` ORDER BY o.slug,v.slug,s.slug`, func(rs *sql.Rows) error {
 		t, err := scanVault(rs)
 		out = append(out, t)
 		return err
@@ -93,7 +133,7 @@ func (q *Q) VaultSets(ctx context.Context) ([]VaultTarget, error) {
 	return out, err
 }
 func (q *Q) VaultSet(ctx context.Context, set string) (VaultTarget, error) {
-	t, err := scanVault(q.q.QueryRowContext(ctx, `SELECT `+vaultCols+` AND s.id=?`, set))
+	t, err := scanVault(q.q.QueryRowContext(ctx, `SELECT `+vaultLive+` AND s.id=?`, set))
 	return t, notFound(err)
 }
 
@@ -188,6 +228,226 @@ func (q *Q) SignerCipher(ctx context.Context, set string) (rec CipherRecord, err
 	return rec, notFound(err)
 }
 
+// SSHKeySets names the sets the catalogue must show as kind "ssh-key".
+func (q *Q) SSHKeySets(ctx context.Context) (map[string]bool, error) {
+	out := map[string]bool{}
+	err := q.rows(ctx, `SELECT set_id FROM ssh_keys`, func(rs *sql.Rows) error {
+		var id string
+		err := rs.Scan(&id)
+		out[id] = true
+		return err
+	})
+	return out, err
+}
+
+// CreateSSHKey inserts an SSH key: a signer row and its marker.
+func (q *Q) CreateSSHKey(ctx context.Context, t VaultTarget, r CipherRecord, now time.Time) error {
+	if err := q.CreateSigner(ctx, t, r, now); err != nil {
+		return err
+	}
+	return one(q.q.ExecContext(ctx, `INSERT INTO ssh_keys(set_id,comment,handout,created) VALUES(?,?,?,?)`, t.SetID, t.Comment, t.Handout, ms(now)))
+}
+
+// SSHKeyMeta is an SSH key's comment and hand-out switch; ok is false for a
+// set that is not an SSH key.
+func (q *Q) SSHKeyMeta(ctx context.Context, set string) (comment string, handout, ok bool, err error) {
+	err = q.q.QueryRowContext(ctx, `SELECT comment,handout FROM ssh_keys WHERE set_id=?`, set).Scan(&comment, &handout)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, false, nil
+	}
+	return comment, handout, err == nil, err
+}
+
+// SetSSHHandout changes whether the key may be handed out. Turning it off
+// also ends hand-out requests that are waiting or approved but not collected.
+func (q *Q) SetSSHHandout(ctx context.Context, set string, handout bool) error {
+	if err := one(q.q.ExecContext(ctx, `UPDATE ssh_keys SET handout=? WHERE set_id=? AND handout!=?`, handout, set, handout)); err != nil {
+		return err
+	}
+	if handout {
+		return nil
+	}
+	_, err := q.q.ExecContext(ctx, `UPDATE sign_requests SET status=CASE status WHEN 'pending' THEN 'expired' ELSE 'revoked' END WHERE status IN ('approved','pending') AND set_id=? AND use='ssh-handout'`, set)
+	return err
+}
+
+// UseHandout spends a hand-out grant: the private key is delivered once.
+func (q *Q) UseHandout(ctx context.Context, grant string, now time.Time) error {
+	return one(q.q.ExecContext(ctx, `UPDATE sign_requests SET used=1,status='used' WHERE grant_id=? AND status='approved' AND used=0 AND use='ssh-handout' AND until_ms>?`, grant, ms(now)))
+}
+
+// ---- the bin (deleted items) ----
+
+// BinTTL is how long a deleted item can be restored before it is purged.
+const BinTTL = 7 * 24 * time.Hour
+
+// DeletedSet is one item in the bin: the set as it was, and who deleted it when.
+type DeletedSet struct {
+	VaultTarget
+	DeletedAt int64  `json:"deleted_at"`
+	PurgeAt   int64  `json:"purge_at"`
+	DeletedBy string `json:"deleted_by"`
+	Digest    string `json:"digest"`
+	// PathTaken: a live item has the path now, so Restore is refused.
+	PathTaken bool `json:"path_taken"`
+}
+
+// Ended counts what a delete ended.
+type Ended struct {
+	Grants   int `json:"grants"`
+	Standing int `json:"standing"`
+	Releases int `json:"releases"`
+	Pending  int `json:"pending"`
+}
+
+// TombstoneSlug is the slug a binned set's row carries so that its path is
+// free: valid under the slug CHECK, unique by the set's own random ID.
+func TombstoneSlug(id, slug string) string {
+	return "zz-deleted-" + id[:min(len(id), 12)] + "-" + slug[:min(len(slug), 39)]
+}
+
+// BinSet moves a live application set to the bin. The UPDATE fires the
+// triggers that end everything that could still use the set: drafts, pending
+// requests and approved releases (env_end_revision), signing requests and
+// grants (sign_end_set) and don't-ask-again rules (env_standing_end_revision).
+// A set whose revision moved since the owner reviewed it is ErrConflict.
+func (q *Q) BinSet(ctx context.Context, t VaultTarget, passkey int64, digest string, now time.Time) (Ended, error) {
+	var e Ended
+	at := ms(now)
+	for _, c := range []struct {
+		n     *int
+		query string
+	}{
+		{&e.Grants, `SELECT count(*) FROM sign_requests WHERE set_id=?1 AND status='approved' AND until_ms>?2`},
+		{&e.Standing, `SELECT count(*) FROM env_standing WHERE set_id=?1 AND revoked_at IS NULL AND expires>?2`},
+		{&e.Releases, `SELECT count(*) FROM env_releases WHERE set_id=?1 AND status='approved' AND NOT consumed AND until_ms>?2`},
+		{&e.Pending, `SELECT (SELECT count(*) FROM sign_requests WHERE set_id=?1 AND status='pending' AND deadline>?2)+(SELECT count(*) FROM env_releases WHERE set_id=?1 AND status='pending' AND deadline>?2)`},
+	} {
+		if err := q.q.QueryRowContext(ctx, c.query, t.SetID, at).Scan(c.n); err != nil {
+			return e, err
+		}
+	}
+	if err := one(q.q.ExecContext(ctx, `UPDATE credential_sets SET archived=1,slug=? WHERE id=? AND NOT archived AND revision=? AND provider='application'`, TombstoneSlug(t.SetID, t.SetSlug), t.SetID, t.Revision)); err != nil {
+		return e, err
+	}
+	return e, one(q.q.ExecContext(ctx, `INSERT INTO deleted_sets(set_id,slug,kind,deleted_at,purge_at,passkey,deleted_by,digest) VALUES(?1,?2,?3,?4,?5,?6,coalesce((SELECT name FROM passkeys WHERE id=?6),''),?7)`, t.SetID, t.SetSlug, t.Kind, at, ms(now.Add(BinTTL)), passkey, digest))
+}
+
+const deletedCols = `,d.deleted_at,d.purge_at,d.deleted_by,d.digest,EXISTS(SELECT 1 FROM credential_sets x WHERE x.service_id=s.service_id AND x.slug=d.slug AND x.id!=s.id)`
+
+func scanDeleted(row interface{ Scan(...any) error }) (DeletedSet, error) {
+	var d DeletedSet
+	t, err := scanVault(scanTail{row, []any{&d.DeletedAt, &d.PurgeAt, &d.DeletedBy, &d.Digest, &d.PathTaken}})
+	d.VaultTarget = t
+	return d, err
+}
+
+// scanTail lets scanVault read its own columns while the caller's follow.
+type scanTail struct {
+	row  interface{ Scan(...any) error }
+	tail []any
+}
+
+func (s scanTail) Scan(dst ...any) error { return s.row.Scan(append(dst, s.tail...)...) }
+
+func deletedQuery(where string) string {
+	i := strings.Index(vaultBinned, " FROM organisations")
+	return `SELECT ` + vaultBinned[:i] + deletedCols + vaultBinned[i:] + where
+}
+
+// DeletedSets lists the bin, soonest purge first.
+func (q *Q) DeletedSets(ctx context.Context) ([]DeletedSet, error) {
+	out := []DeletedSet{}
+	err := q.rows(ctx, deletedQuery(` ORDER BY d.purge_at,s.id`), func(rs *sql.Rows) error {
+		d, err := scanDeleted(rs)
+		out = append(out, d)
+		return err
+	})
+	return out, err
+}
+func (q *Q) DeletedSet(ctx context.Context, set string) (DeletedSet, error) {
+	d, err := scanDeleted(q.q.QueryRowContext(ctx, deletedQuery(` AND s.id=?`), set))
+	return d, notFound(err)
+}
+
+// RestoreSet takes a set out of the bin under its original slug. A live set
+// with that slug in the service (the UNIQUE constraint) is ErrConflict. The
+// UPDATE fires the same triggers as BinSet did; nothing of the set was live.
+func (q *Q) RestoreSet(ctx context.Context, set string) error {
+	if _, err := q.q.ExecContext(ctx, `UPDATE credential_sets SET archived=0,slug=(SELECT slug FROM deleted_sets WHERE set_id=?1) WHERE id=?1 AND archived AND EXISTS(SELECT 1 FROM deleted_sets WHERE set_id=?1)`, set); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return ErrConflict
+		}
+		return err
+	}
+	return one(q.q.ExecContext(ctx, `DELETE FROM deleted_sets WHERE set_id=?`, set))
+}
+
+// DuePurges are the binned sets whose seven days are over.
+func (q *Q) DuePurges(ctx context.Context, now time.Time) ([]string, error) {
+	var ids []string
+	err := q.rows(ctx, `SELECT set_id FROM deleted_sets WHERE purge_at<=? ORDER BY purge_at`, func(rs *sql.Rows) error {
+		var id string
+		err := rs.Scan(&id)
+		ids = append(ids, id)
+		return err
+	}, ms(now))
+	return ids, err
+}
+
+// PurgeInfo is what the audit log keeps of a purged set: never a value.
+type PurgeInfo struct {
+	Path, Kind, Digest, DeletedBy string
+	DeletedAt                     int64
+	Buckets                       [][]byte
+}
+
+// PurgeSet destroys a binned set for good: every sealed record of it (all env
+// revisions and drafts, the signer or SSH key record), its bucket (the wrap
+// of the bucket key to the scope key included) and every row that refers to
+// it, then the set row itself. The store runs with secure_delete, so the
+// freed pages are overwritten. It needs no open bucket and no key. A set that
+// is not in the bin is ErrNotFound.
+func (q *Q) PurgeSet(ctx context.Context, set string) (PurgeInfo, error) {
+	var p PurgeInfo
+	err := q.q.QueryRowContext(ctx, `SELECT coalesce(o.slug,'?')||'/'||coalesce(v.slug,'?')||'/'||d.slug,d.kind,d.digest,d.deleted_by,d.deleted_at FROM deleted_sets d JOIN credential_sets s ON s.id=d.set_id AND s.archived LEFT JOIN services v ON v.id=s.service_id LEFT JOIN organisations o ON o.id=v.org_id WHERE d.set_id=?`, set).Scan(&p.Path, &p.Kind, &p.Digest, &p.DeletedBy, &p.DeletedAt)
+	if err != nil {
+		return p, notFound(err)
+	}
+	if err = q.rows(ctx, `SELECT id FROM buckets WHERE ref=? AND kind IN ('env-set','signer')`, func(rs *sql.Rows) error {
+		var id []byte
+		err := rs.Scan(&id)
+		p.Buckets = append(p.Buckets, id)
+		return err
+	}, set); err != nil {
+		return p, err
+	}
+	for _, stmt := range []string{
+		`DELETE FROM env_drafts WHERE set_id=?`,
+		`DELETE FROM env_revisions WHERE set_id=?`,
+		`DELETE FROM env_releases WHERE set_id=?`,
+		`DELETE FROM env_standing WHERE set_id=?`,
+		`DELETE FROM set_standing WHERE set_id=?`,
+		`DELETE FROM sign_requests WHERE set_id=?`,
+		`DELETE FROM signer_keys WHERE set_id=?`,
+		`DELETE FROM ssh_keys WHERE set_id=?`,
+		`DELETE FROM secret_sets WHERE set_id=?`,
+		`DELETE FROM buckets WHERE ref=? AND kind IN ('env-set','signer')`,
+		`DELETE FROM deleted_sets WHERE set_id=?`,
+	} {
+		if _, err = q.q.ExecContext(ctx, stmt, set); err != nil {
+			return p, err
+		}
+	}
+	err = one(q.q.ExecContext(ctx, `DELETE FROM credential_sets WHERE id=? AND archived AND provider='application'`, set))
+	if err != nil && strings.Contains(err.Error(), "FOREIGN KEY") {
+		// A row of a table this function does not know still names the set:
+		// the archived, emptied row stays as a tombstone. Nothing sealed is left.
+		err = nil
+	}
+	return p, err
+}
+
 // VaultBinding is the host-less binding used to seal a web-form revision.
 func (t VaultTarget) Binding() envset.Binding {
 	return envset.Binding{Org: t.OrgID, Service: t.ServiceID, Set: t.SetID, Revision: t.Revision, Names: t.Names}
@@ -224,7 +484,8 @@ func (q *Q) NewSignRequest(ctx context.Context, host int64, r signer.Request) er
 	if err != nil {
 		return err
 	}
-	return one(q.q.ExecContext(ctx, `INSERT INTO sign_requests(id,host,set_id,binding,items,peer,reason,ttl,max,deadline,status) VALUES(?,?,?,?,?,?,?,?,?,?,'pending')`, r.ID, host, r.Set, string(b), string(items), r.Peer, r.Reason, r.TTL, r.Max, r.Deadline))
+	use := sql.NullString{String: r.Use, Valid: r.Use != ""}
+	return one(q.q.ExecContext(ctx, `INSERT INTO sign_requests(id,host,set_id,binding,items,peer,reason,ttl,max,deadline,status,use) VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)`, r.ID, host, r.Set, string(b), string(items), r.Peer, r.Reason, r.TTL, r.Max, r.Deadline, use))
 }
 func (q *Q) SignRequest(ctx context.Context, id string, grant bool) (r signer.Request, host int64, err error) {
 	col := "id"
@@ -232,7 +493,7 @@ func (q *Q) SignRequest(ctx context.Context, id string, grant bool) (r signer.Re
 		col = "grant_id"
 	}
 	var b, items string
-	err = q.q.QueryRowContext(ctx, `SELECT id,coalesce(grant_id,''),host,binding,items,peer,reason,ttl,max,deadline,until_ms,status,used FROM sign_requests WHERE `+col+`=?`, id).Scan(&r.ID, &r.Grant, &host, &b, &items, &r.Peer, &r.Reason, &r.TTL, &r.Max, &r.Deadline, &r.Until, &r.Status, &r.Used)
+	err = q.q.QueryRowContext(ctx, `SELECT id,coalesce(grant_id,''),host,binding,items,peer,reason,ttl,max,deadline,until_ms,status,used,coalesce(use,'') FROM sign_requests WHERE `+col+`=?`, id).Scan(&r.ID, &r.Grant, &host, &b, &items, &r.Peer, &r.Reason, &r.TTL, &r.Max, &r.Deadline, &r.Until, &r.Status, &r.Used, &r.Use)
 	if err == nil {
 		err = json.Unmarshal([]byte(b), &r.Binding)
 	}
@@ -309,7 +570,7 @@ func (q *Q) SignPending(ctx context.Context, host int64, now time.Time) (int, er
 func (q *Q) SetHistory(ctx context.Context, set, path string, n int) ([]api.AuditEntry, error) {
 	out := []api.AuditEntry{}
 	err := q.rows(ctx, `SELECT at,actor,action,object,detail FROM audit WHERE object='set:'||?1
- OR (actor LIKE 'host:%' AND (action LIKE 'env~_%' ESCAPE '~' OR action='sign' OR action LIKE 'sign~_%' ESCAPE '~') AND (detail=?2 OR substr(detail,1,length(?2)+1)=?2||' '))
+ OR (actor LIKE 'host:%' AND (action LIKE 'env~_%' ESCAPE '~' OR action='sign' OR action LIKE 'sign~_%' ESCAPE '~' OR action LIKE 'ssh~_%' ESCAPE '~') AND (detail=?2 OR substr(detail,1,length(?2)+1)=?2||' '))
  OR (actor='owner' AND action LIKE 'vault~_sign~_%' ESCAPE '~' AND instr(detail,' '||?2||' host=')>0)
  OR (actor='owner' AND action LIKE 'env~_%' ESCAPE '~' AND instr(detail,'\"set\":\"'||?1||'\"')>0)
  ORDER BY id DESC LIMIT ?3`, func(rs *sql.Rows) error {
@@ -351,23 +612,40 @@ func (q *Q) HostSets(ctx context.Context, host int64, now time.Time) ([]HostSet,
 }
 
 // HostSetDetail is what the listing says about one application set: its kind
-// and names. ok is false for a set with nothing to ask for yet.
-func (q *Q) HostSetDetail(ctx context.Context, set string) (kind string, names []string, scheme, note, url string, ok bool, err error) {
+// and names (an SSH key: its scheme, public key, comment and hand-out switch).
+// OK is false for a set with nothing to ask for yet.
+type HostSetDetail struct {
+	Kind      string
+	Names     []string
+	Scheme    string
+	PublicKey []byte
+	Note, URL string
+	Comment   string
+	Handout   bool
+	OK        bool
+}
+
+func (q *Q) HostSetDetail(ctx context.Context, set string) (d HostSetDetail, err error) {
 	var raw string
-	var secret bool
-	err = q.q.QueryRowContext(ctx, `SELECT coalesce(r.names,'[]'),coalesce(k.scheme,''),k.wrap IS NOT NULL,z.set_id IS NOT NULL,coalesce(z.note,''),coalesce(z.url,'') FROM credential_sets s LEFT JOIN signer_keys k ON k.set_id=s.id LEFT JOIN secret_sets z ON z.set_id=s.id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision AND r.wrap IS NOT NULL WHERE s.id=?`, set).Scan(&raw, &scheme, &ok, &secret, &note, &url)
+	var secret, sshKey bool
+	err = q.q.QueryRowContext(ctx, `SELECT coalesce(r.names,'[]'),coalesce(k.scheme,''),k.public_key,k.wrap IS NOT NULL,z.set_id IS NOT NULL,coalesce(z.note,''),coalesce(z.url,''),y.set_id IS NOT NULL,coalesce(y.comment,''),coalesce(y.handout,0) FROM credential_sets s LEFT JOIN signer_keys k ON k.set_id=s.id LEFT JOIN secret_sets z ON z.set_id=s.id LEFT JOIN ssh_keys y ON y.set_id=s.id LEFT JOIN env_revisions r ON r.set_id=s.id AND r.revision=s.revision AND r.wrap IS NOT NULL WHERE s.id=?`, set).Scan(&raw, &d.Scheme, &d.PublicKey, &d.OK, &secret, &d.Note, &d.URL, &sshKey, &d.Comment, &d.Handout)
 	if err != nil {
-		return "", nil, "", "", "", false, notFound(err)
+		return HostSetDetail{}, notFound(err)
 	}
-	if scheme != "" {
-		return "signer", nil, scheme, "", "", ok, nil
+	if d.Scheme != "" {
+		d.Kind, d.Note, d.URL = "signer", "", ""
+		if sshKey {
+			d.Kind = "ssh-key"
+		}
+		return d, nil
 	}
-	if err = json.Unmarshal([]byte(raw), &names); err != nil {
-		return "", nil, "", "", "", false, err
+	if err = json.Unmarshal([]byte(raw), &d.Names); err != nil {
+		return HostSetDetail{}, err
 	}
-	kind = "env-set"
+	d.Kind, d.PublicKey = "env-set", nil
 	if secret {
-		kind = "secret"
+		d.Kind = "secret"
 	}
-	return kind, names, "", note, url, len(names) > 0, nil
+	d.OK = len(d.Names) > 0
+	return d, nil
 }
