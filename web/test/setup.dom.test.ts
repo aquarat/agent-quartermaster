@@ -335,9 +335,9 @@ describe("the Setup queue against a scripted server", () => {
     script = settle(["cutover"]);
     await until(() => fin.querySelectorAll("[data-task]").length === 1);
     const later = card("upgrade");
-    const removed: Node[] = [];
+    const removed: unknown[] = [];
     const watch = new win.MutationObserver((rs) => rs.forEach((r) => removed.push(...r.removedNodes)));
-    watch.observe(root.querySelector(".setup-list")!, { childList: true });
+    watch.observe(root.querySelector(".setup-list") as never, { childList: true });
     script = settle(["cutover", "seal"]);
     await until(() => fin.querySelectorAll("[data-task]").length === 2);
     await new Promise((r) => setTimeout(r, 0));
@@ -348,7 +348,7 @@ describe("the Setup queue against a scripted server", () => {
     await until(() => queue().length === 4);
     expect(queue()).toEqual(["cutover", "enable-updates", "sync-passkeys", "upgrade"]);
     script = () => baseView();
-    await until(() => fin.hidden);
+    await until(() => fin.hidden === true);
     expect(queue()).toEqual(["cutover", "seal", "enable-updates", "sync-passkeys", "upgrade"]);
   });
 
