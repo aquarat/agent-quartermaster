@@ -44,6 +44,9 @@ type Scheme struct {
 	// Output describes the signature bytes; Check is an independent check.
 	Output string `json:"output"`
 	Check  string `json:"check"`
+	// SSH marks the scheme of an SSH key: it signs SSH login requests only
+	// (ssh.go) and is not offered for a signer set.
+	SSH bool `json:"ssh,omitempty"`
 
 	sign   func(priv []byte, it Item) ([]byte, error)
 	verify func(pub []byte, it Item, sig []byte) bool
@@ -91,11 +94,15 @@ var schemes = []Scheme{
 		}},
 }
 
+// All lists the schemes a signer set may be created with. The schemes of SSH
+// keys are found by Lookup only.
 func All() []Scheme { return append([]Scheme(nil), schemes...) }
 func Lookup(id string) (Scheme, bool) {
-	for _, s := range schemes {
-		if s.ID == id {
-			return s, true
+	for _, list := range [][]Scheme{schemes, sshSchemes} {
+		for _, s := range list {
+			if s.ID == id {
+				return s, true
+			}
 		}
 	}
 	return Scheme{}, false
@@ -151,6 +158,11 @@ func (s Scheme) Valid(it Item) error {
 		if it.SHA512 != "" || it.Size != int64(len(it.Message)) || len(it.Message) > MaxMessage || hex.EncodeToString(sum[:]) != it.SHA256 {
 			return errors.New("this scheme signs the artifact itself: send it, at most 4096 bytes")
 		}
+		if s.SSH {
+			if _, err := ParseUserAuth(it.Message); err != nil {
+				return err
+			}
+		}
 	case "sha256":
 		if it.SHA512 != "" || it.Message != nil {
 			return errors.New("this scheme signs a SHA-256 digest only")
@@ -174,7 +186,15 @@ func (s Scheme) Sign(priv []byte, it Item) ([]byte, error) {
 	return s.sign(priv, it)
 }
 func (s Scheme) Verify(pub []byte, it Item, sig []byte) bool {
-	return s.Valid(it) == nil && len(pub) == s.publicLen() && s.verify(pub, it, sig)
+	if s.Valid(it) != nil || len(pub) != s.publicLen() {
+		return false
+	}
+	if s.SSH {
+		if _, err := s.SSHLogin(pub, it); err != nil {
+			return false
+		}
+	}
+	return s.verify(pub, it, sig)
 }
 func (s Scheme) publicLen() int {
 	if s.Key == "ed25519" {

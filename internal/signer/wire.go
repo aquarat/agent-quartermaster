@@ -55,6 +55,28 @@ type Request struct {
 	Until    int64  `json:"not_after"`
 	Status   string `json:"status"`
 	Used     int    `json:"used"`
+	// Use is empty for ordinary signing. For an SSH key it is UseSSHAgent
+	// (login signatures) or UseSSHHandout (the private key is delivered once).
+	Use string `json:"use,omitempty"`
+}
+
+// SSHKey is what an admitted host learns about an SSH key (GET /v2/ssh/key):
+// the binding and the public half. Handout says whether the owner allows the
+// private key to be delivered (`aqmas ssh-key`).
+type SSHKey struct {
+	Binding       Binding `json:"binding"`
+	AuthorizedKey string  `json:"authorized_key"`
+	Fingerprint   string  `json:"fingerprint"`
+	Comment       string  `json:"comment"`
+	Handout       bool    `json:"handout"`
+}
+
+// SSHHandout is the one answer that carries an SSH private key: an OpenSSH
+// private key file, delivered once under an approved hand-out grant.
+type SSHHandout struct {
+	Request       Request `json:"request"`
+	PrivateKey    string  `json:"private_key"`
+	AuthorizedKey string  `json:"authorized_key"`
 }
 type Signature struct {
 	Name      string `json:"name"`
