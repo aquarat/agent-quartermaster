@@ -38,7 +38,7 @@ export interface VaultSet {
   set_slug: string;
   set_title: string;
   /** A secret is one value: `names` holds its one environment variable name. */
-  kind: "env-set" | "signer" | "secret";
+  kind: "env-set" | "signer" | "secret" | "ssh-key";
   revision: number;
   names: string[];
   allow_reveal: boolean;
@@ -54,7 +54,43 @@ export interface VaultSet {
   public_key?: string;
   public_hex?: string;
   public_pem?: string;
+  /** A signer: hex SHA-256 of the raw key. An SSH key: "SHA256:…" as ssh-keygen -lf prints it. */
   fingerprint?: string;
+  /** An SSH key: its public line, comment, and whether the private key may be handed out. */
+  authorized_key?: string;
+  comment?: string;
+  handout?: boolean;
+}
+export interface SshKeyType {
+  id: string;
+  title: string;
+  algorithm: string;
+}
+/** An item in the bin: unusable, restorable until `purge_at`, then destroyed. */
+export interface DeletedSet {
+  org_id: string;
+  org_slug: string;
+  org_title: string;
+  service_id: string;
+  service_slug: string;
+  service_title: string;
+  set_id: string;
+  /** The slug it had (and gets back on Restore). */
+  set_slug: string;
+  set_title: string;
+  kind: VaultSet["kind"];
+  revision: number;
+  names: string[];
+  deleted_at: number;
+  purge_at: number;
+  deleted_by: string;
+  /** SHA-256 over what a purge destroys (hex). */
+  digest: string;
+  scheme?: string;
+  fingerprint?: string;
+  authorized_key?: string;
+  /** A live item has this path now: Restore is refused. */
+  path_taken: boolean;
 }
 export interface SignItem {
   name: string;
@@ -93,13 +129,20 @@ export interface SignRequest {
   not_after: number;
   status: string;
   used: number;
+  /** An SSH key: logins through `aqmas ssh-agent`, or the private key itself handed out. */
+  use?: "ssh-agent" | "ssh-handout";
 }
 export interface VaultState {
   schemes: Scheme[];
   organisations: VaultOrg[];
   sets: VaultSet[];
   requests: SignRequest[];
+  /** Absent on a broker older than 0.11.0. */
+  ssh_key_types?: SshKeyType[];
+  deleted?: DeletedSet[];
+  bin_seconds?: number;
 }
+export const BIN_SECONDS = 604800;
 /** GET /api/ui/seal/vault/history: the item view's "recent activity" (0 = not in the rows read). */
 export interface SetHistory {
   entries: import("./types").AuditEntry[];
@@ -477,7 +520,7 @@ export const standingCap = (s: { standing_cap_seconds?: number }) => s.standing_
 
 /** The set's "longest don't-ask-again": how long one approval may cover later requests. */
 export async function vaultStandingCap(api: Api, v: SealView, set: VaultSet, seconds: number, rp: string) {
-  if (set.kind === "signer") throw Error("A signing key has signing grants instead");
+  if (set.kind === "signer" || set.kind === "ssh-key") throw Error("A key has grants instead");
   if (!Number.isSafeInteger(seconds) || seconds < 0 || seconds > 86400 || seconds % 60 !== 0) throw Error("Choose off, or up to 24 hours");
   if (seconds === standingCap(set)) throw Error("The limit already has that value");
   const r = await review(api, v, "standing-cap", set.set_id, { standing_cap_seconds: seconds }, () => ({ ...targetFields(set), old_standing_cap_seconds: standingCap(set), standing_cap_seconds: seconds }), rp);
@@ -607,12 +650,18 @@ export function hexPreview(m: Uint8Array, max = 4096): string {
 }
 
 /** Approve, deny or revoke a signing request. The expected canonical lists every artifact
- * (name, size, SHA-256, and SHA-512 where that is what gets signed) and the granted limits. */
+ * (name, size, SHA-256, and SHA-512 where that is what gets signed) and the granted limits.
+ * A request for an SSH key (`use`) has no artifacts: it is a number of logins for a time, or
+ * the private key handed out once; its canonical also carries `use`. */
 export async function vaultSignDecision(api: Api, v: SealView, set: VaultSet, req: SignRequest, action: "sign-approve" | "sign-deny" | "sign-revoke", ttl: number, max: number, rp: string) {
-  if (set.kind !== "signer" || set.set_id !== req.set || set.scheme !== req.scheme) throw Error("This request is for another signer");
-  const fingerprint = hex(await sha256(fromStdB64(req.public_key)));
+  const ssh = req.use !== undefined;
+  if (ssh !== (set.kind === "ssh-key") || (!ssh && set.kind !== "signer") || set.set_id !== req.set || set.scheme !== req.scheme) throw Error(ssh ? "This request is for another SSH key" : "This request is for another signer");
+  if (ssh && req.use !== "ssh-agent" && req.use !== "ssh-handout") throw Error("This page does not know that kind of request");
+  const fingerprint = ssh ? (await sshPublic(req.scheme, fromStdB64(req.public_key), "x")).fingerprint : hex(await sha256(fromStdB64(req.public_key)));
   if (set.fingerprint !== fingerprint) throw Error("The request names another public key");
   if (action !== "sign-approve" && (ttl !== 0 || max !== 0)) throw Error("Only an approval has a duration");
+  if (ssh && req.items.length !== 0) throw Error("An SSH key request carries no artifacts");
+  if (ssh && action === "sign-approve" && (req.use === "ssh-handout" ? ttl !== 0 || max !== 1 : !(ttl >= 60 && ttl <= req.ttl_seconds && max >= 1 && max <= req.max_signatures))) throw Error("Choose limits within what was asked for");
   for (const it of req.items) await itemMessage(it);
   const items = req.items.map((it) => (it.sha512 ? { name: it.name, size: it.size, sha256: it.sha256, sha512: it.sha512 } : { name: it.name, size: it.size, sha256: it.sha256 }));
   const body = action === "sign-approve" ? { ttl_seconds: ttl, max_signatures: max } : {};
@@ -620,11 +669,149 @@ export async function vaultSignDecision(api: Api, v: SealView, set: VaultSet, re
     ...targetFields(set), request_id: req.id, host: req.host, enrollment: req.enrollment, address: req.address, scheme: req.scheme, fingerprint, items,
     requested_ttl_seconds: req.ttl_seconds, requested_max_signatures: req.max_signatures, ttl_seconds: ttl, max_signatures: max,
     admission_generation: req.admission_generation, policy_revision: req.policy_revision, service_revision: req.service_revision, soft_cap_seconds: req.soft_cap_seconds, beyond_soft_cap: ttl > req.soft_cap_seconds,
+    ...(ssh ? { use: req.use } : {}),
   }), rp);
-  const what = action === "sign-approve" ? (ttl === 0 ? `sign exactly ${items.length} artifact(s), once` : `up to ${max} signatures over anything ${req.host} submits for ${ttl} seconds${ttl > req.soft_cap_seconds ? " — BEYOND SOFT CAP" : ""}`) : action === "sign-deny" ? "deny" : "revoke";
+  const verb = action === "sign-deny" ? "deny" : "revoke";
+  if (ssh) {
+    const what = action !== "sign-approve" ? verb : req.use === "ssh-handout" ? "HAND OUT THE PRIVATE KEY, once (it leaves aqmas and cannot be recalled)" : `up to ${max} SSH logins for ${ttl} seconds${ttl > req.soft_cap_seconds ? " — BEYOND SOFT CAP" : ""}`;
+    return { opens: r.opens, detail: `SSH key ${pathOf(set)} (${fingerprint}) for ${req.host}, ${req.address}: ${what}`, tap: (auth: Authenticator) => r.finish<unknown>(auth) };
+  }
+  const what = action === "sign-approve" ? (ttl === 0 ? `sign exactly ${items.length} artifact(s), once` : `up to ${max} signatures over anything ${req.host} submits for ${ttl} seconds${ttl > req.soft_cap_seconds ? " — BEYOND SOFT CAP" : ""}`) : verb;
   return {
     opens: r.opens,
     detail: `${pathOf(set)} (${req.scheme}) for ${req.host}, ${req.address}: ${what}\n` + items.map((it) => `${it.name} · ${it.size < 0 ? "size not given" : it.size + " bytes"} · sha256 ${it.sha256}`).join("\n"),
     tap: (auth: Authenticator) => r.finish<unknown>(auth),
   };
+}
+
+// ---- SSH keys ----
+
+const SSH_ALGORITHM: Record<string, string> = { "ssh-ed25519": "ssh-ed25519", "ssh-ecdsa-p256": "ecdsa-sha2-nistp256" };
+const SSH_COMMENT_RE = /^[\x21-\x7e]([\x20-\x7e]{0,98}[\x21-\x7e])?$/;
+
+/** Why a comment is refused (null = fine): 1 to 100 printable ASCII characters. */
+export function sshCommentProblem(comment: string): string | null {
+  return SSH_COMMENT_RE.test(comment) ? null : "Comment: 1 to 100 plain ASCII characters, no space at either end.";
+}
+export const sshDefaultComment = (org: string, service: string, slug: string) => `aqmas:${org}/${service}/${slug}`.slice(0, 100);
+
+/** The authorized_keys line and the fingerprint `ssh-keygen -lf` prints, from the raw public
+ * key: the SSH wire blob is string(algorithm) [+ string("nistp256")] + string(key). */
+export async function sshPublic(scheme: string, rawKey: Uint8Array, comment: string): Promise<{ authorizedKey: string; fingerprint: string }> {
+  const algorithm = SSH_ALGORITHM[scheme];
+  if (!algorithm) throw Error("Unknown SSH key type");
+  if (scheme === "ssh-ed25519" ? rawKey.length !== 32 : rawKey.length !== 65 || rawKey[0] !== 4) throw Error("Invalid public key");
+  if (!SSH_COMMENT_RE.test(comment)) throw Error("Invalid key comment");
+  const parts = scheme === "ssh-ed25519" ? [utf8.encode(algorithm), rawKey] : [utf8.encode(algorithm), utf8.encode("nistp256"), rawKey];
+  const blob = new Uint8Array(parts.reduce((n, p) => n + 4 + p.length, 0));
+  const view = new DataView(blob.buffer);
+  let i = 0;
+  for (const p of parts) {
+    view.setUint32(i, p.length);
+    blob.set(p, i + 4);
+    i += 4 + p.length;
+  }
+  return { authorizedKey: `${algorithm} ${stdB64(blob)} ${comment}`, fingerprint: "SHA256:" + stdB64(await sha256(blob)).replace(/=+$/, "") };
+}
+
+export interface SshKeyResult {
+  set_id: string;
+  path: string;
+  scheme: string;
+  public_key: string;
+  fingerprint: string;
+  authorized_key: string;
+  comment: string;
+  handout: boolean;
+}
+
+/** An SSH key pair: generated inside aqmas, or an existing OpenSSH private key sealed here
+ * once. The public key comes from the broker; this page derives the authorized_keys line and
+ * fingerprint from it and the canonical must carry exactly those. */
+export async function vaultSshKeyCreate(api: Api, v: SealView, parent: SignerParent, set: { id: string; slug: string; title: string }, opts: { scheme: string; source: "generate" | "import"; privateKey?: string; comment: string; handout: boolean }, rp: string) {
+  const { scheme, source, comment, handout } = opts;
+  if (!/^[0-9a-f]{32}$/.test(set.id)) throw Error("Invalid set ID");
+  if (!SSH_ALGORITHM[scheme]) throw Error("Unknown SSH key type");
+  const cp = sshCommentProblem(comment);
+  if (cp) throw Error(cp);
+  if (typeof handout !== "boolean") throw Error("Invalid hand-out setting");
+  const body: Record<string, unknown> = { service_id: parent.service_id, set_slug: set.slug, set_title: set.title, scheme, source, comment, handout };
+  let attempt: string | undefined;
+  let recipient = "";
+  if (source === "import") {
+    if (!opts.privateKey?.trim()) throw Error("Paste the private key to import");
+    const up = await upload(api, v, "signer-import", set.id, utf8.encode(JSON.stringify({ private_key: opts.privateKey })));
+    attempt = up.sent.attempt_id;
+    recipient = up.recipient;
+    Object.assign(body, up.sent);
+  } else if (source !== "generate" || opts.privateKey !== undefined) throw Error("A generated key takes no input");
+  let pub = { authorizedKey: "", fingerprint: "" };
+  let publicKey = "";
+  const r = await review(api, v, "ssh-key-create", set.id, body, async (facts) => {
+    if (attempt !== undefined && facts.attempt_id !== attempt) throw Error("The broker answered for another upload");
+    raw(facts.attempt_id, 32);
+    const key = raw(facts.public_key, 32, 65);
+    pub = await sshPublic(scheme, key, comment);
+    if (facts.fingerprint !== pub.fingerprint || facts.authorized_key !== pub.authorizedKey) throw Error("The public line or fingerprint does not match the public key");
+    publicKey = encode(key);
+    return { org_id: parent.org_id, org_slug: parent.org_slug, org_title: parent.org_title, service_id: parent.service_id, service_slug: parent.service_slug, service_title: parent.service_title, set_id: set.id, set_slug: set.slug, set_title: set.title, kind: "ssh-key", revision: 0, scheme, source, attempt_id: facts.attempt_id, recipient, public_key: facts.public_key, fingerprint: pub.fingerprint, authorized_key: pub.authorizedKey, comment, handout, result_revision: 0 };
+  }, rp);
+  return {
+    detail: `Create SSH key ${parent.org_slug}/${parent.service_slug}/${set.slug} (${scheme}, ${source === "generate" ? "generated in aqmas" : "imported"}${handout ? ", MAY BE HANDED OUT" : ""}). ${pub.authorizedKey} · ${pub.fingerprint}`,
+    authorizedKey: pub.authorizedKey,
+    fingerprint: pub.fingerprint,
+    async tap(auth: Authenticator): Promise<SshKeyResult> {
+      const out = await r.finish<SshKeyResult>(auth);
+      if (out.set_id !== set.id || out.public_key !== publicKey || out.fingerprint !== pub.fingerprint || out.authorized_key !== pub.authorizedKey || out.scheme !== scheme || out.handout !== handout) throw Error("The created SSH key differs from the one you approved");
+      return out;
+    },
+  };
+}
+
+/** "May be handed out": whether `aqmas ssh-key` may ever deliver this private key. */
+export async function vaultSshHandout(api: Api, v: SealView, set: VaultSet, handout: boolean, rp: string) {
+  if (set.kind !== "ssh-key") throw Error("Not an SSH key");
+  if ((set.handout ?? false) === handout) throw Error("The setting already has that value");
+  const r = await review(api, v, "ssh-key-handout", set.set_id, { handout }, () => ({ ...targetFields(set), fingerprint: set.fingerprint ?? "", old_handout: set.handout ?? false, handout }), rp);
+  return { detail: `${pathOf(set)} (${set.fingerprint ?? ""}): the private key ${handout ? "MAY be handed out to a host after an approval" : "may no longer be handed out"}`, tap: (auth: Authenticator) => r.finish<unknown>(auth) };
+}
+
+// ---- delete, restore, purge ----
+
+export interface DeleteResult {
+  ok: boolean;
+  purge_at: number;
+  ended: { grants: number; standing: number; releases: number; pending: number };
+}
+const DELETABLE = ["env-set", "secret", "signer", "ssh-key"];
+
+/** Move an item to the bin: unusable from the tap, restorable for seven days. The canonical
+ * names the path, kind and the revision this page showed. */
+export async function vaultDelete(api: Api, v: SealView, set: VaultSet, rp: string) {
+  if (!DELETABLE.includes(set.kind)) throw Error("This item cannot be deleted here");
+  const fingerprint = set.kind === "signer" || set.kind === "ssh-key" ? (set.fingerprint ?? "") : "";
+  const r = await review(api, v, "delete", set.set_id, { revision: set.revision }, () => ({ ...targetFields(set), path: pathOf(set), fingerprint, bin_seconds: BIN_SECONDS }), rp);
+  return {
+    detail: `Delete ${set.kind} ${pathOf(set)} (revision ${set.revision}): unusable now, restorable for 7 days, then destroyed`,
+    async tap(auth: Authenticator): Promise<DeleteResult> {
+      const out = await r.finish<DeleteResult>(auth);
+      if (out?.ok !== true) throw Error("The broker did not confirm the deletion");
+      return out;
+    },
+  };
+}
+function binnedFields(d: DeletedSet) {
+  return { org_id: d.org_id, org_slug: d.org_slug, org_title: d.org_title, service_id: d.service_id, service_slug: d.service_slug, service_title: d.service_title, set_id: d.set_id, set_slug: d.set_slug, set_title: d.set_title, kind: d.kind, revision: d.revision };
+}
+/** Put a binned item back as it was. Its grants and "don't ask again" rules do not return. */
+export async function vaultRestore(api: Api, v: SealView, item: DeletedSet, rp: string) {
+  if (item.path_taken) throw Error("Another item has that path now: delete or rename it first");
+  const r = await review(api, v, "restore", item.set_id, {}, () => ({ ...binnedFields(item), path: pathOf(item), deleted_at: item.deleted_at }), rp);
+  return { detail: `Restore ${item.kind} ${pathOf(item)} (revision ${item.revision})`, tap: (auth: Authenticator) => r.finish<unknown>(auth) };
+}
+/** Destroy a binned item now: its sealed material and bucket are deleted for good. */
+export async function vaultPurge(api: Api, v: SealView, item: DeletedSet, rp: string) {
+  if (!/^[0-9a-f]{64}$/.test(item.digest)) throw Error("Invalid digest from the server");
+  const r = await review(api, v, "purge", item.set_id, {}, () => ({ ...binnedFields(item), path: pathOf(item), deleted_at: item.deleted_at, digest: item.digest }), rp);
+  return { detail: `PURGE ${item.kind} ${pathOf(item)} (digest ${item.digest}): destroyed for good`, tap: (auth: Authenticator) => r.finish<unknown>(auth) };
 }

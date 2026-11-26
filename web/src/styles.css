@@ -2928,3 +2928,43 @@ dialog.search-dialog::backdrop {
 .vault-secret-facts a {
   overflow-wrap: anywhere;
 }
+
+/* ---- SSH keys and the bin (0.11.0) ---- */
+.ssh-line {
+  margin: 0 0 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line, currentColor);
+  border-radius: var(--radius-ctl);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.ssh-fp {
+  overflow-wrap: anywhere;
+}
+.ssh-where,
+.delete-effects {
+  margin: 0;
+  padding-left: 1.2em;
+  display: grid;
+  gap: 4px;
+}
+.ssh-ask {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+/* The private key leaving aqmas: a red border and band, and the words. Never colour alone. */
+.card.key-leaves {
+  border: 3px solid var(--admin);
+  background: linear-gradient(var(--admin-bg), var(--admin-bg)) padding-box;
+}
+.vault-delete,
+.vault-deleted,
+.deleted-item {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr);
+}
+.vault-deleted {
+  gap: 12px;
+}

@@ -149,3 +149,28 @@ export function prfAuth(origin = "http://localhost", opts: { prf?: boolean; rawI
   };
   return a;
 }
+
+// ---- a throwaway OpenSSH private key (0.11.0 SSH key import tests) ----
+import { generateKeyPairSync } from "node:crypto";
+
+const sshString = (b: Uint8Array | string) => {
+  const body = Buffer.from(b);
+  const n = Buffer.alloc(4);
+  n.writeUInt32BE(body.length);
+  return Buffer.concat([n, body]);
+};
+/** A throwaway Ed25519 key as an unencrypted OpenSSH private key file (made here, used nowhere). */
+export function testOpenSSHKey(comment = "test-only"): { pem: string; pub: Buffer } {
+  const k = generateKeyPairSync("ed25519");
+  const pub = Buffer.from(k.publicKey.export({ format: "jwk" }).x!, "base64url");
+  const seed = k.privateKey.export({ format: "der", type: "pkcs8" }).subarray(-32);
+  const blob = Buffer.concat([sshString("ssh-ed25519"), sshString(pub)]);
+  const check = Buffer.from([1, 2, 3, 4]);
+  let priv = Buffer.concat([check, check, sshString("ssh-ed25519"), sshString(pub), sshString(Buffer.concat([seed, pub])), sshString(comment)]);
+  for (let i = 1; priv.length % 8 !== 0; i++) priv = Buffer.concat([priv, Buffer.from([i])]);
+  const count = Buffer.alloc(4);
+  count.writeUInt32BE(1);
+  const file = Buffer.concat([Buffer.from("openssh-key-v1\0"), sshString("none"), sshString("none"), sshString(""), count, sshString(blob), sshString(priv)]);
+  return { pem: "-----BEGIN OPENSSH PRIVATE KEY-----\n" + file.toString("base64").replace(/(.{70})(?=.)/g, "$1\n") + "\n-----END OPENSSH PRIVATE KEY-----\n", pub };
+}
+

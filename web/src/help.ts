@@ -273,7 +273,7 @@ export function helpPage(c: HelpConfig) {
         { class: "facts help-map" },
         ...[
           ["Approvals", "Everything waiting for you (access requests, signature requests, env releases, hosts asking to join), then who holds access now and your auto-approvals. The number on the tab counts what waits, on every page."],
-          ["Vault", "Every credential the broker holds, as one searchable list: env sets, signing keys, the Cloudflare parent credential, the CAs and the access rules. Filter by type or organisation; open an item for its fields, who may ask for it and what happened to it. “Add item” creates a new one."],
+          ["Vault", "Every credential the broker holds, as one searchable list: secrets, env sets, signing keys, SSH keys, the Cloudflare parent credential, the CAs and the access rules. Filter by type or organisation; open an item for its fields, who may ask for it and what happened to it. “Add item” creates a new one."],
           ["Hosts", "Enrolled hosts, the organisations each may ask for (Admit, Remove) and Revoke. A host that has joined but is admitted nowhere is marked “Not admitted” and can ask for nothing; “Let it join…” on Approvals offers the admission in the same go."],
           ["Activity", "The audit log, with filters."],
           ["Security", "Whether your passkeys can open your credentials (and Enable for the ones that cannot), passkeys, the buckets open right now with Reopen, Rekey and Close all, approval windows, and the recovery key."],
@@ -284,9 +284,9 @@ export function helpPage(c: HelpConfig) {
     ),
     card(
       "Add, change and look at a credential",
-      p("Vault → Add item. Choose Secret (one value, such as an API key), Env set (several values a command gets as environment variables) or Signing key, then the organisation and service it belongs to and its name. A new organisation or service is created on the way: each is one passkey approval, and a new organisation also gets its own encryption key (three taps). The slug becomes part of the path hosts ask for and cannot be changed later."),
+      p("Vault → Add item. Choose Secret (one value, such as an API key), Env set (several values a command gets as environment variables), Signing key or SSH key (a key pair whose public line you add to a forge or a server), then the organisation and service it belongs to and its name. A new organisation or service is created on the way: each is one passkey approval, and a new organisation also gets its own encryption key (three taps). The slug becomes part of the path hosts ask for and cannot be changed later."),
       p("Open an env set to add, replace or remove keys, or drop a .env file on it; “Review and save” shows exactly what changes before the tap. The form is write-only: stored values are never loaded into it. Reveal shows one value, or all of them, for 60 seconds after a passkey tap of its own, and each reveal is logged with the key names; Copy is next to a revealed value. An organisation can have Reveal turned off (the item's “More”)."),
-      p("There is no rename, move or delete of a whole item yet: remove its keys instead (an empty set delivers nothing), and ask before reusing a slug."),
+      p("Delete is on the item's page: one passkey tap moves a secret, env set, signing key or SSH key to Vault → Deleted. From that tap agents cannot use it, and its grants, “don't ask again” rules and waiting requests end. For 7 days you can restore it there (as it was, without those grants and rules) or purge it; after that aqmas destroys it for good. The path is free for a new item at once. A backup of the store made before the purge still contains the sealed item. There is no rename or move: create a new item and delete the old one."),
     ),
     installCard(c, card),
     card(
@@ -298,13 +298,16 @@ export function helpPage(c: HelpConfig) {
       command("aqmas ls"),
       command("aqmas targets"),
       h("h3", null, "As MCP tools"),
-      p("The same abilities as tools for an MCP client: the guide, status, the two lists, run a command with a secret, sign, and run one command over SSH. Tools that need you block until you decide. No tool returns a secret's value."),
+      p("The same abilities as tools for an MCP client: the guide, status, the two lists, run a command with a secret, sign, run a command with an SSH key, and run one command over SSH. Tools that need you block until you decide. No tool returns a secret's value."),
       command("claude mcp add aqmas -- aqmas mcp"),
       p("For a client that reads an mcpServers map:"),
       command('{ "mcpServers": { "aqmas": { "command": "aqmas", "args": ["mcp"] } } }'),
       h("h3", null, "One secret"),
       command('aqmas run acme/infra/tailnet-api-key --why "list devices for the inventory report" -- ./inventory.sh'),
       p("When you approve such a request you can choose “don't ask again” for a while, up to the limit you set on the item (Vault → the item → More): the same machine then gets the same value again without a new tap."),
+      h("h3", null, "An SSH key for a forge or a server"),
+      command('aqmas ssh-agent acme/forge/deploy-key --why "push the release branch" -- git push ssh://git@forge.example.com/acme/app.git release'),
+      p("The command runs with an SSH agent that offers only that key; the private key stays in aqmas, which answers each login under one time-boxed grant you approve (--ttl, --count). It works with git, ssh, scp and rsync. Only when you turned “May be handed out” on for the key can a machine ask for the key file itself (aqmas ssh-key), on a red card: a key handed out cannot be recalled."),
     ),
     card(
       "CLI quick reference",

@@ -9,13 +9,24 @@ import type { ActionChoice, ActionTarget } from "./flows";
 import { countdown, duration, visibleText as vt } from "./format";
 import { type SealView } from "./sealPanel";
 import {
+  BIN_SECONDS,
+  type DeletedSet,
+  type DeleteResult,
   type Edit,
   type Entry,
   type Scheme,
   type SecretResult,
   type SignRequest,
   type SignerResult,
+  type SshKeyResult,
   STANDING_STEPS,
+  sshCommentProblem,
+  sshDefaultComment,
+  vaultDelete,
+  vaultPurge,
+  vaultRestore,
+  vaultSshHandout,
+  vaultSshKeyCreate,
   secretMetaProblem,
   standingCap,
   vaultSecretConvert,
@@ -82,6 +93,15 @@ function digest(hexText: string): HTMLElement {
 }
 function scopeHeading(orgTitle: string, serviceTitle: string, setTitle: string): HTMLElement {
   return h("h3", { class: "vault-scope" }, h("bdi", null, vt(orgTitle)), " › ", h("bdi", null, vt(serviceTitle)), " › ", h("bdi", null, vt(setTitle)));
+}
+/** Time until a purge: "6 days 23 hours", "5 hours", "12 min", "a moment". */
+export function timeLeft(ms: number): string {
+  if (ms <= 0) return "a moment";
+  const hrs = Math.ceil(ms / 3_600_000);
+  if (hrs < 2) return duration(Math.max(60, Math.round(ms / 1000)));
+  const d = Math.floor(hrs / 24), hh = hrs % 24;
+  const days = d === 1 ? "1 day" : `${d} days`, hours = hh === 1 ? "1 hour" : `${hh} hours`;
+  return d === 0 ? hours : hh === 0 ? days : `${days} ${hours}`;
 }
 function bytes(n: number): string {
   return n < 0 ? "size not given" : n === 1 ? "1 byte" : `${n.toLocaleString("en-GB")} bytes`;
@@ -153,7 +173,106 @@ function schemeOf(state: VaultState, id: string): Scheme | undefined {
   return state.schemes.find((s) => s.id === id);
 }
 
+/** A request to use an SSH key: logins through `aqmas ssh-agent` (the key stays in aqmas), or
+ * the private key itself handed out (red: it leaves aqmas for good). No artifacts. */
+function sshCard(host: VaultHost, seal: SealView, state: VaultState, req: SignRequest): HTMLElement {
+  const set = state.sets.find((s) => s.set_id === req.set);
+  const handout = req.use === "ssh-handout";
+  const live = req.status === "approved";
+  const slot = h("div", { class: "vault-slot" });
+  const card = h("article", { class: "card request sign-card ssh-card" + (handout ? " key-leaves" : " high") });
+  card.setAttribute("data-id", req.id);
+  const [orgTitle = "?", serviceTitle = "?", setTitle = "?"] = set ? [set.org_title, set.service_title, set.set_title] : req.title.split(" / ");
+  append(card, [
+    h("div", { class: "card-top" }, h("span", { class: "badge" }, handout ? (live ? "Private key hand-out approved" : "Private key hand-out request") : live ? "SSH login grant" : "SSH key request"), h("span", { class: "muted" }, "Ref ", h("span", { class: "mono" }, vt(req.id.slice(-6).toUpperCase())))),
+    handout ? h("p", { class: "root-band" }, "THE PRIVATE KEY LEAVES AQMAS") : null,
+    scopeHeading(orgTitle, serviceTitle, setTitle),
+    h("p", { class: "mono" }, vt(req.path)),
+  ]);
+  if (!set || set.kind !== "ssh-key" || (req.use !== "ssh-agent" && req.use !== "ssh-handout")) {
+    card.append(h("p", { class: "error" }, "This page does not know that SSH key or kind of request. Reload; do not approve."));
+    return card;
+  }
+  const keyName = () => h("bdi", null, vt(set.set_title));
+  const hostName = () => h("bdi", null, vt(req.host));
+  card.append(
+    handout
+      ? h("p", { class: "ssh-ask bad" }, "Host ", hostName(), " asks for the private key of ", keyName(), " itself. Once delivered it is a file on that host: it cannot be recalled, and logins with it no longer pass through aqmas.")
+      : h("p", { class: "ssh-ask" }, "Host ", hostName(), " asks to log in over SSH with key ", keyName(), ". The key stays in aqmas, which answers each login."),
+    h(
+      "dl",
+      { class: "facts" },
+      h("dt", null, "Key"),
+      h("dd", null, h("span", { class: "mono" }, vt(set.fingerprint ?? "")), set.comment ? h("span", { class: "muted" }, " · ", h("bdi", null, vt(set.comment))) : null),
+      h("dt", null, "From"),
+      h("dd", null, hostName(), h("span", { class: "muted" }, " at ", h("span", { class: "mono" }, vt(req.address)))),
+    ),
+    h("p", { class: "agent-says" }, h("span", { class: "muted" }, "Requester's explanation (unverified): "), h("bdi", null, vt(req.reason))),
+  );
+  const revoke = (text: string) => btn("Revoke…", "deny", () => ceremony(slot, host.auth, "Revoke with passkey", "deny", () => vaultSignDecision(host.api, seal, set, req, "sign-revoke", 0, 0, location.hostname), () => [h("p", null, text)], () => host.changed()));
+  if (live) {
+    card.append(
+      h(
+        "p",
+        { class: "warn" },
+        handout ? "Approved: the host can collect the private key, once. Ends in " : `${req.used} of ${req.max_signatures} logins used. Until it ends, this host can log in with this key wherever its public line is installed. Ends in `,
+        h("span", null, countdown(req.not_after)),
+        ".",
+      ),
+      h("div", { class: "actions" }, revoke(handout ? "Withdraws the approval if the key was not collected yet. A key already collected stays with the host." : "Ends this grant now. Sessions already open stay open.")),
+      slot,
+    );
+    return card;
+  }
+  const minutes = h("input", { type: "number", class: "text num", id: `sg-min-${req.id}`, inputmode: "numeric" });
+  const count = h("input", { type: "number", class: "text num", id: `sg-max-${req.id}`, inputmode: "numeric" });
+  const blunt = h("p", { class: handout ? "bad" : "warn" });
+  const choice = () => (handout ? { ttl: 0, max: 1 } : { ttl: Math.round(Number(minutes.value) * 60), max: Math.round(Number(count.value)) });
+  const grantText = (c: { ttl: number; max: number }) =>
+    handout
+      ? `Hand out the private key of ${set.set_title} to ${req.host}, once. It leaves aqmas and cannot be recalled; to end its use, remove its public line wherever it is installed.`
+      : `SSH logins with key ${set.set_title} from host ${req.host} for ${duration(c.ttl)}: at most ${c.max} login${c.max === 1 ? "" : "s"}, to any server that accepts its public line. Each one is logged.${c.ttl > req.soft_cap_seconds ? " BEYOND SOFT CAP." : ""}`;
+  const describe = () => (blunt.textContent = grantText(choice()));
+  if (!handout) {
+    const maxMin = Math.max(1, Math.floor(req.ttl_seconds / 60));
+    minutes.value = String(maxMin);
+    minutes.min = "1";
+    minutes.max = String(maxMin);
+    count.value = String(req.max_signatures);
+    count.min = "1";
+    count.max = String(req.max_signatures);
+    for (const el of [minutes, count]) el.addEventListener("input", describe);
+    card.append(h("div", { class: "sign-limits" }, h("label", { for: minutes.id }, "Minutes (at most ", String(maxMin), ") ", minutes), h("label", { for: count.id }, "Logins (at most ", String(req.max_signatures), ") ", count)));
+  }
+  describe();
+  const actions = h("div", { class: "actions" });
+  const decide = (action: "sign-approve" | "sign-deny") => {
+    const c = action === "sign-approve" ? choice() : { ttl: 0, max: 0 };
+    if (action === "sign-approve" && !handout && !(c.ttl >= 60 && c.ttl <= req.ttl_seconds && c.max >= 1 && c.max <= req.max_signatures)) {
+      replace(slot, h("p", { class: "error", role: "alert" }, "Choose limits within what was asked for."));
+      return;
+    }
+    actions.hidden = true;
+    const text = action === "sign-approve" ? grantText(c) : "Deny this request. The key is not used.";
+    ceremony(
+      slot,
+      host.auth,
+      action === "sign-deny" ? "Deny with passkey" : handout ? "Hand out with passkey" : "Approve with passkey",
+      action === "sign-deny" || handout ? "deny" : "approve",
+      () => vaultSignDecision(host.api, seal, set, req, action, c.ttl, c.max, location.hostname),
+      () => [h("p", { class: action === "sign-deny" ? "muted" : handout ? "bad" : "warn" }, vt(text))],
+      () => host.changed(),
+      () => (actions.hidden = false),
+      card,
+    );
+  };
+  actions.append(btn("Deny…", "deny", () => decide("sign-deny")), btn(handout ? "Hand out the private key…" : "Approve…", handout ? "deny" : "approve", () => decide("sign-approve")));
+  card.append(blunt, actions, slot);
+  return card;
+}
+
 function signCard(host: VaultHost, seal: SealView, state: VaultState, req: SignRequest): HTMLElement {
+  if (req.use !== undefined) return sshCard(host, seal, state, req);
   const set = state.sets.find((s) => s.set_id === req.set);
   const scheme = schemeOf(state, req.scheme);
   const timed = req.ttl_seconds > 0;
@@ -923,6 +1042,268 @@ export class VaultForms {
       h("div", { class: "actions" }, go),
       slot,
     ]);
+    return root;
+  }
+
+  // ---- SSH keys ----
+
+  private sshFacts(typeTitle: string, line: string, fingerprint: string): HTMLElement {
+    return h(
+      "dl",
+      { class: "facts vault-key" },
+      h("dt", null, "Type"),
+      h("dd", null, vt(typeTitle)),
+      h("dt", null, "Public key"),
+      h("dd", null, h("pre", { class: "mono ssh-line" }, vt(line)), copyButton(() => line, "Copy public key"), h("div", { class: "hint muted" }, "One authorized_keys line. It is public: paste it wherever this key should be accepted.")),
+      h("dt", null, "Fingerprint"),
+      h("dd", null, h("span", { class: "mono ssh-fp" }, vt(fingerprint)), h("div", { class: "hint muted" }, "As ssh-keygen -lf prints it")),
+    );
+  }
+  private sshType(id: string | undefined): string {
+    return this.state?.ssh_key_types?.find((t) => t.id === id)?.title ?? id ?? "?";
+  }
+
+  /** "May be handed out": changed with its own tap. */
+  handoutLine(set: VaultSet): HTMLElement {
+    const slot = h("div", { class: "vault-slot" });
+    const on = set.handout ?? false;
+    const b = btn(on ? "Stop handing out…" : "Allow hand-out…", "small", () =>
+      ceremony(
+        slot,
+        this.host.auth,
+        on ? "Turn off with passkey" : "Allow with passkey",
+        on ? "approve" : "deny",
+        () => vaultSshHandout(this.host.api, this.seal!, set, !on, location.hostname),
+        () => [
+          h(
+            "p",
+            { class: on ? "muted" : "bad" },
+            on
+              ? "The private key can no longer be handed out. Copies already handed out keep working: remove the public line where it is installed to end them."
+              : "A host admitted to this organisation may then ask for the private key itself (aqmas ssh-key). Each hand-out still needs your approval on a red card, but a key that was handed out cannot be recalled.",
+          ),
+        ],
+        () => this.host.changed(),
+        undefined,
+        box,
+      ),
+    );
+    const box = h("div", { class: "vault-policy-box vault-handout" }, h("p", { class: "vault-policy" }, h("span", null, "May be handed out: ", h("strong", null, on ? "yes" : "no"), ". "), b), h("p", { class: "hint muted" }, on ? "For hosts or tools that cannot use aqmas ssh-agent. Prefer ssh-agent: the key then never leaves aqmas." : "The private key never leaves aqmas: hosts log in through aqmas ssh-agent."), slot);
+    return box;
+  }
+
+  sshKeyView(set: VaultSet): HTMLElement {
+    const path = pathOf(set);
+    const line = set.authorized_key ?? "";
+    const agent = `aqmas ssh-agent ${path} --why "…" -- git clone ssh://git@forge.example.com/owner/repo.git`;
+    const out = `aqmas ssh-key ${path} --why "…" --out ~/.ssh/${set.set_slug}`;
+    return h(
+      "article",
+      { class: "card vault-signer vault-ssh-key" },
+      this.created === set.set_id ? h("p", { class: "vault-done", role: "status" }, "Created. Add the public key below where this key should be accepted; the private half is in the sealed store.") : null,
+      scopeHeading(set.org_title, set.service_title, set.set_title),
+      h("p", { class: "muted" }, h("span", { class: "mono" }, vt(path)), " · SSH key · ", set.origin === "imported" ? "imported" : "generated in aqmas", set.created_at ? ` · ${new Date(set.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}` : "", " · ", set.signatures === 1 ? "1 login" : `${set.signatures} logins`, " so far"),
+      this.sshFacts(this.sshType(set.scheme), line, set.fingerprint ?? ""),
+      h("h4", null, "Where to add the public key"),
+      h(
+        "ul",
+        { class: "ssh-where" },
+        h("li", null, "A forge (Forgejo, GitHub, GitLab): as an SSH key of a user (Settings → SSH keys), or as a deploy key of one repository."),
+        h("li", null, "A server: one line in ", h("span", { class: "mono" }, "~/.ssh/authorized_keys"), " of the account to log in to."),
+      ),
+      h("h4", null, "Use it on a host"),
+      h("p", { class: "hint muted" }, "The private key stays in the sealed store. The command runs with an SSH agent that offers only this key; aqmas answers each login under a grant you approve once. It works with git, ssh, scp and rsync."),
+      h("div", { class: "command" }, h("pre", null, h("code", null, agent)), copyButton(() => agent)),
+      set.handout
+        ? [h("p", { class: "hint bad" }, "Hand-out is on: a host may also ask for the private key itself. The approval card is red, and a key handed out cannot be recalled."), h("div", { class: "command" }, h("pre", null, h("code", null, out)), copyButton(() => out))]
+        : null,
+      this.handoutLine(set),
+      h("p", { class: "hint muted" }, "There is no reveal and no export here. To replace a key, create a new one, install its public line, then delete this one."),
+    );
+  }
+
+  /** The new-SSH-key form for one service. `created` gets the new set's id. */
+  newSshKey({ org, service }: Place, created?: (setId: string) => void, frozen?: HTMLElement): HTMLElement {
+    const types = this.state?.ssh_key_types?.length ? this.state.ssh_key_types : [{ id: "ssh-ed25519", title: "Ed25519", algorithm: "ssh-ed25519" }];
+    const slug = h("input", { type: "text", class: "text mono", id: "sk-slug", maxlength: "63", placeholder: "deploy-key", autocomplete: "off", spellcheck: "false" });
+    const title = h("input", { type: "text", class: "text", id: "sk-title", maxlength: "64", placeholder: "Deploy key", autocomplete: "off" });
+    const type = h("select", { class: "text", id: "sk-type" }, types.map((t) => h("option", { value: t.id }, vt(t.title))));
+    const comment = h("input", { type: "text", class: "text mono", id: "sk-comment", maxlength: "100", autocomplete: "off", spellcheck: "false" });
+    const handout = h("input", { type: "checkbox", id: "sk-handout" });
+    const gen = h("input", { type: "radio", name: "sk-source", id: "sk-generate" });
+    const imp = h("input", { type: "radio", name: "sk-source", id: "sk-import" });
+    gen.checked = true;
+    const pasted = h("textarea", { class: "mono kv-value", id: "sk-key", placeholder: "-----BEGIN OPENSSH PRIVATE KEY-----", autocomplete: "off", spellcheck: "false", "aria-label": "OpenSSH private key to import" });
+    pasted.rows = 5;
+    const pasteField = h("div", { class: "field", hidden: true }, h("label", { for: "sk-key" }, "OpenSSH private key (pasted once, without a passphrase)"), pasted, h("p", { class: "hint muted" }, "Encrypted in this tab for the sealed store, then cleared from this field. aqmas shows you the matching public key before you confirm. A key protected by a passphrase is refused: remove it first (ssh-keygen -p)."));
+    for (const el of [gen, imp]) el.addEventListener("change", () => (pasteField.hidden = !imp.checked));
+    const slot = h("div", { class: "vault-slot" });
+    const root = h("div", { class: "card vault-new-signer vault-new-ssh" });
+    const error = h("p", { class: "error", role: "alert" });
+    this.forget.push(() => (pasted.value = ""));
+    const parent = { org_id: org.id, org_slug: org.slug, org_title: org.title, service_id: service.id, service_slug: service.slug, service_title: service.title };
+    const suggest = () => {
+      if (!comment.dataset["typed"]) comment.value = slug.value ? sshDefaultComment(org.slug, service.slug, slug.value) : "";
+    };
+    title.addEventListener("input", () => {
+      if (!slug.dataset["typed"]) slug.value = slugify(title.value);
+      suggest();
+    });
+    slug.addEventListener("input", () => {
+      slug.dataset["typed"] = slug.value ? "1" : "";
+      suggest();
+    });
+    comment.addEventListener("input", () => (comment.dataset["typed"] = comment.value ? "1" : ""));
+    const go = btn("Review…", "approve", () => {
+      const t = title.value.trim();
+      if (!SLUG_RE.test(slug.value) || !TITLE_RE.test(t)) {
+        error.textContent = "Slug: lower-case letters, digits and dashes. Name: letters, digits, spaces, dot, dash, underscore.";
+        return;
+      }
+      const cp = sshCommentProblem(comment.value);
+      if (cp) {
+        error.textContent = cp;
+        return;
+      }
+      if (imp.checked && !pasted.value.trim()) {
+        error.textContent = "Paste the private key to import.";
+        return;
+      }
+      error.textContent = "";
+      const set = { id: newSetId(), slug: slug.value, title: t };
+      const chosen = { scheme: type.value, source: (imp.checked ? "import" : "generate") as "import" | "generate", privateKey: imp.checked ? pasted.value : undefined, comment: comment.value, handout: handout.checked };
+      let shown: { authorizedKey: string; fingerprint: string } | undefined;
+      ceremony<SshKeyResult>(
+        slot,
+        this.host.auth,
+        "Create with passkey",
+        "approve",
+        async () => {
+          const p = await vaultSshKeyCreate(this.host.api, this.seal!, parent, set, chosen, location.hostname);
+          pasted.value = "";
+          chosen.privateKey = undefined;
+          shown = p;
+          return p;
+        },
+        () => [
+          h("p", null, chosen.source === "import" ? "aqmas read your key. Compare this public key with the one you already use before confirming:" : "aqmas generated this key pair. The private half never leaves the sealed store:"),
+          scopeHeading(org.title, service.title, set.title),
+          this.sshFacts(this.sshType(chosen.scheme), shown!.authorizedKey, shown!.fingerprint),
+          chosen.handout ? h("p", { class: "bad" }, "May be handed out: a host may ask for the private key itself; each hand-out needs your approval on a red card and cannot be recalled.") : h("p", { class: "muted" }, "Not handed out: hosts log in through aqmas ssh-agent only."),
+        ],
+        (out) => {
+          slug.value = title.value = comment.value = "";
+          handout.checked = false;
+          this.created = out.set_id;
+          created?.(out.set_id);
+          this.host.changed();
+        },
+        undefined,
+        frozen ?? root,
+      );
+    });
+    append(root, [
+      h("h3", null, "New SSH key in ", h("bdi", null, vt(org.title)), " › ", h("bdi", null, vt(service.title))),
+      h("p", { class: "hint muted" }, "An SSH key pair for a machine or forge you add its public key to. The private half lives in the sealed store; hosts log in through aqmas (aqmas ssh-agent), each use approved or covered by a time-boxed grant, each one logged."),
+      h("div", { class: "vault-selects" }, h("div", { class: "field" }, h("label", { for: "sk-title" }, "Name"), title), h("div", { class: "field" }, h("label", { for: "sk-slug" }, "Slug (in the path agents use)"), slug), h("div", { class: "field" }, h("label", { for: "sk-type" }, "Key type"), type)),
+      h("div", { class: "field" }, h("label", { for: "sk-comment" }, "Comment (the end of the public line; plain ASCII)"), comment),
+      h("div", { class: "vault-source" }, h("label", { class: "check", for: "sk-generate" }, gen, " Generate in aqmas"), h("label", { class: "check", for: "sk-import" }, imp, " Paste an existing OpenSSH private key")),
+      pasteField,
+      h("label", { class: "check", for: "sk-handout" }, handout, " May be handed out"),
+      h("p", { class: "hint muted" }, "Off: the private key never leaves aqmas. On: a host may also ask for the key file itself, for a tool that cannot use an SSH agent; a key handed out cannot be recalled. You can change this later."),
+      error,
+      h("div", { class: "actions" }, go),
+      slot,
+    ]);
+    return root;
+  }
+
+  // ---- delete, and the bin ----
+
+  /** Delete on an item's page: one tap moves it to the bin. */
+  deleteLine(set: VaultSet, done?: (out: DeleteResult) => void): HTMLElement {
+    const slot = h("div", { class: "vault-slot" });
+    const days = Math.round((this.state?.bin_seconds ?? BIN_SECONDS) / 86400);
+    const b = btn("Delete…", "deny small", () =>
+      ceremony<DeleteResult>(
+        slot,
+        this.host.auth,
+        "Delete with passkey",
+        "deny",
+        () => vaultDelete(this.host.api, this.seal!, set, location.hostname),
+        () => [
+          h("p", null, "Delete ", h("span", { class: "mono" }, vt(pathOf(set))), "?"),
+          h(
+            "ul",
+            { class: "delete-effects" },
+            h("li", null, "Agents cannot use it from this tap on: to them it no longer exists."),
+            h("li", null, "Its grants, “don't ask again” rules and requests waiting for you end now."),
+            h("li", null, `It stays under Vault → Deleted for ${days} days, where you can restore it (without those grants and rules) or purge it. After that aqmas destroys it for good.`),
+            h("li", null, "The path is free for a new item at once."),
+          ),
+        ],
+        (out) => {
+          done?.(out);
+          this.host.changed();
+        },
+        undefined,
+        box,
+      ),
+    );
+    const box = h("article", { class: "card vault-delete" }, h("h4", null, "Delete this item"), h("p", { class: "hint muted" }, `Moves it to Vault → Deleted: unusable at once, restorable for ${days} days, then destroyed.`), h("div", { class: "actions start" }, b), slot);
+    return box;
+  }
+
+  /** Vault → Deleted: every binned item with Restore and Purge now. */
+  deletedList(): HTMLElement {
+    const list = this.state?.deleted ?? [];
+    const root = h("div", { class: "vault-deleted" });
+    if (!list.length) {
+      root.append(h("p", { class: "empty" }, "Nothing is in the bin."));
+      return root;
+    }
+    const KIND: Record<string, string> = { "env-set": "Env set", secret: "Secret", signer: "Signing key", "ssh-key": "SSH key" };
+    root.append(h("p", { class: "hint muted" }, "Deleted items are unusable and wait here until aqmas destroys them. Restore puts an item back as it was, without its former grants and “don't ask again” rules."));
+    for (const d of [...list].sort((a, b) => b.deleted_at - a.deleted_at)) {
+      const slot = h("div", { class: "vault-slot" });
+      const card = h("article", { class: "card deleted-item" });
+      card.setAttribute("data-id", d.set_id);
+      const restore = btn("Restore…", "approve small", () =>
+        ceremony(slot, this.host.auth, "Restore with passkey", "approve", () => vaultRestore(this.host.api, this.seal!, d, location.hostname), () => [h("p", null, "Restore ", h("span", { class: "mono" }, vt(pathOf(d))), " as it was. Hosts can ask for it again; its former grants and “don't ask again” rules do not come back.")], () => this.host.changed(), undefined, card),
+      );
+      restore.disabled = d.path_taken;
+      const purge = btn("Purge now…", "deny small", () =>
+        ceremony(
+          slot,
+          this.host.auth,
+          "Purge with passkey",
+          "deny",
+          () => vaultPurge(this.host.api, this.seal!, d, location.hostname),
+          () => [h("p", { class: "bad" }, "Destroy ", h("span", { class: "mono" }, vt(pathOf(d))), " for good, now. Its sealed contents and its bucket are deleted from the store. This cannot be undone."), h("p", { class: "hint muted" }, "A backup of the store made before this moment still contains the sealed item.")],
+          () => this.host.changed(),
+          undefined,
+          card,
+        ),
+      );
+      append(card, [
+        scopeHeading(d.org_title, d.service_title, d.set_title),
+        h("p", { class: "muted" }, h("span", { class: "mono" }, vt(pathOf(d))), " · ", KIND[d.kind] ?? vt(d.kind), d.kind === "env-set" || d.kind === "secret" ? ` · revision ${d.revision}` : ""),
+        h(
+          "dl",
+          { class: "facts" },
+          h("dt", null, "Deleted"),
+          h("dd", null, h("time", { datetime: new Date(d.deleted_at).toISOString() }, new Date(d.deleted_at).toLocaleString("en-GB", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })), " by ", h("bdi", null, vt(d.deleted_by || "the owner"))),
+          h("dt", null, "Destroyed in"),
+          h("dd", { class: "deleted-left" }, timeLeft(d.purge_at - Date.now())),
+          d.names.length ? [h("dt", null, "Keys"), h("dd", null, h("span", { class: "mono" }, vt(d.names.join(", "))))] : null,
+          d.fingerprint ? [h("dt", null, "Fingerprint"), h("dd", null, h("span", { class: "mono" }, vt(d.fingerprint)))] : null,
+        ),
+        d.path_taken ? h("p", { class: "warn" }, "Another item has the path ", h("span", { class: "mono" }, vt(pathOf(d))), " now, so this one cannot be restored. Delete that item first, or purge this one.") : null,
+        h("div", { class: "actions" }, restore, purge),
+        slot,
+      ]);
+      root.append(card);
+    }
     return root;
   }
 }

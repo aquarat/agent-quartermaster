@@ -8,7 +8,7 @@
 import { createECDH, createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import { suite, tuple } from "../src/seal";
 import type { MockBuckets } from "./buckets";
-import { canonicalJSON, editChanges, editCommitment, type Edit, type SignItem, type SignRequest, type VaultOrg, type VaultSet } from "../src/vault";
+import { BIN_SECONDS, canonicalJSON, editChanges, editCommitment, sshCommentProblem, type DeletedSet, type Edit, type SignItem, type SignRequest, type VaultOrg, type VaultSet } from "../src/vault";
 
 const b64url = (b: Uint8Array | Buffer) => Buffer.from(b).toString("base64url");
 const hex = (b: Uint8Array | Buffer) => Buffer.from(b).toString("hex");
@@ -32,6 +32,54 @@ const SCHEMES = [
   { id: "ed25519ph", title: "Ed25519ph (RFC 8032 prehash, SHA-512)", key: "ed25519", input: "sha512", signed: "the artifact's SHA-512, as Ed25519ph with an empty context", output: "64 raw bytes (R || S)", check: "an RFC 8032 Ed25519ph verifier (empty context) over FILE" },
   { id: "ecdsa-p256-sha256", title: "ECDSA P-256 over SHA-256", key: "ecdsa-p256", input: "sha256", signed: "the artifact's SHA-256 (ECDSA, NIST P-256)", output: "ASN.1 DER (r, s)", check: "openssl dgst -sha256 -verify pub.pem -signature FILE.sig FILE" },
 ];
+
+const SSH_TYPES = [
+  { id: "ssh-ed25519", title: "Ed25519", algorithm: "ssh-ed25519" },
+  { id: "ssh-ecdsa-p256", title: "ECDSA P-256", algorithm: "ecdsa-sha2-nistp256" },
+];
+const sshString = (b: Uint8Array | string) => {
+  const body = Buffer.from(b);
+  const n = Buffer.alloc(4);
+  n.writeUInt32BE(body.length);
+  return Buffer.concat([n, body]);
+};
+/** The SSH wire blob, authorized_keys line and fingerprint of a raw public key. */
+function sshPub(scheme: string, raw: Uint8Array, comment: string) {
+  const algorithm = SSH_TYPES.find((t) => t.id === scheme)!.algorithm;
+  const blob = scheme === "ssh-ed25519" ? Buffer.concat([sshString(algorithm), sshString(raw)]) : Buffer.concat([sshString(algorithm), sshString("nistp256"), sshString(raw)]);
+  return { authorized_key: `${algorithm} ${blob.toString("base64")} ${comment}`, fingerprint: "SHA256:" + sha256(blob).toString("base64").replace(/=+$/, "") };
+}
+/** The raw public key inside an unencrypted OpenSSH private key file (the mock keeps no
+ * private key). Throws for anything else, a passphrase-protected key included. */
+function opensshPublic(scheme: string, pem: string): Buffer {
+  const m = /^-----BEGIN OPENSSH PRIVATE KEY-----\s+([A-Za-z0-9+/=\s]+)-----END OPENSSH PRIVATE KEY-----\s*$/.exec(pem.trim() + "\n");
+  if (!m) throw new Error("not an OpenSSH private key");
+  const b = Buffer.from(m[1]!.replace(/\s+/g, ""), "base64");
+  const magic = Buffer.from("openssh-key-v1\0");
+  if (!b.subarray(0, magic.length).equals(magic)) throw new Error("not an OpenSSH private key");
+  let i = magic.length;
+  const str = (buf: Buffer = b): Buffer => {
+    const n = buf.readUInt32BE(i);
+    i += 4;
+    const out = buf.subarray(i, i + n);
+    if (out.length !== n) throw new Error("truncated key");
+    i += n;
+    return out;
+  };
+  if (str().toString() !== "none" || str().toString() !== "none") throw new Error("encrypted key");
+  str();
+  if (b.readUInt32BE(i) !== 1) throw new Error("one key expected");
+  i += 4;
+  const blob = str();
+  i = 0;
+  const algorithm = str(blob).toString();
+  if (algorithm !== SSH_TYPES.find((t) => t.id === scheme)!.algorithm) throw new Error("another key type");
+  if (scheme !== "ssh-ed25519") str(blob);
+  const raw = str(blob);
+  if (raw.length !== (scheme === "ssh-ed25519" ? 32 : 65)) throw new Error("invalid public key");
+  return Buffer.from(raw);
+}
+type Binned = DeletedSet & { set: VaultSet };
 
 function spki(raw: Uint8Array): string {
   const prefix = raw.length === 32 ? "302a300506032b6570032100" : "3059301306072a8648ce3d020106082a8648ce3d030107034200";
@@ -68,7 +116,7 @@ interface Attempt {
   session: string | undefined;
   priv: Buffer;
   expires: number;
-  purpose?: "edit" | "signer-import" | "signer-generate";
+  purpose?: "edit" | "signer-import" | "signer-generate" | "ssh-generate";
   target?: string;
   enc?: Buffer;
   ct?: Buffer;
@@ -88,6 +136,8 @@ export class MockVault {
   orgs: VaultOrg[] = [];
   sets: VaultSet[] = [];
   requests: SignRequest[] = [];
+  /** The bin: items deleted less than seven days ago (their values stay in `values`). */
+  deleted: Binned[] = [];
   /** Application services (also ones that have no set yet). */
   services: { id: string; org_id: string; slug: string; title: string }[] = [];
   /** Enrolled hosts and the organisations each is admitted to (catalogue + /api/ui/hosts). */
@@ -117,6 +167,46 @@ export class MockVault {
       id, grant_id: "", mode, address: hst.address, reason, ttl_seconds: 600, deadline: Date.now() + 540_000, not_after: 0, status: "pending", consumed: false,
     });
     return id;
+  }
+  /** A host asks to use an SSH key: logins through `aqmas ssh-agent`, or the key itself. */
+  addSshRequest(path: string, use: "ssh-agent" | "ssh-handout", host = "build-1", ttl = 3600, max = 20, reason = "push the release branch"): string {
+    const s = this.sets.find((x) => `${x.org_slug}/${x.service_slug}/${x.set_slug}` === path);
+    if (!s || s.kind !== "ssh-key") throw new Error("no SSH key " + path);
+    if (use === "ssh-handout" && !s.handout) throw new Error("hand-out is off for " + path);
+    const hst = this.hosts.find((x) => x.name === host)!;
+    const id = "01MOCKSSHREQ" + String(this.requests.length + 1).padStart(4, "0") + b64url(randomBytes(6)).replace(/[^A-Za-z0-9]/g, "X").toUpperCase();
+    const handout = use === "ssh-handout";
+    this.requests.push({
+      path, title: `${s.org_title} / ${s.service_title} / ${s.set_title}`, org: s.org_id, service: s.service_id, set: s.set_id, revision: 0, service_revision: 1, policy_revision: this.policies.get(s.org_id)?.revision ?? 1, admission_generation: 1,
+      enrollment: hst.enrollment, host, class: hst.class, scheme: s.scheme!, public_key: Buffer.from(s.public_key!, "base64url").toString("base64"), default_seconds: 3600, soft_cap_seconds: 86400,
+      id, grant_id: "", address: hst.address, reason, items: [], ttl_seconds: handout ? 0 : ttl, max_signatures: handout ? 1 : max, deadline: Date.now() + 540_000, not_after: 0, status: "pending", used: 0, use,
+    });
+    return id;
+  }
+  /** An SSH key as the broker would list it (the mock keeps the public half only). */
+  addSshKey(path: string, title: string, opts: { scheme?: string; handout?: boolean; comment?: string } = {}): VaultSet {
+    const [o, v, slug] = path.split("/") as [string, string, string];
+    const org = this.orgs.find((x) => x.slug === o)!, svc = this.services.find((x) => x.org_id === org.id && x.slug === v)!;
+    const scheme = opts.scheme ?? "ssh-ed25519", comment = opts.comment ?? `aqmas:${path}`;
+    const pub = rawPublic(scheme === "ssh-ed25519" ? generateKeyPairSync("ed25519").publicKey : generateKeyPairSync("ec", { namedCurve: "P-256" }).publicKey);
+    const s: VaultSet = { org_id: org.id, org_slug: org.slug, org_title: org.title, service_id: svc.id, service_slug: svc.slug, service_title: svc.title, set_id: id32("ssh:" + path), set_slug: slug, set_title: title, kind: "ssh-key", revision: 0, names: [], allow_reveal: true, scheme, origin: "generated", created_at: Date.now(), signatures: 0, public_key: b64url(pub), ...sshPub(scheme, pub, comment), comment, handout: opts.handout ?? false };
+    this.sets.push(s);
+    return s;
+  }
+  private binnedView(d: Binned): DeletedSet {
+    const { set: _set, ...rest } = d;
+    return { ...rest, path_taken: this.sets.some((s) => s.service_id === d.service_id && s.set_slug === d.set_slug) };
+  }
+  /** What the broker's sweeper does: destroy what has been in the bin for seven days. */
+  private sweepBin(): void {
+    for (const d of this.deleted.filter((x) => x.purge_at <= Date.now())) this.destroy(d, "auto ");
+  }
+  private destroy(d: Binned, prefix = ""): void {
+    this.deleted = this.deleted.filter((x) => x !== d);
+    this.values.delete(d.set_id);
+    this.history.delete(d.set_id);
+    this.caps.delete(d.set_id);
+    this.deps.audit("vault_purge", "set:" + d.set_id, `${prefix}${d.org_slug}/${d.service_slug}/${d.set_slug} kind=${d.kind} digest=${d.digest}`);
   }
   private cap(set: string): number {
     return this.caps.get(set) ?? 3600;
@@ -313,7 +403,16 @@ export class MockVault {
   }
 
   private state() {
-    return { schemes: SCHEMES, organisations: this.orgs, sets: this.sets.map((s) => ({ ...s, allow_reveal: this.orgs.find((o) => o.id === s.org_id)!.allow_reveal, standing_cap_seconds: s.kind === "signer" ? 0 : this.cap(s.set_id) })), requests: this.requests.filter((r) => r.status === "pending" || r.status === "approved") };
+    this.sweepBin();
+    return {
+      schemes: SCHEMES,
+      ssh_key_types: SSH_TYPES,
+      bin_seconds: BIN_SECONDS,
+      organisations: this.orgs,
+      sets: this.sets.map((s) => ({ ...s, allow_reveal: this.orgs.find((o) => o.id === s.org_id)!.allow_reveal, standing_cap_seconds: s.kind === "signer" || s.kind === "ssh-key" ? 0 : this.cap(s.set_id) })),
+      deleted: this.deleted.map((d) => this.binnedView(d)),
+      requests: this.requests.filter((r) => r.status === "pending" || r.status === "approved"),
+    };
   }
   private target(s: VaultSet) {
     return { org_id: s.org_id, org_slug: s.org_slug, org_title: s.org_title, service_id: s.service_id, service_slug: s.service_slug, service_title: s.service_title, set_id: s.set_id, set_slug: s.set_slug, set_title: s.set_title, kind: s.kind, revision: s.revision };
@@ -423,6 +522,61 @@ export class MockVault {
           facts,
         };
       }
+      case "ssh-key-create": {
+        const svc = this.services.find((v) => v.id === c.service_id) ?? fail(404, "not_found", "not found");
+        const po = this.orgs.find((o) => o.id === svc.org_id)!;
+        const type = SSH_TYPES.find((x) => x.id === c.scheme);
+        if (!type || typeof c.id !== "string" || !/^[0-9a-f]{32}$/.test(c.id) || typeof c.set_slug !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(c.set_slug) || typeof c.set_title !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,63}$/.test(c.set_title) || typeof c.comment !== "string" || sshCommentProblem(c.comment) || typeof c.handout !== "boolean") return fail(400, "bad_request", "invalid SSH key");
+        if (this.sets.some((s) => s.set_id === c.id || (s.service_id === svc.id && s.set_slug === c.set_slug)) || this.deleted.some((d) => d.set_id === c.id)) fail(409, "conflict", "a set with that name or ID exists; reload");
+        let attempt = c.attempt_id as string | undefined;
+        let pub: Buffer;
+        let recipient = "";
+        if (c.source === "generate" && begin) {
+          if (c.attempt_id || c.enc || c.ciphertext) fail(400, "bad_request", "unexpected upload");
+          attempt = b64url(randomBytes(32));
+          pub = rawPublic(type.id === "ssh-ed25519" ? generateKeyPairSync("ed25519").publicKey : generateKeyPairSync("ec", { namedCurve: "P-256" }).publicKey);
+          this.attempts.set(attempt, { session, priv: Buffer.alloc(0), expires: Date.now() + 300_000, purpose: "ssh-generate", target: c.id, scheme: type.id, pub });
+        } else if (c.source === "generate") {
+          const a = this.live(session, attempt);
+          if (a.purpose !== "ssh-generate" || a.target !== c.id || a.scheme !== type.id) fail(409, "conflict", "generated key expired; start again");
+          pub = a.pub!;
+        } else if (c.source === "import") {
+          const a = begin ? this.submit(session, c, "signer-import", c.id) : this.live(session, attempt);
+          if (a.purpose !== "signer-import" || a.target !== c.id || a.scheme !== type.id) fail(409, "conflict", "upload attempt expired; start again");
+          recipient = a.recipient ?? "";
+          const packet = JSON.parse((await this.open(a, "signer-import", attempt!, c.id)).toString("utf8")) as { private_key?: string };
+          try {
+            pub = opensshPublic(type.id, String(packet.private_key ?? ""));
+          } catch {
+            return fail(400, "bad_request", `not an unencrypted ${type.title} OpenSSH private key`);
+          }
+        } else return fail(400, "bad_request", "choose generate or import");
+        const line = sshPub(type.id, pub, c.comment);
+        Object.assign(facts, { attempt_id: attempt, public_key: b64url(pub), ...line });
+        return {
+          meta: { org_id: po.id, org_slug: po.slug, org_title: po.title, service_id: svc.id, service_slug: svc.slug, service_title: svc.title, set_id: c.id, set_slug: c.set_slug, set_title: c.set_title, kind: "ssh-key", revision: 0, scheme: type.id, source: c.source, attempt_id: attempt, recipient, public_key: b64url(pub), ...line, comment: c.comment, handout: c.handout, result_revision: 0 },
+          facts,
+        };
+      }
+      case "ssh-key-handout": {
+        const s = setOf(c.id);
+        if (s.kind !== "ssh-key") fail(400, "bad_request", "not an SSH key");
+        if (typeof c.handout !== "boolean" || c.handout === (s.handout ?? false)) fail(409, "conflict", "the setting already has that value; reload");
+        return { meta: { ...this.target(s), fingerprint: s.fingerprint, old_handout: s.handout ?? false, handout: c.handout }, facts };
+      }
+      case "delete": {
+        const s = setOf(c.id);
+        if (c.revision !== s.revision) fail(409, "conflict", "the item changed; reload");
+        return { meta: { ...this.target(s), path: `${s.org_slug}/${s.service_slug}/${s.set_slug}`, fingerprint: s.kind === "signer" || s.kind === "ssh-key" ? s.fingerprint : "", bin_seconds: BIN_SECONDS }, facts };
+      }
+      case "restore":
+      case "purge": {
+        this.sweepBin();
+        const d = this.deleted.find((x) => x.set_id === c.id) ?? fail(404, "not_found", "not found");
+        const path = `${d.org_slug}/${d.service_slug}/${d.set_slug}`;
+        if (c.action === "restore" && this.binnedView(d).path_taken) fail(409, "conflict", `a live item has the path ${path} now: delete or purge one of them`);
+        return { meta: { ...this.target(d.set), path, deleted_at: d.deleted_at, ...(c.action === "purge" ? { digest: d.digest } : {}) }, facts };
+      }
       case "secret-create": {
         const svc = this.services.find((v) => v.id === c.service_id) ?? fail(404, "not_found", "not found");
         const po = this.orgs.find((o) => o.id === svc.org_id)!;
@@ -453,7 +607,7 @@ export class MockVault {
       case "standing-cap": {
         const s = setOf(c.id);
         const n = c.standing_cap_seconds;
-        if (s.kind === "signer") fail(400, "bad_request", "only env sets and secrets have a don't-ask-again limit");
+        if (s.kind === "signer" || s.kind === "ssh-key") fail(400, "bad_request", "only env sets and secrets have a don't-ask-again limit");
         if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0 || n > 86400 || n % 60 !== 0) return fail(400, "bad_request", "the limit is between 0 (off) and 24 hours, in whole minutes");
         if (n === this.cap(s.set_id)) fail(409, "conflict", "the limit already has that value; reload");
         return { meta: { ...this.target(s), old_standing_cap_seconds: this.cap(s.set_id), standing_cap_seconds: n }, facts };
@@ -466,16 +620,17 @@ export class MockVault {
         const s = setOf(r.set);
         const ttl = Number(c.ttl_seconds ?? 0), max = Number(c.max_signatures ?? 0);
         if (c.action === "sign-approve") {
-          const single = ttl === 0 && max === r.items.length;
-          const timed = r.ttl_seconds > 0 && ttl > 0 && ttl <= r.ttl_seconds && max >= 1 && max <= r.max_signatures;
+          const single = r.use ? r.use === "ssh-handout" && ttl === 0 && max === 1 : ttl === 0 && max === r.items.length;
+          const timed = r.use !== "ssh-handout" && r.ttl_seconds > 0 && ttl >= (r.use ? 60 : 1) && ttl <= r.ttl_seconds && max >= 1 && max <= r.max_signatures;
           if (!single && !timed) fail(400, "bad_request", "duration or count exceeds the request");
         } else if (ttl !== 0 || max !== 0) fail(400, "bad_request", "unexpected duration");
         return {
           meta: {
-            ...this.target(s), request_id: r.id, host: r.host, enrollment: r.enrollment, address: r.address, scheme: r.scheme, fingerprint: hex(sha256(Buffer.from(r.public_key, "base64"))),
+            ...this.target(s), request_id: r.id, host: r.host, enrollment: r.enrollment, address: r.address, scheme: r.scheme, fingerprint: r.use ? sshPub(r.scheme, Buffer.from(r.public_key, "base64"), "x").fingerprint : hex(sha256(Buffer.from(r.public_key, "base64"))),
             items: r.items.map((it) => (it.sha512 ? { name: it.name, size: it.size, sha256: it.sha256, sha512: it.sha512 } : { name: it.name, size: it.size, sha256: it.sha256 })),
             requested_ttl_seconds: r.ttl_seconds, requested_max_signatures: r.max_signatures, ttl_seconds: ttl, max_signatures: max,
             admission_generation: r.admission_generation, policy_revision: r.policy_revision, service_revision: r.service_revision, soft_cap_seconds: r.soft_cap_seconds, beyond_soft_cap: ttl > r.soft_cap_seconds,
+            ...(r.use ? { use: r.use } : {}),
           },
           facts,
         };
@@ -553,7 +708,7 @@ export class MockVault {
       const c = this.buckets?.enabled ? (await this.buckets.finish(body, session)).canonical : this.deps.redeem(body.challenge_id, body.assertion, session);
       if (c.object !== "vault") fail(409, "conflict", "wrong ceremony");
       const signed = JSON.parse(c.metadata as string) as Record<string, unknown>;
-      const choice: Record<string, unknown> = { action: c.action, id: c.id, attempt_id: signed.attempt_id, names: signed.names, recipient: signed.recipient, allow_reveal: signed.allow_reveal, service_id: signed.service_id, set_slug: signed.set_slug, set_title: signed.set_title, scheme: signed.scheme, source: signed.source, ttl_seconds: signed.ttl_seconds, max_signatures: signed.max_signatures, note: signed.note, url: signed.url, standing_cap_seconds: signed.standing_cap_seconds };
+      const choice: Record<string, unknown> = { action: c.action, id: c.id, attempt_id: signed.attempt_id, names: signed.names, recipient: signed.recipient, allow_reveal: signed.allow_reveal, service_id: signed.service_id, set_slug: signed.set_slug, set_title: signed.set_title, scheme: signed.scheme, source: signed.source, ttl_seconds: signed.ttl_seconds, max_signatures: signed.max_signatures, note: signed.note, url: signed.url, standing_cap_seconds: signed.standing_cap_seconds, comment: signed.comment, handout: signed.handout, revision: signed.revision };
       let reviewed: Awaited<ReturnType<MockVault["review"]>>;
       try {
         reviewed = await this.review(session, choice, false);
@@ -610,6 +765,59 @@ export class MockVault {
           this.caps.set(s.set_id, signed.standing_cap_seconds as number);
           this.standing = this.standing.filter((x) => x.set !== s.set_id);
           this.note(s.set_id, "vault_standing_cap", `${s.org_slug}/${s.service_slug}/${s.set_slug} standing_cap=${signed.standing_cap_seconds}`);
+          return { ok: true };
+        }
+        case "ssh-key-create": {
+          const m = reviewed.meta as Record<string, string> & { handout: boolean };
+          const s: VaultSet = { org_id: m.org_id!, org_slug: m.org_slug!, org_title: m.org_title!, service_id: m.service_id!, service_slug: m.service_slug!, service_title: m.service_title!, set_id: m.set_id!, set_slug: m.set_slug!, set_title: m.set_title!, kind: "ssh-key", revision: 0, names: [], allow_reveal: true, scheme: m.scheme, origin: m.source === "import" ? "imported" : "generated", created_at: Date.now(), signatures: 0, public_key: m.public_key, fingerprint: m.fingerprint, authorized_key: m.authorized_key, comment: m.comment, handout: m.handout };
+          this.sets.push(s);
+          const path = `${s.org_slug}/${s.service_slug}/${s.set_slug}`;
+          this.note(s.set_id, "vault_ssh_key_create", `${path} scheme=${s.scheme} origin=${s.origin} fingerprint=${s.fingerprint} handout=${s.handout}`);
+          return { set_id: s.set_id, path, scheme: s.scheme, public_key: s.public_key, fingerprint: s.fingerprint, authorized_key: s.authorized_key, comment: s.comment, handout: s.handout };
+        }
+        case "ssh-key-handout": {
+          const s = this.sets.find((x) => x.set_id === c.id)!;
+          s.handout = signed.handout as boolean;
+          // Turning hand-out off ends hand-out requests that were not collected.
+          if (!s.handout) for (const r of this.requests) if (r.set === s.set_id && r.use === "ssh-handout" && (r.status === "pending" || r.status === "approved")) r.status = r.status === "pending" ? "expired" : "revoked";
+          this.note(s.set_id, "vault_ssh_key_handout", `${s.org_slug}/${s.service_slug}/${s.set_slug} handout=${s.handout}`);
+          return { ok: true };
+        }
+        case "delete": {
+          const s = this.sets.find((x) => x.set_id === c.id)!;
+          const path = `${s.org_slug}/${s.service_slug}/${s.set_slug}`;
+          const ended = { grants: 0, standing: 0, releases: 0, pending: 0 };
+          for (const r of this.requests) {
+            if (r.set !== s.set_id || (r.status !== "pending" && r.status !== "approved")) continue;
+            if (r.status === "pending") ended.pending++;
+            else ended.grants++;
+            r.status = r.status === "pending" ? "expired" : "revoked";
+          }
+          for (const r of this.releases) {
+            if (r.set !== s.set_id || (r.status !== "pending" && r.status !== "approved")) continue;
+            if (r.status === "pending") ended.pending++;
+            else ended.releases++;
+            r.status = r.status === "pending" ? "expired" : "revoked";
+          }
+          ended.standing = this.standing.filter((x) => x.set === s.set_id).length;
+          this.standing = this.standing.filter((x) => x.set !== s.set_id);
+          this.sets = this.sets.filter((x) => x !== s);
+          const now = Date.now();
+          const digest = hex(sha256(`mock-bin:${s.set_id}:${s.revision}:${s.fingerprint ?? ""}:${s.names.join(",")}`));
+          this.deleted.push({ ...this.target(s), names: [...s.names], deleted_at: now, purge_at: now + BIN_SECONDS * 1000, deleted_by: "Mock passkey", digest, ...(s.scheme ? { scheme: s.scheme } : {}), ...(s.fingerprint ? { fingerprint: s.fingerprint } : {}), ...(s.authorized_key ? { authorized_key: s.authorized_key } : {}), path_taken: false, set: s });
+          this.note(s.set_id, "vault_delete", `${path} kind=${s.kind} revision=${s.revision} digest=${digest} ended grants=${ended.grants} standing=${ended.standing} releases=${ended.releases} pending=${ended.pending}`);
+          return { ok: true, purge_at: now + BIN_SECONDS * 1000, ended };
+        }
+        case "restore": {
+          const d = this.deleted.find((x) => x.set_id === c.id)!;
+          this.deleted = this.deleted.filter((x) => x !== d);
+          this.sets.push(d.set);
+          const path = `${d.org_slug}/${d.service_slug}/${d.set_slug}`;
+          this.note(d.set_id, "vault_restore", `${path} kind=${d.kind} revision=${d.revision}`);
+          return { ok: true, path };
+        }
+        case "purge": {
+          this.destroy(this.deleted.find((x) => x.set_id === c.id)!);
           return { ok: true };
         }
         case "signer-create": {

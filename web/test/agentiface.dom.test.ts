@@ -149,7 +149,7 @@ describe("agent interface, secrets and don't-ask-again in a DOM", () => {
       el.value = value;
       fire(el, ev);
     };
-    expect([...form.querySelectorAll(".type-card strong")].map((e) => e.textContent)).toEqual(["Secret (single value)", "Env set", "Signing key"]);
+    expect([...form.querySelectorAll(".type-card strong")].map((e) => e.textContent)).toEqual(["Secret (single value)", "Env set", "Signing key", "SSH key"]);
     set("#add-org", state.organisations.find((o) => o.slug === "client-a")!.id, "change");
     const radio = form.querySelector<HTMLInputElement>("#add-type-secret")!;
     radio.checked = true;

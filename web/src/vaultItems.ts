@@ -6,18 +6,19 @@ import type { Catalogue } from "./catalogue";
 import type { BucketInfo, SealView } from "./sealPanel";
 import type { VaultSet, VaultState } from "./vault";
 
-export type ItemType = "env-set" | "secret" | "signer" | "cloudflare" | "ssh-ca" | "internal-ca" | "access";
+export type ItemType = "env-set" | "secret" | "signer" | "ssh-key" | "cloudflare" | "ssh-ca" | "internal-ca" | "access";
 
 export const TYPE_WORDS: Record<ItemType, { one: string; many: string }> = {
   "env-set": { one: "Env set", many: "Env sets" },
   secret: { one: "Secret", many: "Secrets" },
   signer: { one: "Signing key", many: "Signing keys" },
+  "ssh-key": { one: "SSH key", many: "SSH keys" },
   cloudflare: { one: "Cloudflare", many: "Cloudflare" },
   "ssh-ca": { one: "SSH CA", many: "SSH CAs" },
   "internal-ca": { one: "Internal CA", many: "Internal CAs" },
   access: { one: "Access rule", many: "Access rules" },
 };
-export const TYPE_ORDER: ItemType[] = ["secret", "env-set", "signer", "cloudflare", "ssh-ca", "internal-ca", "access"];
+export const TYPE_ORDER: ItemType[] = ["secret", "env-set", "signer", "ssh-key", "cloudflare", "ssh-ca", "internal-ca", "access"];
 
 export interface VaultItem {
   /** The set id, or "b-" + a short form of the bucket id for a bucket no set stands for. */
@@ -58,6 +59,7 @@ export const bucketItemId = (id: string) => "b-" + id.replace(/[^A-Za-z0-9_-]/g,
 
 function typeOfKind(kind: string, provider: string): ItemType {
   if (kind === "signer") return "signer";
+  if (kind === "ssh-key") return "ssh-key";
   if (kind === "secret") return "secret";
   if (kind === "env-set") return "env-set";
   if (provider === "cloudflare" || kind.startsWith("cloudflare") || kind.startsWith("cf-")) return "cloudflare";
@@ -78,15 +80,15 @@ export function buildItems(vault: VaultState | undefined, cat: Catalogue | null 
     seen.add(s.set_id);
     items.push({
       id: s.set_id,
-      type: s.kind === "signer" ? "signer" : s.kind === "secret" ? "secret" : "env-set",
+      type: s.kind === "signer" ? "signer" : s.kind === "ssh-key" ? "ssh-key" : s.kind === "secret" ? "secret" : "env-set",
       title: s.set_title,
       path,
       orgId: s.org_id,
       orgTitle: s.org_title,
       serviceId: s.service_id,
       serviceTitle: s.service_title,
-      sub: s.kind === "signer" ? `${scheme} · ${plural(s.signatures, "signature")}` : s.kind === "secret" ? `$${s.names[0] ?? "?"} · revision ${s.revision}` : s.names.length ? `${plural(s.names.length, "key")} · revision ${s.revision}` : "empty",
-      names: s.kind === "signer" ? [] : s.names,
+      sub: s.kind === "ssh-key" ? `${vault?.ssh_key_types?.find((x) => x.id === s.scheme)?.title ?? s.scheme ?? ""} · ${plural(s.signatures, "login")}${s.handout ? " · may be handed out" : ""}` : s.kind === "signer" ? `${scheme} · ${plural(s.signatures, "signature")}` : s.kind === "secret" ? `$${s.names[0] ?? "?"} · revision ${s.revision}` : s.names.length ? `${plural(s.names.length, "key")} · revision ${s.revision}` : "empty",
+      names: s.kind === "signer" || s.kind === "ssh-key" ? [] : s.names,
       set: s,
       bucket: takeBucket(path),
       kind: s.kind,
@@ -103,6 +105,8 @@ export function buildItems(vault: VaultState | undefined, cat: Catalogue | null 
       }
   // What is left is the broker's own (the CAs), or a set no list above named.
   for (const b of buckets) {
+    // The bucket of an item in the bin: Vault → Deleted lists that item, not this list.
+    if (b.label.startsWith("(deleted) ")) continue;
     const type: ItemType = b.kind === "ssh-ca" ? "ssh-ca" : b.kind === "internal-ca" ? "internal-ca" : b.kind === "cf-proxy" ? "cloudflare" : b.kind === "signer" ? "signer" : "env-set";
     const own = b.scope === INSTALLATION;
     items.push({ id: bucketItemId(b.id), type, title: b.label, path: b.label, orgId: own ? INSTALLATION : b.scope, orgTitle: b.scope_title || (own ? "Installation" : b.scope), serviceId: "", serviceTitle: "", sub: own ? "held by the broker" : "Cloudflare parent token", names: [], bucket: b, kind: b.kind });
