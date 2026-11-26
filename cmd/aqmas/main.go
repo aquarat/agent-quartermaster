@@ -78,6 +78,17 @@ Usage:
       --format raw|hex|base64, --force); stdin and --digest print hex. --ttl asks
       for a signing grant reused by later calls; "aqmas sign PATH --end" ends it.
   aqmas signer ORG/SERVICE/KEY [--pem]   the key's scheme and public key
+  aqmas ssh-agent ORG/SERVICE/KEY --why REASON [--ttl 10m] [--count N] -- COMMAND...
+      Run COMMAND (git, ssh, scp, rsync -e ssh ...) with an SSH key that stays in aqmas:
+      SSH_AUTH_SOCK points at a private agent socket that offers exactly that key, and
+      each login is signed by aqmasd under one approved grant (default 10 minutes, 20
+      logins; later calls reuse it). --socket instead of a command serves the agent and
+      prints SSH_AUTH_SOCK=PATH for a script; "aqmas ssh-agent PATH --end" ends the grant.
+  aqmas ssh-key ORG/SERVICE/KEY --public   the key's authorized_keys line (no approval)
+  aqmas ssh-key ORG/SERVICE/KEY --why REASON [--out FILE] [--force]
+      Hand the private key out as a file (0600, plus FILE.pub). Only for a key the owner
+      marked "may be handed out", after a red approval card: the key has then left aqmas
+      and cannot be recalled. Prefer ssh-agent.
   aqmas version | help
   aqmas upgrade | update [--check] [--yes --expect-sha256 HEX] [--allow-single-source]
       A system-wide install (e.g. /usr/local/bin/aqmas): sudo aqmas upgrade. It uses
@@ -249,6 +260,54 @@ func run(args []string) int {
 			}
 		}
 		return fail(env.Sign(ctx, o))
+	case "ssh-agent":
+		f, err := parseFlags(rest, map[string]bool{"why": true, "ttl": true, "count": true, "socket": false, "end": false})
+		if err != nil {
+			return fail(err)
+		}
+		if len(f.pos) != 1 {
+			return fail(&client.UsageError{Msg: "usage: aqmas ssh-agent ORG/SERVICE/KEY --why REASON [--ttl 10m] [--count N] -- COMMAND..."})
+		}
+		if f.bool["end"] {
+			if len(f.cmd) > 0 || f.bool["socket"] {
+				return fail(&client.UsageError{Msg: "--end takes only the key path"})
+			}
+			return fail(env.SSHAgentEnd(ctx, f.pos[0]))
+		}
+		o := client.SSHAgentOptions{Path: f.pos[0], Why: f.str["why"], Command: f.cmd, Socket: f.bool["socket"]}
+		if f.str["ttl"] != "" {
+			d, err := time.ParseDuration(f.str["ttl"])
+			if err != nil || d < time.Minute || d%time.Second != 0 || d > 24*time.Hour {
+				return fail(&client.UsageError{Msg: "--ttl is a duration from 1m to 24h, such as 30m"})
+			}
+			o.TTL = int(d / time.Second)
+		}
+		if f.str["count"] != "" {
+			if o.Count, err = strconv.Atoi(f.str["count"]); err != nil || o.Count < 1 || o.Count > 1000 {
+				return fail(&client.UsageError{Msg: "--count is between 1 and 1000"})
+			}
+		}
+		code, err := env.SSHAgent(ctx, o)
+		if err != nil {
+			return fail(err)
+		}
+		return code
+	case "ssh-key":
+		f, err := parseFlags(rest, map[string]bool{"why": true, "out": true, "force": false, "public": false})
+		if err != nil {
+			return fail(err)
+		}
+		if len(f.pos) != 1 || f.cmd != nil {
+			return fail(&client.UsageError{Msg: "usage: aqmas ssh-key ORG/SERVICE/KEY --public | --why REASON [--out FILE] [--force]"})
+		}
+		if f.bool["public"] {
+			if f.str["out"] != "" || f.bool["force"] {
+				return fail(&client.UsageError{Msg: "--public prints the authorized_keys line and takes no other flag"})
+			}
+			return fail(env.SSHKeyPublic(ctx, f.pos[0]))
+		}
+		home, _ := os.UserHomeDir()
+		return fail(env.SSHKeyHandout(ctx, client.SSHKeyOptions{Path: f.pos[0], Why: f.str["why"], Out: f.str["out"], Force: f.bool["force"], Home: home}))
 	case "ci", "checkin", "cis", "checkin-shell":
 		if len(rest) != 1 {
 			return fail(&client.UsageError{Msg: "expected qualified set path"})

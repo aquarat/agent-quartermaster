@@ -47,6 +47,12 @@ func holds(c api.HostCredential) string {
 		return "$" + sanitize(c.Env)
 	case "signer":
 		return sanitize(c.Scheme)
+	case "ssh-key":
+		// The public line is public: it is what goes into authorized_keys or a forge.
+		if c.Handout {
+			return sanitize(c.PublicKey) + " (may be handed out)"
+		}
+		return sanitize(c.PublicKey)
 	case "env-set":
 		names := make([]string, len(c.Names))
 		for i, n := range c.Names {
@@ -168,6 +174,8 @@ func GuideJSON() GuideSummary {
 			{"checkout", "aqmas checkout ORG/SERVICE/SET --why TEXT [--file .env]; aqmas checkin ORG/SERVICE/SET", "a RAM-backed .env file until check-in or expiry", "owner"},
 			{"sign", "aqmas sign ORG/SERVICE/KEY --why TEXT FILE... | --digest sha256:HEX", "have aqmas sign; the key never leaves it", "owner"},
 			{"signer", "aqmas signer ORG/SERVICE/KEY [--pem]", "a signing key's scheme and public key", "none"},
+			{"ssh-agent", "aqmas ssh-agent ORG/SERVICE/KEY --why TEXT [--ttl 10m] [--count N] -- COMMAND...", "run git, ssh, scp or rsync with an SSH key that stays in aqmas: a private agent socket offers that one key for the command; one approval covers the logins within the grant", "sometimes"},
+			{"ssh-key", "aqmas ssh-key ORG/SERVICE/KEY --public | --why TEXT [--out FILE]", "--public prints the authorized_keys line; otherwise the private key is handed out as a file, only for a key the owner allows it for; prefer ssh-agent", "owner"},
 			{"cf", "aqmas cf scopes|request|api|env|curl|token|snapshot ...", "Cloudflare API through the broker's proxy, by scope (aqmas cf help)", "sometimes"},
 			{"bastion", "aqmas bastion; aqmas bastion task NAME --why TEXT; aqmas ssh BASTION --why TEXT -- INSPECT-COMMAND", "read-only inspection and routine maintenance of the bastion", "owner"},
 			{"guide", "aqmas guide [--json]", "this guide", "none"},
@@ -180,7 +188,7 @@ func GuideJSON() GuideSummary {
 		},
 		Errors: map[string]string{
 			"not_admitted": "the host is enrolled but the owner has not admitted it to an organisation; ask the owner (Hosts tab)",
-			"not_found":    "no such path or target for this host; check with aqmas ls / aqmas targets or ask the owner",
+			"not_found":    "no such path or target for this host (a deleted item looks the same); check with aqmas ls / aqmas targets or ask the owner",
 			"locked":       "the credential's bucket is closed; the owner needs one more tap, the command keeps waiting",
 			"rate_limited": "too many pending requests from this host; wait for the owner",
 			"forbidden":    "refused by the owner's policy (for example aqmas get turned off: use aqmas run)",

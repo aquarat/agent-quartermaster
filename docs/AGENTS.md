@@ -8,11 +8,11 @@ summary of the commands.
 ## What aqmas is
 
 aqmas is a credential broker. A server (`aqmasd`) on a separate bastion holds the
-credentials: an SSH certificate authority, API tokens, signing keys, environment values.
-This host holds none of them. When you need access you ask with the `aqmas` CLI (or its MCP
-server), the owner approves on their phone or laptop with a passkey, and you get something
-short-lived: an SSH certificate, a command run with a secret in its environment, a
-signature, a time-boxed API grant.
+credentials: an SSH certificate authority, SSH keys, API tokens, signing keys, environment
+values. This host holds none of them. When you need access you ask with the `aqmas` CLI (or
+its MCP server), the owner approves on their phone or laptop with a passkey, and you get
+something short-lived: an SSH certificate, a command run with a secret in its environment,
+a signature, SSH logins with a key that stays in aqmas, a time-boxed API grant.
 
 **The rule: do not look for long-lived credentials on this host, do not ask the owner to
 paste one, and do not store one you were handed.** Ask aqmas each time. If aqmas does not
@@ -41,8 +41,8 @@ So:
 - Ctrl-C (or a cancelled tool call) withdraws a pending request.
 - Some things need no tap: a cached SSH certificate that is still valid, an SSH target the
   owner gave an auto-approval for, the Cloudflare scopes the owner marked automatic.
-  Environment values, secrets and signatures always need a tap (or, for signing, a
-  time-boxed grant the owner approved once).
+  Environment values, secrets and signatures always need a tap (or, for signing and for SSH
+  logins with a key, a time-boxed grant the owner approved once).
 
 ## Is this host set up?
 
@@ -74,8 +74,9 @@ aqmas targets --json
 
 Listing is an owner setting per organisation ("Hosts may list what they can ask for"),
 off by default. When it is off, `aqmas ls` says so and lists nothing: that does not mean
-nothing exists. Ask the owner for the path, or to turn listing on. A path you cannot see
-and a path that does not exist give the same `not_found`; aqmas never tells them apart.
+nothing exists. Ask the owner for the path, or to turn listing on. A path you cannot see,
+a path that does not exist and an item the owner deleted give the same `not_found`; aqmas
+never tells them apart.
 
 Kinds:
 
@@ -84,6 +85,7 @@ Kinds:
 | `secret` | one value with an environment variable name, e.g. an API key | `aqmas run`, `aqmas get` |
 | `env-set` | several named values | `aqmas run`, `aqmas checkout` |
 | `signer` | a private key that never leaves aqmas | `aqmas sign` |
+| `ssh-key` | an SSH key pair; `aqmas ls` shows its public `authorized_keys` line | `aqmas ssh-agent` (the key stays in aqmas); `aqmas ssh-key` only where the owner allows hand-out |
 | `cloudflare-proxy`, `cloudflare-mint` | Cloudflare API access by scope | `aqmas cf ...` |
 | SSH target | a machine this host may log in to | `aqmas ssh`, `aqmas mosh`, `aqmas cert` |
 
@@ -168,6 +170,58 @@ signs. If a signing key sits in an env set instead, tell the owner it could be a
 `--ttl 30m --count 20` asks for a grant that later `sign` calls reuse; `aqmas sign PATH
 --end` ends it.
 
+### Use an SSH key with a forge
+
+For a host you reach with a plain SSH key instead of an aqmas certificate: a Git forge
+(a user key or a deploy key), or a server that is not an aqmas target. The owner creates
+the key in the Vault and puts its public line on the forge or in the server's
+`~/.ssh/authorized_keys`. You never need the private half:
+
+```sh
+aqmas ssh-agent acme/forge/deploy-key --why "clone the app repository for the build" -- git clone ssh://git@forge.example.com/acme/app.git
+aqmas ssh-agent acme/forge/deploy-key --why "push the release branch" --ttl 30m -- git push origin release
+aqmas ssh-agent acme/forge/deploy-key --why "..." -- ssh -o BatchMode=yes deploy@build.example.com uptime
+aqmas ssh-agent acme/forge/deploy-key --why "..." -- rsync -e ssh -a out/ deploy@build.example.com:/srv/out/
+aqmas ssh-key acme/forge/deploy-key --public       # the authorized_keys line (no approval)
+aqmas ssh-agent acme/forge/deploy-key --end        # give the grant back early
+```
+
+`aqmas ssh-agent PATH --why "..." -- COMMAND` runs COMMAND with `SSH_AUTH_SOCK` pointing at
+a private agent socket that offers exactly that one key. Whatever speaks SSH underneath
+(`git`, `ssh`, `scp`, `sftp`, `rsync -e ssh`) uses it without further options;
+`GIT_SSH_COMMAND` and `-i` are not needed. Each login's signature is made by aqmas. The
+exit status is the command's.
+
+- One approval is a grant: `--ttl` (default 10 minutes, at most 24 hours) and `--count`
+  logins (default 20). Later `aqmas ssh-agent` calls for the same key on this host reuse it
+  without a tap and without `--why`, until it runs out, expires or the owner revokes it.
+  For several commands, either run them one after the other like this or put them in one
+  script and run that.
+- It signs SSH logins with that key and nothing else. It is not a general SSH agent: no
+  keys can be added, and `ssh-keygen -Y sign`, Git commit signing with the key or agent
+  forwarding tricks are refused.
+- Use the forge's host name, and the host key you already trust: aqmas does not manage
+  `known_hosts` for these hosts. If the host key is unknown, tell the owner rather than
+  turning host key checking off.
+- For a script that makes many SSH connections, `aqmas ssh-agent PATH --why "..." --socket`
+  serves the agent in the foreground and prints `SSH_AUTH_SOCK=/path`; start it in the
+  background, read that line, export the variable, and stop the process when done.
+- If a login fails with "the SSH login grant ... is over", run the command again: it asks
+  anew. If the path answers `not_found`, the key was deleted or this host may not see it.
+
+**Hand-out, only when the agent cannot be used.** Some tools insist on a key file. If the
+owner marked the key "may be handed out" (`aqmas ls` says so), then
+
+```sh
+aqmas ssh-key acme/forge/deploy-key --why "the backup tool only reads a key file" --out ~/.ssh/backup_key
+```
+
+asks with a red card and, once approved, writes the private key (mode 0600) and
+`FILE.pub`, and prints the `ssh -i` and `GIT_SSH_COMMAND` forms to use. From then on the
+key is a file on this host and aqmas cannot recall it: delete it when the task is done and
+never copy it elsewhere. Every hand-out is its own approval. For a key without that setting
+the command is refused before the owner is asked; use `aqmas ssh-agent`.
+
 ### Cloudflare
 
 ```sh
@@ -207,7 +261,9 @@ Messages you may see:
 
 - `not_admitted`: this host has no admission. Ask the owner to admit it.
 - `not_found`: no such path or target *for this host*. Check the spelling with `aqmas ls`
-  or `aqmas targets`, or ask the owner for the path.
+  or `aqmas targets`, or ask the owner for the path. An item the owner deleted answers the
+  same way from that moment, and everything that was open for it (grants, releases waiting
+  to be collected, "don't ask again") has ended: do not retry, ask the owner.
 - "waiting for the owner to reopen ...": the credential's bucket is closed (for example
   after the bastion restarted). The request is fine; the owner needs one more tap.
 - "refusing to replace inherited NAME": that variable is already set in your environment;
@@ -230,12 +286,15 @@ or, for any client that reads an `mcpServers` map:
 ```
 
 Tools: `aqmas_guide` (this text), `aqmas_status`, `aqmas_list_credentials`,
-`aqmas_list_targets`, `aqmas_run`, `aqmas_sign`, `aqmas_ssh_exec`. The tools that need the
-owner (`aqmas_run`, `aqmas_sign`, `aqmas_ssh_exec`) **block until the owner decides** or
+`aqmas_list_targets`, `aqmas_run`, `aqmas_sign`, `aqmas_with_ssh_key`, `aqmas_ssh_exec`.
+The tools that need the owner (`aqmas_run`, `aqmas_sign`, `aqmas_with_ssh_key`,
+`aqmas_ssh_exec`) **block until the owner decides** or
 the tool's `approval_timeout_seconds` passes; they take a required `why`. There is no tool
 that returns a secret's value: `aqmas_run` runs your command with the value in its
 environment and returns the exit code and output. If your command prints the secret, the
-output contains it, so do not print it.
+output contains it, so do not print it. `aqmas_with_ssh_key` runs your command with an SSH
+key through the agent socket described above (`aqmas_list_credentials` shows the key's
+public line); no tool hands out a private key.
 
 The CLI and the MCP server do the same things with the same approvals; use whichever your
 harness makes easier.
@@ -247,5 +306,6 @@ user can use the same enrolment. The delivery modes are about accidents, not abo
 process: a command started by `aqmas run` can print its environment, so turning `aqmas get`
 off, or approving `run` rather than `get`, does not keep the value from a host that wants
 it. What limits a host is which organisations admit it and what the owner approves. A value delivered by `run`, `get` or `checkout` is in a
-process on this host from then on, and a certificate works until it expires even if the
-grant is revoked. That is why requests should be narrow, short and honestly described.
+process on this host from then on, a handed-out SSH key is a file on it, and a certificate
+works until it expires even if the grant is revoked. An SSH login grant lets anything
+running as your user log in with that key until it runs out; the key itself stays in aqmas. That is why requests should be narrow, short and honestly described.

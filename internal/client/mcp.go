@@ -29,7 +29,7 @@ var mcpVersions = []string{"2025-06-18", "2025-03-26", "2024-11-05"}
 const (
 	mcpMaxMessage  = 4 << 20
 	mcpMaxOutput   = 64 << 10
-	mcpInstruction = "aqmas brokers credentials for this host: SSH certificates, secrets and env sets, signatures. " +
+	mcpInstruction = "aqmas brokers credentials for this host: SSH certificates, SSH keys, secrets and env sets, signatures. " +
 		"The host holds no long-lived credentials; ask through these tools. Tools that need the owner block until the owner approves with a passkey, denies, or the approval timeout passes; give a specific, honest `why`. " +
 		"Call aqmas_guide first."
 )
@@ -64,7 +64,7 @@ func mcpTools() []mcpTool {
 			call:        func(context.Context, *Env, json.RawMessage) (string, error) { return Guide(), nil }},
 		{Name: "aqmas_status", Description: "This host's enrolment (server, host name, client certificate), whether the owner admitted it, whether listing is allowed, cached SSH certificates and active grants. Needs no approval.",
 			InputSchema: schema(nil, map[string]any{}), call: mcpStatus},
-		{Name: "aqmas_list_credentials", Description: "Credential sets this host may ask for: path (organisation/service/set), kind (secret, env-set, signer, cloudflare-*), key names or variable name (never values) and the command to use. Returns a clear \"discovery is disabled by the owner\" result when the owner has listing off; that does not mean nothing exists. Needs no approval.",
+		{Name: "aqmas_list_credentials", Description: "Credential sets this host may ask for: path (organisation/service/set), kind (secret, env-set, signer, ssh-key, cloudflare-*), key names or variable name (never values), an SSH key's public authorized_keys line, and the command to use. Returns a clear \"discovery is disabled by the owner\" result when the owner has listing off; that does not mean nothing exists. Needs no approval.",
 			InputSchema: schema(nil, map[string]any{}), call: mcpList(false)},
 		{Name: "aqmas_list_targets", Description: "SSH targets this host may ask a certificate for: name, address, port, allowed login users. Returns a clear \"discovery is disabled by the owner\" result when the owner has listing off. Needs no approval.",
 			InputSchema: schema(nil, map[string]any{}), call: mcpList(true)},
@@ -88,6 +88,17 @@ func mcpTools() []mcpTool {
 				"force":                    prop("boolean", "Overwrite an existing FILE.sig."),
 				"approval_timeout_seconds": propApprove,
 			}), call: mcpSign},
+		{Name: "aqmas_with_ssh_key", Description: "Run a command on this host with an SSH key that stays in aqmas (like `aqmas ssh-agent PATH --why ... -- COMMAND`): git clone/fetch/push over SSH, ssh, scp, rsync -e ssh. The command gets SSH_AUTH_SOCK pointing at a private agent socket that offers exactly that key; each login is signed by the broker under one approved grant, and a grant that is still open is reused without asking. The command is started directly, without a shell; there is nobody to answer prompts, so pass options such as -o BatchMode=yes to ssh. Returns the exit code and the captured stdout and stderr (each truncated to 64 KiB). No tool hands out a private key." + blocks,
+			InputSchema: schema([]string{"path", "why", "command"}, map[string]any{
+				"path":                     prop("string", "organisation/service/key of an SSH key (kind ssh-key in aqmas_list_credentials, which also shows its public line)."),
+				"why":                      propWhy,
+				"command":                  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1, "description": "The command and its arguments, for example [\"git\",\"clone\",\"ssh://git@forge.example.com/acme/app.git\"]."},
+				"cwd":                      prop("string", "Working directory for the command (default: the MCP server's)."),
+				"ttl_seconds":              prop("integer", "How long the login grant lasts (60 to 86400; default 600). Ask for what the task needs."),
+				"count":                    prop("integer", "How many logins the grant covers (default 20, at most 1000)."),
+				"timeout_seconds":          propTimeout,
+				"approval_timeout_seconds": propApprove,
+			}), call: mcpWithSSHKey},
 		{Name: "aqmas_ssh_exec", Description: "Run one command on an SSH target with a short-lived certificate (like `aqmas ssh USER@HOST --why ... -- COMMAND`). The command line is run by the remote login shell. Returns the exit code and the captured stdout and stderr (each truncated to 64 KiB). A cached certificate that is still valid is reused without asking; otherwise this" + strings.ToLower(blocks[:2]) + blocks[2:],
 			InputSchema: schema([]string{"target", "why", "command"}, map[string]any{
 				"target":                   prop("string", "[USER@]HOST: a target name from aqmas_list_targets and one of its allowed users."),
@@ -548,6 +559,43 @@ func mcpRun(ctx context.Context, e *Env, raw json.RawMessage) (string, error) {
 		return "", err
 	}
 	res.Note = "Output is returned as the command printed it. If the command printed the secret, it is in this result: do not repeat it anywhere."
+	return resultJSON(res)
+}
+
+func mcpWithSSHKey(ctx context.Context, e *Env, raw json.RawMessage) (string, error) {
+	var a struct {
+		Path, Why, Cwd string
+		Command        []string
+		TTL            int `json:"ttl_seconds"`
+		Count          int
+		Timeout        int `json:"timeout_seconds"`
+		Approval       int `json:"approval_timeout_seconds"`
+	}
+	if err := mcpArgs(raw, &a); err != nil {
+		return "", err
+	}
+	if !envset.ValidPath(a.Path) || len(a.Command) == 0 || strings.TrimSpace(a.Why) == "" {
+		return "", &UsageError{Msg: "path (organisation/service/key), why and command are required"}
+	}
+	if a.TTL != 0 && (a.TTL < 60 || a.TTL > 86400) || a.Count < 0 || a.Count > 1000 {
+		return "", &UsageError{Msg: "ttl_seconds is 60 to 86400 and count 1 to 1000"}
+	}
+	var res runResult
+	err := approval(ctx, seconds(a.Approval, 600, 3600), func(actx context.Context) error {
+		_, err := e.SSHAgent(actx, SSHAgentOptions{Path: a.Path, Why: a.Why, TTL: a.TTL, Count: a.Count, Command: a.Command,
+			// The command runs under the call's own context, not the approval deadline.
+			Run: func(exe string, argv, env []string) (code int, err error) {
+				res, err = runCaptured(ctx, seconds(a.Timeout, 300, 3600), exe, argv, env, a.Cwd)
+				return res.ExitCode, err
+			}})
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	if notes := strings.TrimSpace(e.Stderr.(*progressWriter).String()); notes != "" {
+		res.Note = notes
+	}
 	return resultJSON(res)
 }
 

@@ -47,6 +47,9 @@ func (e *Env) signBinding(ctx context.Context, c *APIClient, path string) (signe
 	if b.Path != path || b.Org == "" || b.Service == "" || b.Set == "" || b.Enrollment == "" || len(b.PublicKey) == 0 {
 		return b, sc, errors.New("unexpected signer binding")
 	}
+	if ok && sc.SSH {
+		return b, sc, fmt.Errorf("%s is an SSH key, not a signing key: use `aqmas ssh-agent %s --why \"...\" -- COMMAND` (its public line: `aqmas ssh-key %s --public`)", path, path, path)
+	}
 	if !ok {
 		return b, sc, fmt.Errorf("this aqmas does not know signing scheme %q; upgrade", sanitize(b.Scheme))
 	}
