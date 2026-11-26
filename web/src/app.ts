@@ -646,7 +646,7 @@ export class App {
       case "settings":
         // The reveal policy lines sign against the broker's current epoch.
         if (this.vaultState && seal) (this.vaultView ??= new VaultView(this.vaultHost())).forms.bind(this.vaultState, seal);
-        this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Switch to organisations, seal the store, enable self-update, maintenance passkeys and upgrades: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);
+        this.section('setup',[this.setupView],()=>[h('article',{class:'card'},h('p',null,setupSummary(this.setupView)),h('p',{class:'muted'},'Upgrades, maintenance passkeys and any setup steps still open: each is one passkey approval.'),h('div',{class:'actions'},(()=>{const a=nav('Open Setup','#/setup','Setup');a.className='btn approve';return a;})()))],false,false,0);
         this.section('bastion',!!this.bastionPanel,()=>this.bastionPanel?[this.bastionPanel.el]:[h('p',{class:'empty'},'This server has no bastion access.')],false,false,0);
         this.section('orgs',[this.catalogue,this.vaultState?.organisations,seal?.epoch],()=>this.orgsPage(),false,!!this.root.querySelector('#sec-orgs .vault-confirm'),this.catalogue?.organisations.length??0);
         break;

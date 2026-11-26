@@ -483,19 +483,19 @@ export class MockSetup {
       let rerunnable = false;
       switch (spec.id) {
         case "cutover":
-          if (this.scoped) t.state = "done";
+          if (this.scoped) [t.state, t.settled] = ["done", true];
           break;
         case "seal":
-          if (this.sealed) t.state = "done";
+          if (this.sealed) [t.state, t.settled] = ["done", true];
           else if (!this.scoped) [t.state, blocked] = ["blocked", "Switch to organisations first."];
           break;
         case "buckets":
-          if (this.sealed && !this.format1) t.state = "done";
-          else if (!this.sealed) [t.state, blocked] = ["blocked", "Only for a store sealed by an older version. Sealing now uses buckets already."];
+          if (this.sealed && !this.format1) [t.state, t.settled] = ["done", true];
+          else if (!this.sealed) [t.state, blocked, t.settled] = ["blocked", "Only for a store sealed by an older version. Sealing now uses buckets already.", true];
           break;
         case "enable-updates":
           rerunnable = true;
-          if (this.updatesReady) t.state = "done";
+          if (this.updatesReady) [t.state, t.settled] = ["done", !this.sourcesProblem];
           break;
         case "sync-passkeys":
           rerunnable = true;
@@ -518,12 +518,14 @@ export class MockSetup {
           if (spec.group) rerunnable = true;
       }
       if (t.state === "available" && last?.state === "failed") t.state = "failed";
+      if (last?.state === "failed") t.settled = false;
       if (t.state === "available" || t.state === "failed" || (t.state === "done" && rerunnable)) {
         if (!this.installed) [t.state, blocked] = ["blocked", "The maintenance runner is not installed on this machine yet."];
         else if ((this.mode !== "serve" || this.current) && t.state !== "done") [t.state, blocked] = ["blocked", "Another task is in progress."];
       }
       if (this.current?.task === spec.id) {
         t.state = this.current.state;
+        t.settled = false;
         blocked = "";
         last = this.current;
       }

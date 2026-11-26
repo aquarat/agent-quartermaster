@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -49,6 +50,7 @@ type setupOut struct {
 	Tasks     []struct {
 		ID, State string
 		Blocked   string `json:"blocked_by"`
+		Settled   bool
 	}
 	Passkeys []struct {
 		Credential string
@@ -65,6 +67,16 @@ func (o setupOut) state(id string) string {
 		}
 	}
 	return ""
+}
+
+func (o setupOut) settled() []string {
+	var out []string
+	for _, t := range o.Tasks {
+		if t.Settled {
+			out = append(out, t.ID)
+		}
+	}
+	return out
 }
 
 func TestSetupQueue(t *testing.T) {
@@ -84,6 +96,10 @@ func TestSetupQueue(t *testing.T) {
 	if !v.Installed || v.state("cutover") != "available:" || v.state("seal") != "blocked:Switch to organisations first." || v.state("enable-updates") != "available:" ||
 		v.state("upgrade") != "blocked:Enable self-update first." || v.state("sync-passkeys") != "done:" || !v.Passkeys[0].Pinned {
 		t.Fatalf("unexpected queue: %+v", v)
+	}
+	// An unsealed store never needs the bucket migration; nothing else is finished yet.
+	if got := v.settled(); !slices.Equal(got, []string{"buckets"}) {
+		t.Fatalf("settled = %v", got)
 	}
 	var plan struct{ ID, Plan string }
 	mustStatus(t, "preview", e.webDo("GET", "/api/ui/setup/cutover/preview", nil, &plan), 200)

@@ -37,6 +37,16 @@ upgrade needs self-update; the move to buckets needs a format-1 store) or when a
 running. While a format-1 store waits for the move, upgrades are refused. Every task can be
 run again after a failure.
 
+One-time setup that is finished or does not apply to this broker is folded into a closed
+**Finished or not needed** section below the queue, so day to day the queue shows only
+upgrades, the maintenance passkeys and whatever is still open. That covers "Switch to
+organisations" once done, "Seal the store" once sealed, "Move to per-credential buckets"
+unless a format-1 store is waiting for it, and "Enable self-update" once enabled. Self-update
+returns to the queue when its release sources need it run again (a dropped source, or pinned
+sources that differ from the running ones). A task that is running or waiting for you is
+always in the queue. The folded cards stay complete, with the last run and "Run again" where
+allowed. The API marks them with `"settled": true` in `GET /api/ui/setup`.
+
 ## Install the runner (once, as root)
 
 ```sh

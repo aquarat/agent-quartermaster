@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -300,6 +301,9 @@ func TestSetupSources(t *testing.T) {
 	}
 	p.cfg.Updates.Repo = p.sources.Repo
 	pv := view(p)
+	if slices.Contains(pv.settled(), "enable-updates") {
+		t.Fatal("self-update with a source problem was folded away")
+	}
 	if s := pv.Sources; !strings.Contains(s.Problem, "[updates.second]\napi = \""+p.sources.SecondAPI+"\"") || !strings.Contains(s.Problem, "--github-only") || s.Note != "" ||
 		!strings.HasPrefix(pv.state("upgrade"), "blocked:The release sources pinned on this machine include a second source") {
 		t.Fatalf("pin with a second source, configuration without: %+v / %s", s, pv.state("upgrade"))
@@ -317,8 +321,35 @@ func TestSetupSources(t *testing.T) {
 	p.s.updates.Lock()
 	p.s.updates.view.checked = true // a finished check that found nothing newer
 	p.s.updates.Unlock()
-	if pv = view(p); pv.Sources.Problem != "" || strings.HasPrefix(pv.state("upgrade"), "blocked") {
-		t.Fatalf("pin and configuration agree: %+v", pv.Sources)
+	if pv = view(p); pv.Sources.Problem != "" || strings.HasPrefix(pv.state("upgrade"), "blocked") || !slices.Contains(pv.settled(), "enable-updates") {
+		t.Fatalf("pin and configuration agree: %+v %v", pv.Sources, pv.settled())
+	}
+	// A failed "Run again" stays in the queue with its failure, though self-update is on.
+	status := maint.ReadStatus(maint.StatusPath(p.cfg.Updates.Cache()))
+	status.Tasks[maint.TaskUpdates] = &maint.TaskStatus{Task: maint.TaskUpdates, State: "failed", Message: "the release check failed"}
+	b, _ := json.Marshal(status)
+	requireNoError(t, os.WriteFile(maint.StatusPath(p.cfg.Updates.Cache()), b, 0o644))
+	if pv = view(p); slices.Contains(pv.settled(), "enable-updates") {
+		t.Fatalf("a failed re-run was folded away: %v", pv.settled())
+	}
+	delete(status.Tasks, maint.TaskUpdates)
+	b, _ = json.Marshal(status)
+	requireNoError(t, os.WriteFile(maint.StatusPath(p.cfg.Updates.Cache()), b, 0o644))
+	// A pinned repository the running configuration does not use yet: back in the queue,
+	// also when neither side has a second source.
+	q := newEnv(t)
+	q.setupOwner()
+	q.sources = &maint.Sources{Repo: "https://github.com/example/fork.git", GitHubAPI: "https://api.github.com/repos/example/fork"}
+	q.installRunner()
+	q.cfg.Updates.Repo = release.GitHubRepo
+	one := two
+	one.Second = nil
+	oneRecord, _ := json.Marshal(one)
+	if err := os.WriteFile(filepath.Join(q.cfg.Updates.Cache(), "latest.json"), oneRecord, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if qv := view(q); slices.Contains(qv.settled(), "enable-updates") || qv.state("enable-updates") != "done:" || qv.Sources.Problem != "" || !strings.Contains(qv.Sources.Note, "differ") {
+		t.Fatalf("pinned repository differs: %s %v %+v", qv.state("enable-updates"), qv.settled(), qv.Sources)
 	}
 	// No pin: the installed release was verified against two sources, the configuration
 	// names one. Blocked until the owner pins GitHub alone at the machine.

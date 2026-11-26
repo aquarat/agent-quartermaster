@@ -93,10 +93,13 @@ type setupPasskey struct {
 
 type setupTask struct {
 	maint.Spec
-	State      string            `json:"state"` // available | blocked | idle | running | waiting | done | failed
-	Blocked    string            `json:"blocked_by,omitempty"`
-	Rerunnable bool              `json:"rerunnable,omitempty"`
-	Last       *maint.TaskStatus `json:"last,omitempty"`
+	State      string `json:"state"` // available | blocked | idle | running | waiting | done | failed
+	Blocked    string `json:"blocked_by,omitempty"`
+	Rerunnable bool   `json:"rerunnable,omitempty"`
+	// Settled: one-time setup that is finished or does not apply to this broker. The page
+	// tucks it away under "Finished or not needed" so the queue shows only what still matters.
+	Settled bool              `json:"settled,omitempty"`
+	Last    *maint.TaskStatus `json:"last,omitempty"`
 }
 
 type setupView struct {
@@ -129,6 +132,9 @@ type setupSources struct {
 	// Problem is set when the configuration names fewer sources than this machine is bound
 	// to (maint.SourcesProblem): nothing is discovered or installed until it is fixed.
 	Problem string `json:"problem,omitempty"`
+	// Pending: running "Enable self-update" would change something (a problem to fix, or
+	// fixed sources that differ from the running ones). Keeps the task in the queue.
+	Pending bool `json:"-"`
 }
 
 func (s *Server) setupSources(pinned *maint.Sources) setupSources {
@@ -143,13 +149,20 @@ func (s *Server) setupSources(pinned *maint.Sources) setupSources {
 		// Only once self-update is on: before that the task itself writes the sources.
 		v.Problem = maint.SourcesProblem(pinned, u, maint.ReadInstalled(u.Cache()))
 	}
+	runningGH := u.GitHub.API
+	if runningGH == "" {
+		runningGH = release.GitHubAPI
+	}
+	differs := u.Repo != "" && (u.Repo != eff.Repo || u.Second.API != eff.SecondAPI || runningGH != eff.GitHubAPI)
 	switch {
 	case v.Problem != "":
+	case differs:
+		v.Note = "The sources fixed for this task differ from the ones the broker is using now; running the task applies them."
 	case u.Repo != "" && !u.Sources().HasSecond() && eff.SecondAPI == "":
 		v.Note = "No second release source is configured: releases are compared with GitHub and this machine's own rebuild."
-	case u.Repo != "" && (u.Second.API != eff.SecondAPI || u.Repo != eff.Repo):
-		v.Note = "The sources fixed for this task differ from the ones the broker is using now; running the task applies them."
 	}
+	// Pending: running "Enable self-update" would change something, so it stays in the queue.
+	v.Pending = v.Problem != "" || differs
 	return v
 }
 
@@ -219,28 +232,29 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 		switch spec.ID {
 		case maint.TaskCutover:
 			if scoped {
-				t.State = "done"
+				t.State, t.Settled = "done", true
 			}
 		case maint.TaskSeal:
 			if sealed {
-				t.State = "done"
+				t.State, t.Settled = "done", true
 			} else if !scoped {
 				t.State, t.Blocked = "blocked", "Switch to organisations first."
 			}
 		case maint.TaskBuckets:
 			switch {
 			case s.sealServing():
-				t.State = "done"
+				t.State, t.Settled = "done", true
 			case migration || s.bucketMigrate:
 			case s.seal == nil && !s.sealSetup:
-				t.State, t.Blocked = "blocked", "Not needed: sealing this store creates per-credential buckets directly."
+				t.State, t.Blocked, t.Settled = "blocked", "Not needed: sealing this store creates per-credential buckets directly.", true
 			default:
-				t.State, t.Blocked = "blocked", "Only a store sealed by aqmas 0.4.1 needs this."
+				t.State, t.Blocked, t.Settled = "blocked", "Only a store sealed by aqmas 0.4.1 needs this.", true
 			}
 		case maint.TaskUpdates:
 			t.Rerunnable = true
 			if s.updatesReady() {
-				t.State = "done"
+				// Folded away once enabled, unless the release sources need it run again.
+				t.State, t.Settled = "done", !v.Updates.Pending
 			}
 		case maint.TaskPins:
 			t.Rerunnable = true
@@ -280,6 +294,9 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 		if t.State == "available" && t.Last != nil && t.Last.State == "failed" {
 			t.State = "failed"
 		}
+		if t.Last != nil && t.Last.State == "failed" {
+			t.Settled = false // a failed re-run stays where the owner sees it
+		}
 		if t.State == "available" || t.State == "failed" || t.State == "done" && t.Rerunnable {
 			switch {
 			case !installed:
@@ -291,7 +308,7 @@ func (s *Server) setupView(ctx context.Context, sess string) (setupView, error) 
 			}
 		}
 		if st.Current != nil && st.Current.Task == spec.ID {
-			t.State, t.Blocked, t.Last = st.Current.State, "", st.Current
+			t.State, t.Blocked, t.Last, t.Settled = st.Current.State, "", st.Current, false
 		}
 		v.Tasks = append(v.Tasks, t)
 	}

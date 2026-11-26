@@ -44,6 +44,9 @@ export interface SetupTask {
   state: SetupState | string;
   blocked_by?: string;
   rerunnable?: boolean;
+  /** One-time setup that is finished or does not apply to this broker: shown folded away
+   * under "Finished or not needed" instead of in the queue. */
+  settled?: boolean;
   last?: SetupRun | null;
   /** Where the page shows the task: "" / absent = the Setup queue; "bastion" and "routine"
    * = Settings → Bastion access (maint.Spec.Group). */

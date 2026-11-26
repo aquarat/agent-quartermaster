@@ -309,6 +309,49 @@ describe("the Setup queue against a scripted server", () => {
     expect(badge("seal")).toBe("Done");
   });
 
+  test("finished one-time setup folds away under its own heading, and comes back when it needs attention", async () => {
+    const queue = () => [...root.querySelector(".setup-list")!.children].map((c) => (c as HTMLElement).dataset["task"]);
+    const fin = root.querySelector<HTMLDetailsElement>("details.setup-finished")!;
+    expect(fin.hidden).toBe(true);
+    const settle = (ids: string[]) => () => baseView({ tasks: baseView().tasks!.map((t) => (ids.includes(t.id) ? { ...t, settled: true } : t)) });
+    script = settle(["cutover", "seal"]);
+    await until(() => !fin.hidden);
+    expect(queue()).toEqual(["enable-updates", "sync-passkeys", "upgrade"]);
+    expect([...fin.querySelectorAll<HTMLElement>("[data-task]")].map((c) => c.dataset["task"])).toEqual(["cutover", "seal"]);
+    expect(fin.open).toBe(false);
+    expect(fin.querySelector("summary")!.textContent).toBe("Finished or not needed (2)");
+    // Polling with the section open keeps it open, and a focused field elsewhere keeps focus.
+    fin.open = true;
+    const field = card("enable-updates").querySelector<HTMLElement>("input, button")!;
+    field.focus();
+    const before = calls;
+    script = settle(["cutover", "seal", "sync-passkeys"]);
+    await until(() => calls > before + 2 && fin.querySelectorAll("[data-task]").length === 3);
+    expect(fin.open).toBe(true);
+    expect(doc.activeElement).toBe(field);
+    expect([...fin.querySelectorAll<HTMLElement>("[data-task]")].map((c) => c.dataset["task"])).toEqual(["cutover", "seal", "sync-passkeys"]);
+    fin.open = false;
+    // A card earlier in the queue folding away leaves the later cards where they are.
+    script = settle(["cutover"]);
+    await until(() => fin.querySelectorAll("[data-task]").length === 1);
+    const later = card("upgrade");
+    const removed: Node[] = [];
+    const watch = new win.MutationObserver((rs) => rs.forEach((r) => removed.push(...r.removedNodes)));
+    watch.observe(root.querySelector(".setup-list")!, { childList: true });
+    script = settle(["cutover", "seal"]);
+    await until(() => fin.querySelectorAll("[data-task]").length === 2);
+    await new Promise((r) => setTimeout(r, 0));
+    watch.disconnect();
+    expect(removed).toEqual([card("seal")]);
+    expect(later.parentElement).toBe(root.querySelector(".setup-list"));
+    script = settle(["seal"]);
+    await until(() => queue().length === 4);
+    expect(queue()).toEqual(["cutover", "enable-updates", "sync-passkeys", "upgrade"]);
+    script = () => baseView();
+    await until(() => fin.hidden);
+    expect(queue()).toEqual(["cutover", "seal", "enable-updates", "sync-passkeys", "upgrade"]);
+  });
+
   test("an idle upgrade reads as up to date", async () => {
     script = () => baseView({ tasks: baseView().tasks!.map((t) => (t.id === "upgrade" ? { ...t, state: "idle", blocked_by: undefined } : t)) });
     await until(() => card("upgrade").dataset["state"] === "idle");
@@ -398,11 +441,13 @@ describe("Setup through the App and the mock", () => {
     expect([...root.querySelectorAll<HTMLElement>("#setup-root [data-task]")].map((c) => [c.dataset["task"], c.dataset["state"]])).toEqual([
       ["cutover", "available"],
       ["seal", "blocked"],
-      ["buckets", "blocked"],
       ["enable-updates", "available"],
       ["sync-passkeys", "done"],
       ["upgrade", "blocked"],
+      // Not needed on an unsealed store: folded away under "Finished or not needed".
+      ["buckets", "blocked"],
     ]);
+    expect(card("buckets").closest("details.setup-finished")).not.toBeNull();
     expect(card("seal").querySelector(".setup-blocked")!.textContent).toContain("Switch to organisations first.");
   });
 

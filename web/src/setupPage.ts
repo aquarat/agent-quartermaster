@@ -205,6 +205,11 @@ export class SetupPage {
   private banner = h("p", { class: "setup-banner", role: "status", "aria-live": "polite" }, "Loading…");
   private notices = h("div", { class: "setup-notices" });
   private list = h("div", { class: "setup-list" });
+  // One-time setup that is finished or does not apply (organisations, sealing, buckets,
+  // self-update once enabled): out of the way, but still there to re-run or read.
+  private finishedList = h("div", { class: "setup-list" });
+  private finishedLabel = h("summary", null);
+  private finished = h("details", { class: "setup-more setup-finished", "data-finished": "" }, this.finishedLabel, this.finishedList);
 
   constructor(
     private root: HTMLElement,
@@ -212,7 +217,8 @@ export class SetupPage {
     private auth: Authenticator,
     private hooks: SetupHooks,
   ) {
-    replace(root, this.banner, this.notices, this.list);
+    this.finished.hidden = true;
+    replace(root, this.banner, this.notices, this.list, this.finished);
   }
 
   start(): void {
@@ -346,9 +352,38 @@ export class SetupPage {
       if (!c) {
         c = this.newCard(t);
         this.cards.set(t.id, c);
-        this.list.appendChild(c.root);
       }
       this.renderCard(c, t, v);
+    }
+    // Put each card on its side in server order, moving only the ones out of place so
+    // polling never disturbs focus elsewhere on the page.
+    const active = this.root.ownerDocument.activeElement as HTMLElement | null;
+    let carried = false;
+    const sides = [
+      [this.list, v.tasks!.filter((t) => !t.settled)],
+      [this.finishedList, v.tasks!.filter((t) => t.settled)],
+    ] as const;
+    // First the cards that change side (appended), then order only those newcomers.
+    for (const [list, want] of sides)
+      for (const t of want) {
+        const el = this.cards.get(t.id)!.root;
+        if (el.parentElement === list) continue;
+        if (active && el.contains(active)) carried = true;
+        list.appendChild(el);
+      }
+    for (const [list, want] of sides)
+      want.forEach((t, i) => {
+        const el = this.cards.get(t.id)!.root;
+        if (list.children[i] !== el) list.insertBefore(el, list.children[i] ?? null);
+      });
+    const n = this.finishedList.children.length;
+    this.finished.hidden = n === 0;
+    this.finishedLabel.textContent = `Finished or not needed (${n})`;
+    // A control the owner was using moved with its card: keep focus on it, or on the
+    // section heading if it is now folded out of sight.
+    if (carried && active) {
+      if (active.closest("details.setup-finished") && !this.finished.open) this.finishedLabel.focus();
+      else active.focus();
     }
   }
 

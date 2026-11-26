@@ -1311,6 +1311,12 @@ a.btn {
   display: grid;
   gap: 10px;
 }
+.setup-finished {
+  margin-top: 12px;
+}
+.setup-finished[hidden] {
+  display: none;
+}
 .setup-steps,
 .setup-checklist {
   margin: 0;

@@ -498,7 +498,7 @@ func TestBucketMigration(t *testing.T) {
 	var setup setupView
 	mustStatus(t, "setup", v.web("GET", "/api/ui/setup", nil, &setup), 200)
 	for _, task := range setup.Tasks {
-		if task.ID == maint.TaskBuckets && (task.State == "done" || strings.Contains(task.Blocked, "Only") || strings.Contains(task.Blocked, "Not needed")) {
+		if task.ID == maint.TaskBuckets && (task.State == "done" || task.Settled || strings.Contains(task.Blocked, "Only") || strings.Contains(task.Blocked, "Not needed")) {
 			t.Fatalf("buckets task %+v", task)
 		}
 	}
@@ -593,6 +593,16 @@ func TestBucketMigration(t *testing.T) {
 	}
 	if topic, _ := v.s.store.Q().NoticeTopic(ctx); topic != sentinelTopic || v.s.notify.TopicURL != sentinelTopic {
 		t.Fatal("notice channel not carried over")
+	}
+	// Migrated and serving: organisations, sealing and buckets are folded away as finished.
+	setup = setupView{}
+	mustStatus(t, "setup after", v.web("GET", "/api/ui/setup", nil, &setup), 200)
+	settled := map[string]bool{}
+	for _, task := range setup.Tasks {
+		settled[task.ID] = task.Settled
+	}
+	if !settled[maint.TaskCutover] || !settled[maint.TaskSeal] || !settled[maint.TaskBuckets] || settled[maint.TaskUpgrade] || settled[maint.TaskPins] {
+		t.Fatalf("settled after migration: %v", settled)
 	}
 	got := openAll(t, v.s, f.inst, f.identity, f.recipient)
 	want := map[string]string{seal.RoleSSHCA: string(f.cas[seal.RoleSSHCA]), seal.RoleInternalCA: string(f.cas[seal.RoleInternalCA]), seal.RoleCFProxy: testProxyToken, "env:APP_TOKEN": sentinelValue, "env:OTHER_SECRET": sentinelSecond}
