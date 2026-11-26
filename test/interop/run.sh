@@ -112,13 +112,14 @@ HostKey $T/sshd/hostkey
 PidFile $T/sshd/sshd.pid
 TrustedUserCAKeys $T/sshd/ca.pub
 AuthorizedPrincipalsFile $T/sshd/principals/%u
-AuthorizedKeysFile none
+AuthorizedKeysFile $T/sshd/authorized_keys
 StrictModes no
 UsePAM no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 LogLevel VERBOSE
 EOF
+: >"$T/sshd/authorized_keys" # empty until the SSH key scenario adds the line of a Vault key
 "$SSHD" -D -e -f "$T/sshd/sshd_config" >"$T/sshd.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PS") 2>/dev/null && break; sleep 0.1; done
@@ -428,6 +429,7 @@ source "$ROOT/test/interop/browserkey.sh"
 browser_key_scenario
 source "$ROOT/test/interop/vault.sh"
 source "$ROOT/test/interop/agentiface.sh"
+source "$ROOT/test/interop/sshkeys.sh"
 source "$ROOT/test/interop/envsets.sh"
 env_scenario
 echo "interop: ALL OK"

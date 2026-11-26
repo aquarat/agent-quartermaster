@@ -199,8 +199,28 @@ try {
       const vault=await import(`${web}/src/vault.ts`);const [verb,ttl,max]=args;
       for(let n=0;;n++){const st=await api.vaultState();const req=st.requests.find((r:any)=>r.status===(verb==='revoke'?'approved':'pending'));
         if(req){const set=st.sets.find((s:any)=>s.set_id===req.set);const single=verb==='approve'&&ttl===undefined;
-          const p=await vault.vaultSignDecision(api,await api.sealStatus(),set,req,'sign-'+verb,verb==='approve'?(single?0:Number(ttl)):0,verb==='approve'?(single?req.items.length:Number(max)):0,new URL(origin).hostname);await p.tap(auth);break}
+          // An SSH key hand-out is one delivery (0, 1); SSH logins are always a time-boxed grant.
+          const one=req.use==='ssh-handout'?1:req.items.length;
+          const p=await vault.vaultSignDecision(api,await api.sealStatus(),set,req,'sign-'+verb,verb==='approve'?(single?0:Number(ttl)):0,verb==='approve'?(single?one:Number(max)):0,new URL(origin).hostname);await p.tap(auth);break}
         if(n>=150)throw Error('no signing request queued');await Bun.sleep(100)}break;}
+    case 'vault-ssh-key': { // ORG/SERVICE/SLUG TYPE generate|import [KEYFILE|-] [handout]: Add item → SSH key; prints the created key as JSON
+      const vault=await import(`${web}/src/vault.ts`);const [path,scheme,source,file,handout]=args;const [o,sv,slug]=path!.split('/');
+      const cat=await api.catalogue();const org=cat.organisations.find((x:any)=>x.slug===o),service=org.services.find((x:any)=>x.slug===sv);
+      const parent={org_id:org.id,org_slug:org.slug,org_title:org.title,service_id:service.id,service_slug:service.slug,service_title:service.title};
+      const p=await vault.vaultSshKeyCreate(api,await api.sealStatus(),parent,{id:vault.newSetId(),slug,title:slug},{scheme,source,privateKey:source==='import'?readFileSync(file!,'utf8'):undefined,comment:vault.sshDefaultComment(o,sv,slug),handout:handout==='handout'},new URL(origin).hostname);
+      const made=await p.tap(auth);if(made.authorized_key!==p.authorizedKey||made.fingerprint!==p.fingerprint)throw Error('created another key than the one reviewed');console.log(JSON.stringify(made));break;}
+    case 'vault-ssh-handout': { // PATH on|off: the key's "May be handed out" setting
+      const vault=await import(`${web}/src/vault.ts`);const [path,to]=args;
+      const set=(await api.vaultState()).sets.find((s:any)=>`${s.org_slug}/${s.service_slug}/${s.set_slug}`===path);if(!set)throw Error('no set '+path);
+      await (await vault.vaultSshHandout(api,await api.sealStatus(),set,to==='on',new URL(origin).hostname)).tap(auth);break;}
+    case 'vault-delete': { // PATH: Delete on the item page; prints what the delete ended
+      const vault=await import(`${web}/src/vault.ts`);const [path]=args;
+      const set=(await api.vaultState()).sets.find((s:any)=>`${s.org_slug}/${s.service_slug}/${s.set_slug}`===path);if(!set)throw Error('no set '+path);
+      console.log(JSON.stringify(await (await vault.vaultDelete(api,await api.sealStatus(),set,new URL(origin).hostname)).tap(auth)));break;}
+    case 'vault-restore': case 'vault-purge': { // PATH: Vault → Deleted → Restore / Purge now (the newest binned item with that path)
+      const vault=await import(`${web}/src/vault.ts`);const [path]=args;
+      const item=((await api.vaultState()).deleted??[]).filter((s:any)=>`${s.org_slug}/${s.service_slug}/${s.set_slug}`===path).sort((a:any,b:any)=>b.deleted_at-a.deleted_at)[0];if(!item)throw Error('nothing in the bin named '+path);
+      await (await (cmd==='vault-restore'?vault.vaultRestore:vault.vaultPurge)(api,await api.sealStatus(),item,new URL(origin).hostname)).tap(auth);break;}
     case 'batch': {const state=await api.state(),v=await api.sealStatus();const sel=args.map(id=>({item:state.pending.find((p:any)=>p.id===id),action:'approve',ttl_seconds:300}));const b=await (await import(`${web}/src/approvals.ts`)).batchReview(api,v,sel,new URL(origin).hostname);await b.tap(auth);break;}
     case 'seal-status': console.log((await api.sealStatus()).mode);break;
     // ---- Settings → Setup (docs/SETUP.md), through the web UI's own setup module ----

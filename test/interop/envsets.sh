@@ -42,6 +42,7 @@ env_scenario() {
   ok 'env release: only its bucket opens; close all and restart pause it (423); one Reopen tap resumes it'
   vault_scenario
   agent_iface_scenario
+  ssh_key_scenario
   # No diagnostic, audit or SQLite WAL (including free pages) contains the value.
   if grep -aFl "$sentinel" "$T/data/aqmas.db" "$T/data/aqmas.db-wal" "$T"/env-*.out "$T"/env-*.err "$T"/seal-*.log; then fail 'env value leaked'; fi
   rmdir "$ram/aqmas-env" "$ram"; ok 'env import, signed revision, child env, RAM checkout/checkin, revoke, shell export/unset, sentinel scan'
