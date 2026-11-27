@@ -136,6 +136,7 @@ type fakeServer struct {
 	cf      fakeCF      // milestone 2: Cloudflare (cf_fake_test.go)
 	bastion fakeBastion // the bastion itself (bastion_test.go)
 	ssh     fakeSSH     // one SSH key held by the broker (sshkey_test.go)
+	prop    fakeProps
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -190,6 +191,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 	f.setupCF(mux)
 	f.setupBastion(mux)
 	f.setupIface(mux)
+	f.setupProposals(mux)
 	f.setupSSH(mux)
 	f.srv = httptest.NewUnstartedServer(mux)
 	f.srv.Config.ErrorLog = log.New(io.Discard, "", 0) // handshake failures are expected in some tests

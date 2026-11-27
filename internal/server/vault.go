@@ -278,7 +278,7 @@ func (s *Server) vaultHistory(ctx context.Context, r *http.Request, sess string)
 		}
 		for _, e := range rows {
 			switch {
-			case out.LastChanged == 0 && (e.Action == "vault_commit" || e.Action == "vault_signer_create" || e.Action == "vault_ssh_key_create" || e.Action == "vault_secret_create" || e.Action == "vault_restore" || e.Action == "env_commit"):
+			case out.LastChanged == 0 && (e.Action == "vault_commit" || e.Action == "vault_signer_create" || e.Action == "vault_ssh_key_create" || e.Action == "vault_secret_create" || e.Action == "vault_restore" || e.Action == "env_commit" || e.Action == "env_proposal_commit"):
 				out.LastChanged = e.At.UnixMilli()
 			case out.LastUsed == 0 && (e.Action == "sign" || e.Action == "ssh_key_collect" || strings.HasPrefix(e.Action, "env_collect_")):
 				out.LastUsed = e.At.UnixMilli()

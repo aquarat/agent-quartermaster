@@ -450,6 +450,7 @@ func (q *Q) PurgeSet(ctx context.Context, set string) (PurgeInfo, error) {
 	}
 	for _, stmt := range []string{
 		`DELETE FROM env_drafts WHERE set_id=?`,
+		`DELETE FROM env_proposals WHERE set_id=?`,
 		`DELETE FROM env_revisions WHERE set_id=?`,
 		`DELETE FROM env_releases WHERE set_id=?`,
 		`DELETE FROM env_standing WHERE set_id=?`,

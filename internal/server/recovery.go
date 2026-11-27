@@ -493,6 +493,17 @@ func (f *recoveryFlow) commit(ctx context.Context, text string, assertion []byte
 				return err
 			}
 		}
+		// Proposals waiting for the lost passkeys end too; what they sealed was
+		// to the keys replaced below (the table exists since 0.11.0).
+		var proposals int
+		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='env_proposals'`).Scan(&proposals); err != nil {
+			return err
+		}
+		if proposals > 0 {
+			if _, err = tx.ExecContext(ctx, `UPDATE env_proposals SET status='superseded',payload=NULL,bucket=NULL WHERE status='pending'`); err != nil {
+				return err
+			}
+		}
 		// Rekey every scope (§10): the retired passkeys' wraps, and copies of
 		// them in old backups, open only the old scope keys. Every bucket gets
 		// a new key pair under the new scope key and every record is

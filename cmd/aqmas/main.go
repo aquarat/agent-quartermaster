@@ -64,8 +64,20 @@ Usage:
   aqmas ssh-config [USER@]HOST...  print an opt-in ~/.ssh/config snippet (read its notes)
   aqmas cf scopes|request|api|env|curl|token|snapshot ...
       Cloudflare API access through aqmasd (aqmas cf help).
-  aqmas set import PATH --from FILE | set put PATH KEY | set unset PATH KEY
-      Enter the Admin upload ticket at the hidden prompt or via --ticket-fd FD.
+  aqmas set import PATH --from FILE --why REASON [--create [--title TITLE]]
+  aqmas set put PATH KEY --why REASON [--create [--title TITLE]]
+  aqmas set unset PATH KEY --why REASON
+      Ask the owner to store values in an env set: import replaces the whole set from a
+      dotenv FILE, put sets one key (value from a hidden prompt, or stdin when it is not
+      a terminal), unset removes one. Prints the Ref, the commitment and the key changes
+      (names only), then waits for the owner to commit or discard; Ctrl-C withdraws.
+      --create also creates a missing set (and service) in an existing organisation.
+      An owner device with an upload ticket from the Vault adds --ticket (hidden prompt)
+      or --ticket-fd FD instead of --why: the edit is then staged for the Vault.
+  aqmas set check --from FILE [PATH]
+      Check FILE against the import rules, sending nothing: key names on stdout, each
+      problem with its line number on stderr, never a value; exit 1 if it would not
+      import. With PATH also what an import would add, replace and remove.
   aqmas run PATH --why REASON [--ttl 10m] [--env NAME] -- COMMAND...
       Run COMMAND with a secret or env set in its environment. --env renames a secret's variable.
   aqmas get PATH --why REASON [--ttl 10m]
@@ -169,29 +181,7 @@ func run(args []string) int {
 		}
 		return fail(env.HoldEnv(ctx, rest[0], rest[1]))
 	case "set":
-		if len(rest) < 2 {
-			return fail(&client.UsageError{Msg: "set requires import, put or unset and a qualified set path"})
-		}
-		op := rest[0]
-		f, err := parseFlags(rest[1:], map[string]bool{"from": true, "ticket-fd": true})
-		if err != nil {
-			return fail(err)
-		}
-		if f.cmd != nil || !(op == "import" && len(f.pos) == 1 && f.str["from"] != "" || (op == "put" || op == "unset") && len(f.pos) == 2 && f.str["from"] == "") {
-			return fail(&client.UsageError{Msg: "invalid set edit arguments"})
-		}
-		fd := -1
-		if f.str["ticket-fd"] != "" {
-			fd, err = strconv.Atoi(f.str["ticket-fd"])
-			if err != nil || fd < 3 {
-				return fail(&client.UsageError{Msg: "ticket fd must be at least 3"})
-			}
-		}
-		key := ""
-		if len(f.pos) == 2 {
-			key = f.pos[1]
-		}
-		return fail(env.SetEdit(ctx, op, f.pos[0], key, f.str["from"], fd))
+		return runSet(ctx, env, rest)
 	case "run", "get", "checkout", "co", "checkout-shell", "cos":
 		f, err := parseFlags(rest, map[string]bool{"why": true, "ttl": true, "file": true, "env": true})
 		if err != nil {
@@ -577,6 +567,126 @@ func fail(err error) int {
 		fmt.Fprintf(os.Stderr, "aqmas: %s%s\n", client.Sanitize(err.Error()), hint)
 	}
 	return code
+}
+
+// setUsage is the part of the usage text about `aqmas set`.
+func setUsage() string {
+	var b strings.Builder
+	in := false
+	for _, line := range strings.SplitAfter(usage, "\n") {
+		if strings.HasPrefix(line, "  aqmas ") {
+			in = strings.HasPrefix(line, "  aqmas set ")
+		} else if !strings.HasPrefix(line, "      ") {
+			in = false
+		}
+		if in {
+			b.WriteString(line)
+		}
+	}
+	return "Usage:\n" + b.String()
+}
+
+// runSet is `aqmas set import|put|unset|check`. Without a ticket option an
+// edit is a proposal the owner commits on the approval page; --ticket and
+// --ticket-fd keep the owner-device upload against a Vault ticket.
+func runSet(ctx context.Context, env *client.Env, rest []string) int {
+	for i, a := range rest {
+		if a == "--" {
+			break
+		}
+		if a == "--help" || a == "-h" || a == "help" && i < 2 {
+			fmt.Print(setUsage())
+			return 0
+		}
+	}
+	bad := func(msg string) int {
+		return fail(&client.UsageError{Msg: msg + " (aqmas set --help)"})
+	}
+	if len(rest) == 0 {
+		return bad("set needs import, put, unset or check, then a set path")
+	}
+	op := rest[0]
+	if op != "import" && op != "put" && op != "unset" && op != "check" {
+		return bad(fmt.Sprintf("set needs import, put, unset or check, not %q", op))
+	}
+	f, err := parseFlags(rest[1:], map[string]bool{"from": true, "why": true, "create": false, "title": true, "ticket": false, "ticket-fd": true})
+	if err != nil {
+		return fail(err)
+	}
+	if f.cmd != nil {
+		return bad("set " + op + " takes no -- COMMAND")
+	}
+	_, hasFrom := f.str["from"]
+	_, hasWhy := f.str["why"]
+	_, hasFD := f.str["ticket-fd"]
+	_, hasTitle := f.str["title"]
+	ticket := f.bool["ticket"] || hasFD
+	if op == "check" {
+		switch {
+		case f.str["from"] == "":
+			return bad("set check needs --from FILE")
+		case len(f.pos) > 1:
+			return bad("set check takes at most one PATH after --from FILE")
+		case hasWhy || ticket || f.bool["create"] || hasTitle:
+			return bad("set check takes only --from FILE and an optional PATH: it sends nothing")
+		}
+		path := ""
+		if len(f.pos) == 1 {
+			path = f.pos[0]
+		}
+		return fail(env.SetCheck(ctx, f.str["from"], path))
+	}
+	key := ""
+	if op == "import" {
+		switch {
+		case len(f.pos) == 0:
+			return bad("set import needs PATH (organisation/service/set)")
+		case len(f.pos) > 1:
+			return bad("set import takes one PATH; the file goes in --from FILE")
+		case f.str["from"] == "":
+			return bad("set import needs --from FILE")
+		}
+	} else {
+		switch {
+		case len(f.pos) < 2:
+			return bad("set " + op + " needs PATH (organisation/service/set) and KEY")
+		case len(f.pos) > 2:
+			return bad("set " + op + " takes PATH and one KEY")
+		case hasFrom && op == "put":
+			return bad("set put reads its value from a hidden prompt or stdin, not --from (set import takes a file)")
+		case hasFrom:
+			return bad("set unset takes no --from")
+		}
+		key = f.pos[1]
+	}
+	if hasTitle && !f.bool["create"] {
+		return bad("--title names the set that --create makes: add --create")
+	}
+	if f.bool["create"] && op == "unset" {
+		return bad("--create goes with set import or set put")
+	}
+	if ticket {
+		switch {
+		case f.bool["ticket"] && hasFD:
+			return bad("give --ticket (hidden prompt) or --ticket-fd FD, not both")
+		case f.bool["create"]:
+			return bad("--create proposes a new set to the owner: leave out the ticket option and give --why")
+		case hasWhy:
+			return bad("--why goes with a proposal; with a ticket the edit is reviewed in the Vault: leave one out")
+		}
+		fd := -1
+		if hasFD {
+			if fd, err = strconv.Atoi(f.str["ticket-fd"]); err != nil || fd < 3 {
+				return bad("--ticket-fd needs a descriptor number of at least 3")
+			}
+		}
+		return fail(env.SetEdit(ctx, op, f.pos[0], key, f.str["from"], fd))
+	}
+	if strings.TrimSpace(f.str["why"]) == "" {
+		return bad("set " + op + " needs --why \"...\": what the values are for, shown to the owner (an owner device with a Vault upload ticket gives --ticket instead)")
+	}
+	_, err = env.SetPropose(ctx, client.SetOptions{Op: op, Path: f.pos[0], Key: key, From: f.str["from"], Why: f.str["why"], Create: f.bool["create"], Title: f.str["title"]})
+	return fail(err)
 }
 
 type flags struct {

@@ -56,9 +56,15 @@ func (f *fakeServer) setupIface(mux *http.ServeMux) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		b, ok := binding(host, r.URL.Query().Get("path"))
+		if !ok && r.URL.Query().Get("create") == "1" {
+			b, ok = f.proposalBase(host, r.URL.Query().Get("path"))
+		}
 		if !ok {
 			apiErr(w, 404, api.ErrNotFound, "not found")
 			return
+		}
+		if b.Names == nil {
+			b.Names = []string{}
 		}
 		writeJSON(w, 200, b)
 	})
@@ -272,7 +278,7 @@ func TestGuideContent(t *testing.T) {
 			t.Errorf("command summary: %+v", c)
 		}
 	}
-	for _, want := range []string{"ls", "targets", "run", "get", "sign", "ssh", "ssh-agent", "ssh-key", "mcp", "guide"} {
+	for _, want := range []string{"ls", "targets", "run", "get", "set", "set check", "sign", "ssh", "ssh-agent", "ssh-key", "mcp", "guide"} {
 		if !names[want] {
 			t.Errorf("guide --json lacks %s", want)
 		}
@@ -431,7 +437,7 @@ func TestMCPServer(t *testing.T) {
 		if tool.Description == "" || tool.InputSchema.Type != "object" || tool.InputSchema.Properties == nil || tool.InputSchema.Required == nil {
 			t.Errorf("tool %s: incomplete definition", tool.Name)
 		}
-		needsOwner := tool.Name == "aqmas_run" || tool.Name == "aqmas_sign" || tool.Name == "aqmas_ssh_exec" || tool.Name == "aqmas_with_ssh_key"
+		needsOwner := tool.Name == "aqmas_run" || tool.Name == "aqmas_sign" || tool.Name == "aqmas_ssh_exec" || tool.Name == "aqmas_with_ssh_key" || tool.Name == "aqmas_store_env"
 		if needsOwner != strings.Contains(tool.Description, "locks until the owner approves") {
 			t.Errorf("tool %s: blocking is not stated where it applies: %s", tool.Name, tool.Description)
 		}
@@ -442,12 +448,12 @@ func TestMCPServer(t *testing.T) {
 			t.Errorf("a tool that returns values: %s", tool.Name)
 		}
 	}
-	for _, want := range []string{"aqmas_guide", "aqmas_status", "aqmas_list_credentials", "aqmas_list_targets", "aqmas_run", "aqmas_sign", "aqmas_ssh_exec", "aqmas_with_ssh_key"} {
+	for _, want := range []string{"aqmas_guide", "aqmas_status", "aqmas_list_credentials", "aqmas_list_targets", "aqmas_run", "aqmas_sign", "aqmas_ssh_exec", "aqmas_with_ssh_key", "aqmas_store_env"} {
 		if !seen[want] {
 			t.Errorf("tools/list lacks %s", want)
 		}
 	}
-	if len(list.Tools) != 8 {
+	if len(list.Tools) != 9 {
 		t.Errorf("%d tools", len(list.Tools))
 	}
 
