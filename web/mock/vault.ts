@@ -8,6 +8,7 @@
 import { createECDH, createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import { suite, tuple } from "../src/seal";
 import type { MockBuckets } from "./buckets";
+import type { EnvProposal } from "../src/envsets";
 import { BIN_SECONDS, canonicalJSON, editChanges, editCommitment, sshCommentProblem, type DeletedSet, type Edit, type SignItem, type SignRequest, type VaultOrg, type VaultSet } from "../src/vault";
 
 const b64url = (b: Uint8Array | Buffer) => Buffer.from(b).toString("base64url");
@@ -168,6 +169,109 @@ export class MockVault {
     });
     return id;
   }
+  /** Values hosts ask to store (docs/API.md "Env proposals"), every status; `state` lists the
+   * pending ones. The values wait in `proposed` (the broker keeps them sealed to the bucket). */
+  proposals: EnvProposal[] = [];
+  private proposed = new Map<string, Record<string, string>>();
+
+  /** A host asks to store values (as `aqmas set import|put|unset PATH --why REASON` would):
+   * a pending proposal. `values` are the entries sent (for `unset`, the one key with any
+   * value). With `create`, the set, and the service when it is missing too, need not exist. */
+  addProposal(path: string, operation: "import" | "put" | "unset", values: Record<string, string>, opts: { host?: string; reason?: string; create?: boolean; title?: string } = {}): string {
+    const [o, v, slug, ...rest] = path.split("/");
+    const org = this.orgs.find((x) => x.slug === o);
+    const hst = this.hosts.find((x) => x.name === (opts.host ?? "build-1"));
+    if (!org || !hst || !v || !slug || rest.length) throw new Error("no organisation, host or path for " + path);
+    const adm = hst.orgs.get(org.id);
+    if (!adm?.active || hst.revoked_at) throw new Error(`${hst.name} is not admitted to ${org.slug}`); // the broker answers 404
+    const svc = this.services.find((x) => x.org_id === org.id && x.slug === v);
+    const s = this.sets.find((x) => x.org_id === org.id && x.service_slug === v && x.set_slug === slug);
+    if (s && opts.create) throw new Error("409: " + path + " exists"); // an existing path given with create
+    if (!s && (!opts.create || operation === "unset")) throw new Error("no set " + path + " (create?)");
+    if (s && s.kind !== "env-set") throw new Error("a secret is replaced in the Vault");
+    const keys = Object.keys(values).sort();
+    if (operation !== "import" && keys.length !== 1) throw new Error(operation + " names exactly one key");
+    const old = s?.names ?? [];
+    const entries = operation === "unset" ? [] : keys.map((name) => ({ name, value: values[name]! }));
+    const changes = editChanges({ operation: operation === "import" ? "import" : "merge", entries, remove: operation === "unset" ? keys : [] }, old);
+    const now = Date.now();
+    const id = "01MOCKENVPRP" + String(this.proposals.length + 1).padStart(4, "0") + b64url(randomBytes(6)).replace(/[^A-Za-z0-9]/g, "X").toUpperCase();
+    const service = svc?.id ?? hex(randomBytes(16)), set = s?.set_id ?? hex(randomBytes(16)), revision = s?.revision ?? 0;
+    // Key order is the broker's (envset.Proposal): it is what the page signs over. The
+    // commitment is a stand-in of the right shape: the page never sees values to recompute it.
+    this.proposals.push({
+      path, title: `${org.title} / ${svc?.title ?? v} / ${s?.set_title ?? opts.title ?? slug}`, org: org.id, service, set, revision, service_revision: svc ? 1 : 0, policy_revision: this.policies.get(org.id)?.revision ?? 1, admission_generation: adm.generation,
+      enrollment: hst.enrollment, host: hst.name, class: hst.class, names: [...old], default_seconds: 3600, soft_cap_seconds: 86400, offers_indefinite: true,
+      id, ref: id.slice(-6), operation, commitment: hex(sha256(JSON.stringify(["aqmas-env-edit-v1", hex(randomBytes(32)), org.id, service, set, revision, operation, entries, changes]))), changes,
+      reason: opts.reason ?? "store the values the deploy just generated", address: hst.address, new_service: !svc, new_set: !s, status: "pending", created_at: now, expires_at: now + 600_000, result_revision: 0,
+    });
+    this.proposed.set(id, values);
+    return id;
+  }
+  /** The dev fixture's proposal: an import that adds, replaces and removes keys. */
+  exampleProposal(): string {
+    return this.addProposal("client-a/paas/staging", "import", { APP_SECRET: "mock-rotated-app-secret", DATABASE_URL: "postgres://app:mock-rotated@db.example.com:5432/staging", SMTP_PASSWORD: "mock rotated smtp pass", SENTRY_DSN: "https://mock@sentry.example.com/1" }, { reason: "rotate the staging credentials after the provider's key roll" });
+  }
+  /** The host cancels its own pending proposal (`POST /v2/env/proposals/{id}/cancel`, Ctrl-C). */
+  cancelProposal(id: string): void {
+    const p = this.proposals.find((x) => x.id === id && x.status === "pending");
+    if (!p) throw new Error("no pending proposal " + id);
+    this.endProposal(p, "cancelled");
+  }
+  /** A proposal that is no longer pending keeps no values (the broker: no bucket, no record). */
+  private endProposal(p: EnvProposal, status: string): void {
+    p.status = status;
+    this.proposed.delete(p.id);
+  }
+  /** Why a pending proposal can no longer be decided ("" while it can): what the broker's
+   * triggers do when the set's revision, the host's admission or the policy changes, or, for
+   * a new set, when the path or an ID is taken. */
+  private proposalStale(p: EnvProposal): string {
+    const hst = this.hosts.find((x) => x.enrollment === p.enrollment), adm = hst?.orgs.get(p.org);
+    if (!hst || hst.revoked_at || !adm?.active || adm.generation !== p.admission_generation) return "the host's admission changed";
+    if ((this.policies.get(p.org)?.revision ?? 1) !== p.policy_revision) return "the organisation's policy changed";
+    const [, v, slug] = p.path.split("/");
+    const svc = this.services.find((x) => x.org_id === p.org && x.slug === v);
+    const s = this.sets.find((x) => x.org_id === p.org && x.service_slug === v && x.set_slug === slug);
+    const taken = (id: string) => this.services.some((x) => x.id === id) || [...this.sets, ...this.deleted.map((d) => d.set)].some((x) => x.set_id === id);
+    if (p.new_set) return s || taken(p.set) ? "the path or its ID was taken" : p.new_service ? (svc || taken(p.service) ? "the service or its ID was taken" : "") : svc?.id === p.service ? "" : "the service changed";
+    if (!s || s.set_id !== p.set || s.kind !== "env-set") return "the set is gone or is no longer an env set";
+    return s.revision === p.revision ? "" : "the set has a newer revision";
+  }
+  /** Pending proposals after the sweeps the broker runs: expiry and "superseded". */
+  private pendingProposals(): EnvProposal[] {
+    for (const p of this.proposals.filter((x) => x.status === "pending")) {
+      if (p.expires_at <= Date.now()) {
+        this.endProposal(p, "expired");
+        this.deps.audit("env_proposal_expire", "env:" + p.id, p.path);
+      } else if (this.proposalStale(p)) this.endProposal(p, "superseded");
+    }
+    return this.proposals.filter((x) => x.status === "pending");
+  }
+  /** Commit: creates the service and set when asked, then writes the next revision exactly
+   * as a committed draft does. */
+  private commitProposal(p: EnvProposal): void {
+    const [o, v, slug] = p.path.split("/") as [string, string, string];
+    const org = this.orgs.find((x) => x.id === p.org)!;
+    if (p.new_service) this.services.push({ id: p.service, org_id: org.id, slug: v, title: v });
+    const svc = this.services.find((x) => x.id === p.service)!;
+    if (p.new_set) {
+      this.sets.push({ org_id: org.id, org_slug: o, org_title: org.title, service_id: svc.id, service_slug: svc.slug, service_title: svc.title, set_id: p.set, set_slug: slug, set_title: p.title.split(" / ").at(-1)!, kind: "env-set", revision: 0, names: [], allow_reveal: org.allow_reveal, signatures: 0 });
+      this.values.set(p.set, new Map());
+    }
+    const s = this.sets.find((x) => x.set_id === p.set)!;
+    const sent = this.proposed.get(p.id)!;
+    const values = p.operation === "import" ? new Map<string, string>() : this.values.get(s.set_id)!;
+    for (const [name, value] of Object.entries(sent)) p.operation === "unset" ? values.delete(name) : values.set(name, value);
+    this.values.set(s.set_id, values);
+    s.revision++;
+    s.names = [...values.keys()].sort();
+    p.result_revision = s.revision;
+    this.endProposal(p, "committed");
+    const rows = this.history.get(s.set_id) ?? [];
+    rows.unshift({ at: new Date().toISOString(), actor: "owner", action: "env_proposal_commit", object: "env:" + p.id, detail: `passkey=1 ${p.path} revision=${s.revision} host=${p.host} changes=${p.changes}` });
+    this.history.set(s.set_id, rows);
+  }
   /** A host asks to use an SSH key: logins through `aqmas ssh-agent`, or the key itself. */
   addSshRequest(path: string, use: "ssh-agent" | "ssh-handout", host = "build-1", ttl = 3600, max = 20, reason = "push the release branch"): string {
     const s = this.sets.find((x) => `${x.org_slug}/${x.service_slug}/${x.set_slug}` === path);
@@ -225,6 +329,13 @@ export class MockVault {
       const st = this.standing.find((x) => x.id === c.id) ?? fail(409, "conflict", "that rule has ended; reload");
       return JSON.stringify({ ...st, uses: 0 });
     }
+    if (c.action === "proposal-commit" || c.action === "proposal-discard") {
+      // Always one tap for one proposal: no duration, no "don't ask again".
+      if (ttl !== 0 || standing !== 0) fail(400, "bad_request", "a proposal takes no duration");
+      const p = this.proposals.find((x) => x.id === c.id) ?? fail(404, "not_found", "not found");
+      if (!this.pendingProposals().includes(p)) fail(409, "conflict", p.status === "superseded" ? "the set changed since this was proposed; the host must propose again" : "decision no longer available");
+      return JSON.stringify({ ...p, reason: "" });
+    }
     const r = this.releases.find((x) => x.id === c.id) ?? fail(404, "not_found", "not found");
     if (standing !== 0 && c.action !== "approve") fail(400, "bad_request", "unexpected standing duration");
     if ((c.action === "revoke") !== (r.status === "approved") || (c.action !== "revoke" && r.status !== "pending")) fail(409, "conflict", "decision no longer available");
@@ -249,6 +360,8 @@ export class MockVault {
     if (c.object !== "env") fail(409, "conflict", "wrong ceremony");
     if (this.envMeta(c) !== c.metadata) fail(409, "conflict", "env proposal changed; review again");
     if (c.action === "standing-revoke") this.standing = this.standing.filter((x) => x.id !== c.id);
+    else if (c.action === "proposal-commit") this.commitProposal(this.proposals.find((x) => x.id === c.id)!);
+    else if (c.action === "proposal-discard") this.endProposal(this.proposals.find((x) => x.id === c.id)!, "discarded");
     else {
       const r = this.releases.find((x) => x.id === c.id)!;
       if (c.action === "approve") {
@@ -329,6 +442,9 @@ export class MockVault {
       { name: "image-b.bin", size: 339104, sha256: hex(sha256("mock image b")) },
     ], 1800, 20);
     request(imageKey, "01MOCKSIGNREQUEST0000C5R1WZ", "laptop", "198.51.100.7", "bench images", [{ name: "bench.bin", size: 120044, sha256: hex(sha256("mock bench")) }], 3600, 10, "approved", 4);
+    // One host asks to store values, so the card is there to look at (it expires after ten
+    // minutes like a real one; `GET /mock/propose` adds another).
+    this.exampleProposal();
   }
 
   catalogue() {
@@ -667,7 +783,7 @@ export class MockVault {
     if (p === "/api/ui/seal/env/state" && !post) {
       const live = this.releases.filter((r) => r.status === "pending" || r.status === "approved");
       this.standing = this.standing.filter((x) => (x.expires_at as number) > Date.now());
-      return { drafts: [], releases: live, standing: this.standing, standing_caps: Object.fromEntries(live.map((r) => [r.set, this.cap(r.set as string)])) };
+      return { drafts: [], releases: live, proposals: this.pendingProposals(), standing: this.standing, standing_caps: Object.fromEntries(live.map((r) => [r.set, this.cap(r.set as string)])) };
     }
     if ((p === "/api/ui/seal/env/challenge" || p === "/api/ui/seal/env/finish") && post) return this.env(req, p.slice("/api/ui/seal/env/".length), body, session);
     if (p === "/api/ui/catalogue" && !post) return this.catalogue();

@@ -2922,6 +2922,28 @@ dialog.search-dialog::backdrop {
   padding-top: 8px;
   border-top: 1px solid var(--line);
 }
+/* 0.11.0: a host asks to store values (one card per proposal, one tap each) */
+.env-proposal {
+  display: grid;
+  gap: 8px;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.env-proposal > p,
+.env-proposal > h3 {
+  margin: 0;
+}
+.env-proposal .commitment {
+  font-size: 0.8125rem;
+}
+.env-proposal-status {
+  display: grid;
+  gap: 8px;
+}
+.env-proposal-status:empty {
+  display: none;
+}
 .vault-standing select {
   width: auto;
 }

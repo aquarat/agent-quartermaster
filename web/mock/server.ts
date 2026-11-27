@@ -4,6 +4,7 @@
 //   bun run mock:fresh      same, with no passkey registered (first-run flow; code printed)
 //   bun mock/server.ts --port 9000 --fresh
 //   GET /mock/spawn         adds a new pending SSH request (dev convenience)
+//   GET /mock/propose       adds an env proposal: a host asks to store values (sealed view)
 //   GET /mock/login         MOCK ONLY: signs this browser in without a passkey (screenshots)
 //   GET /mock/setup?...     jumps Settings → Setup to a state (see mock/setup.ts)
 //   GET /mock/vault?mode=buckets|migration-required&closed=1   sealed view (mock/vault.ts, mock/buckets.ts)
@@ -1196,6 +1197,9 @@ export function startMock(opts: MockOptions = {}) {
         } else if (url.pathname.startsWith("/api/") && store.setup.downUntil > Date.now()) {
           // A setup task is restarting the broker.
           res = json({ error: "unavailable", message: "broker restarting" }, 502);
+        } else if (url.pathname === "/mock/propose") {
+          // MOCK ONLY: a host asks to store values (the sealed view's approval card).
+          res = json({ proposed: store.vault.exampleProposal() });
         } else if (url.pathname === "/mock/spawn") {
           const item = store.spawnRequest();
           res = json({ spawned: item.id });
@@ -1242,5 +1246,6 @@ if (import.meta.main) {
   console.log(`aqmas mock on ${url}  (open http://localhost:${m.server.port}: WebAuthn needs "localhost", not an IP)`);
   if (m.store.enrollCode) console.log(`no passkey yet; enroll code: ${m.store.enrollCode}`);
   console.log(`add a pending request: curl ${url}/mock/spawn`);
+  console.log(`add an env proposal (sealed view): curl ${url}/mock/propose`);
   console.log(`setup queue: ${url}/#/setup  (jump: curl '${url}/mock/setup?scoped=1&mode=seal-setup&wrap=tested')`);
 }

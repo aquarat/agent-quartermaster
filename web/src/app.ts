@@ -125,6 +125,7 @@ export class App {
     pending: this.state?.pending ?? [],
     signing: (this.vaultState?.requests ?? []).filter((r) => r.status === "pending"),
     releases: (this.envState?.releases ?? []).filter((r) => r.status === "pending"),
+    proposals: this.envState?.proposals ?? [],
     canAdd: !!this.vaultState,
     toEnable: readiness(this.seal)?.fixable.length ?? 0,
   }), () => void this.loadDirectory());
@@ -531,7 +532,7 @@ export class App {
         main = h(
           "main",
           { class: "sections" },
-          h("div", { class: "col col-queue" }, section("signing", "Signatures to approve"), section("env", "Env releases and staged edits"), section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
+          h("div", { class: "col col-queue" }, section("signing", "Signatures to approve"), section("env", "Env releases, proposals and staged edits"), section("pending", "Waiting for you"), section("enroll", "Hosts asking to join")),
           h("div", { class: "col col-access" }, section("grants", "Active access", "tiles"), section("standing", "Auto-approvals", "tiles")),
         );
         break;
@@ -592,7 +593,7 @@ export class App {
   /** Requests of every kind that wait for a decision (the Approvals tab's badge, the title). */
   private waiting(): number {
     const s = this.state;
-    return (s?.pending ?? []).length + (this.vaultState?.requests ?? []).filter((r) => r.status === "pending").length + (this.envState?.releases ?? []).filter((r) => r.status === "pending").length + (this.envState?.drafts ?? []).length;
+    return (s?.pending ?? []).length + (this.vaultState?.requests ?? []).filter((r) => r.status === "pending").length + (this.envState?.releases ?? []).filter((r) => r.status === "pending").length + (this.envState?.drafts ?? []).length + (this.envState?.proposals ?? []).length;
   }
 
   /** One line for the tray and the Vault's empty pane when some passkey opens too little. */
@@ -749,8 +750,10 @@ export class App {
       this.section("signing", [reqs, this.seal?.epoch], () => (v && this.seal ? signCards(this.vaultHost(), this.seal, v) : []), reqs.length === 0, touching || busy, reqs.filter((r) => r.status === "pending").length);
     }
     {
-      // Env releases hosts asked for and edits staged from the CLI: approve, deny, revoke, commit.
-      const e = this.envState, n = (e?.releases.length ?? 0) + (e?.drafts.length ?? 0) + (e?.standing?.length ?? 0);
+      // Env releases hosts asked for, values hosts ask to store (proposals) and edits staged
+      // from the CLI: approve, deny, revoke, commit, discard. Proposals are only ever here, never
+      // in `pending`, so no approval window or batch can select one.
+      const e = this.envState, n = (e?.releases.length ?? 0) + (e?.drafts.length ?? 0) + (e?.standing?.length ?? 0) + (e?.proposals?.length ?? 0);
       this.section("env", [e, this.seal?.mode], () => (e && this.seal ? [envPanel(this.api, this.auth, this.seal, e, null, () => this.changed())] : []), n === 0, touching || !!this.root.querySelector("#sec-env [role=status] button"), n);
     }
     this.section("enroll", enrolls, () => enrolls.map((p) => this.enrollCard(p)), enrolls.length === 0, touching);
