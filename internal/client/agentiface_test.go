@@ -250,7 +250,7 @@ func TestGetAndRunSecret(t *testing.T) {
 func TestGuideContent(t *testing.T) {
 	g := Guide()
 	for _, want := range []string{
-		"aqmas status", "aqmas ls", "aqmas targets", "aqmas ssh ", "aqmas mosh ", "aqmas cert ", "aqmas run ", "aqmas get ", "aqmas checkout ", "aqmas sign ", "aqmas signer ", "aqmas ssh-agent ", "aqmas ssh-key ", "aqmas cf ", "aqmas bastion", "aqmas guide --json",
+		"aqmas status", "aqmas ls", "aqmas targets", "aqmas ssh ", "aqmas mosh ", "aqmas cert ", "aqmas run ", "aqmas get ", "aqmas checkout ", "aqmas sign ", "aqmas signer ", "aqmas ssh-agent ", "aqmas ssh-key ", "aqmas cf ", "aqmas bastion", "aqmas guide --json", "aqmas set import ", "aqmas set check ", "--create", "replaces the whole set",
 		"--why", "Ref", "passkey", "do not look for long-lived credentials", "Prefer `sign` over fetching keys", "not_admitted", "not_found", "Hosts may list what they can ask for", "| `ssh-key` |", "ssh://git@forge.example.com/", "may be handed out",
 		"claude mcp add aqmas -- aqmas mcp", `"mcpServers"`, "block until the owner decides",
 		"| 3 |", "| 4 |", "| 5 |", "| 130 |",
