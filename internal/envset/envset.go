@@ -83,6 +83,45 @@ type Release struct {
 	Consumed bool   `json:"consumed"`
 }
 
+// Proposal is a host's request to store values (docs/API.md "Env proposals"):
+// the binding the edit applies to (for a new set the proposed IDs, revision 0
+// and no names), what it changes by name, and its state. It carries no value.
+// The field order is the signed order: the page rebuilds the reviewed text
+// from it.
+type Proposal struct {
+	Binding
+	ID         string `json:"id"`
+	Ref        string `json:"ref"`
+	Operation  string `json:"operation"`
+	Commitment string `json:"commitment"`
+	Changes    string `json:"changes"`
+	Reason     string `json:"reason"`
+	Peer       string `json:"address"`
+	NewService bool   `json:"new_service"`
+	NewSet     bool   `json:"new_set"`
+	Status     string `json:"status"`
+	Created    int64  `json:"created_at"`
+	Expires    int64  `json:"expires_at"`
+	Result     int    `json:"result_revision"`
+}
+
+// ProposalCreate asks for a set (and, with ServiceID, a service) that does
+// not exist yet; the host chooses the IDs so that its commitment covers them.
+type ProposalCreate struct {
+	ServiceID string `json:"service_id"`
+	SetID     string `json:"set_id"`
+	Title     string `json:"title"`
+}
+
+// ProposalRequest is the body of POST /v2/env/proposals.
+type ProposalRequest struct {
+	Path       string          `json:"path"`
+	Reason     string          `json:"reason"`
+	Edit       Edit            `json:"edit"`
+	Commitment string          `json:"commitment"`
+	Create     *ProposalCreate `json:"create"`
+}
+
 // Standing is a "don't ask again" rule the owner made while approving one
 // release: later releases of the same set revision to the same host, from the
 // same address, in the same delivery mode and within MaxTTL are approved
@@ -269,78 +308,167 @@ func ParseFile(b []byte) ([]Entry, error) {
 	s := strings.ReplaceAll(string(b), "\r\n", "\n")
 	var out []Entry
 	line := 1
-	bad := func() ([]Entry, error) { return nil, fmt.Errorf("unsupported literal assignment on line %d", line) }
 	for len(s) > 0 {
-		if s[0] == '\n' {
-			s = s[1:]
-			line++
-			continue
+		a := nextAssignment(s, line)
+		if a.why != "" {
+			return nil, fmt.Errorf("unsupported literal assignment on line %d", a.at)
 		}
-		end := strings.IndexByte(s, '\n')
-		if end < 0 {
-			end = len(s)
+		if a.ok {
+			out = append(out, Entry{a.name, a.value})
 		}
-		if s[0] == '#' {
-			s = s[end:]
-			continue
-		}
-		k, rest, ok := strings.Cut(s[:end], "=")
-		if !ok || !SafeName(k) {
-			return bad()
-		}
-		var v string
-		if rest != "" && (rest[0] == '\'' || rest[0] == '"') {
-			quote := rest[0]
-			body := s[len(k)+2:]
-			var sb strings.Builder
-			i, start := 0, line
-			for {
-				if i >= len(body) {
-					line = start
-					return bad()
-				}
-				c := body[i]
-				i++
-				if c == quote {
-					break
-				}
-				if c == '\n' {
-					line++
-				}
-				if c == '\\' && quote == '"' {
-					if i >= len(body) {
-						line = start
-						return bad()
-					}
-					e := strings.IndexByte(`nrt\"`, body[i])
-					if e < 0 {
-						return bad()
-					}
-					c = "\n\r\t\\\""[e]
-					i++
-				}
-				sb.WriteByte(c)
-			}
-			v = sb.String()
-			tail := body[i:]
-			end = strings.IndexByte(tail, '\n')
-			if end < 0 {
-				end = len(tail)
-			}
-			if strings.Trim(tail[:end], " \t") != "" {
-				return bad()
-			}
-			s = tail[end:]
-		} else {
-			if strings.ContainsAny(rest, "\r\x00\"'`$\\#") || strings.TrimSpace(rest) != rest {
-				return bad()
-			}
-			v = rest
-			s = s[end:]
-		}
-		out = append(out, Entry{k, v})
+		s, line = a.rest, a.next
 	}
 	return out, Validate(out)
+}
+
+// assignment is one step of the dotenv scanner: a blank line, a comment, an
+// entry (ok) or a refusal (why, noticed on line at). After a refusal inside a
+// quoted value the rest of the file cannot be read (fatal).
+type assignment struct {
+	ok          bool
+	name, value string
+	rest        string
+	next        int // the line rest starts on (a comment leaves its newline in rest)
+	at          int
+	why         string
+	fatal       bool
+}
+
+func nextAssignment(s string, line int) assignment {
+	skip := func(at int, why string) assignment {
+		// The refused line is dropped whole, so a checker can go on with the
+		// next. Not when it holds a quote: the author may have meant a quoted
+		// value that runs on, and the lines after it would then be value text
+		// that must never be read (or named) as assignments.
+		rest, this := "", s
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			rest, this = s[i:], s[:i]
+		}
+		return assignment{rest: rest, next: line, at: at, why: why, fatal: strings.ContainsAny(this, "'\"")}
+	}
+	if s[0] == '\n' {
+		return assignment{rest: s[1:], next: line + 1}
+	}
+	end := strings.IndexByte(s, '\n')
+	if end < 0 {
+		end = len(s)
+	}
+	if s[0] == '#' {
+		return assignment{rest: s[end:], next: line}
+	}
+	k, rest, ok := strings.Cut(s[:end], "=")
+	if !ok {
+		return skip(line, "not a NAME=value line")
+	}
+	if !SafeName(k) {
+		return skip(line, "aqmas does not deliver under this name ("+NameRule+")")
+	}
+	if rest == "" || rest[0] != '\'' && rest[0] != '"' {
+		if strings.ContainsAny(rest, "\r\x00\"'`$\\#") || strings.TrimSpace(rest) != rest {
+			return skip(line, "a bare value cannot hold quotes, backslash, $, backtick, # or surrounding space: put it in single quotes")
+		}
+		return assignment{ok: true, name: k, value: rest, rest: s[end:], next: line}
+	}
+	quote := rest[0]
+	body := s[len(k)+2:]
+	var sb strings.Builder
+	i, start := 0, line
+	for {
+		if i >= len(body) {
+			return assignment{at: start, why: "the quoted value that starts here is never closed", fatal: true}
+		}
+		c := body[i]
+		i++
+		if c == quote {
+			break
+		}
+		if c == '\n' {
+			line++
+		}
+		if c == '\\' && quote == '"' {
+			if i >= len(body) {
+				return assignment{at: start, why: "the quoted value that starts here is never closed", fatal: true}
+			}
+			e := strings.IndexByte(`nrt\"`, body[i])
+			if e < 0 {
+				return assignment{at: line, why: `a double-quoted value accepts only the escapes \n \r \t \\ \": use single quotes for literal text`, fatal: true}
+			}
+			c = "\n\r\t\\\""[e]
+			i++
+		}
+		sb.WriteByte(c)
+	}
+	tail := body[i:]
+	end = strings.IndexByte(tail, '\n')
+	if end < 0 {
+		end = len(tail)
+	}
+	if strings.Trim(tail[:end], " \t") != "" {
+		return assignment{rest: tail[end:], next: line, at: line, why: "text after the closing quote", fatal: strings.ContainsAny(tail[:end], "'\"")}
+	}
+	return assignment{ok: true, name: k, value: sb.String(), rest: tail[end:], next: line}
+}
+
+// NameRule says which names aqmas delivers (SafeName), for messages.
+const NameRule = "capital letters, digits and underscores, starting with APP_ or ending in _TOKEN, _KEY, _PASSWORD, _SECRET, _URL, _DSN, _USER, _USERNAME or _ID; never a name a shell, loader or tool reads as configuration"
+
+// Problem is one reason a file would not import. Line is 0 for the file as a
+// whole. Neither field ever holds a value or any other text from the file.
+type Problem struct {
+	Line int
+	Why  string
+}
+
+func (p Problem) String() string {
+	if p.Line == 0 {
+		return p.Why
+	}
+	return fmt.Sprintf("line %d: %s", p.Line, p.Why)
+}
+
+// CheckFile validates a dotenv file against the import rules (ParseFile) and
+// reports every problem it can find instead of the first. names are the keys
+// of the lines that would import, in file order. The file imports exactly
+// when there are no problems. Nothing returned contains a value: a refused
+// line is named by its number only, because what looks like its name may be
+// part of a value.
+func CheckFile(b []byte) (names []string, problems []Problem) {
+	if len(b) > MaxBytes+4096 {
+		return nil, []Problem{{0, fmt.Sprintf("the file is larger than an env set may be (%d bytes of names and values)", MaxBytes)}}
+	}
+	if !utf8.Valid(b) {
+		return nil, []Problem{{0, "the file is not UTF-8 text"}}
+	}
+	s := strings.ReplaceAll(string(b), "\r\n", "\n")
+	seen := map[string]bool{}
+	line, size := 1, 0
+	for len(s) > 0 {
+		a := nextAssignment(s, line)
+		switch {
+		case a.why != "":
+			problems = append(problems, Problem{a.at, a.why})
+			if a.fatal {
+				problems = append(problems, Problem{0, fmt.Sprintf("nothing after line %d was checked", a.at)})
+				return names, problems
+			}
+		case a.ok && seen[a.name]:
+			problems = append(problems, Problem{line, "this name is already set on an earlier line"})
+		case a.ok && (len(a.value) > 8192 || strings.ContainsRune(a.value, 0)):
+			problems = append(problems, Problem{line, "the value is longer than 8192 bytes or holds a NUL byte"})
+		case a.ok:
+			seen[a.name] = true
+			names = append(names, a.name)
+			size += len(a.name) + len(a.value)
+		}
+		s, line = a.rest, a.next
+	}
+	if len(names) > 64 {
+		problems = append(problems, Problem{0, "more than 64 keys"})
+	}
+	if size > MaxBytes {
+		problems = append(problems, Problem{0, fmt.Sprintf("names and values together are larger than %d bytes", MaxBytes)})
+	}
+	return names, problems
 }
 
 // FileBytes renders the portable literal subset only: `checkout` refuses a

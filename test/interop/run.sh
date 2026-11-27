@@ -430,6 +430,7 @@ browser_key_scenario
 source "$ROOT/test/interop/vault.sh"
 source "$ROOT/test/interop/agentiface.sh"
 source "$ROOT/test/interop/sshkeys.sh"
+source "$ROOT/test/interop/proposals.sh"
 source "$ROOT/test/interop/envsets.sh"
 env_scenario
 echo "interop: ALL OK"

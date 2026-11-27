@@ -165,6 +165,11 @@ try {
     case 'env-ticket':{const cat=await api.catalogue();const host=cat.organisations.find((o:any)=>o.slug==='client-a').hosts.find((h:any)=>h.active&&h.class==='owner-device');console.log((await api.envPost('ticket',{path:'client-a/paas/staging',operation:args[0],enrollment:host.enrollment})).ticket);break}
     case 'env-decide':{const [action,mode,standing]=args; // approve|deny|revoke|commit MODE [STANDING-SECONDS]: "don't ask again" rides an approval
       for(let n=0;;n++){const state=await api.envState();const item=action==='commit'?state.drafts[0]:state.releases.find((r:any)=>r.mode===mode&&r.status===(action==='revoke'?'approved':'pending'));if(item){const env=await import(`${web}/src/envsets.ts`);if(standing&&!env.standingChoices(state.standing_caps?.[item.set]??0).includes(Number(standing)))throw Error('the card does not offer that duration');const review=await env.envReview(api,await api.sealStatus(),item,action,action==='approve'?300:0,new URL(origin).hostname,Number(standing??0));await review.tap(auth);break}if(n>=150)throw Error('no env decision queued');await Bun.sleep(100)}break}
+    case 'env-proposal':{const [action,path]=args; // commit|discard PATH: the owner's tap on a host's proposal through the web card's own review; prints the proposal
+      const env=await import(`${web}/src/envsets.ts`);
+      for(let n=0;;n++){const item=((await api.envState()) as any).proposals?.find((p:any)=>p.path===path&&p.status==='pending');
+        if(item){await (await env.envProposalReview(api,await api.sealStatus(),item,'proposal-'+action as any,new URL(origin).hostname)).tap(auth);console.log(JSON.stringify(item));break}
+        if(n>=150)throw Error('no proposal queued for '+path);await Bun.sleep(100)}break}
     case 'env-state': console.log(JSON.stringify(await api.envState()));break;
     case 'env-standing-revoke':{const env=await import(`${web}/src/envsets.ts`);const st=(await api.envState()).standing?.[0];if(!st)throw Error('no rule to revoke');await (await env.envStandingRevoke(api,await api.sealStatus(),st,new URL(origin).hostname)).tap(auth);break}
     case 'vault-secret': { // ORG/SERVICE/SLUG ENVNAME VALUEFILE [NOTE] [URL]: Add item → Secret, the value sealed in this process

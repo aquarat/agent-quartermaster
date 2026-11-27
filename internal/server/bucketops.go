@@ -244,19 +244,9 @@ func (s *Server) ensureSetBucket(ctx context.Context, q *store.Q, kind, set, org
 	if err == nil || !errors.Is(err, store.ErrNotFound) {
 		return row, err
 	}
-	sc, err := q.Scope(ctx, org)
-	if errors.Is(err, store.ErrNotFound) {
-		return row, errConflict("this organisation has no scope key yet: create the scope first (Security → Buckets)")
-	}
+	sc, err := s.writableScope(ctx, q, org)
 	if err != nil {
 		return row, err
-	}
-	// A new scope's only wrap was made with a page-supplied KEK: nothing is
-	// written into it until a passkey has opened it once (§7).
-	if ok, err := q.ScopeTested(ctx, org); err != nil {
-		return row, err
-	} else if !ok {
-		return row, errConflict("test the new scope first: no passkey has opened " + scopeName(ctx, q, org) + " yet (Security → Passkeys → Test)")
 	}
 	if err = s.insertBucket(ctx, q, sc, kind, set, nil); err != nil {
 		return row, err
@@ -264,12 +254,42 @@ func (s *Server) ensureSetBucket(ctx context.Context, q *store.Q, kind, set, org
 	return q.BucketByRef(ctx, kind, set)
 }
 
+// writableScope is the organisation's scope key when a first write may be
+// sealed under it.
+func (s *Server) writableScope(ctx context.Context, q *store.Q, org string) (store.ScopeRow, error) {
+	sc, err := q.Scope(ctx, org)
+	if errors.Is(err, store.ErrNotFound) {
+		return sc, errConflict("this organisation has no scope key yet: create the scope first (Security → Buckets)")
+	}
+	if err != nil {
+		return sc, err
+	}
+	// A new scope's only wrap was made with a page-supplied KEK: nothing is
+	// written into it until a passkey has opened it once (§7).
+	if ok, err := q.ScopeTested(ctx, org); err != nil {
+		return sc, err
+	} else if !ok {
+		return sc, errConflict("test the new scope first: no passkey has opened " + scopeName(ctx, q, org) + " yet (Security → Passkeys → Test)")
+	}
+	return sc, nil
+}
+
 // insertBucket creates a bucket in scope sc. With seal non-nil the caller
 // receives the new private key (rekey); otherwise it is wiped here.
 func (s *Server) insertBucket(ctx context.Context, q *store.Q, sc store.ScopeRow, kind, ref string, keep **seal.Key) error {
-	sk, pub, err := seal.NewKeyPair()
+	row, err := s.newBucket(sc, kind, ref, keep)
 	if err != nil {
 		return err
+	}
+	return q.InsertBucket(ctx, row)
+}
+
+// newBucket makes a bucket's row without storing it: a fresh key pair wrapped
+// to the scope's public key.
+func (s *Server) newBucket(sc store.ScopeRow, kind, ref string, keep **seal.Key) (store.BucketRow, error) {
+	sk, pub, err := seal.NewKeyPair()
+	if err != nil {
+		return store.BucketRow{}, err
 	}
 	id := seal.RandomID()
 	b := seal.Bucket{Installation: s.seal.installation, ID: id, Scope: sc.Scope, Kind: kind, Public: pub}
@@ -280,9 +300,9 @@ func (s *Server) insertBucket(ctx context.Context, q *store.Q, sc store.ScopeRow
 		sk.Destroy()
 	}
 	if err != nil {
-		return err
+		return store.BucketRow{}, err
 	}
-	return q.InsertBucket(ctx, store.BucketRow{ID: id[:], Scope: sc.Scope, Kind: kind, Ref: ref, Public: pub, Wrap: wrap, Created: s.now()})
+	return store.BucketRow{ID: id[:], Scope: sc.Scope, Kind: kind, Ref: ref, Public: pub, Wrap: wrap, Created: s.now()}, nil
 }
 
 // ---- env entry records (§3.2, §11) ----

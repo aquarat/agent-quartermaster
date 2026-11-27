@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +30,7 @@ var mcpVersions = []string{"2025-06-18", "2025-03-26", "2024-11-05"}
 const (
 	mcpMaxMessage  = 4 << 20
 	mcpMaxOutput   = 64 << 10
-	mcpInstruction = "aqmas brokers credentials for this host: SSH certificates, SSH keys, secrets and env sets, signatures. " +
+	mcpInstruction = "aqmas brokers credentials for this host: SSH certificates, SSH keys, secrets and env sets (to use, and to propose new values for), signatures. " +
 		"The host holds no long-lived credentials; ask through these tools. Tools that need the owner block until the owner approves with a passkey, denies, or the approval timeout passes; give a specific, honest `why`. " +
 		"Call aqmas_guide first."
 )
@@ -88,6 +89,15 @@ func mcpTools() []mcpTool {
 				"force":                    prop("boolean", "Overwrite an existing FILE.sig."),
 				"approval_timeout_seconds": propApprove,
 			}), call: mcpSign},
+		{Name: "aqmas_store_env", Description: "Ask the owner to store the values of a dotenv file in an env set (like `aqmas set import PATH --from FILE --why ...`). The import replaces the whole set. The file is checked on this host before anything is sent (problems are reported by line number, never by content); its values go to the broker over the mutual-TLS agent API, are sealed there on arrival and are stored only if the owner commits. The owner sees this host, the path, the key names that would be added, replaced and removed, and your why. With create, a set (and its service) that does not exist yet is created in an existing organisation. Returns the status, the Ref, the revision written and the key changes by name; never a value." + blocks,
+			InputSchema: schema([]string{"path", "file", "why"}, map[string]any{
+				"path":                     prop("string", "organisation/service/set of the env set to write (see aqmas_list_credentials)."),
+				"file":                     prop("string", "Absolute path of the dotenv file on this host: NAME=value lines, # comments, quoted values may span lines. It must be a regular file owned by this user and not writable by others."),
+				"why":                      propWhy,
+				"create":                   prop("boolean", "Create the set (and the service) when the path does not exist yet. Without it a missing path is an error, so a typo creates nothing."),
+				"title":                    prop("string", "With create: the new set's title (default: its name)."),
+				"approval_timeout_seconds": propApprove,
+			}), call: mcpStoreEnv},
 		{Name: "aqmas_with_ssh_key", Description: "Run a command on this host with an SSH key that stays in aqmas (like `aqmas ssh-agent PATH --why ... -- COMMAND`): git clone/fetch/push over SSH, ssh, scp, rsync -e ssh. The command gets SSH_AUTH_SOCK pointing at a private agent socket that offers exactly that key; each login is signed by the broker under one approved grant, and a grant that is still open is reused without asking. The command is started directly, without a shell; there is nobody to answer prompts, so pass options such as -o BatchMode=yes to ssh. Returns the exit code and the captured stdout and stderr (each truncated to 64 KiB). No tool hands out a private key." + blocks,
 			InputSchema: schema([]string{"path", "why", "command"}, map[string]any{
 				"path":                     prop("string", "organisation/service/key of an SSH key (kind ssh-key in aqmas_list_credentials, which also shows its public line)."),
@@ -630,6 +640,36 @@ func mcpSign(ctx context.Context, e *Env, raw json.RawMessage) (string, error) {
 		sigs[i] = f + ".sig"
 	}
 	return resultJSON(map[string]any{"signatures": sigs, "notes": notes})
+}
+
+func mcpStoreEnv(ctx context.Context, e *Env, raw json.RawMessage) (string, error) {
+	var a struct {
+		Path, File, Why, Title string
+		Create                 bool
+		Approval               int `json:"approval_timeout_seconds"`
+	}
+	if err := mcpArgs(raw, &a); err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(a.File) {
+		return "", &UsageError{Msg: "file must be an absolute path"}
+	}
+	var p envset.Proposal
+	err := approval(ctx, seconds(a.Approval, 600, 3600), func(actx context.Context) (err error) {
+		p, err = e.SetPropose(actx, SetOptions{Op: "import", Path: a.Path, From: a.File, Why: a.Why, Create: a.Create, Title: a.Title})
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	changes := map[string][]string{"add": {}, "replace": {}, "remove": {}}
+	for _, c := range strings.Split(p.Changes, ",") {
+		if name, kind, ok := strings.Cut(c, ":"); ok {
+			changes[kind] = append(changes[kind], name)
+		}
+	}
+	return resultJSON(map[string]any{"status": p.Status, "ref": p.Ref, "path": p.Path, "revision": p.Result, "changes": changes, "new_set": p.NewSet, "new_service": p.NewService,
+		"notes": strings.TrimSpace(e.Stderr.(*progressWriter).String())})
 }
 
 func mcpSSH(ctx context.Context, e *Env, raw json.RawMessage) (string, error) {

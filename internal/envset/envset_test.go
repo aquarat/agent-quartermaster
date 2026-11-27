@@ -92,3 +92,67 @@ func TestMergeEditAndQuotedDotenv(t *testing.T) {
 		t.Fatal("portable value refused")
 	}
 }
+
+// CheckFile and ParseFile are one scanner: a file has no problems exactly
+// when it imports, the names agree, and no problem repeats text of the file.
+func TestCheckFileAgreesWithParseFileAndNeverEchoes(t *testing.T) {
+	long := bytes.Repeat([]byte("x"), 8193)
+	many := ""
+	for i := 0; i < 65; i++ {
+		many += "APP_K" + string(rune('A'+i/26)) + string(rune('A'+i%26)) + "=v\n"
+	}
+	files := []string{
+		"", "\n\n", "# only a comment", "APP_TOKEN=sentinel\nAPP_URL=https://example.com/sentinel\n",
+		"APP_TOKEN='sentinel\nline two'\r\nAPP_ID=\n", "APP_TOKEN=\"sentinel\\n\\\"q\\\"\"  \n# c\nAPP_KEY=sentinel",
+		"PATH=sentinel", "sentinel", "SENTINEL=", "APP_TOKEN='sentinel", "APP_TOKEN=\"sentinel\\x\"", "APP_TOKEN='sentinel' trailing\nAPP_ID=ok",
+		"APP_TOKEN=\"sentinel\\", "APP_TOKEN=$(sentinel)", "APP_TOKEN=sentinel\nAPP_TOKEN=sentinel", "APP_TOKEN= sentinel", "APP_TOKEN=sentinel#x",
+		"DATABASE_HOST=sentinel\nAPP_OK=1\nnot an assignment sentinel\nAPP_OK=2\nLD_PRELOAD=sentinel\nAPP_LAST='sentinel\nsentinel'\n",
+		"APP_TOKEN=" + string(long), "APP_TOKEN='sentinel\x00'", many, "APP_TOKEN=\xff",
+	}
+	for i, f := range files {
+		entries, err := ParseFile([]byte(f))
+		names, problems := CheckFile([]byte(f))
+		if (err == nil) != (len(problems) == 0) {
+			t.Errorf("file %d: ParseFile %v, CheckFile %v", i, err, problems)
+		}
+		if err == nil {
+			got := make([]string, len(entries))
+			for j, e := range entries {
+				got[j] = e.Name
+			}
+			if !slices.Equal(got, names) {
+				t.Errorf("file %d: names %v, parsed %v", i, names, got)
+			}
+		}
+		for _, p := range problems {
+			if s := p.String(); bytes.Contains([]byte(s), []byte("sentinel")) || bytes.Contains([]byte(s), []byte("SENTINEL")) || bytes.Contains([]byte(s), []byte("DATABASE")) || p.Line < 0 {
+				t.Errorf("file %d: a problem repeats the file: %s", i, s)
+			}
+		}
+	}
+	// Every refused line is reported, with its own number, and the good keys are named.
+	names, problems := CheckFile([]byte(files[17]))
+	var lines []int
+	for _, p := range problems {
+		lines = append(lines, p.Line)
+	}
+	if !slices.Equal(names, []string{"APP_OK", "APP_LAST"}) || !slices.Equal(lines, []int{1, 3, 4, 5}) {
+		t.Fatalf("names %v, problem lines %v: %v", names, lines, problems)
+	}
+	// After an unclosed quote nothing more can be checked, and the report says so.
+	_, problems = CheckFile([]byte("APP_OK=1\nAPP_TOKEN='sentinel\nAPP_ID=2\n"))
+	if len(problems) != 2 || problems[0].Line != 2 || problems[1].Line != 0 {
+		t.Fatalf("unclosed quote: %v", problems)
+	}
+	// A refused line that holds a quote may open a value that runs on: nothing
+	// after it is read, so no later line's "name" (value text) is printed.
+	for _, f := range []string{"bad_name='x\nAPP_SECRET_KEY=hunter2\n'\nAPP_ID=1\n", "APP_OK=1\nexport APP_X=\"a\nAPP_SECRET_KEY=hunter2\n\"\n", "APP_A='a' 'b\nAPP_SECRET_KEY=hunter2\n'\n", "APP_A=it's\nAPP_SECRET_KEY=hunter2\n'\n"} {
+		names, problems := CheckFile([]byte(f))
+		if slices.Contains(names, "APP_SECRET_KEY") || slices.Contains(names, "APP_ID") || len(problems) != 2 || problems[1].Line != 0 || !bytes.Contains([]byte(problems[1].Why), []byte("nothing after line")) {
+			t.Errorf("%q: names %v problems %v", f, names, problems)
+		}
+		if _, err := ParseFile([]byte(f)); err == nil {
+			t.Errorf("%q imports", f)
+		}
+	}
+}

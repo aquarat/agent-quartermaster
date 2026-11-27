@@ -749,6 +749,12 @@ func TestSealRecoverBuckets(t *testing.T) {
 	v.s.Close()
 	v.cfg.Seal.Manifest = seal.Digest([]byte(manifest))
 	v.startMode(Options{})
+	// A host's proposal is waiting when the passkeys are lost.
+	res, err := v.s.store.DB().Exec(`INSERT INTO env_proposals(id,host,org_id,service_id,set_id,service_slug,set_slug,new_service,new_set,expires,status,metadata,payload,wrap) SELECT 'waiting-proposal',(SELECT min(id) FROM hosts),?,?,?,'paas','staging',0,0,?,'pending','{}',x'5b5d',x'00' WHERE EXISTS(SELECT 1 FROM hosts)`, vOrg, vService, vSet, v.clock.Now().Add(time.Hour).UnixMilli())
+	requireNoError(t, err)
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Fatal("no host to propose from")
+	}
 	// A standalone backup restored into a private directory.
 	dir := t.TempDir()
 	requireNoError(t, os.Mkdir(filepath.Join(dir, "ca"), 0700))
@@ -757,7 +763,7 @@ func TestSealRecoverBuckets(t *testing.T) {
 		requireNoError(t, err)
 		requireNoError(t, os.WriteFile(filepath.Join(dir, "ca", name), b, 0600))
 	}
-	_, err := v.s.store.DB().Exec(`VACUUM INTO ?`, DBPath(dir))
+	_, err = v.s.store.DB().Exec(`VACUUM INTO ?`, DBPath(dir))
 	requireNoError(t, err)
 	v.s.Close()
 	cfg := *v.cfg
@@ -844,6 +850,12 @@ func TestSealRecoverBuckets(t *testing.T) {
 	}
 	call("replace", begin.Session, map[string]any{"assertion": repl.Assert(sha256Bytes(final.Canonical))}, nil)
 	requireNoError(t, <-done)
+	// Recovery ends it and erases what it had sealed to the replaced keys.
+	var ended int
+	requireNoError(t, s.store.DB().QueryRow(`SELECT count(*) FROM env_proposals WHERE id='waiting-proposal' AND status='superseded' AND payload IS NULL AND bucket IS NULL`).Scan(&ended))
+	if ended != 1 {
+		t.Fatal("a pending proposal survived recovery")
+	}
 	next, err := os.ReadFile(filepath.Join(sock, "replacement-manifest.json"))
 	var nm BucketManifest
 	if err != nil || json.Unmarshal(next, &nm) != nil || nm.Format != 2 || !strings.Contains(string(next), "recovery_transition") {

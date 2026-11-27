@@ -63,9 +63,15 @@ func (s *Server) envAgentRoutes(m *http.ServeMux) {
 		}))
 	}
 	route("GET /v2/env/set", false, func(ctx context.Context, q *store.Q, r *http.Request, h *store.Host) (any, error) {
+		if r.URL.Query().Get("create") == "1" {
+			return s.envBase(ctx, q, h.ID, r.URL.Query().Get("path"))
+		}
 		return q.EnvBinding(ctx, h.ID, r.URL.Query().Get("path"), s.now())
 	})
 	route("POST /v2/env/upload", true, s.envUpload)
+	route("POST /v2/env/proposals", true, s.envPropose)
+	m.Handle("GET /v2/env/proposals/{id}", s.requireHost(s.envProposalPoll))
+	route("POST /v2/env/proposals/{id}/cancel", false, s.envProposalCancel)
 	route("POST /v2/env/requests", false, s.envRequest)
 	route("GET /v2/env/requests/{id}", false, func(ctx context.Context, q *store.Q, r *http.Request, h *store.Host) (any, error) {
 		return q.VisibleEnvRelease(ctx, h.ID, peerIP(r), r.PathValue("id"), false, s.now())
@@ -388,6 +394,7 @@ func (s *Server) envState(ctx context.Context, r *http.Request, sess string) (an
 	var drafts []envset.Draft
 	var releases []envset.Release
 	var standing []envset.Standing
+	var proposals []envset.Proposal
 	caps := map[string]int{}
 	err := s.store.Tx(ctx, func(q *store.Q) error {
 		pk, err := q.SessionPasskeyID(ctx, sess)
@@ -410,6 +417,9 @@ func (s *Server) envState(ctx context.Context, r *http.Request, sess string) (an
 		if standing, err = q.ActiveEnvStanding(ctx, 0, "", s.now()); err != nil {
 			return err
 		}
+		if proposals, err = q.PendingEnvProposals(ctx, s.now()); err != nil {
+			return err
+		}
 		// What each waiting card may offer: its set's "longest don't-ask-again".
 		for _, r := range releases {
 			if caps[r.Set], err = q.StandingCap(ctx, r.Set); err != nil {
@@ -418,7 +428,7 @@ func (s *Server) envState(ctx context.Context, r *http.Request, sess string) (an
 		}
 		return nil
 	})
-	return map[string]any{"drafts": drafts, "releases": releases, "standing": standing, "standing_caps": caps}, err
+	return map[string]any{"drafts": drafts, "releases": releases, "standing": standing, "standing_caps": caps, "proposals": proposals}, err
 }
 
 type envChoice struct {
@@ -454,6 +464,8 @@ func (s *Server) envReview(ctx context.Context, q *store.Q, sess string, pk int6
 		}
 		st.Uses = 0 // a use between review and tap does not change what is signed
 		return reviewJSON(st)
+	case "proposal-commit", "proposal-discard":
+		return s.reviewProposal(ctx, q, sess, pk, in)
 	case "commit", "discard":
 		x, err := q.EnvDraft(ctx, sess, in.ID, s.now())
 		if err != nil {
@@ -590,6 +602,16 @@ func (s *Server) envFinish(ctx context.Context, r *http.Request, sess string) (a
 			return errConflict("env proposal changed; review again")
 		}
 		switch m.Action {
+		case "proposal-commit":
+			if err = s.commitProposal(ctx, q, m.ID); err == nil {
+				// Proposals to create what this one just created end now, not
+				// at the next sweep: their hosts are waiting.
+				err = q.SweepEnv(ctx, s.now())
+			}
+		case "proposal-discard":
+			if err = q.EndEnvProposal(ctx, m.ID, "discarded", 0); err != nil {
+				err = errConflict("decision no longer available")
+			}
 		case "discard":
 			err = q.DeleteEnvDraft(ctx, m.ID, sess)
 		case "commit":
@@ -657,7 +679,11 @@ func (s *Server) allPending(ctx context.Context, q *store.Q, host int64, now tim
 			return 0, err
 		}
 		g, err := q.SignPending(ctx, host, now)
-		return n + e + g, err
+		if err != nil {
+			return 0, err
+		}
+		p, err := q.EnvProposalsPending(ctx, host, now)
+		return n + e + g + p, err
 	}
 	return n, err
 }

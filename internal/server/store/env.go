@@ -32,6 +32,9 @@ CREATE TRIGGER IF NOT EXISTS env_end_revision AFTER UPDATE ON credential_sets BE
 	if _, err = s.db.ExecContext(ctx, envStandingDDL); err != nil {
 		return err
 	}
+	if _, err = s.db.ExecContext(ctx, envProposalDDL); err != nil {
+		return err
+	}
 	// standing: the "don't ask again" rule that approved a release without a tap, if any.
 	for col, ddl := range map[string]string{"delivery": `TEXT CHECK(delivery IS NULL OR delivery='get')`, "standing": `TEXT`} {
 		var has int
@@ -58,6 +61,171 @@ CREATE TABLE IF NOT EXISTS set_standing(set_id TEXT PRIMARY KEY REFERENCES crede
 CREATE TRIGGER IF NOT EXISTS env_standing_end_admission AFTER UPDATE ON org_hosts BEGIN UPDATE env_standing SET revoked_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE revoked_at IS NULL AND host=NEW.host_id AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.org_id);END;
 CREATE TRIGGER IF NOT EXISTS env_standing_end_policy AFTER UPDATE ON organisations BEGIN UPDATE env_standing SET revoked_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE revoked_at IS NULL AND set_id IN(SELECT s.id FROM credential_sets s JOIN services v ON v.id=s.service_id WHERE v.org_id=NEW.id);END;
 CREATE TRIGGER IF NOT EXISTS env_standing_end_revision AFTER UPDATE ON credential_sets BEGIN UPDATE env_standing SET revoked_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE revoked_at IS NULL AND set_id=NEW.id;END;`
+
+// envProposalDDL (0.11.0): a host's request to store values, waiting for the
+// owner. A proposal is not bound to a web session (unlike a draft) and may
+// name a set or service that does not exist yet, so set_id and service_id are
+// not foreign keys. payload holds the sealed records; bucket holds, for a set
+// that has no bucket yet, the public material of the bucket it will get (the
+// bucket row itself is inserted at commit). Both are gone as soon as the
+// proposal is no longer pending, whatever ended it: the CHECK says so. The
+// triggers end a proposal on the events that delete drafts. A previous binary
+// ignores the table.
+const envProposalDDL = `CREATE TABLE IF NOT EXISTS env_proposals(id TEXT PRIMARY KEY,host INTEGER NOT NULL REFERENCES hosts(id),org_id TEXT NOT NULL REFERENCES organisations(id),service_id TEXT NOT NULL,set_id TEXT NOT NULL,service_slug TEXT NOT NULL,set_slug TEXT NOT NULL,new_service INTEGER NOT NULL CHECK(new_service IN (0,1)),new_set INTEGER NOT NULL CHECK(new_set IN (0,1)),expires INTEGER NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','committed','discarded','cancelled','expired','superseded')),result_revision INTEGER NOT NULL DEFAULT 0,metadata TEXT NOT NULL,payload BLOB,wrap BLOB,bucket TEXT,CHECK(status='pending' OR (payload IS NULL AND bucket IS NULL))) STRICT;
+CREATE INDEX IF NOT EXISTS env_proposals_by_host ON env_proposals(host,status);
+CREATE TRIGGER IF NOT EXISTS env_proposal_end_admission AFTER UPDATE ON org_hosts BEGIN UPDATE env_proposals SET status='superseded',payload=NULL,bucket=NULL WHERE status='pending' AND host=NEW.host_id AND org_id=NEW.org_id;END;
+CREATE TRIGGER IF NOT EXISTS env_proposal_end_policy AFTER UPDATE ON organisations BEGIN UPDATE env_proposals SET status='superseded',payload=NULL,bucket=NULL WHERE status='pending' AND org_id=NEW.id;END;
+CREATE TRIGGER IF NOT EXISTS env_proposal_end_revision AFTER UPDATE ON credential_sets BEGIN UPDATE env_proposals SET status='superseded',payload=NULL,bucket=NULL WHERE status='pending' AND set_id=NEW.id;END;`
+
+// StagedProposal is a proposal with what only the broker reads: the sealed
+// records, the bucket they are sealed to and, for a set without a bucket yet,
+// the bucket to insert at commit.
+type StagedProposal struct {
+	P                      envset.Proposal
+	Host                   int64
+	ServiceSlug, SetSlug   string
+	ServiceTitle, SetTitle string
+	Record                 CipherRecord
+	Bucket                 string
+}
+
+// proposalMeta is the metadata column: the proposal as the host made it, and
+// the titles a new service and set get (they are also in P.Title, joined).
+type proposalMeta struct {
+	P            envset.Proposal `json:"proposal"`
+	ServiceTitle string          `json:"service_title"`
+	SetTitle     string          `json:"set_title"`
+}
+
+func (q *Q) NewEnvProposal(ctx context.Context, x StagedProposal) error {
+	raw, err := json.Marshal(proposalMeta{x.P, x.ServiceTitle, x.SetTitle})
+	if err != nil {
+		return err
+	}
+	var bucket any
+	if x.Bucket != "" {
+		bucket = x.Bucket
+	}
+	return one(q.q.ExecContext(ctx, `INSERT INTO env_proposals(id,host,org_id,service_id,set_id,service_slug,set_slug,new_service,new_set,expires,status,metadata,payload,wrap,bucket) VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)`, x.P.ID, x.Host, x.P.Org, x.P.Service, x.P.Set, x.ServiceSlug, x.SetSlug, x.P.NewService, x.P.NewSet, x.P.Expires, string(raw), x.Record.Payload, x.Record.Wrap, bucket))
+}
+
+const envProposalCols = `metadata,host,service_slug,set_slug,status,result_revision,payload,wrap,coalesce(bucket,'') FROM env_proposals`
+
+func scanEnvProposal(row interface{ Scan(...any) error }) (x StagedProposal, err error) {
+	var raw, status string
+	var result int
+	if err = row.Scan(&raw, &x.Host, &x.ServiceSlug, &x.SetSlug, &status, &result, &x.Record.Payload, &x.Record.Wrap, &x.Bucket); err != nil {
+		return x, err
+	}
+	var m proposalMeta
+	if err = json.Unmarshal([]byte(raw), &m); err != nil {
+		return x, err
+	}
+	x.P, x.ServiceTitle, x.SetTitle = m.P, m.ServiceTitle, m.SetTitle
+	// The columns are what the triggers and decisions change.
+	x.P.Status, x.P.Result = status, result
+	return x, nil
+}
+
+// EnvProposal loads one proposal in any state.
+func (q *Q) EnvProposal(ctx context.Context, id string) (StagedProposal, error) {
+	x, err := scanEnvProposal(q.q.QueryRowContext(ctx, `SELECT `+envProposalCols+` WHERE id=?`, id))
+	return x, notFound(err)
+}
+
+// PendingEnvProposals lists what waits for the owner, oldest first.
+func (q *Q) PendingEnvProposals(ctx context.Context, now time.Time) ([]envset.Proposal, error) {
+	out := []envset.Proposal{}
+	err := q.rows(ctx, `SELECT `+envProposalCols+` WHERE status='pending' AND expires>? ORDER BY id`, func(rs *sql.Rows) error {
+		x, err := scanEnvProposal(rs)
+		out = append(out, x.P)
+		return err
+	}, ms(now))
+	return out, err
+}
+
+// EndEnvProposal moves a pending proposal to its final state and drops its
+// sealed records and bucket material in the same statement.
+func (q *Q) EndEnvProposal(ctx context.Context, id, status string, result int) error {
+	return one(q.q.ExecContext(ctx, `UPDATE env_proposals SET status=?,result_revision=?,payload=NULL,bucket=NULL WHERE id=? AND status='pending'`, status, result, id))
+}
+
+// EnvProposalsPending counts a host's proposals that wait for the owner.
+func (q *Q) EnvProposalsPending(ctx context.Context, host int64, now time.Time) (int, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, `SELECT count(*) FROM env_proposals WHERE host=? AND status='pending' AND expires>?`, host, ms(now)).Scan(&n)
+	return n, err
+}
+
+// sweepEnvProposals expires proposals (audited: nobody else records that the
+// owner never decided), supersedes those that would create a path or use an
+// ID somebody took since, and forgets ended ones after a day.
+func (q *Q) sweepEnvProposals(ctx context.Context, now time.Time) error {
+	type gone struct{ id, detail string }
+	var expired []gone
+	if err := q.rows(ctx, `UPDATE env_proposals SET status='expired',payload=NULL,bucket=NULL WHERE status='pending' AND expires<=? RETURNING id,json_extract(metadata,'$.proposal.path')||' host='||json_extract(metadata,'$.proposal.host')`, func(rs *sql.Rows) error {
+		var g gone
+		err := rs.Scan(&g.id, &g.detail)
+		expired = append(expired, g)
+		return err
+	}, ms(now)); err != nil {
+		return err
+	}
+	for _, g := range expired {
+		if err := q.Audit(ctx, now, "system", "env_proposal_expire", "proposal:"+g.id, g.detail); err != nil {
+			return err
+		}
+	}
+	if _, err := q.q.ExecContext(ctx, `UPDATE env_proposals SET status='superseded',payload=NULL,bucket=NULL WHERE status='pending' AND ((new_set AND EXISTS(SELECT 1 FROM credential_sets s WHERE s.id=env_proposals.set_id OR (s.service_id=env_proposals.service_id AND s.slug=env_proposals.set_slug))) OR (new_service AND EXISTS(SELECT 1 FROM services v WHERE v.id=env_proposals.service_id OR (v.org_id=env_proposals.org_id AND v.slug=env_proposals.service_slug))))`); err != nil {
+		return err
+	}
+	_, err := q.q.ExecContext(ctx, `DELETE FROM env_proposals WHERE status!='pending' AND expires<=?`, ms(now.Add(-24*time.Hour)))
+	return err
+}
+
+// SupersedeScopeProposals ends the pending proposals of an organisation whose
+// scope key is replaced: their records and bucket wraps are to the old keys.
+func (q *Q) SupersedeScopeProposals(ctx context.Context, scope string) error {
+	_, err := q.q.ExecContext(ctx, `UPDATE env_proposals SET status='superseded',payload=NULL,bucket=NULL WHERE status='pending' AND (org_id=?1 OR wrap IN (SELECT id FROM buckets WHERE scope=?1))`, scope)
+	return err
+}
+
+// EnvBase is what a set that does not exist yet would be bound to: the
+// host's admission to the organisation and, when the service exists, the
+// service. Set, Revision and Names are empty.
+type EnvBase struct {
+	envset.Binding
+	OrgTitle, ServiceTitle string
+	// ServiceBlocked: a service has the slug but cannot take an env set (it
+	// is archived or belongs to another provider).
+	ServiceBlocked bool
+}
+
+// EnvBase resolves org/service for a host admitted to the organisation;
+// ErrNotFound exactly where EnvBinding would hide the organisation.
+func (q *Q) EnvBase(ctx context.Context, host int64, org, service string, now time.Time) (EnvBase, error) {
+	var b EnvBase
+	err := q.q.QueryRowContext(ctx, `SELECT o.id,o.title,o.revision,a.generation,h.enrollment_id,h.name,e.class,p.default_seconds,p.soft_cap,p.indefinite,coalesce(v.id,''),coalesce(v.title,''),coalesce(v.revision,0),coalesce(v.archived OR v.provider!='application',0) FROM org_hosts a JOIN hosts h ON h.id=a.host_id JOIN enrollments e ON e.id=h.enrollment_id JOIN organisations o ON o.id=a.org_id JOIN org_policies p ON p.org_id=o.id AND p.revision=o.revision LEFT JOIN services v ON v.org_id=o.id AND v.slug=?1 WHERE h.id=?2 AND o.slug=?3 AND a.active AND NOT o.archived AND h.revoked_at IS NULL AND h.not_after>?4`, service, host, org, ms(now)).Scan(&b.Org, &b.OrgTitle, &b.PolicyRevision, &b.Generation, &b.Enrollment, &b.Host, &b.Class, &b.Default, &b.Soft, &b.Forever, &b.Service, &b.ServiceTitle, &b.ServiceRevision, &b.ServiceBlocked)
+	b.Names = []string{}
+	return b, notFound(err)
+}
+
+// ServiceIDFree reports whether no service has this ID.
+func (q *Q) ServiceIDFree(ctx context.Context, id string) (bool, error) {
+	var n int
+	err := q.q.QueryRowContext(ctx, `SELECT count(*) FROM services WHERE id=?`, id).Scan(&n)
+	return n == 0, err
+}
+
+// CreateEnvService and CreateEnvSet insert what a committed proposal asked
+// for, as the catalogue does (WriteCatalogue): an application service at
+// revision 1, an env set at revision 0.
+func (q *Q) CreateEnvService(ctx context.Context, id, org, slug, title string) error {
+	return one(q.q.ExecContext(ctx, `INSERT INTO services(id,org_id,slug,title,provider,revision) VALUES(?,?,?,?,'application',1)`, id, org, slug, title))
+}
+func (q *Q) CreateEnvSet(ctx context.Context, id, service, slug, title string) error {
+	return one(q.q.ExecContext(ctx, `INSERT INTO credential_sets(id,service_id,provider,slug,title,kind,revision) VALUES(?,?,'application',?,?,'env-set',0)`, id, service, slug, title))
+}
 
 const envStandingCols = `id,binding,mode,peer,max_ttl,created,expires,uses FROM env_standing`
 
@@ -203,8 +371,10 @@ func (q *Q) SweepEnv(ctx context.Context, now time.Time) error {
 	if _, err := q.q.ExecContext(ctx, `DELETE FROM env_drafts WHERE expires<=?`, ms(now)); err != nil {
 		return err
 	}
-	_, err := q.q.ExecContext(ctx, `UPDATE env_releases SET status='expired' WHERE (status='pending' AND deadline<=?1) OR (status='approved' AND until_ms<=?1)`, ms(now))
-	return err
+	if _, err := q.q.ExecContext(ctx, `UPDATE env_releases SET status='expired' WHERE (status='pending' AND deadline<=?1) OR (status='approved' AND until_ms<=?1)`, ms(now)); err != nil {
+		return err
+	}
+	return q.sweepEnvProposals(ctx, now)
 }
 func (q *Q) EnvBinding(ctx context.Context, host int64, path string, now time.Time) (envset.Binding, error) {
 	var b envset.Binding

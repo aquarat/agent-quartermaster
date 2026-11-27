@@ -366,6 +366,7 @@ flagged).
   | `aqmas_run` | `path, why, command[]`, optional `env, cwd, ttl_seconds, timeout_seconds, approval_timeout_seconds` | yes |
   | `aqmas_sign` | `path, why`, `files[]` or `digest`, optional `force, approval_timeout_seconds` | yes |
   | `aqmas_with_ssh_key` | `path, why, command[]`, optional `cwd, ttl_seconds, count, timeout_seconds, approval_timeout_seconds`: the command runs with the agent socket of `aqmas ssh-agent` | unless a login grant for the key is still open |
+  | `aqmas_store_env` | `path, file, why`, optional `create, title, approval_timeout_seconds`: an import proposal ("Env proposals") | yes |
   | `aqmas_ssh_exec` | `target, why, command`, optional `ttl_seconds, timeout_seconds, approval_timeout_seconds` | unless a cached certificate or auto-approval covers it |
 
   A tool that needs the owner blocks until the decision or `approval_timeout_seconds`
@@ -1098,8 +1099,9 @@ not recalled by closing a window. A window click is not a passkey signature.
 The sealed runtime resolves `GET /v2/env/set?path=org/service/set` only for
 the authenticated host's current admission. Vault (an env set's “More”)
 issues a one-use, five-minute upload ticket bound to session, enrolled
-owner-device, operation, immutable path IDs and base revision. Enter the
-ticket at the CLI prompt (`--ticket-fd N` for a protected input stream).
+owner-device, operation, immutable path IDs and base revision. Give the
+ticket to the CLI with `--ticket` (hidden prompt) or `--ticket-fd N` (a
+protected input stream); without either the edit is a proposal (next section).
 `aqmas set import PATH --from FILE` replaces the **entire** set. `set put PATH
 KEY` reads a hidden prompt or exact stdin bytes; `set unset PATH KEY` removes
 one key. Imports accept UTF-8 literal assignments, whole-line comments and
@@ -1218,6 +1220,154 @@ and the public WebAuthn verification fields when signed authenticator data
 has no extensions. When it carries extensions, audit records that the opener
 was verified live; the assertion cannot later be independently reverified
 from the audit alone. No PRF/KEK or decrypted finish packet is persisted.
+
+# Env proposals: a host asks to store values (0.11.0)
+
+Until 0.11.0 only an enrolled **owner device** could write env values from the CLI, with a
+one-use upload ticket copied from the Vault. A **proposal** lets any host admitted to an
+organisation ask to store values; the owner sees an ordinary approval card and commits or
+discards it with one tap. The ticket flow stays for owner devices (`--ticket-fd FD`, or
+`--ticket` for the hidden prompt).
+
+**What a host may propose.** `import` (replaces the whole set), `put` (one key) or `unset`
+(one key) on an existing `env-set` of an organisation the host is admitted to, at the set's
+current revision; secrets are refused as in the ticket flow ("a secret is replaced in the
+Vault"), and so is an edit that changes nothing. With `create`, `import` or `put` may also name
+a set that does not exist yet, and a service that does not exist yet, inside an existing
+organisation that has a tested scope key; the host chooses the new IDs (32 lowercase hex, like
+the Vault form), slugs follow the usual name rules and the title rules of the catalogue. The one
+`title` is the new set's (default: its slug); a new service takes its slug as its title. A new
+organisation is never proposed.
+
+**Values.** As in the ticket flow, the CLI computes the edit commitment
+(`aqmas-env-edit-v1`, see "Env sets" above; for a new set over the IDs it chose, base revision
+0) and the server recomputes it, seals each entry to the set's bucket at once (nothing is
+opened) and keeps no plaintext. A set that has no bucket yet (a new set, or one never written)
+gets the bucket it will have: its key pair is made when the proposal arrives, and its public
+half and the wrap of the private half to the organisation's scope key wait **in the proposal
+row**; the bucket row is inserted at commit. The sealed entries and that bucket material are
+erased in the same statement that ends a proposal, whatever ends it (a CHECK on the table says
+so), so a discarded, cancelled, expired or superseded proposal leaves no bucket, sealed record,
+service or set row behind. The row itself (metadata only) is forgotten a day after it expired.
+
+**Host API** (sealed runtime, like the other `/v2/env` routes; metadata only, never values):
+
+* `GET /v2/env/set?path=P&create=1` → the set's Binding when it exists, exactly as without
+  `create`; otherwise the **base** of a set to be created at P: the Binding the host would have
+  (`org`, policy and admission fields, `host`, `class`), `service` and `service_revision` of the
+  service when it exists (else `""` and 0), `set` `""`, `revision` 0, `names` `[]`, `title`
+  "Organisation / Service". The CLI needs it to compute the commitment over the real service
+  ID. 404 when the host is not admitted to the organisation, 409 when the path cannot be
+  created (the service is archived or not an application service, or another kind of item has
+  the name). Accepted trade-off: an admitted host can tell from these answers (and from the
+  409s of the POST) whether a service or set name exists in its own organisation, also while
+  the organisation's listing is off. Organisations it is not admitted to stay 404.
+* `POST /v2/env/proposals` body
+  `{"path","reason","edit":{operation,salt,entries},"commitment","create":null|{"service_id":""|HEX32,"set_id":HEX32,"title":""}}`
+  → a Proposal, status `pending`. `reason` is required (the `--why`, 1-500 characters, one
+  line, shown as unverified). `create.service_id` is empty when the service exists. Errors: 404
+  for a path the host may not see (as `GET /v2/env/set`; also a missing set without `create`),
+  409 for an existing path given with `create`, a taken ID, a `service_id` for a service that
+  exists, or an organisation that cannot take a first write yet (no scope key, or an untested
+  one), 400 for a bad commitment, operation, name, ID, title or reason, a secret, an edit
+  that changes nothing, a `put` of an empty value (a ticket upload may still store one), or a
+  result that would not fit an env set (64 keys, 8192 bytes a value, 24 KiB together; checked
+  against the set as it is, so a `put` onto a full set is refused at once), 429 when the host
+  already has five things pending (proposals count with requests, env releases and signing
+  requests). The request body is limited to 64 KiB like every agent route; a set near its
+  24 KiB limit whose values need heavy JSON escaping may not fit in one import.
+* `GET /v2/env/proposals/{id}[?wait=SECONDS]` → the Proposal (long-poll like
+  `GET /v1/requests/{id}`: it answers as soon as the proposal is no longer pending), only to
+  the proposing host at the address it proposed from; 404 otherwise. The host can read the
+  outcome even after its admission ended. The poll only reads: a pending proposal past
+  `expires_at` is answered as `expired` at once, and the sweeper (every 15 s) and the write
+  paths persist that and end proposals whose path or ID was taken.
+* `POST /v2/env/proposals/{id}/cancel` → the Proposal, status `cancelled` (pending only; 409
+  afterwards).
+
+**Proposal** (JSON; `envset.Proposal` / web `EnvProposal`; 29 keys, always all of them, in this
+order): every field of a Binding (`path, title, org, service, set, revision, service_revision,
+policy_revision, admission_generation, enrollment, host, class, names, default_seconds,
+soft_cap_seconds, offers_indefinite`; for a new set `set` is the proposed ID, `revision` 0,
+`names` `[]` and `title` "Organisation / Service / Set title"; for a new service `service` is
+the proposed ID and `service_revision` 0), then `id` (a request ID like a release's), `ref`
+(its last six characters in capitals, the same Ref the CLI prints), `operation`, `commitment`,
+`changes` (as a draft: `NAME:add`, `NAME:replace`, `NAME:remove`, comma-separated), `reason`,
+`address` (peer IP), `new_service`, `new_set` (booleans), `status` (`pending`, `committed`,
+`discarded`, `cancelled`, `expired`, `superseded`), `created_at`, `expires_at` (ms; ten minutes
+after creation), `result_revision` (the revision written, when `committed`; else 0).
+
+`superseded`: the host's enrolment was revoked, the set's revision, the host's admission or the organisation's policy changed
+(the triggers that delete drafts; committing one proposal supersedes the set's others), the
+organisation's scope key was replaced (rekey, recovery), or for `create` the path or an ID was
+taken, before the owner decided. The CLI exits 4 for `expired` and `superseded`, 3 for
+`discarded`, 130 after `cancelled` by itself, 0 for `committed`.
+
+**Owner side.** `GET /api/ui/seal/env/state` gains `proposals` (pending ones, oldest first).
+Decisions use the env challenge/finish pair with `{"id": PROPOSAL, "action": "proposal-commit" |
+"proposal-discard", "ttl_seconds": 0}` (no `standing_seconds`); the signed metadata is the
+complete Proposal, as JSON with the keys in the order above, with `reason` blank (it is
+untrusted). The signer must be an approver of the proposal's organisation. Every decision is a
+fresh individual tap that opens no bucket: no approval window or batch approves a proposal (a
+proposal is not a `/v1` request, which is all those paths decide). A commit is offered and
+applied only while the binding re-derived from the store equals the proposal's (and for `create`
+while the path and IDs are still free; 409 otherwise, also between challenge and finish). The
+challenge runs every check of the commit, so the owner is not asked to tap for a commit that
+would fail: also 409 when the set got a bucket since, the scope key changed, or the merged
+result no longer fits an env set. The commit
+creates the service (revision 1) and set when asked, inserts the set's bucket when the proposal
+carried it, and publishes the next revision exactly as a committed draft; the CLI then reads
+`committed` and `result_revision`. New proposals send the usual notification. Audit:
+`env_proposal` (host; object `proposal:ID`, detail starting with the path: operation, set ID,
+`new_service`, `new_set`, commitment, changes, address), `env_proposal_commit`,
+`env_proposal_discard` (owner; object `env:ID`, with passkey and canonical),
+`env_proposal_cancel` (host), `env_proposal_expire` (system).
+
+**The card** says, in the owner's words: which host (and address) wants to store values in
+which path; whether it creates the service and/or set; the operation, with `import` stated as
+replacing the whole set; the key changes by name (added, replaced, removed); that the values
+were chosen by that host and become what every later request for the set receives; the
+commitment and Ref to compare with the CLI; the reason, marked unverified; when it expires.
+
+**CLI.**
+
+* `aqmas set import PATH --from FILE --why REASON [--create [--title TITLE]]`,
+  `aqmas set put PATH KEY --why REASON [--create [--title TITLE]]` (value from a hidden prompt,
+  or exact stdin bytes when stdin is not a terminal), `aqmas set unset PATH KEY --why REASON`:
+  without a ticket option these make a proposal, print the Ref, the commitment and the key
+  changes (names only) to stderr, and wait for the owner like any request (Ctrl-C cancels).
+  Once the broker has accepted the proposal, the CLI never leaves it silently: the Ref is
+  printed first; an answer that is not the edit it sent, or any error while waiting, withdraws
+  the proposal (exit 1, or the error's own code); an unreachable broker or a 5xx is retried
+  with backoff until `expires_at`, then withdrawn (exit 5); and when the withdrawal itself
+  fails, stderr says "proposal REF could not be withdrawn and may still be committed by the
+  owner until HH:MM" with what to check (or that it was committed meanwhile, when the broker
+  says so). An empty `put` value is refused before anything is sent.
+  `--create` is needed to create a missing set or service, so a typo never creates one (without
+  it a missing path is exit 1 with a hint); given for a set that exists, it proposes the edit to
+  that set and creates nothing. The title defaults to the set's slug. The file is read and
+  checked (as `set check`) before the enrolment is loaded or anything is sent; a file that would
+  not import is exit 1 with every problem on stderr.
+* `--ticket` (hidden prompt) or `--ticket-fd FD` instead of `--why`: the owner-device ticket
+  flow of the previous section. `--create` and `--why` are refused with a ticket option.
+* `aqmas set check --from FILE [PATH]`: validates FILE against the import rules locally and
+  prints the key names of the lines that would import to stdout, one per line, and each problem
+  to stderr as `line N: reason` (the reason is fixed text; neither a value nor the name on a
+  refused line is printed, because what looks like a name there may be part of a value). After a
+  quoted value that is never closed, a bad escape inside one, or any refused line that holds a
+  quote character (it may open a value that runs on), nothing further is checked or named and
+  the report says so. With PATH it also prints what an import would do, one `add NAME`,
+  `replace NAME` or `remove NAME` per line (from the set's metadata; for a path that does not
+  exist, every key is an `add` and stderr says that `--create` would propose it). Exit 0 when
+  the file would import, 1 when not. FILE must be a regular file owned by the user, not writable
+  by others (as for an import).
+* `aqmas set`, `aqmas set OP` with `--help`, `-h` or `help` print the set usage and exit 0; a
+  usage error names what is missing ("set import needs --from FILE").
+* MCP tool `aqmas_store_env` `{path, file, why, create?, title?, approval_timeout_seconds?}`:
+  an import proposal of FILE (an absolute path); blocks like the other owner tools and returns
+  `{status, ref, path, revision, changes: {add, replace, remove}, new_set, new_service, notes}`;
+  never a value. A discarded, expired or superseded proposal is a tool error with the CLI's
+  exit code.
 
 # Vault: web form, reveal, signer sets, SSH keys and the bin
 

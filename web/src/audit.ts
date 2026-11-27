@@ -77,6 +77,11 @@ const KNOWN: Record<string, EventInfo> = {
   env_deny: { kind: "deny", label: "Env release denied", groups: ["decisions"] },
   env_revoke: { kind: "revoke", label: "Env release revoked", groups: ["decisions"] },
   env_commit: { kind: "system", label: "Values saved (CLI)", groups: ["decisions"] },
+  env_proposal: { kind: "request", label: "Host asked to store values", groups: ["requests"] },
+  env_proposal_commit: { kind: "approve", label: "Proposed values committed", groups: ["decisions"] },
+  env_proposal_discard: { kind: "deny", label: "Proposed values discarded", groups: ["decisions"] },
+  env_proposal_cancel: { kind: "system", label: "Proposal cancelled by the host", groups: ["requests"] },
+  env_proposal_expire: { kind: "system", label: "Proposal expired", groups: ["requests"] },
   env_collect_run: { kind: "token", label: "Values delivered", groups: ["requests"] },
   env_collect_process: { kind: "token", label: "Values delivered (run)", groups: ["requests"] },
   env_collect_file: { kind: "token", label: "Values delivered (file)", groups: ["requests"] },
@@ -191,7 +196,7 @@ export function objectRef(o: string): ObjectRef {
 /** Does the detail text carry requester-influenced strings (host names, enroll notes...)? */
 export function detailUntrusted(e: AuditEntry): boolean {
   if (!e.detail) return false;
-  return e.actor.startsWith("host:") || /^(request|enrollment|host|grant|standing):/.test(e.object) || e.action === "enroll_request";
+  return e.actor.startsWith("host:") || /^(request|enrollment|host|grant|standing|proposal):/.test(e.object) || e.action === "enroll_request";
 }
 
 export interface DayGroup {
