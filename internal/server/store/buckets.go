@@ -468,10 +468,13 @@ func (q *Q) RekeySigner(ctx context.Context, set string, payload, wrap []byte) e
 	return one(q.q.ExecContext(ctx, `UPDATE signer_keys SET payload=?,wrap=? WHERE set_id=?`, payload, wrap, set))
 }
 
-// DropScopeDrafts deletes every env draft of the sets in a scope (rekey).
+// DropScopeDrafts deletes every env draft of the sets in a scope (rekey) and
+// ends the pending proposals sealed under it.
 func (q *Q) DropScopeDrafts(ctx context.Context, scope string) error {
-	_, err := q.q.ExecContext(ctx, `DELETE FROM env_drafts WHERE set_id IN (SELECT ref FROM buckets WHERE scope=? AND kind='env-set') OR wrap IN (SELECT id FROM buckets WHERE scope=?)`, scope, scope)
-	return err
+	if _, err := q.q.ExecContext(ctx, `DELETE FROM env_drafts WHERE set_id IN (SELECT ref FROM buckets WHERE scope=? AND kind='env-set') OR wrap IN (SELECT id FROM buckets WHERE scope=?)`, scope, scope); err != nil {
+		return err
+	}
+	return q.SupersedeScopeProposals(ctx, scope)
 }
 
 // DeletePasskeyScopeWraps removes one passkey's wraps of these scopes, or all (disable).
