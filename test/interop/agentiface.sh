@@ -10,7 +10,7 @@ agent_iface_scenario() {
   # The guide is in the CLI itself, for people and for programs.
   "$AQMAS" guide >"$w/guide.md"
   grep -q 'aqmas run' "$w/guide.md" && grep -q 'claude mcp add aqmas -- aqmas mcp' "$w/guide.md" && grep -q 'not_admitted' "$w/guide.md" || fail 'aqmas guide lacks the essentials'
-  "$AQMAS" guide --json | bun -e 'const g=await Bun.stdin.json(); if(!g.commands.some(c=>c.name==="get")||!g.exit_codes["3"]||g.mcp.tools.length!==8||!g.commands.some(c=>c.name==="ssh-agent"))process.exit(1)' || fail 'aqmas guide --json'
+  "$AQMAS" guide --json | bun -e 'const g=await Bun.stdin.json(); if(!g.commands.some(c=>c.name==="get")||!g.exit_codes["3"]||g.mcp.tools.length!==9||!g.commands.some(c=>c.name==="ssh-agent"))process.exit(1)' || fail 'aqmas guide --json'
   "$AQMAS" help | grep -q 'aqmas guide' || fail 'aqmas help does not point to the guide'
 
   # Discovery is off until the owner turns it on, per organisation.
@@ -74,7 +74,7 @@ agent_iface_scenario() {
   SUM="$sum" SECRET_PATH="$path" bun -e 'const by={}; for (const l of (await Bun.file(process.argv[1]).text()).trim().split("\n")) { const m=JSON.parse(l); if(m.jsonrpc!=="2.0")process.exit(2); if(m.id!==undefined)by[m.id]=m }
     const text=(id)=>{ if(by[id].error||by[id].result.isError)throw Error(JSON.stringify(by[id])); return by[id].result.content[0].text };
     const names=by[2].result.tools.map(t=>t.name).sort().join();
-    if(by[1].result.protocolVersion!=="2025-06-18"||by[1].result.serverInfo.name!=="aqmas"||names!=="aqmas_guide,aqmas_list_credentials,aqmas_list_targets,aqmas_run,aqmas_sign,aqmas_ssh_exec,aqmas_status,aqmas_with_ssh_key")process.exit(3);
+    if(by[1].result.protocolVersion!=="2025-06-18"||by[1].result.serverInfo.name!=="aqmas"||names!=="aqmas_guide,aqmas_list_credentials,aqmas_list_targets,aqmas_run,aqmas_sign,aqmas_ssh_exec,aqmas_status,aqmas_store_env,aqmas_with_ssh_key")process.exit(3);
     const creds=JSON.parse(text(3)).credentials; if(!creds.some(c=>c.path===process.env.SECRET_PATH&&c.kind==="secret"&&c.env==="TAILNET_API_KEY"))process.exit(4);
     if(!JSON.parse(text(4)).targets.some(t=>t.name==="testhost"))process.exit(5);
     const run=JSON.parse(text(5)); if(run.exit_code!==0||run.stdout.trim()!==process.env.SUM)process.exit(6);' "$T/iface-mcp.out" || fail "MCP session: $(cat "$T/iface-mcp.out")"

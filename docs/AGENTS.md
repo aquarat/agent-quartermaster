@@ -286,7 +286,8 @@ or, for any client that reads an `mcpServers` map:
 ```
 
 Tools: `aqmas_guide` (this text), `aqmas_status`, `aqmas_list_credentials`,
-`aqmas_list_targets`, `aqmas_run`, `aqmas_sign`, `aqmas_with_ssh_key`, `aqmas_ssh_exec`.
+`aqmas_list_targets`, `aqmas_run`, `aqmas_sign`, `aqmas_with_ssh_key`, `aqmas_ssh_exec`,
+`aqmas_store_env`.
 The tools that need the owner (`aqmas_run`, `aqmas_sign`, `aqmas_with_ssh_key`,
 `aqmas_ssh_exec`) **block until the owner decides** or
 the tool's `approval_timeout_seconds` passes; they take a required `why`. There is no tool

@@ -165,6 +165,15 @@ try {
     case 'env-ticket':{const cat=await api.catalogue();const host=cat.organisations.find((o:any)=>o.slug==='client-a').hosts.find((h:any)=>h.active&&h.class==='owner-device');console.log((await api.envPost('ticket',{path:'client-a/paas/staging',operation:args[0],enrollment:host.enrollment})).ticket);break}
     case 'env-decide':{const [action,mode,standing]=args; // approve|deny|revoke|commit MODE [STANDING-SECONDS]: "don't ask again" rides an approval
       for(let n=0;;n++){const state=await api.envState();const item=action==='commit'?state.drafts[0]:state.releases.find((r:any)=>r.mode===mode&&r.status===(action==='revoke'?'approved':'pending'));if(item){const env=await import(`${web}/src/envsets.ts`);if(standing&&!env.standingChoices(state.standing_caps?.[item.set]??0).includes(Number(standing)))throw Error('the card does not offer that duration');const review=await env.envReview(api,await api.sealStatus(),item,action,action==='approve'?300:0,new URL(origin).hostname,Number(standing??0));await review.tap(auth);break}if(n>=150)throw Error('no env decision queued');await Bun.sleep(100)}break}
+    case 'env-proposal':{const [action,path]=args; // commit|discard PATH: the owner's tap on a host's proposal; prints the proposal as the card had it
+      const keys=['path','title','org','service','set','revision','service_revision','policy_revision','admission_generation','enrollment','host','class','names','default_seconds','soft_cap_seconds','offers_indefinite','id','ref','operation','commitment','changes','reason','address','new_service','new_set','status','created_at','expires_at','result_revision'];
+      for(let n=0;;n++){const item=((await api.envState()) as any).proposals?.find((p:any)=>p.path===path&&p.status==='pending');
+        if(item){if(Object.keys(item).length!==keys.length||!keys.every(k=>Object.hasOwn(item,k)))throw Error('unknown or incomplete proposal');
+          const v=await api.sealStatus(),act='proposal-'+action,metadata=JSON.stringify({...item,reason:''},keys);
+          const b:any=await api.envPost('challenge',{id:item.id,action:act,ttl_seconds:0});
+          const tap=await (await import(`${web}/src/review.ts`)).checkTap(b,{v:3,object:'env',action:act,id:item.id,installation:v.installation,epoch:v.epoch,metadata,ttl_seconds:0},new URL(origin).hostname,{allowOpen:false});
+          await api.envPost('finish',{challenge_id:b.challenge_id,...(await tap.sign(auth))});console.log(JSON.stringify(item));break}
+        if(n>=150)throw Error('no proposal queued for '+path);await Bun.sleep(100)}break}
     case 'env-state': console.log(JSON.stringify(await api.envState()));break;
     case 'env-standing-revoke':{const env=await import(`${web}/src/envsets.ts`);const st=(await api.envState()).standing?.[0];if(!st)throw Error('no rule to revoke');await (await env.envStandingRevoke(api,await api.sealStatus(),st,new URL(origin).hostname)).tap(auth);break}
     case 'vault-secret': { // ORG/SERVICE/SLUG ENVNAME VALUEFILE [NOTE] [URL]: Add item → Secret, the value sealed in this process
