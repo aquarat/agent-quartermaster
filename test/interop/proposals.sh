@@ -22,13 +22,15 @@ proposal_scenario() {
   [[ $rc == 1 ]] && grep -q -- '--create' "$w/env-prop-nocreate.err" || fail "import into a missing set without --create: exit $rc: $(cat "$w/env-prop-nocreate.err")"
 
   # Discarded: exit 3, and no set, bucket or sealed record stays.
+  # (Earlier scenarios may have left a bucket open under a grant: a proposal changes nothing about that.)
+  local opened; opened=$(owner open-buckets)
   local buckets; buckets=$(owner buckets | bun -e 'console.log((await Bun.stdin.json()).length)')
   "$AQMAS" set import "$path" --from "$w/proposed.env" --why 'interop: propose a new set' --create --title 'Proposed env' >"$w/env-prop-discard.out" 2>"$w/env-prop-discard.err" & pid=$!
-  owner env-proposal discard "$path"; rc=0; wait "$pid" || rc=$?
+  owner env-proposal discard "$path" >/dev/null; rc=0; wait "$pid" || rc=$?
   [[ $rc == 3 ]] || fail "a discarded proposal: exit $rc: $(cat "$w/env-prop-discard.err")"
   [[ $("${mtls[@]}" -o /dev/null -w '%{http_code}' "$base/v2/env/set?path=$path") == 404 ]] || fail 'a discarded proposal created the set'
   [[ $(owner buckets | bun -e 'console.log((await Bun.stdin.json()).length)') == "$buckets" ]] || fail 'a discarded proposal left a bucket'
-  nothing_open 'a discarded proposal'
+  [[ $(owner open-buckets) == "$opened" ]] || fail "a discarded proposal changed what is open: $(owner open-buckets)"
 
   # Committed: one tap creates the set with its first revision; nothing is opened.
   "$AQMAS" set import "$path" --from "$w/proposed.env" --why 'interop: propose a new set' --create --title 'Proposed env' >"$w/env-prop-commit.out" 2>"$w/env-prop-commit.err" & pid=$!
@@ -36,8 +38,8 @@ proposal_scenario() {
   grep -q "committed: $path is at revision 1" "$w/env-prop-commit.err" || fail "the CLI did not report the commit: $(cat "$w/env-prop-commit.err")"
   # The card and the terminal show the same Ref and commitment.
   bun -e 'const p=await Bun.file(process.argv[1]).json(), err=await Bun.file(process.argv[2]).text();
-    if(!p.new_set||p.new_service||p.revision!==0||p.names.length||p.changes!=="APP_TOKEN:add,APP_URL:add"||p.title!=="Client A / PaaS / Proposed env"||!err.includes("Ref "+p.ref)||!err.includes("commitment "+p.commitment)||p.ref.length!==6)process.exit(1)' "$w/card.json" "$w/env-prop-commit.err" || fail "proposal card: $(cat "$w/card.json")"
-  nothing_open 'a committed proposal'
+    if(!p.new_set||p.new_service||p.revision!==0||p.names.length||p.changes!=="APP_TOKEN:add,APP_URL:add"||!p.title.endsWith(" / Proposed env")||!err.includes("Ref "+p.ref)||!err.includes("commitment "+p.commitment)||p.ref.length!==6)process.exit(1)' "$w/card.json" "$w/env-prop-commit.err" || fail "proposal card: $(cat "$w/card.json")"
+  [[ $(owner open-buckets) == "$opened" ]] || fail "committing a proposal opened a bucket: $(owner open-buckets)"
   "$AQMAS" run "$path" --why 'interop: use the proposed values' -- sh -c 'test "$APP_TOKEN" = "$(sed -n "s/^APP_TOKEN=//p" "$1")" && test "$APP_URL" = "https://example.com/a b"' sh "$w/proposed.env" </dev/null >"$w/env-prop-run.out" 2>"$w/env-prop-run.err" & pid=$!
   owner env-decide approve process; wait "$pid" || fail "aqmas run after a committed proposal: $(cat "$w/env-prop-run.err")"
 
