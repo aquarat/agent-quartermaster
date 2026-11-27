@@ -48,20 +48,25 @@ func commandUsage(cmd string) (string, bool) {
 }
 
 // wantsHelp reports whether args (the words after the command) ask for its help: a first
-// word "help", or --help / -h anywhere before "--" (after it they belong to COMMAND).
+// word help, -h or --help, or -h / --help as the last word before "--" (or the end) when the
+// word before it is not a flag. So "aqmas run P --why --help -- cmd" is not help: there
+// --help may be the value of --why, and the command is parsed (and refused) as written.
 func wantsHelp(args []string) bool {
-	if len(args) > 0 && args[0] == "help" {
+	if len(args) > 0 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
 		return true
 	}
-	for _, a := range args {
+	end := len(args)
+	for i, a := range args {
 		if a == "--" {
-			return false
-		}
-		if a == "--help" || a == "-h" {
-			return true
+			end = i
+			break
 		}
 	}
-	return false
+	if end == 0 {
+		return false
+	}
+	last := args[end-1]
+	return end >= 2 && (last == "--help" || last == "-h") && !strings.HasPrefix(args[end-2], "-")
 }
 
 // usageHint is appended to a usage error's message.
@@ -73,7 +78,7 @@ func usageHint() string {
 		return " (see: aqmas cf help)"
 	}
 	if helpCommand == "set" {
-		return " (see: aqmas set --help)"
+		return "" // set's own usage errors already say where to look
 	}
 	return " (see: aqmas help)"
 }

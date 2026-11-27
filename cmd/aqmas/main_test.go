@@ -80,7 +80,7 @@ func TestCommandHelp(t *testing.T) {
 	if _, ok := commandUsage("bogus"); ok {
 		t.Error("help for an unknown command")
 	}
-	for args, want := range map[string]bool{"--help": true, "x -h": true, "help": true, "x --why y": false, "x -- cmd --help": false, "x -- -h": false, "": false} {
+	for args, want := range map[string]bool{"--help": true, "-h": true, "x -h": true, "help": true, "x --help -- cmd": true, "x --why y": false, "x -- cmd --help": false, "x -- -h": false, "": false, "x --why --help -- cmd": false, "x --why -h": false, "x --fresh --help": false} {
 		if got := wantsHelp(strings.Fields(args)); got != want {
 			t.Errorf("wantsHelp(%q) = %v", args, got)
 		}
