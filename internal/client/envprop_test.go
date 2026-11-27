@@ -26,6 +26,12 @@ type fakeProps struct {
 	polls     int
 	cancelled []string
 	gets      int // GET /v2/env/set?create=1
+	// Faults: a POST answered with another commitment, polls answered 503 (that
+	// many, or all with -1), a cancel that fails, and a short life.
+	tamper     bool
+	pollFail   int
+	cancelFail bool
+	ttl        time.Duration
 }
 
 // proposalBase: organisation "acme" exists with the service "billing".
@@ -80,7 +86,16 @@ func (f *fakeServer) setupProposals(mux *http.ServeMux) {
 		now := time.Now()
 		p := &envset.Proposal{Binding: b, ID: id, Ref: RefCode(id), Operation: in.Edit.Op, Commitment: commit, Changes: changes, Reason: in.Reason, Peer: "127.0.0.1",
 			NewService: in.Create != nil && in.Create.ServiceID != "", NewSet: in.Create != nil, Status: "pending", Created: now.UnixMilli(), Expires: now.Add(10 * time.Minute).UnixMilli()}
+		if f.prop.ttl > 0 {
+			p.Expires = now.Add(f.prop.ttl).UnixMilli()
+		}
 		f.prop.proposals[id] = p
+		if f.prop.tamper {
+			q := *p
+			q.Commitment = strings.Repeat("0", 64)
+			writeJSON(w, 200, q)
+			return
+		}
 		writeJSON(w, 200, p)
 	})
 	mux.HandleFunc("GET /v2/env/proposals/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +110,13 @@ func (f *fakeServer) setupProposals(mux *http.ServeMux) {
 			return
 		}
 		f.prop.polls++
+		if f.prop.pollFail != 0 {
+			if f.prop.pollFail > 0 {
+				f.prop.pollFail--
+			}
+			apiErr(w, 503, "unavailable", "restarting")
+			return
+		}
 		if p.Status == "pending" {
 			switch f.prop.decision {
 			case "pending":
@@ -112,6 +134,14 @@ func (f *fakeServer) setupProposals(mux *http.ServeMux) {
 		p := f.prop.proposals[r.PathValue("id")]
 		if p == nil {
 			apiErr(w, 404, api.ErrNotFound, "not found")
+			return
+		}
+		if f.prop.cancelFail {
+			apiErr(w, 503, "unavailable", "restarting")
+			return
+		}
+		if p.Status != "pending" {
+			apiErr(w, 409, "conflict", "proposal no longer pending")
 			return
 		}
 		p.Status = "cancelled"
@@ -371,5 +401,103 @@ func TestMCPStoreEnv(t *testing.T) {
 	}
 	if strings.Contains(seen.String(), value) {
 		t.Fatal("a proposal's metadata holds a value")
+	}
+}
+
+// After the POST the broker holds something the owner can commit: every
+// failure withdraws it or says that it may still be committed.
+func TestSetProposeNeverLeavesASilentProposal(t *testing.T) {
+	pending := func(f *fakeServer) (n int) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for _, p := range f.prop.proposals {
+			if p.Status == "pending" {
+				n++
+			}
+		}
+		return n
+	}
+	put := func(e *testEnv) (envset.Proposal, error) {
+		e.Stdin = strings.NewReader("new-value")
+		return e.SetPropose(context.Background(), SetOptions{Op: "put", Path: propSet, Key: "APP_TOKEN", Why: "rotate"})
+	}
+	// The broker's answer is not the edit that was sent: withdrawn, exit 1, the Ref already printed.
+	f, e := proposalEnv(t)
+	f.prop.tamper = true
+	_, err := put(e)
+	if ExitCode(err) != ExitError || !strings.Contains(err.Error(), "differs from the submitted edit") || !strings.Contains(err.Error(), "was withdrawn") || pending(f) != 0 || len(f.prop.cancelled) != 1 || !strings.Contains(e.stderr.String(), "proposal Ref ") {
+		t.Fatalf("tampered answer: %v\n%s", err, e.stderr)
+	}
+	// A broker that is briefly away is asked again.
+	f, e = proposalEnv(t)
+	f.prop.pollFail = 3
+	p, err := put(e)
+	if err != nil || p.Status != "committed" || !strings.Contains(e.stderr.String(), "still waiting for the decision") {
+		t.Fatalf("transient poll failures: %v\n%s", err, e.stderr)
+	}
+	// Away until the proposal would have expired: withdrawn if the cancel gets through.
+	f, e = proposalEnv(t)
+	f.prop.pollFail, f.prop.ttl = -1, 200*time.Millisecond
+	_, err = put(e)
+	if ExitCode(err) != ExitUnreachable || !strings.Contains(err.Error(), "was withdrawn") || pending(f) != 0 {
+		t.Fatalf("unreachable, cancel worked: %v\n%s", err, e.stderr)
+	}
+	// ... and when it does not, the terminal says that it may still be committed, until when, and how to check.
+	f, e = proposalEnv(t)
+	f.prop.pollFail, f.prop.cancelFail, f.prop.ttl = -1, true, 200*time.Millisecond
+	_, err = put(e)
+	out := e.stderr.String()
+	if ExitCode(err) != ExitUnreachable || pending(f) != 1 || !strings.Contains(out, "may still be committed by the owner until ") || !strings.Contains(out, "check the approval page") || strings.Contains(out+err.Error(), "new-value") {
+		t.Fatalf("unreachable, cancel failed: %v\n%s", err, out)
+	}
+	// Ctrl-C with a cancel that fails says the same; exit 130.
+	f, e = proposalEnv(t)
+	f.prop.decision, f.prop.cancelFail = "pending", true
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil {
+			time.Sleep(10 * time.Millisecond)
+			f.mu.Lock()
+			polled := f.prop.polls > 0
+			f.mu.Unlock()
+			if polled {
+				cancel()
+			}
+		}
+	}()
+	e.Stdin = strings.NewReader("new-value")
+	_, err = e.SetPropose(ctx, SetOptions{Op: "put", Path: propSet, Key: "APP_TOKEN", Why: "rotate"})
+	if ExitCode(err) != ExitCancelled || !strings.Contains(e.stderr.String(), "may still be committed by the owner until ") {
+		t.Fatalf("interrupted, cancel failed: %v\n%s", err, e.stderr)
+	}
+	// Committed while the withdraw was on its way: said so.
+	f, e = proposalEnv(t)
+	f.prop.decision = "pending"
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel2()
+	go func() {
+		for ctx2.Err() == nil {
+			time.Sleep(10 * time.Millisecond)
+			f.mu.Lock()
+			if f.prop.polls > 0 {
+				for _, p := range f.prop.proposals {
+					p.Status, p.Result = "committed", 2
+				}
+				cancel2()
+			}
+			f.mu.Unlock()
+		}
+	}()
+	e.Stdin = strings.NewReader("new-value")
+	_, err = e.SetPropose(ctx2, SetOptions{Op: "put", Path: propSet, Key: "APP_TOKEN", Why: "rotate"})
+	if ExitCode(err) != ExitCancelled || !strings.Contains(e.stderr.String(), "was COMMITTED by the owner meanwhile") {
+		t.Fatalf("committed during the interrupt: %v\n%s", err, e.stderr)
+	}
+	// An empty value is refused here: usually an empty stdin.
+	f, e = proposalEnv(t)
+	e.Stdin = strings.NewReader("")
+	if _, err = e.SetPropose(context.Background(), SetOptions{Op: "put", Path: propSet, Key: "APP_TOKEN", Why: "rotate"}); err == nil || !strings.Contains(err.Error(), "the value is empty: was stdin empty?") || len(f.prop.posts) != 0 {
+		t.Fatalf("empty put: %v", err)
 	}
 }

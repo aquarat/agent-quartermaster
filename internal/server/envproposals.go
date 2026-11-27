@@ -177,6 +177,9 @@ func (s *Server) envPropose(ctx context.Context, q *store.Q, r *http.Request, h 
 	if op != "import" && op != "put" && op != "unset" || len(in.Edit.Remove) > 0 {
 		return nil, errBad("a proposal is an import, a put or an unset")
 	}
+	if op == "put" && len(in.Edit.Entries) == 1 && in.Edit.Entries[0].Value == "" {
+		return nil, errBad("the value is empty: a proposal does not store an empty value (to remove a key, propose an unset)")
+	}
 	if in.Create != nil && op == "unset" {
 		return nil, errBad("a new set is created by an import or a put")
 	}
@@ -233,6 +236,14 @@ func (s *Server) envPropose(ctx context.Context, q *store.Q, r *http.Request, h 
 	if op == "unset" {
 		recs = []envRecord{{N: in.Edit.Entries[0].Name}}
 	} else if recs, err = s.sealEntries(s.sealBucket(row), b.Set, in.Edit.Entries); err != nil {
+		return nil, err
+	}
+	// What the set would hold after the commit must fit: refused now, not at the owner's tap.
+	old, _, err := s.revisionRecords(ctx, q, b)
+	if err != nil {
+		return nil, err
+	}
+	if err = checkRecordLimits(mergeRecords(old, op, recs, nil)); err != nil {
 		return nil, err
 	}
 	payload, err := recordsJSON(recs)
@@ -297,20 +308,24 @@ func (s *Server) envProposalPoll(w http.ResponseWriter, r *http.Request, h *stor
 		s.writeErr(w, r, s.hostNotFound(ctx, h, err))
 		return
 	}
+	// Reads only, like GET /v1/requests/{id}: waiting hosts take no write lock.
+	// Expiry is applied in memory here; the sweeper and the write paths persist
+	// it (and end proposals whose path or ID was taken).
 	var out envset.Proposal
 	err := s.longPoll(ctx, parseWait(r.URL.Query().Get("wait")), func() (bool, error) {
-		err := s.store.Tx(ctx, func(q *store.Q) error {
-			if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
-				return err
-			}
-			if err := q.SweepEnv(ctx, s.now()); err != nil {
-				return err
-			}
-			x, err := s.visibleProposal(ctx, q, r, h)
-			out = x.P
-			return err
-		})
-		return out.Status != "pending", err
+		q := s.store.Q()
+		if err := requireActiveIdentity(ctx, q, h.ID); err != nil {
+			return false, err
+		}
+		x, err := s.visibleProposal(ctx, q, r, h)
+		if err != nil {
+			return false, err
+		}
+		out = x.P
+		if out.Status == "pending" && s.now().UnixMilli() >= out.Expires {
+			out.Status = "expired"
+		}
+		return out.Status != "pending", nil
 	})
 	if err != nil {
 		s.writeErr(w, r, s.hostNotFound(ctx, h, err))
@@ -340,7 +355,8 @@ func (s *Server) reviewProposal(ctx context.Context, q *store.Q, sess string, pk
 		return "", errBad("unexpected duration")
 	}
 	if in.Action == "proposal-commit" {
-		if _, _, err = s.currentProposal(ctx, q, x); err != nil {
+		// Everything the commit will check, before the owner is asked to tap.
+		if _, err = s.planCommit(ctx, q, x); err != nil {
 			return "", err
 		}
 	}
@@ -370,6 +386,87 @@ func (s *Server) currentProposal(ctx context.Context, q *store.Q, x store.Staged
 	return b, t, nil
 }
 
+// commitPlan is a commit that would succeed now: the target, the set's bucket
+// (insert: it is the one the proposal carried) and the records of the next
+// revision.
+type commitPlan struct {
+	b      envset.Binding
+	t      proposalTarget
+	row    store.BucketRow
+	insert bool
+	recs   []envRecord
+}
+
+// planCommit runs every check of a commit without writing: the binding is
+// still the proposed one, the sealed records are the proposed edit, the
+// bucket they were sealed to is still the set's (or the set still has none
+// and the scope key is the one the proposal's bucket was wrapped to), and the
+// result fits an env set. The owner's review and the commit both use it, so a
+// commit that would fail is refused before the tap.
+func (s *Server) planCommit(ctx context.Context, q *store.Q, x store.StagedProposal) (commitPlan, error) {
+	var p commitPlan
+	var err error
+	if p.b, p.t, err = s.currentProposal(ctx, q, x); err != nil {
+		return p, err
+	}
+	again := ": discard it and have the host propose again"
+	unset := x.P.Operation == "unset"
+	recs, err := parseRecords(x.Record.Payload, !unset)
+	if err != nil {
+		return p, err
+	}
+	if (x.P.Operation == "put" || unset) && len(recs) != 1 {
+		return p, errConflict("edit commitment or manifest mismatch")
+	}
+	names := make([]envset.Entry, len(recs))
+	for i, r := range recs {
+		names[i] = envset.Entry{Name: r.N}
+	}
+	changes, err := envset.Edit{Op: x.P.Operation, Entries: names}.Changes(p.b.Names)
+	if err != nil || changes != x.P.Changes {
+		return p, errConflict("edit commitment or manifest mismatch")
+	}
+	if x.Bucket != "" {
+		var pb pendingBucket
+		if json.Unmarshal([]byte(x.Bucket), &pb) != nil || !bytes.Equal(pb.ID, x.Record.Wrap) {
+			return p, errConflict("damaged proposal")
+		}
+		if _, err := q.BucketByRef(ctx, "env-set", p.b.Set); err == nil {
+			return p, errConflict("the set got its key since this was proposed" + again)
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return p, err
+		}
+		sc, err := s.writableScope(ctx, q, p.b.Org)
+		if err != nil {
+			return p, err
+		}
+		if !bytes.Equal(sc.Public, pb.ScopePublic) {
+			return p, errConflict("the organisation's scope key changed since this was proposed" + again)
+		}
+		p.insert, p.row = true, store.BucketRow{ID: pb.ID, Scope: sc.Scope, Kind: "env-set", Ref: p.b.Set, Public: pb.Public, Wrap: pb.Wrap, Created: s.now()}
+	} else {
+		if p.row, err = s.setRow(ctx, q, "env-set", p.b.Set); err != nil {
+			return p, err
+		}
+		if !bytes.Equal(x.Record.Wrap, p.row.ID) {
+			return p, errConflict("the proposal was sealed to another key" + again)
+		}
+	}
+	old, _, err := s.revisionRecords(ctx, q, p.b)
+	if err != nil {
+		return p, err
+	}
+	p.recs = mergeRecords(old, x.P.Operation, recs, nil)
+	if err = checkRecordLimits(p.recs); err != nil {
+		var ae *apiErr
+		if errors.As(err, &ae) {
+			return p, errConflict(ae.msg + again)
+		}
+		return p, err
+	}
+	return p, nil
+}
+
 // commitProposal publishes a proposal as the set's next revision, creating
 // the service, the set and the set's bucket first when the proposal asked
 // for them. No bucket is opened: the entries were sealed when they arrived.
@@ -378,77 +475,30 @@ func (s *Server) commitProposal(ctx context.Context, q *store.Q, id string) erro
 	if err != nil {
 		return err
 	}
-	b, t, err := s.currentProposal(ctx, q, x)
+	p, err := s.planCommit(ctx, q, x)
 	if err != nil {
 		return err
-	}
-	unset := x.P.Operation == "unset"
-	recs, err := parseRecords(x.Record.Payload, !unset)
-	if err != nil {
-		return err
-	}
-	if (x.P.Operation == "put" || unset) && len(recs) != 1 {
-		return errConflict("edit commitment or manifest mismatch")
-	}
-	names := make([]envset.Entry, len(recs))
-	for i, r := range recs {
-		names[i] = envset.Entry{Name: r.N}
-	}
-	changes, err := envset.Edit{Op: x.P.Operation, Entries: names}.Changes(b.Names)
-	if err != nil || changes != x.P.Changes {
-		return errConflict("edit commitment or manifest mismatch")
-	}
-	var row store.BucketRow
-	if x.Bucket != "" {
-		var pb pendingBucket
-		if json.Unmarshal([]byte(x.Bucket), &pb) != nil || !bytes.Equal(pb.ID, x.Record.Wrap) {
-			return errConflict("damaged proposal")
-		}
-		if _, err := q.BucketByRef(ctx, "env-set", b.Set); err == nil {
-			return errConflict("the set got its key since this was proposed: discard it and have the host propose again")
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return err
-		}
-		sc, err := s.writableScope(ctx, q, b.Org)
-		if err != nil {
-			return err
-		}
-		if !bytes.Equal(sc.Public, pb.ScopePublic) {
-			return errConflict("the organisation's scope key changed since this was proposed: discard it and have the host propose again")
-		}
-		row = store.BucketRow{ID: pb.ID, Scope: sc.Scope, Kind: "env-set", Ref: b.Set, Public: pb.Public, Wrap: pb.Wrap, Created: s.now()}
-	} else {
-		if row, err = s.setRow(ctx, q, "env-set", b.Set); err != nil {
-			return err
-		}
-		if !bytes.Equal(x.Record.Wrap, row.ID) {
-			return errConflict("the proposal was sealed to another key: discard it and have the host propose again")
-		}
 	}
 	// Committed first: writing the revision updates the set's row, and the
 	// trigger on it supersedes every proposal of the set still pending.
-	if err = q.EndEnvProposal(ctx, x.P.ID, "committed", b.Revision+1); err != nil {
+	if err = q.EndEnvProposal(ctx, x.P.ID, "committed", p.b.Revision+1); err != nil {
 		return errConflict("decision no longer available")
 	}
 	exists := errConflict("a service or set with that name or ID exists now: discard this and have the host propose again")
-	if t.newService {
-		if err = q.CreateEnvService(ctx, b.Service, b.Org, t.serviceSlug, t.serviceTitle); err != nil {
+	if p.t.newService {
+		if err = q.CreateEnvService(ctx, p.b.Service, p.b.Org, p.t.serviceSlug, p.t.serviceTitle); err != nil {
 			return exists
 		}
 	}
-	if t.newSet {
-		if err = q.CreateEnvSet(ctx, b.Set, b.Service, t.setSlug, t.setTitle); err != nil {
+	if p.t.newSet {
+		if err = q.CreateEnvSet(ctx, p.b.Set, p.b.Service, p.t.setSlug, p.t.setTitle); err != nil {
 			return exists
 		}
 	}
-	if x.Bucket != "" {
-		if err = q.InsertBucket(ctx, row); err != nil {
+	if p.insert {
+		if err = q.InsertBucket(ctx, p.row); err != nil {
 			return err
 		}
 	}
-	old, _, err := s.revisionRecords(ctx, q, b)
-	if err != nil {
-		return err
-	}
-	return s.writeRevision(ctx, q, b, row, mergeRecords(old, x.P.Operation, recs, nil))
+	return s.writeRevision(ctx, q, p.b, p.row, p.recs)
 }

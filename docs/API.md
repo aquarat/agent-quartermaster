@@ -1259,7 +1259,9 @@ service or set row behind. The row itself (metadata only) is forgotten a day aft
   "Organisation / Service". The CLI needs it to compute the commitment over the real service
   ID. 404 when the host is not admitted to the organisation, 409 when the path cannot be
   created (the service is archived or not an application service, or another kind of item has
-  the name).
+  the name). Accepted trade-off: an admitted host can tell from these answers (and from the
+  409s of the POST) whether a service or set name exists in its own organisation, also while
+  the organisation's listing is off. Organisations it is not admitted to stay 404.
 * `POST /v2/env/proposals` body
   `{"path","reason","edit":{operation,salt,entries},"commitment","create":null|{"service_id":""|HEX32,"set_id":HEX32,"title":""}}`
   → a Proposal, status `pending`. `reason` is required (the `--why`, 1-500 characters, one
@@ -1267,13 +1269,19 @@ service or set row behind. The row itself (metadata only) is forgotten a day aft
   for a path the host may not see (as `GET /v2/env/set`; also a missing set without `create`),
   409 for an existing path given with `create`, a taken ID, a `service_id` for a service that
   exists, or an organisation that cannot take a first write yet (no scope key, or an untested
-  one), 400 for a bad commitment, operation, name, ID, title or reason, a secret, or an edit
-  that changes nothing, 429 when the host already has five things pending (proposals count with
-  requests, env releases and signing requests).
+  one), 400 for a bad commitment, operation, name, ID, title or reason, a secret, an edit
+  that changes nothing, a `put` of an empty value (a ticket upload may still store one), or a
+  result that would not fit an env set (64 keys, 8192 bytes a value, 24 KiB together; checked
+  against the set as it is, so a `put` onto a full set is refused at once), 429 when the host
+  already has five things pending (proposals count with requests, env releases and signing
+  requests). The request body is limited to 64 KiB like every agent route; a set near its
+  24 KiB limit whose values need heavy JSON escaping may not fit in one import.
 * `GET /v2/env/proposals/{id}[?wait=SECONDS]` → the Proposal (long-poll like
   `GET /v1/requests/{id}`: it answers as soon as the proposal is no longer pending), only to
   the proposing host at the address it proposed from; 404 otherwise. The host can read the
-  outcome even after its admission ended.
+  outcome even after its admission ended. The poll only reads: a pending proposal past
+  `expires_at` is answered as `expired` at once, and the sweeper (every 15 s) and the write
+  paths persist that and end proposals whose path or ID was taken.
 * `POST /v2/env/proposals/{id}/cancel` → the Proposal, status `cancelled` (pending only; 409
   afterwards).
 
@@ -1289,7 +1297,7 @@ the proposed ID and `service_revision` 0), then `id` (a request ID like a releas
 `discarded`, `cancelled`, `expired`, `superseded`), `created_at`, `expires_at` (ms; ten minutes
 after creation), `result_revision` (the revision written, when `committed`; else 0).
 
-`superseded`: the set's revision, the host's admission or the organisation's policy changed
+`superseded`: the host's enrolment was revoked, the set's revision, the host's admission or the organisation's policy changed
 (the triggers that delete drafts; committing one proposal supersedes the set's others), the
 organisation's scope key was replaced (rekey, recovery), or for `create` the path or an ID was
 taken, before the owner decided. The CLI exits 4 for `expired` and `superseded`, 3 for
@@ -1303,7 +1311,10 @@ untrusted). The signer must be an approver of the proposal's organisation. Every
 fresh individual tap that opens no bucket: no approval window or batch approves a proposal (a
 proposal is not a `/v1` request, which is all those paths decide). A commit is offered and
 applied only while the binding re-derived from the store equals the proposal's (and for `create`
-while the path and IDs are still free; 409 otherwise, also between challenge and finish); it
+while the path and IDs are still free; 409 otherwise, also between challenge and finish). The
+challenge runs every check of the commit, so the owner is not asked to tap for a commit that
+would fail: also 409 when the set got a bucket since, the scope key changed, or the merged
+result no longer fits an env set. The commit
 creates the service (revision 1) and set when asked, inserts the set's bucket when the proposal
 carried it, and publishes the next revision exactly as a committed draft; the CLI then reads
 `committed` and `result_revision`. New proposals send the usual notification. Audit:
@@ -1325,6 +1336,13 @@ commitment and Ref to compare with the CLI; the reason, marked unverified; when 
   or exact stdin bytes when stdin is not a terminal), `aqmas set unset PATH KEY --why REASON`:
   without a ticket option these make a proposal, print the Ref, the commitment and the key
   changes (names only) to stderr, and wait for the owner like any request (Ctrl-C cancels).
+  Once the broker has accepted the proposal, the CLI never leaves it silently: the Ref is
+  printed first; an answer that is not the edit it sent, or any error while waiting, withdraws
+  the proposal (exit 1, or the error's own code); an unreachable broker or a 5xx is retried
+  with backoff until `expires_at`, then withdrawn (exit 5); and when the withdrawal itself
+  fails, stderr says "proposal REF could not be withdrawn and may still be committed by the
+  owner until HH:MM" with what to check (or that it was committed meanwhile, when the broker
+  says so). An empty `put` value is refused before anything is sent.
   `--create` is needed to create a missing set or service, so a typo never creates one (without
   it a missing path is exit 1 with a hint); given for a set that exists, it proposes the edit to
   that set and creates nothing. The title defaults to the set's slug. The file is read and
@@ -1336,7 +1354,8 @@ commitment and Ref to compare with the CLI; the reason, marked unverified; when 
   prints the key names of the lines that would import to stdout, one per line, and each problem
   to stderr as `line N: reason` (the reason is fixed text; neither a value nor the name on a
   refused line is printed, because what looks like a name there may be part of a value). After a
-  quoted value that is never closed, or a bad escape inside one, nothing further is checked and
+  quoted value that is never closed, a bad escape inside one, or any refused line that holds a
+  quote character (it may open a value that runs on), nothing further is checked or named and
   the report says so. With PATH it also prints what an import would do, one `add NAME`,
   `replace NAME` or `remove NAME` per line (from the set's metadata; for a path that does not
   exist, every key is an `add` and stderr says that `--create` would propose it). Exit 0 when

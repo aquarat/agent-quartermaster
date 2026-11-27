@@ -144,4 +144,15 @@ func TestCheckFileAgreesWithParseFileAndNeverEchoes(t *testing.T) {
 	if len(problems) != 2 || problems[0].Line != 2 || problems[1].Line != 0 {
 		t.Fatalf("unclosed quote: %v", problems)
 	}
+	// A refused line that holds a quote may open a value that runs on: nothing
+	// after it is read, so no later line's "name" (value text) is printed.
+	for _, f := range []string{"bad_name='x\nAPP_SECRET_KEY=hunter2\n'\nAPP_ID=1\n", "APP_OK=1\nexport APP_X=\"a\nAPP_SECRET_KEY=hunter2\n\"\n", "APP_A='a' 'b\nAPP_SECRET_KEY=hunter2\n'\n", "APP_A=it's\nAPP_SECRET_KEY=hunter2\n'\n"} {
+		names, problems := CheckFile([]byte(f))
+		if slices.Contains(names, "APP_SECRET_KEY") || slices.Contains(names, "APP_ID") || len(problems) != 2 || problems[1].Line != 0 || !bytes.Contains([]byte(problems[1].Why), []byte("nothing after line")) {
+			t.Errorf("%q: names %v problems %v", f, names, problems)
+		}
+		if _, err := ParseFile([]byte(f)); err == nil {
+			t.Errorf("%q imports", f)
+		}
+	}
 }

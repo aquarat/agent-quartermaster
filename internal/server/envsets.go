@@ -603,7 +603,11 @@ func (s *Server) envFinish(ctx context.Context, r *http.Request, sess string) (a
 		}
 		switch m.Action {
 		case "proposal-commit":
-			err = s.commitProposal(ctx, q, m.ID)
+			if err = s.commitProposal(ctx, q, m.ID); err == nil {
+				// Proposals to create what this one just created end now, not
+				// at the next sweep: their hosts are waiting.
+				err = q.SweepEnv(ctx, s.now())
+			}
 		case "proposal-discard":
 			if err = q.EndEnvProposal(ctx, m.ID, "discarded", 0); err != nil {
 				err = errConflict("decision no longer available")

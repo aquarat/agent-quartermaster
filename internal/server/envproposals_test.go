@@ -179,6 +179,11 @@ func TestEnvProposalCommit(t *testing.T) {
 	if !slices.Equal(keys, proposalKeys) || !strings.Contains(c.Metadata, `"names":[]`) || !strings.Contains(c.Metadata, `"reason":""`) {
 		t.Fatalf("signed keys: %v\n%s", keys, c.Metadata)
 	}
+	// Proposed, listed, reviewed, committed: the value is in no response, log,
+	// audit row or database page (the host has not collected anything yet).
+	if where := v.leaked(secret); where != "" {
+		t.Fatalf("value leaked into %s", where)
+	}
 	got, st := v.proposal(v.agent, p.ID)
 	if st != 200 || got.Status != "committed" || got.Result != 1 || v.revision() != 1 {
 		t.Fatalf("after commit: %+v revision %d", got, v.revision())
@@ -400,7 +405,7 @@ func TestEnvProposalSuperseded(t *testing.T) {
 	}
 	// A scope rekey ends what was sealed under the old keys.
 	p = v.propose(v.agent, propPath, "put", entries(), false)
-	requireNoError(t, v.s.store.Tx(t.Context(), func(q *store.Q) error { return q.DropScopeDrafts(t.Context(), vOrg) }))
+	mustStatus(t, "rekey", v.control(map[string]any{"action": "rekey", "scope": v.org}, nil), 200)
 	superseded("rekey", v.agent, p)
 }
 
@@ -630,4 +635,75 @@ func TestEnvProposalLimitsAndIndividualTap(t *testing.T) {
 	if len(openBuckets(t, v.s)) != 0 {
 		t.Fatal("a proposal commit left a bucket open")
 	}
+}
+
+// What ends a host ends what it proposed; what would not commit is refused
+// before the owner's tap, and what would not fit is refused when proposed.
+func TestEnvProposalReviewFixes(t *testing.T) {
+	v := newVault(t)
+	// An empty value is not stored by a proposal.
+	if _, st, body := v.proposeRaw(v.agent, propPath, "put", []envset.Entry{{Name: "APP_TOKEN", Value: ""}}, false, nil); st != 400 || !strings.Contains(body, "the value is empty") {
+		t.Fatalf("empty put: %d %s", st, body)
+	}
+	// A pending proposal past its time reads as expired at once, without a sweep.
+	p := v.propose(v.agent, propPath, "put", []envset.Entry{{Name: "APP_TOKEN", Value: "v"}}, false)
+	v.clock.Advance(ProposalTTL + time.Second)
+	if got, st := v.proposal(v.agent, p.ID); st != 200 || got.Status != "expired" {
+		t.Fatalf("read after expiry: %d %s", st, got.Status)
+	}
+	if n := v.count(`SELECT count(*) FROM env_proposals WHERE id=? AND status='pending'`, p.ID); n != 1 {
+		t.Fatal("a poll wrote to the store")
+	}
+	v.login()
+	// The set got its key while a proposal carried one for it: no commit challenge.
+	p = v.propose(v.agent, propPath, "put", []envset.Entry{{Name: "APP_TOKEN", Value: "v"}}, false)
+	requireNoError(t, v.s.store.Tx(t.Context(), func(q *store.Q) error {
+		_, err := v.s.ensureSetBucket(t.Context(), q, "env-set", vSet, vOrg)
+		return err
+	}))
+	var body struct{ Message string }
+	challenge := func(id string) (int, string) {
+		t.Helper()
+		before := v.seen.Len()
+		st := v.web("POST", "/api/ui/seal/env/challenge", map[string]any{"id": id, "action": "proposal-commit", "ttl_seconds": 0}, nil)
+		_ = json.Unmarshal(v.seen.Bytes()[before:], &body)
+		return st, body.Message
+	}
+	if st, msg := challenge(p.ID); st != 409 || !strings.Contains(msg, "got its key") {
+		t.Fatalf("commit challenge after the set got a bucket: %d %s", st, msg)
+	}
+	mustStatus(t, "discard still works", v.decideProposal(p.ID, "discard"), 200)
+	// The merged result must fit an env set: a put onto a full set is refused when proposed.
+	full := make([]envset.Entry, 64)
+	for i := range full {
+		full[i] = envset.Entry{Name: "APP_K" + string(rune('A'+i/26)) + string(rune('A'+i%26)), Value: "v"}
+	}
+	p = v.propose(v.agent, propPath, "import", full, false)
+	// ... and a second proposal made before the first was committed is refused at review.
+	extra := v.propose(v.other, propPath, "put", []envset.Entry{{Name: "APP_EXTRA", Value: "v"}}, false)
+	mustStatus(t, "commit the full set", v.decideProposal(p.ID, "commit"), 200)
+	if got, _ := v.proposal(v.other, extra.ID); got.Status != "superseded" {
+		t.Fatalf("the other proposal: %s", got.Status)
+	}
+	if _, st, body := v.proposeRaw(v.agent, propPath, "put", []envset.Entry{{Name: "APP_EXTRA", Value: "v"}}, false, nil); st != 400 || !strings.Contains(body, "too many keys") {
+		t.Fatalf("put onto a full set: %d %s", st, body)
+	}
+	big := strings.Repeat("x", 8000)
+	if _, st, body := v.proposeRaw(v.agent, propPath, "put", []envset.Entry{{Name: "APP_KAA", Value: big}}, false, nil); st != 200 {
+		t.Fatalf("a large value that fits: %d %s", st, body)
+	}
+	// Revoking a host ends its pending proposals and erases what they sealed.
+	p = v.propose(v.other, propPath, "put", []envset.Entry{{Name: "APP_KAB", Value: "from-other"}}, false)
+	otherID := int64(v.count(`SELECT id FROM hosts WHERE name='other'`))
+	requireNoError(t, v.s.store.Tx(t.Context(), func(q *store.Q) error { return q.RevokeHost(t.Context(), otherID, v.s.now()) }))
+	if n := v.count(`SELECT count(*) FROM env_proposals WHERE id=? AND status='superseded' AND payload IS NULL AND bucket IS NULL`, p.ID); n != 1 {
+		t.Fatal("a revoked host's proposal is still pending")
+	}
+	if n := v.count(`SELECT count(*) FROM env_proposals WHERE status='pending'`); n != 1 {
+		t.Fatalf("%d pending: revoking one host ended another's proposal, or not its own", n)
+	}
+	if st, _ := challenge(p.ID); st != 409 {
+		t.Fatalf("commit challenge for a revoked host's proposal: %d", st)
+	}
+	v.nothingKept()
 }

@@ -510,7 +510,16 @@ func (q *Q) RevokeHost(ctx context.Context, id int64, now time.Time) error {
 	if _, err := q.q.ExecContext(ctx, "UPDATE grants SET revoked_at = ? WHERE host_id = ? AND kind = 'cloudflare' AND revoked_at IS NULL", ms(now), id); err != nil {
 		return err
 	}
-	_, err := q.q.ExecContext(ctx, "UPDATE requests SET status = 'expired', decision_note = 'host identity revoked', decided_at = ? WHERE host_id = ? AND status = 'pending'", ms(now), id)
+	if _, err := q.q.ExecContext(ctx, "UPDATE requests SET status = 'expired', decision_note = 'host identity revoked', decided_at = ? WHERE host_id = ? AND status = 'pending'", ms(now), id); err != nil {
+		return err
+	}
+	// What the host proposed to store ends with its identity, sealed values
+	// included (the table exists once a 0.11.0 broker has served a sealed store).
+	var proposals int
+	if err := q.q.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='env_proposals'`).Scan(&proposals); err != nil || proposals == 0 {
+		return err
+	}
+	_, err := q.q.ExecContext(ctx, `UPDATE env_proposals SET status='superseded',payload=NULL,bucket=NULL WHERE status='pending' AND host=?`, id)
 	return err
 }
 

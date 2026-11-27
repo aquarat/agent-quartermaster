@@ -245,6 +245,9 @@ func (e *Env) SetPropose(ctx context.Context, o SetOptions) (envset.Proposal, er
 	if err != nil {
 		return none, err
 	}
+	if o.Op == "put" && edit.Entries[0].Value == "" {
+		return none, errors.New("the value is empty: was stdin empty? (nothing was sent; to remove a key use aqmas set unset)")
+	}
 	_, c, err := e.authedClient()
 	if err != nil {
 		return none, err
@@ -296,19 +299,54 @@ func (e *Env) SetPropose(ctx context.Context, o SetOptions) (envset.Proposal, er
 	if err = c.do(ctx, "POST", "/v2/env/proposals", req, &p); err != nil {
 		return none, err
 	}
-	b.Title = p.Title // a new set's title is composed by the broker
-	if !reflect.DeepEqual(b, p.Binding) || p.Commitment != req.Commitment || p.Operation != o.Op || p.Changes != changes || p.Status != "pending" || !safeID(p.ID) || p.Ref != RefCode(p.ID) ||
-		p.NewSet != (req.Create != nil) || p.NewService != (req.Create != nil && req.Create.ServiceID != "") {
-		return none, errors.New("the broker's proposal differs from the submitted edit")
-	}
+	// From here the broker holds a proposal the owner can commit: every way out
+	// either withdraws it or says plainly that it may still be committed.
 	id := p.ID
-	defer func() {
-		if ctx.Err() != nil {
-			bg, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			_ = c.do(bg, "POST", "/v2/env/proposals/"+id+"/cancel", struct{}{}, nil)
+	if !safeID(id) {
+		return none, errors.New("the broker answered without a usable proposal ID; if a card appears on the approval page for " + o.Path + ", discard it")
+	}
+	refCode := RefCode(id)
+	e.logf("proposal Ref %s", refCode)
+	until := time.UnixMilli(p.Expires)
+	if p.Expires <= 0 || time.Until(until) > 15*time.Minute {
+		until = time.Now().Add(10 * time.Minute)
+	}
+	maybe := fmt.Sprintf("proposal %s could not be withdrawn and may still be committed by the owner until %s: check the approval page (discard the card with Ref %s), or afterwards the set's keys with `aqmas set check --from FILE %s`", refCode, until.Local().Format("15:04"), refCode, o.Path)
+	// giveUp ends a wait that failed: the proposal is withdrawn, or the error
+	// says what became of it, or that it may still be committed.
+	giveUp := func(cause error) error {
+		bg, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := c.do(bg, "POST", "/v2/env/proposals/"+id+"/cancel", struct{}{}, nil)
+		if err == nil {
+			if errors.Is(cause, ErrCancelled) {
+				return cause
+			}
+			return fmt.Errorf("%w (proposal %s was withdrawn; nothing was stored)", cause, refCode)
 		}
-	}()
+		outcome := maybe
+		var ae *APIError
+		if errors.As(err, &ae) && ae.HTTPStatus == 409 {
+			// No longer pending: say what it became, if the broker will tell.
+			var got envset.Proposal
+			if c.do(bg, "GET", "/v2/env/proposals/"+id, nil, &got) == nil && got.ID == id && got.Status == "committed" {
+				outcome = fmt.Sprintf("proposal %s was COMMITTED by the owner meanwhile: %s is at revision %d", refCode, o.Path, got.Result)
+			} else if got.ID == id && got.Status != "" && got.Status != "pending" {
+				outcome = fmt.Sprintf("proposal %s is %s; nothing was stored", refCode, got.Status)
+			}
+		}
+		var ue *UnreachableError
+		if errors.As(cause, &ue) || errors.Is(cause, ErrCancelled) {
+			e.logf("%s", outcome)
+			return cause
+		}
+		return fmt.Errorf("%w; %s", cause, outcome)
+	}
+	b.Title = p.Title // a new set's title is composed by the broker
+	if !reflect.DeepEqual(b, p.Binding) || p.Commitment != req.Commitment || p.Operation != o.Op || p.Changes != changes || p.Status != "pending" || p.Ref != refCode ||
+		p.NewSet != (req.Create != nil) || p.NewService != (req.Create != nil && req.Create.ServiceID != "") {
+		return none, giveUp(errors.New("the broker's proposal differs from the submitted edit"))
+	}
 	what := o.Op + " into " + o.Path
 	switch {
 	case p.NewService:
@@ -322,22 +360,49 @@ func (e *Env) SetPropose(ctx context.Context, o SetOptions) (envset.Proposal, er
 	e.logf("changes: %s", changeWords(p.Changes))
 	e.logf("commitment %s", p.Commitment)
 	e.logf("waiting for the owner to commit or discard on the approval page (compare Ref and commitment with the card; Ctrl-C withdraws)")
-	end := time.UnixMilli(p.Expires).Add(2 * time.Minute)
+	first := time.Second
+	if e.PollMin > 0 {
+		first = e.PollMin
+	}
+	backoff, told := first, false
 	for p.Status == "pending" {
-		if time.Now().After(end) {
-			return p, &DecisionError{Status: "expired", What: "proposal " + p.Ref}
-		}
 		var got envset.Proposal
-		if err = c.do(ctx, "GET", "/v2/env/proposals/"+id+"?wait=25", nil, &got); err != nil {
-			return p, err
+		err = c.do(ctx, "GET", "/v2/env/proposals/"+id+"?wait=25", nil, &got)
+		if ctx.Err() != nil {
+			return p, giveUp(ErrCancelled)
+		}
+		var ue *UnreachableError
+		var ae *APIError
+		if errors.As(err, &ue) || errors.As(err, &ae) && ae.HTTPStatus >= 500 {
+			// A broker restart or a network blip: the proposal is still there.
+			// Keep asking until it would have expired.
+			if time.Now().After(until) {
+				return p, giveUp(&UnreachableError{Err: fmt.Errorf("no answer about proposal %s since it was made: %w", refCode, err)})
+			}
+			if !told {
+				e.logf("the broker is not answering (%s); still waiting for the decision on proposal %s", Sanitize(err.Error()), refCode)
+				told = true
+			}
+			if sleepCtx(ctx, backoff) != nil {
+				return p, giveUp(ErrCancelled)
+			}
+			backoff = min(backoff*2, 15*time.Second)
+			continue
+		}
+		if err != nil {
+			return p, giveUp(err)
 		}
 		if got.ID != id || got.Commitment != p.Commitment || got.Set != p.Set {
-			return p, errors.New("proposal changed")
+			return p, giveUp(errors.New("the broker answered with another proposal"))
 		}
+		backoff, told = first, false
 		if p = got; p.Status == "pending" {
+			if time.Now().After(until.Add(2 * time.Minute)) {
+				return p, giveUp(&DecisionError{Status: "expired", What: "proposal " + p.Ref})
+			}
 			// A broker that answers at once must not be polled in a tight loop.
-			if err = sleepCtx(ctx, max(e.PollMin, 0)); err != nil {
-				return p, err
+			if sleepCtx(ctx, max(e.PollMin, 0)) != nil {
+				return p, giveUp(ErrCancelled)
 			}
 		}
 	}
