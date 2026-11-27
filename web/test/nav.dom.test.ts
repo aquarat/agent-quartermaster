@@ -82,9 +82,16 @@ describe("navigation", () => {
     expect(tabs.map((a) => a.getAttribute("href"))).toEqual(TABS.map((t) => t.hash));
     expect(tabs.map((a) => a.querySelector(".tab-label")!.textContent)).toEqual(["Approvals", "Vault", "Hosts", "Activity", "Security", "Settings", "Help"]);
     expect(current()).toEqual(["Approvals"]);
-    // Requests, enrollments and signature requests all wait for the owner.
-    const waiting = m.store.pending.length + m.store.vault.requests.filter((r) => r.status === "pending").length;
+    // Requests, enrollments, signature requests and env proposals all wait for the owner.
+    const proposals = m.store.vault.proposals.filter((p) => p.status === "pending").length;
+    expect(proposals).toBe(1); // the dev fixture's example
+    const waiting = m.store.pending.length + m.store.vault.requests.filter((r) => r.status === "pending").length + proposals;
     expect(root.querySelector('.tab[data-tab="approvals"] .tab-count')!.textContent).toBe(String(waiting));
+    // The proposal's card is on the Approvals page with the env releases, counted in its section.
+    expect(root.querySelectorAll("#sec-env [data-proposal]").length).toBe(1);
+    expect(root.querySelector<HTMLElement>("#sec-env")!.hidden).toBe(false);
+    expect(root.querySelector("#sec-env .count")!.textContent).toBe("1");
+    expect(root.querySelector("#sec-seal [data-proposal], #sec-pending [data-proposal]")).toBeNull();
     expect(doc.title).toBe(`(${waiting}) aqmas`);
     // One passkey opens nothing yet: Security carries a mark with words for a screen reader.
     const mark = root.querySelector('.tab[data-tab="security"] .tab-count')!;
