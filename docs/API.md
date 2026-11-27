@@ -1395,7 +1395,7 @@ and an SSH key (SSH targets and Cloudflare sets are configuration and have no de
 here). One tap over the path, kind and current revision moves the item to the bin:
 
 * its `credential_sets` row is archived and renamed to a tombstone slug
-  (`zz-deleted-` + 12 characters of the set ID + `-` + the slug), so the path is free at
+  (`zz-deleted-` + the set ID + `-` + the start of the slug), so the path is free at
   once, and a `deleted_sets(set_id, slug, kind, deleted_at, purge_at, passkey, deleted_by,
   digest)` row keeps what it was called, who deleted it and when;
 * every route that resolves a path or lists sets skips it: hosts get the uniform

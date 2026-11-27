@@ -455,6 +455,43 @@ func TestVaultPurge(t *testing.T) {
 	if n := rows(f.id); n != 0 {
 		t.Fatalf("%d rows of the auto-purged signer are left", n)
 	}
+	// A row of a table the purge does not know still names a set: its sealed
+	// records and bucket go all the same, the empty archived row stays, and the
+	// audit row says so instead of hiding it.
+	const held = "77777777777777777777777777777777"
+	v.createSecret(held, "held", "Held token", "HELD_TOKEN", "held-"+value, "", "")
+	v.delete(held, "held", "Held token", "secret", 1, "")
+	_, err := v.s.store.DB().Exec(`INSERT INTO set_policies VALUES(?,1,'cf.read',60,60,0,0,0)`, held)
+	requireNoError(t, err)
+	p, st := v.binChallenge("purge", held)
+	mustStatus(t, "purge challenge", st, 200)
+	mustStatus(t, "purge", v.tap(p, nil), 200)
+	if v.count(`SELECT count(*) FROM env_revisions WHERE set_id=?`, held)+v.count(`SELECT count(*) FROM buckets WHERE ref=?`, held)+v.count(`SELECT count(*) FROM deleted_sets WHERE set_id=?`, held) != 0 {
+		t.Fatal("sealed material of a purged set with a foreign reference is left")
+	}
+	if v.count(`SELECT count(*) FROM credential_sets WHERE id=? AND archived AND slug LIKE 'zz-deleted-%'`, held) != 1 || !v.audited("vault_purge", "client-a/paas/held kind=secret") || !v.audited("vault_purge", "tombstone=kept") {
+		t.Fatal("the kept tombstone row is not recorded in the purge's audit row")
+	}
+	if s := v.binState(); len(s.Deleted) != 0 || len(s.Sets) != 1 {
+		t.Fatalf("a kept tombstone shows in the Vault: %+v", s)
+	}
+	// An item named exactly like another item's tombstone: the delete is a
+	// conflict the owner can read, not an internal error, and nothing is binned.
+	const clash = "66666666666666666666666666666666"
+	v.createSecret(clash, "clash", "Clash token", "CLASH_TOKEN", "clash-"+value, "", "")
+	_, err = v.s.store.DB().Exec(`INSERT INTO credential_sets(id,service_id,provider,slug,title,kind,revision) VALUES('55555555555555555555555555555555',?,'application',?,'Squatter','env-set',0)`, vService, store.TombstoneSlug(clash, "clash"))
+	requireNoError(t, err)
+	if len(store.TombstoneSlug(clash, strings.Repeat("s", 63))) != 63 || !strings.HasPrefix(store.TombstoneSlug(clash, "clash"), "zz-deleted-"+clash+"-") {
+		t.Fatal("tombstone slug does not carry the whole ID within 63 characters")
+	}
+	c, st := v.deleteChallenge(clash, "clash", "Clash token", "secret", 1, "")
+	mustStatus(t, "delete challenge", st, 200)
+	if st := v.tap(c, nil); st != 409 {
+		t.Fatalf("delete with a taken tombstone slug: %d", st)
+	}
+	if v.count(`SELECT count(*) FROM deleted_sets WHERE set_id=?`, clash) != 0 || v.count(`SELECT count(*) FROM credential_sets WHERE id=? AND NOT archived AND slug='clash'`, clash) != 1 {
+		t.Fatal("a refused delete changed the item")
+	}
 	// The path of a purged item is free like any other.
 	v.createSecret(first, "tailnet", "Tailnet API key", "TAILNET_API_KEY", value, "", "")
 }

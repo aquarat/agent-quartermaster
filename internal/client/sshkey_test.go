@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -377,6 +379,10 @@ func TestSSHAgentProtocol(t *testing.T) {
 	if _, err := os.Stat(filepath.Dir(sock)); !os.IsNotExist(err) {
 		t.Fatalf("the socket directory was not removed: %v", err)
 	}
+	// The standard logger was quiet only while the socket was served.
+	if log.Writer() == io.Discard {
+		t.Fatal("the process's logger stays silenced after the agent ended")
+	}
 	if len(f.ssh.uses) != 1 || f.ssh.uses[0] != signer.UseSSHAgent || f.ssh.reqs["SSHREQ0001"].TTL != 600 || f.ssh.reqs["SSHREQ0001"].Max != 3 || f.ssh.reqs["SSHREQ0001"].Reason != "clone the deploy repository" {
 		t.Fatalf("request: %+v", f.ssh.reqs["SSHREQ0001"])
 	}
@@ -633,6 +639,43 @@ func TestSSHKeyHandoutCommand(t *testing.T) {
 	os.Remove(out + ".pub")
 	if err := e.SSHKeyHandout(ctx, SSHKeyOptions{Path: testSSHPath, Why: "x", Out: out}); ExitCode(err) != ExitDenied {
 		t.Fatalf("denied: %v", err)
+	}
+	// --force replaces a key only with a delivered, verified key: a denial, or a
+	// broker that delivers another key, leaves the existing files as they were.
+	os.WriteFile(out, []byte("the old key"), 0o600)
+	os.WriteFile(out+".pub", []byte("the old line"), 0o644)
+	intact := func(what string) {
+		t.Helper()
+		a, _ := os.ReadFile(out)
+		b, _ := os.ReadFile(out + ".pub")
+		if string(a) != "the old key" || string(b) != "the old line" {
+			t.Fatalf("%s: --force destroyed the existing key (%q, %q)", what, a, b)
+		}
+		left, _ := filepath.Glob(filepath.Join(filepath.Dir(out), ".*aqmas-*"))
+		if len(left) != 0 {
+			t.Fatalf("%s: temporary files left behind: %v", what, left)
+		}
+	}
+	if err := e.SSHKeyHandout(ctx, SSHKeyOptions{Path: testSSHPath, Why: "x", Out: out, Force: true}); ExitCode(err) != ExitDenied {
+		t.Fatalf("denied with --force: %v", err)
+	}
+	intact("denied")
+	f.ssh.decision, f.ssh.wrongKey = "approved", true
+	if err := e.SSHKeyHandout(ctx, SSHKeyOptions{Path: testSSHPath, Why: "x", Out: out, Force: true}); err == nil {
+		t.Fatal("a wrong key was accepted with --force")
+	}
+	intact("a wrong key")
+	f.ssh.wrongKey = false
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := e.SSHKeyHandout(cctx, SSHKeyOptions{Path: testSSHPath, Why: "x", Out: out, Force: true}); err == nil {
+		t.Fatal("a cancelled hand-out succeeded")
+	}
+	intact("cancelled")
+	// An unwritable destination directory is found before the owner is asked.
+	n := len(f.ssh.uses)
+	if err := e.SSHKeyHandout(ctx, SSHKeyOptions{Path: testSSHPath, Why: "x", Out: filepath.Join(home, "no-such-dir", "key")}); err == nil || len(f.ssh.uses) != n {
+		t.Fatalf("a missing directory cost a request: %v", err)
 	}
 }
 

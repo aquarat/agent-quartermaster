@@ -85,7 +85,11 @@ func sealIDs(raw [][]byte) []seal.ID {
 }
 
 func purgeDetail(p store.PurgeInfo) string {
-	return fmt.Sprintf("%s kind=%s digest=%s deleted_at=%d deleted_by=%q", p.Path, p.Kind, p.Digest, p.DeletedAt, p.DeletedBy)
+	d := fmt.Sprintf("%s kind=%s digest=%s deleted_at=%d deleted_by=%q", p.Path, p.Kind, p.Digest, p.DeletedAt, p.DeletedBy)
+	if p.TombstoneKept {
+		d += " tombstone=kept (sealed records and bucket destroyed; another table still refers to the set, so its empty archived row remains)"
+	}
+	return d
 }
 
 // applyDelete bins a set inside the finish transaction. The store's triggers
@@ -105,7 +109,7 @@ func (s *Server) applyDelete(ctx context.Context, q *store.Q, pk int64, id strin
 	ended, err := q.BinSet(ctx, t, pk, digest, now)
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			err = errConflict("the item changed since you opened it; reload and review again")
+			err = errConflict("the item changed since you opened it, or an item is named like its place in the bin; reload and review again")
 		}
 		return nil, "", "", "", nil, err
 	}

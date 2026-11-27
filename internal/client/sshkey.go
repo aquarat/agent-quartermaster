@@ -362,10 +362,39 @@ func (e *Env) agentSocket() (net.Listener, string, func(), error) {
 	return nil, "", nil, fmt.Errorf("cannot create the SSH agent socket: %w", lastErr)
 }
 
+// The protocol server (golang.org/x/crypto/ssh/agent) reports each refused
+// request through the process's standard logger; this command says what
+// matters itself, in its own words. The logger is quiet only while an agent
+// socket is being served, and gets its writer back when the last one closes
+// (the MCP server is long-lived and may serve several at once).
+var agentLog struct {
+	sync.Mutex
+	n    int
+	prev io.Writer
+}
+
+func quietAgentLog() (restore func()) {
+	agentLog.Lock()
+	if agentLog.n == 0 {
+		agentLog.prev = log.Writer()
+		log.SetOutput(io.Discard)
+	}
+	agentLog.n++
+	agentLog.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			agentLog.Lock()
+			if agentLog.n--; agentLog.n == 0 {
+				log.SetOutput(agentLog.prev)
+				agentLog.prev = nil
+			}
+			agentLog.Unlock()
+		})
+	}
+}
+
 func serveAgent(l net.Listener, a agent.Agent) {
-	// The protocol server reports each refused request through the standard
-	// logger; this command says what matters itself, in its own words.
-	log.SetOutput(io.Discard)
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -420,6 +449,7 @@ func (e *Env) SSHAgent(ctx context.Context, o SSHAgentOptions) (int, error) {
 		return 0, err
 	}
 	defer cleanup()
+	defer quietAgentLog()()
 	// Signatures are asked for under their own context: the command may still be
 	// finishing a login while this process is being told to stop.
 	actx, stop := context.WithCancel(context.WithoutCancel(ctx))
@@ -530,29 +560,29 @@ func (e *Env) SSHKeyHandout(ctx context.Context, o SSHKeyOptions) error {
 			}
 		}
 	}
-	// Both files exist, empty and private, before the owner is asked: a
-	// directory that cannot be written must not cost the one delivery.
+	// Two private temporary files beside the destination exist before the owner
+	// is asked: a directory that cannot be written must not cost the one
+	// delivery. The destination itself is touched only at the very end, when
+	// the delivered key has been checked; until then an existing key file and
+	// its .pub stay exactly as they were, also with --force.
 	if _, err = e.checkWhy(o.Why); err != nil {
 		return err
 	}
-	keyFile, err := createFresh(out, 0o600, o.Force)
+	keyFile, err := os.CreateTemp(filepath.Dir(out), "."+filepath.Base(out)+".aqmas-*")
 	if err != nil {
 		return err
 	}
-	pubFile, err := createFresh(out+".pub", 0o644, o.Force)
+	pubFile, err := os.CreateTemp(filepath.Dir(out), "."+filepath.Base(out)+".pub.aqmas-*")
 	if err != nil {
 		keyFile.Close()
-		os.Remove(out)
+		os.Remove(keyFile.Name())
 		return err
 	}
-	written := false
-	defer func() {
+	defer func() { // a no-op for a file that was moved into place
 		keyFile.Close()
 		pubFile.Close()
-		if !written {
-			os.Remove(out)
-			os.Remove(out + ".pub")
-		}
+		os.Remove(keyFile.Name())
+		os.Remove(pubFile.Name())
 	}()
 	v, err := e.sshRequest(ctx, c, k, signer.UseSSHHandout, o.Why, 0, 0, "SSH key hand-out request",
 		fmt.Sprintf("awaiting approval to HAND OUT the private SSH key %s (%s) to this host: it leaves aqmas and cannot be recalled", o.Path, k.Fingerprint))
@@ -587,18 +617,14 @@ func (e *Env) SSHKeyHandout(ctx context.Context, o SSHKeyOptions) error {
 	if err != nil || !bytes.Equal(parsed.PublicKey().Marshal(), pub.Marshal()) || got.AuthorizedKey != k.AuthorizedKey {
 		return errors.New("the delivered key is not the private half of " + o.Path + "; nothing written")
 	}
-	if _, err = pubFile.WriteString(k.AuthorizedKey + "\n"); err == nil {
-		err = pubFile.Sync()
-	}
-	if err == nil {
-		if _, err = keyFile.Write(file); err == nil {
-			err = keyFile.Sync()
+	if err = fillAndPlace(pubFile, []byte(k.AuthorizedKey+"\n"), 0o644, out+".pub", o.Force); err == nil {
+		if err = fillAndPlace(keyFile, file, 0o600, out, o.Force); err != nil {
+			os.Remove(out + ".pub") // never a public half without its key
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("the key was delivered but could not be written (nothing is left on disk; ask again): %w", err)
+		return fmt.Errorf("the key was delivered but could not be written (ask again): %w", err)
 	}
-	written = true
 	e.logf("the private key of %s is now a file on this host. aqmas cannot recall it: delete the file when the task is done, and tell the owner if it may have been copied", o.Path)
 	q := shellQuote(out)
 	_, err = fmt.Fprintf(e.Stdout, "private key  %s\npublic key   %s.pub\nfingerprint  %s\nssh          ssh -i %s -o IdentitiesOnly=yes USER@HOST\ngit          GIT_SSH_COMMAND=%s git clone ssh://git@forge.example.com/OWNER/REPO.git\n",
@@ -606,22 +632,23 @@ func (e *Env) SSHKeyHandout(ctx context.Context, o SSHKeyOptions) error {
 	return err
 }
 
-// createFresh creates path, empty, with exactly mode. An existing regular
-// file is replaced only with force; a link is never followed.
-func createFresh(path string, mode os.FileMode, force bool) (*os.File, error) {
+// fillAndPlace writes b to the temporary file f (created 0600 by
+// os.CreateTemp, which never follows a link), gives it its mode and moves it
+// to path. Without force the move is a hard link, which fails if anything is
+// there; with force it is a rename, which replaces the name itself and never
+// writes through a link.
+func fillAndPlace(f *os.File, b []byte, mode os.FileMode, path string, force bool) error {
+	if _, err := f.Write(b); err != nil {
+		return err
+	}
+	if err := f.Chmod(mode); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
 	if force {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
+		return os.Rename(f.Name(), path)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, mode)
-	if err != nil {
-		return nil, err
-	}
-	if err = f.Chmod(mode); err != nil { // whatever the umask says
-		f.Close()
-		os.Remove(path)
-		return nil, err
-	}
-	return f, nil
+	return os.Link(f.Name(), path) // the temporary name is removed by the caller
 }

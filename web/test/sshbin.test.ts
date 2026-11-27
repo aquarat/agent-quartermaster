@@ -5,7 +5,7 @@ import { createApi, type Api } from "../src/api";
 import { completeLogin, prepareLogin } from "../src/flows";
 import { startMock } from "../mock/server";
 import { jarFetch, prfAuth, testOpenSSHKey } from "./helpers";
-import { BIN_SECONDS, canonicalJSON, newSetId, sshCommentProblem, sshDefaultComment, sshPublic, vaultCommit, vaultDelete, vaultPurge, vaultRestore, vaultSignDecision, vaultSshHandout, vaultSshKeyCreate, vaultStandingCap, type VaultState } from "../src/vault";
+import { BIN_SECONDS, canonicalJSON, newSetId, sshCommentProblem, sshDefaultComment, sshPublic, vaultCommit, vaultDelete, vaultPurge, vaultRestore, vaultSignDecision, vaultSignerCreate, vaultSshHandout, vaultSshKeyCreate, vaultStandingCap, type VaultState } from "../src/vault";
 import type { SealView } from "../src/sealPanel";
 
 type Json = Record<string, unknown>;
@@ -131,7 +131,7 @@ describe("SSH keys and the bin against the mock", () => {
     expect(p.authorizedKey).toBe((await sshPublic("ssh-ed25519", new Uint8Array(k.pub), "pasted")).authorizedKey);
     expect(p.detail).toContain("MAY BE HANDED OUT");
     expect((await p.tap(auth)).handout).toBe(true);
-    await expect(vaultSshKeyCreate(api, seal, parent(), { id: newSetId(), slug: "wrong-type", title: "Wrong type" }, { scheme: "ssh-ecdsa-p256", source: "import", privateKey: k.pem, comment: "c", handout: false }, rp)).rejects.toThrow("OpenSSH private key");
+    await expect(vaultSshKeyCreate(api, seal, parent(), { id: newSetId(), slug: "wrong-type", title: "Wrong type" }, { scheme: "ssh-ecdsa-p256", source: "import", privateKey: k.pem, comment: "c", handout: false }, rp)).rejects.toThrow("private key (hex seed");
     await expect(vaultSshKeyCreate(api, seal, parent(), { id: newSetId(), slug: "no-key", title: "No key" }, { scheme: "ssh-ed25519", source: "import", privateKey: " ", comment: "c", handout: false }, rp)).rejects.toThrow("Paste");
     const ec = await vaultSshKeyCreate(api, seal, parent(), { id: newSetId(), slug: "ec-key", title: "EC key" }, { scheme: "ssh-ecdsa-p256", source: "generate", comment: "ec", handout: false }, rp);
     expect(ec.authorizedKey.startsWith("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTY")).toBe(true);
@@ -290,6 +290,30 @@ describe("SSH keys and the bin against the mock", () => {
     await refresh();
     expect(state.deleted).toEqual([]);
     expect(set("club/website/deploy")).toBeUndefined();
+  });
+
+  test("the mock answers like the broker: one key one family, hand-out re-checked at approval, a late restore is a conflict", async () => {
+    // The same private key as a signing key and as an SSH key is refused, both ways.
+    const seed = "42".repeat(32);
+    await (await vaultSignerCreate(api, seal, parent(), { id: newSetId(), slug: "plain-key", title: "Plain key" }, "ed25519", "import", seed, rp)).tap(auth);
+    await expect(vaultSshKeyCreate(api, seal, parent(), { id: newSetId(), slug: "same-key", title: "Same key" }, { scheme: "ssh-ed25519", source: "import", privateKey: seed, comment: "c", handout: false }, rp)).rejects.toThrow("already holds this key as a signing key");
+    const other = "17".repeat(32);
+    await (await vaultSshKeyCreate(api, seal, parent(), { id: newSetId(), slug: "seed-key", title: "Seed key" }, { scheme: "ssh-ed25519", source: "import", privateKey: other, comment: "c", handout: true }, rp)).tap(auth);
+    await expect(vaultSignerCreate(api, seal, parent(), { id: newSetId(), slug: "same-signer", title: "Same signer" }, "ed25519", "import", other, rp)).rejects.toThrow("already holds this key as an SSH key");
+    // A hand-out request whose key lost the setting cannot be approved.
+    m.store.vault.addSshRequest("client-a/paas/seed-key", "ssh-handout");
+    m.store.vault.sets.find((x) => x.set_slug === "seed-key")!.handout = false;
+    await refresh();
+    const req = state.requests.find((r) => r.use === "ssh-handout" && r.status === "pending" && r.set === set("client-a/paas/seed-key").set_id)!;
+    await expect(vaultSignDecision(api, seal, set("client-a/paas/seed-key"), req, "sign-approve", 0, 1, rp)).rejects.toThrow("no longer be handed out");
+    await (await vaultSignDecision(api, seal, set("client-a/paas/seed-key"), req, "sign-deny", 0, 0, rp)).tap(auth);
+    // Past its deadline but not swept yet: restore is a conflict, as on the broker.
+    await (await vaultDelete(api, seal, set("client-a/paas/seed-key"), rp)).tap(auth);
+    const late = { ...(await api.vaultState!()).deleted!.find((d) => d.set_slug === "seed-key")! };
+    m.store.vault.deleted.find((d) => d.set_slug === "seed-key")!.purge_at = Date.now() - 1;
+    await expect(vaultRestore(api, seal, late, rp)).rejects.toThrow("seven days are over");
+    await refresh();
+    expect(state.deleted!.some((d) => d.set_slug === "seed-key")).toBe(false);
   });
 });
 

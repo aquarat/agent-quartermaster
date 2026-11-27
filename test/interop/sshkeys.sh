@@ -95,6 +95,18 @@ ssh_key_scenario() {
     const run=JSON.parse(text(3)); if(run.exit_code!==0||run.stdout.trim()!=="mcp-ok")process.exit(3);' "$T/sshkey-mcp.out" || fail "MCP with an SSH key: $(cat "$T/sshkey-mcp.out")"
   ok 'MCP: aqmas_list_credentials shows the public line; aqmas_with_ssh_key runs ssh with the key'
 
+  # An ECDSA P-256 key generated in aqmas logs in the same way.
+  local ec=client-a/paas/ec-key ecline ecfp
+  owner vault-ssh-key "$ec" ssh-ecdsa-p256 generate >"$w/ec.json" || fail 'creating the ECDSA SSH key'
+  ecline=$(bun -e 'const k=await Bun.file(process.argv[1]).json(); if(!k.authorized_key.startsWith("ecdsa-sha2-nistp256 "))process.exit(1); console.log(k.authorized_key)' "$w/ec.json") || fail "ECDSA key: $(cat "$w/ec.json")"
+  ecfp=$(bun -e 'console.log((await Bun.file(process.argv[1]).json()).fingerprint)' "$w/ec.json")
+  printf '%s\n' "$ecline" >"$w/ec.pub"; [[ $(ssh-keygen -lf "$w/ec.pub" | cut -d' ' -f2) == "$ecfp" ]] || fail 'ECDSA fingerprint is not what ssh-keygen -lf prints'
+  printf '%s\n' "$ecline" >>"$T/sshd/authorized_keys"
+  "$AQMAS" ssh-agent "$ec" --why 'interop: ssh with an ECDSA key' --ttl 5m --count 1 -- ssh "${sshopts[@]}" "$dest" echo ec-ok </dev/null >"$T/sshkey-ec.out" 2>"$T/sshkey-ec.err" & pid=$!
+  owner vault-sign approve 300 1; wait "$pid" || { cat "$T/sshkey-ec.err"; fail 'aqmas ssh-agent -- ssh with an ECDSA key'; }
+  grep -q ec-ok "$T/sshkey-ec.out" && grep -q "Accepted publickey for $ME .* ECDSA $ecfp" "$T/sshd.log" || fail 'sshd did not log a login with the ECDSA Vault key'
+  ok 'an ECDSA P-256 SSH key generated in aqmas logs in to the real sshd through aqmas ssh-agent'
+
   # Hand-out is off unless the owner allows it for this key.
   if "$AQMAS" ssh-key "$k" --why 'interop: wants the key file' --out "$w/handed" </dev/null >/dev/null 2>"$T/sshkey-ho0.err"; then fail 'a key that may not be handed out was handed out'; fi
   grep -q "aqmas ssh-agent $k" "$T/sshkey-ho0.err" && [[ ! -e $w/handed ]] || fail "hand-out refusal: $(cat "$T/sshkey-ho0.err")"

@@ -197,6 +197,13 @@ export class MockVault {
     const { set: _set, ...rest } = d;
     return { ...rest, path_taken: this.sets.some((s) => s.service_id === d.service_id && s.set_slug === d.set_slug) };
   }
+  /** One private key is a signing key or an SSH key, never both (binned items count). */
+  private oneFamily(pub: Uint8Array, ssh: boolean): void {
+    const key = b64url(Buffer.from(pub));
+    for (const s of [...this.sets, ...this.deleted.map((d) => d.set)])
+      if (s.public_key === key && (s.kind === "ssh-key") !== ssh && (s.kind === "ssh-key" || s.kind === "signer"))
+        this.deps.fail(409, "conflict", ssh ? "aqmas already holds this key as a signing key: an SSH key must be a key of its own" : "aqmas already holds this key as an SSH key: a signing key must be a key of its own");
+  }
   /** What the broker's sweeper does: destroy what has been in the bin for seven days. */
   private sweepBin(): void {
     for (const d of this.deleted.filter((x) => x.purge_at <= Date.now())) this.destroy(d, "auto ");
@@ -516,6 +523,7 @@ export class MockVault {
             return fail(400, "bad_request", `not an unencrypted ${scheme.key} private key (hex seed, PKCS#8, SEC1 or OpenSSH PEM)`);
           }
         } else return fail(400, "bad_request", "choose generate or import");
+        this.oneFamily(pub, false);
         Object.assign(facts, { attempt_id: attempt, public_key: b64url(pub), fingerprint: hex(sha256(pub)), public_hex: hex(pub), public_pem: spki(pub) });
         return {
           meta: { org_id: parent.org_id, org_slug: parent.org_slug, org_title: parent.org_title, service_id: parent.service_id, service_slug: parent.service_slug, service_title: parent.service_title, set_id: c.id, set_slug: c.set_slug, set_title: c.set_title, kind: "signer", revision: 0, scheme: scheme.id, source: c.source, attempt_id: attempt, public_key: b64url(pub), fingerprint: hex(sha256(pub)), result_revision: 0, recipient },
@@ -545,12 +553,15 @@ export class MockVault {
           if (a.purpose !== "signer-import" || a.target !== c.id || a.scheme !== type.id) fail(409, "conflict", "upload attempt expired; start again");
           recipient = a.recipient ?? "";
           const packet = JSON.parse((await this.open(a, "signer-import", attempt!, c.id)).toString("utf8")) as { private_key?: string };
+          // As the broker's ParsePrivate: an OpenSSH file, or a hex seed, PKCS#8 or SEC1 PEM.
+          const text = String(packet.private_key ?? "");
           try {
-            pub = opensshPublic(type.id, String(packet.private_key ?? ""));
+            pub = text.includes("BEGIN OPENSSH PRIVATE KEY") ? opensshPublic(type.id, text) : keyFor(type.id === "ssh-ed25519" ? "ed25519" : "ecdsa-p256-sha256", text);
           } catch {
-            return fail(400, "bad_request", `not an unencrypted ${type.title} OpenSSH private key`);
+            return fail(400, "bad_request", `not an unencrypted ${type.title} private key (hex seed, PKCS#8, SEC1 or OpenSSH PEM)`);
           }
         } else return fail(400, "bad_request", "choose generate or import");
+        this.oneFamily(pub, true);
         const line = sshPub(type.id, pub, c.comment);
         Object.assign(facts, { attempt_id: attempt, public_key: b64url(pub), ...line });
         return {
@@ -571,6 +582,8 @@ export class MockVault {
       }
       case "restore":
       case "purge": {
+        // Like the broker: a restore asked for after the deadline, before the sweep, is 409.
+        if (c.action === "restore" && this.deleted.some((x) => x.set_id === c.id && x.purge_at <= Date.now())) fail(409, "conflict", "the seven days are over: this item is being purged");
         this.sweepBin();
         const d = this.deleted.find((x) => x.set_id === c.id) ?? fail(404, "not_found", "not found");
         const path = `${d.org_slug}/${d.service_slug}/${d.set_slug}`;
@@ -622,6 +635,7 @@ export class MockVault {
         if (c.action === "sign-approve") {
           const single = r.use ? r.use === "ssh-handout" && ttl === 0 && max === 1 : ttl === 0 && max === r.items.length;
           const timed = r.use !== "ssh-handout" && r.ttl_seconds > 0 && ttl >= (r.use ? 60 : 1) && ttl <= r.ttl_seconds && max >= 1 && max <= r.max_signatures;
+          if (r.use === "ssh-handout" && !s.handout) fail(409, "conflict", "this key may no longer be handed out; deny the request");
           if (!single && !timed) fail(400, "bad_request", "duration or count exceeds the request");
         } else if (ttl !== 0 || max !== 0) fail(400, "bad_request", "unexpected duration");
         return {

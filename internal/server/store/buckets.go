@@ -86,12 +86,12 @@ type ScopeWrapRow struct {
 }
 
 const bucketCols = `b.id,b.scope,b.kind,b.ref,b.public_key,b.wrap,b.payload,b.created,
- CASE b.kind WHEN 'ssh-ca' THEN 'SSH user CA' WHEN 'internal-ca' THEN 'Internal agent CA' WHEN s.archived AND s.slug LIKE 'zz-deleted-%' THEN '(deleted) '||o.slug||'/'||v.slug||'/'||substr(s.slug,25) ELSE coalesce(o.slug||'/'||v.slug||'/'||s.slug,'(deleted set '||b.ref||')') END,
+ CASE b.kind WHEN 'ssh-ca' THEN 'SSH user CA' WHEN 'internal-ca' THEN 'Internal agent CA' WHEN s.archived AND s.slug LIKE 'zz-deleted-%' THEN '(deleted) '||o.slug||'/'||v.slug||'/'||substr(s.slug,45) ELSE coalesce(o.slug||'/'||v.slug||'/'||s.slug,'(deleted set '||b.ref||')') END,
  coalesce(o.title,''),coalesce(o.id,''),coalesce(v.id,'')
  FROM buckets b LEFT JOIN credential_sets s ON s.id=b.ref AND b.kind NOT IN ('ssh-ca','internal-ca') LEFT JOIN services v ON v.id=s.service_id LEFT JOIN organisations o ON o.id=v.org_id`
 
 // The label of a bucket whose set is in the Vault's bin (vault.go TombstoneSlug:
-// "zz-deleted-" + 12 characters of the ID + "-" + the slug) reads
+// "zz-deleted-" + the 32-character ID + "-" + the start of the slug) reads
 // "(deleted) org/service/slug" until the set is restored or purged.
 func scanBucket(sc interface{ Scan(...any) error }) (BucketRow, error) {
 	var b BucketRow

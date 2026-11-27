@@ -314,10 +314,15 @@ type Ended struct {
 }
 
 // TombstoneSlug is the slug a binned set's row carries so that its path is
-// free: valid under the slug CHECK, unique by the set's own random ID.
+// free: valid under the slug CHECK and unique, because it holds the set's
+// whole ID. What is left of the 63 characters keeps the start of the slug it
+// had, for the bucket list (deleted_sets has the full one).
 func TombstoneSlug(id, slug string) string {
-	return "zz-deleted-" + id[:min(len(id), 12)] + "-" + slug[:min(len(slug), 39)]
+	t := tombstonePrefix + id + "-"
+	return t + slug[:min(len(slug), max(63-len(t), 0))]
 }
+
+const tombstonePrefix = "zz-deleted-"
 
 // BinSet moves a live application set to the bin. The UPDATE fires the
 // triggers that end everything that could still use the set: drafts, pending
@@ -341,6 +346,10 @@ func (q *Q) BinSet(ctx context.Context, t VaultTarget, passkey int64, digest str
 		}
 	}
 	if err := one(q.q.ExecContext(ctx, `UPDATE credential_sets SET archived=1,slug=? WHERE id=? AND NOT archived AND revision=? AND provider='application'`, TombstoneSlug(t.SetID, t.SetSlug), t.SetID, t.Revision)); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			// Somebody named a live set exactly like this set's tombstone.
+			return e, ErrConflict
+		}
 		return e, err
 	}
 	return e, one(q.q.ExecContext(ctx, `INSERT INTO deleted_sets(set_id,slug,kind,deleted_at,purge_at,passkey,deleted_by,digest) VALUES(?1,?2,?3,?4,?5,?6,coalesce((SELECT name FROM passkeys WHERE id=?6),''),?7)`, t.SetID, t.SetSlug, t.Kind, at, ms(now.Add(BinTTL)), passkey, digest))
@@ -413,6 +422,10 @@ type PurgeInfo struct {
 	Path, Kind, Digest, DeletedBy string
 	DeletedAt                     int64
 	Buckets                       [][]byte
+	// TombstoneKept: every sealed record and the bucket are gone, but a row
+	// this code does not know still refers to the set, so its archived,
+	// emptied row could not be deleted and stays.
+	TombstoneKept bool
 }
 
 // PurgeSet destroys a binned set for good: every sealed record of it (all env
@@ -455,8 +468,9 @@ func (q *Q) PurgeSet(ctx context.Context, set string) (PurgeInfo, error) {
 	err = one(q.q.ExecContext(ctx, `DELETE FROM credential_sets WHERE id=? AND archived AND provider='application'`, set))
 	if err != nil && strings.Contains(err.Error(), "FOREIGN KEY") {
 		// A row of a table this function does not know still names the set:
-		// the archived, emptied row stays as a tombstone. Nothing sealed is left.
-		err = nil
+		// the archived, emptied row stays as a tombstone. Nothing sealed is left,
+		// and the audit row of the purge says so.
+		p.TombstoneKept, err = true, nil
 	}
 	return p, err
 }

@@ -208,7 +208,7 @@ describe("SSH keys and the bin in a DOM", () => {
     setIn(form, "#sk-key", "-----BEGIN OPENSSH PRIVATE KEY-----\nbm90IGEga2V5\n-----END OPENSSH PRIVATE KEY-----\n");
     click(f, "Review…");
     await until(() => !!f.querySelector(".vault-slot .error"));
-    expect(f.querySelector(".vault-slot .error")!.textContent).toContain("OpenSSH private key");
+    expect(f.querySelector(".vault-slot .error")!.textContent).toContain("private key (hex seed");
     setIn(form, "#sk-key", k.pem);
     const handout = form.querySelector<HTMLInputElement>("#sk-handout")!;
     handout.checked = true;
