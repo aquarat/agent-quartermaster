@@ -336,12 +336,15 @@ type assignment struct {
 
 func nextAssignment(s string, line int) assignment {
 	skip := func(at int, why string) assignment {
-		// The refused line is dropped whole, so a checker can go on with the next.
-		rest := ""
+		// The refused line is dropped whole, so a checker can go on with the
+		// next. Not when it holds a quote: the author may have meant a quoted
+		// value that runs on, and the lines after it would then be value text
+		// that must never be read (or named) as assignments.
+		rest, this := "", s
 		if i := strings.IndexByte(s, '\n'); i >= 0 {
-			rest = s[i:]
+			rest, this = s[i:], s[:i]
 		}
-		return assignment{rest: rest, next: line, at: at, why: why}
+		return assignment{rest: rest, next: line, at: at, why: why, fatal: strings.ContainsAny(this, "'\"")}
 	}
 	if s[0] == '\n' {
 		return assignment{rest: s[1:], next: line + 1}
@@ -401,7 +404,7 @@ func nextAssignment(s string, line int) assignment {
 		end = len(tail)
 	}
 	if strings.Trim(tail[:end], " \t") != "" {
-		return assignment{rest: tail[end:], next: line, at: line, why: "text after the closing quote"}
+		return assignment{rest: tail[end:], next: line, at: line, why: "text after the closing quote", fatal: strings.ContainsAny(tail[:end], "'\"")}
 	}
 	return assignment{ok: true, name: k, value: sb.String(), rest: tail[end:], next: line}
 }
