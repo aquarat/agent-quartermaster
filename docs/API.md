@@ -1219,6 +1219,90 @@ has no extensions. When it carries extensions, audit records that the opener
 was verified live; the assertion cannot later be independently reverified
 from the audit alone. No PRF/KEK or decrypted finish packet is persisted.
 
+# Env proposals: a host asks to store values (0.11.0)
+
+Until 0.11.0 only an enrolled **owner device** could write env values from the CLI, with a
+one-use upload ticket copied from the Vault. A **proposal** lets any host admitted to an
+organisation ask to store values; the owner sees an ordinary approval card and commits or
+discards it with one tap. The ticket flow stays for owner devices (`--ticket-fd FD`, or
+`--ticket` for the hidden prompt).
+
+**What a host may propose.** `import` (replaces the whole set), `put` (one key) or `unset`
+(one key) on an existing `env-set` of an organisation the host is admitted to, at the set's
+current revision; secrets are refused as in the ticket flow ("a secret is replaced in the
+Vault"). With `create`, `import` or `put` may also name a set that does not exist yet, and a
+service that does not exist yet, inside an existing organisation that has a scope key; the
+host chooses the new IDs (32 lowercase hex, like the Vault form), slugs follow the usual
+name rules and the title rules of the catalogue. A new organisation is never proposed.
+
+**Values.** As in the ticket flow, the CLI computes the edit commitment
+(`aqmas-env-edit-v1`, see "Env sets" above; for a new set over the IDs it chose, base revision
+0) and the server recomputes it, seals each entry to the set's bucket at once (nothing is
+opened) and keeps no plaintext. A proposal for a new set gets the bucket the set will have; a
+discarded, cancelled or expired proposal leaves no bucket, sealed record or set row behind.
+
+**Host API** (sealed runtime, like the other `/v2/env` routes; metadata only, never values):
+
+* `POST /v2/env/proposals` body
+  `{"path","reason","edit":{operation,salt,entries},"commitment","create":null|{"service_id":""|HEX32,"set_id":HEX32,"title":""}}`
+  → a Proposal, status `pending`. `reason` is required (the `--why`, 1-500 characters, shown
+  as unverified). `create.service_id` is empty when the service exists. Errors: 404 for a
+  path the host may not see (as `GET /v2/env/set`), 409 for an existing path given with
+  `create` or a taken ID, 400 for a bad commitment, operation or name, 429 when the host
+  already has five things pending (proposals count with requests, env releases and signing
+  requests).
+* `GET /v2/env/proposals/{id}[?wait=SECONDS]` → the Proposal (long-poll like
+  `GET /v1/requests/{id}`), only to the proposing host.
+* `POST /v2/env/proposals/{id}/cancel` → the Proposal, status `cancelled` (pending only).
+
+**Proposal** (JSON; `envset.Proposal` / web `EnvProposal`): every field of a Binding
+(`path, title, org, service, set, revision, ..., host, class, names`; for a new set `set` is
+the proposed ID, `revision` 0, `names` []), plus `id` (draft ID), `ref` (six characters, the
+same Ref the CLI prints), `operation`, `commitment`, `changes` (as a draft: `NAME:add`,
+`NAME:replace`, `NAME:remove`, comma-separated), `reason`, `address` (peer IP),
+`new_service`, `new_set` (booleans), `status` (`pending`, `committed`, `discarded`,
+`cancelled`, `expired`, `superseded`), `created_at`, `expires_at` (ms; ten minutes after
+creation), `result_revision` (the revision written, when `committed`; else 0).
+
+`superseded`: the set's revision, the host's admission or the organisation's policy changed
+(the triggers that delete drafts), or for `create` the path or an ID was taken, before the
+owner decided. The CLI exits 4 for `expired` and `superseded`, 3 for `discarded`, 130 after
+`cancelled` by itself, 0 for `committed`.
+
+**Owner side.** `GET /api/ui/seal/env/state` gains `proposals` (pending ones). Decisions
+use the env challenge/finish pair with `{"id": PROPOSAL, "action": "proposal-commit" |
+"proposal-discard", "ttl_seconds": 0}`; the signed metadata is the complete Proposal with
+`reason` blank (it is untrusted). Every decision is a fresh individual tap: no approval
+window or batch approves a proposal. Commit re-checks the binding (and for `create` that the
+path and IDs are still free), creates the service and set when asked, and publishes the next
+revision exactly as a committed draft; the CLI then reads `committed` and `result_revision`.
+New proposals send the usual notification. Audit: `env_proposal` (host), `env_proposal_commit`,
+`env_proposal_discard` (owner, with passkey and canonical), `env_proposal_cancel` (host),
+`env_proposal_expire` (system).
+
+**The card** says, in the owner's words: which host (and address) wants to store values in
+which path; whether it creates the service and/or set; the operation, with `import` stated as
+replacing the whole set; the key changes by name (added, replaced, removed); that the values
+were chosen by that host and become what every later request for the set receives; the
+commitment and Ref to compare with the CLI; the reason, marked unverified; when it expires.
+
+**CLI.**
+
+* `aqmas set import PATH --from FILE --why REASON [--create [--title TITLE]]`,
+  `aqmas set put PATH KEY --why REASON [--create [--title TITLE]]` (value from a hidden prompt,
+  or exact stdin bytes when stdin is not a terminal), `aqmas set unset PATH KEY --why REASON`:
+  without a ticket option these make a proposal, print the Ref, the commitment and the key
+  changes (names only) to stderr, and wait for the owner like any request (Ctrl-C cancels).
+  `--create` is needed to create a missing set or service, so a typo never creates one; the
+  title defaults to the set's slug. The file is checked (as `set check`) before anything is
+  sent.
+* `aqmas set check --from FILE [PATH]`: validates FILE against the import rules locally and
+  prints the key names, one per line, and each problem with its line number; never a value.
+  With PATH it also prints what an import would add, replace and remove (from the set's
+  metadata). Exit 0 when the file would import, 1 when not.
+* MCP tool `aqmas_store_env` `{path, file, why, create?, title?}`: an import proposal of FILE;
+  returns status, Ref, revision and the key changes; never a value.
+
 # Vault: web form, reveal, signer sets, SSH keys and the bin
 
 Sealed, organisation-scoped installations only. The owner's **Vault** tab
