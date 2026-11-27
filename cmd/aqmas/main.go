@@ -72,6 +72,7 @@ Usage:
       Print one secret's value to stdout. Prefer run: with get the value has left aqmas.
   aqmas checkout|co PATH --why REASON [--file .env]; aqmas checkin|ci PATH
   aqmas checkout-shell|cos PATH --why REASON; aqmas checkin-shell|cis PATH
+  aqmas reap-checkouts        remove what a killed checkout holder left (run at login)
   aqmas sign ORG/SERVICE/KEY --why REASON [--ttl 30m [--count N]] FILE... | - | --digest sha256:HEX
       Have aqmas sign: files are hashed here, the owner approves the names, sizes
       and SHA-256 digests, the key never leaves aqmas. Writes FILE.sig (or --out,
@@ -107,6 +108,13 @@ func run(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, usage)
 		return client.ExitUsage
+	}
+	helpCommand = args[0]
+	if !ownHelp[args[0]] && wantsHelp(args[1:]) {
+		if text, ok := commandUsage(args[0]); ok {
+			fmt.Print(text)
+			return 0
+		}
 	}
 	env, err := client.DefaultEnv(term.IsTerminal(int(os.Stdin.Fd())))
 	if err != nil {
@@ -346,6 +354,13 @@ func run(args []string) int {
 		}
 		return fail(env.Upgrade(ctx, f.bool["check"], f.bool["yes"], f.bool["allow-single-source"], f.str["expect-sha256"], term.IsTerminal(int(os.Stderr.Fd()))))
 	case "help", "-h", "--help":
+		if len(rest) == 1 {
+			if text, ok := commandUsage(rest[0]); ok {
+				fmt.Print(text)
+				return 0
+			}
+			return fail(&client.UsageError{Msg: fmt.Sprintf("no command %q", rest[0])})
+		}
 		fmt.Fprint(os.Stdout, usage)
 		return 0
 	case "version", "--version":
@@ -555,7 +570,11 @@ func fail(err error) int {
 	case errors.Is(err, client.ErrCancelled), errors.Is(err, context.Canceled):
 		fmt.Fprintln(os.Stderr, "aqmas: cancelled")
 	default:
-		fmt.Fprintf(os.Stderr, "aqmas: %s\n", client.Sanitize(err.Error()))
+		hint := ""
+		if u := (*client.UsageError)(nil); errors.As(err, &u) {
+			hint = usageHint()
+		}
+		fmt.Fprintf(os.Stderr, "aqmas: %s%s\n", client.Sanitize(err.Error()), hint)
 	}
 	return code
 }
