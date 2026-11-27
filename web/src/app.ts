@@ -739,7 +739,15 @@ export class App {
       () =>
         requests.length
           ? requests.map((p) => this.requestCard(p))
-          : [h("p", { class: "empty" }, "Nothing is waiting. New requests show up here within a few seconds.")],
+          : [
+              h(
+                "p",
+                { class: "empty" },
+                this.waiting() > s.pending!.length
+                  ? "No access requests. Other things are waiting for you further down this page."
+                  : "Nothing is waiting. New requests show up here within a few seconds.",
+              ),
+            ],
       false,
       // A queued task being approved keeps its card until that is done.
       touching || !!this.root.querySelector("#sec-pending .queued-run.busy"),

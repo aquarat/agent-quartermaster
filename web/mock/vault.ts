@@ -202,7 +202,7 @@ export class MockVault {
     this.proposals.push({
       path, title: `${org.title} / ${svc?.title ?? v} / ${s?.set_title ?? opts.title ?? slug}`, org: org.id, service, set, revision, service_revision: svc ? 1 : 0, policy_revision: this.policies.get(org.id)?.revision ?? 1, admission_generation: adm.generation,
       enrollment: hst.enrollment, host: hst.name, class: hst.class, names: [...old], default_seconds: 3600, soft_cap_seconds: 86400, offers_indefinite: true,
-      id, ref: id.slice(-6), operation, commitment: hex(sha256(JSON.stringify(["aqmas-env-edit-v1", hex(randomBytes(32)), org.id, service, set, revision, operation, entries, changes]))), changes,
+      id, ref: id.slice(-6).toUpperCase(), operation, commitment: hex(sha256(JSON.stringify(["aqmas-env-edit-v1", hex(randomBytes(32)), org.id, service, set, revision, operation, entries, changes]))), changes,
       reason: opts.reason ?? "store the values the deploy just generated", address: hst.address, new_service: !svc, new_set: !s, status: "pending", created_at: now, expires_at: now + 600_000, result_revision: 0,
     });
     this.proposed.set(id, values);

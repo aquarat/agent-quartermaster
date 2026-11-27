@@ -254,17 +254,23 @@ export function proposalWords(p: EnvProposal) {
     reason: `Requester explanation (unverified): ${p.reason}`,
   };
 }
-/** Commit or discard a proposal: always one fresh tap for this one proposal. The signed
- * metadata is the whole proposal with the reason blank (it is the host's, unverified). */
-export async function envProposalReview(api: Api, v: SealView, p: EnvProposal, action: ProposalAction, rp: string) {
-  if (
+/** Whether the broker's proposal is one this page can show and sign: exactly the contract's
+ * keys, typed as the broker sends them, and a Ref that is the ID's own (the CLI prints it). */
+export function proposalReadable(p: EnvProposal): boolean {
+  return !(
     Object.keys(p).length !== proposalKeys.length ||
     !proposalKeys.every((k) => Object.hasOwn(p, k)) ||
+    typeof p.path !== "string" ||
+    typeof p.title !== "string" ||
+    typeof p.host !== "string" ||
+    typeof p.class !== "string" ||
+    typeof p.address !== "string" ||
+    typeof p.reason !== "string" ||
+    typeof p.id !== "string" ||
+    p.ref !== p.id.slice(-6).toUpperCase() ||
     !p.path ||
     !p.enrollment ||
     !p.id ||
-    typeof p.ref !== "string" ||
-    p.ref.length !== 6 ||
     !Number.isSafeInteger(p.revision) ||
     p.revision < 0 ||
     !Array.isArray(p.names) ||
@@ -276,8 +282,12 @@ export async function envProposalReview(api: Api, v: SealView, p: EnvProposal, a
     p.status !== "pending" ||
     !/^[0-9a-f]{64}$/.test(p.commitment) ||
     !["import", "put", "unset"].includes(p.operation)
-  )
-    throw Error("Unknown or incomplete env proposal");
+  );
+}
+/** Commit or discard a proposal: always one fresh tap for this one proposal. The signed
+ * metadata is the whole proposal with the reason blank (it is the host's, unverified). */
+export async function envProposalReview(api: Api, v: SealView, p: EnvProposal, action: ProposalAction, rp: string) {
+  if (!proposalReadable(p)) throw Error("Unknown or incomplete env proposal");
   if (action !== "proposal-commit" && action !== "proposal-discard") throw Error("A proposal is committed or discarded, nothing else");
   const metadata = JSON.stringify({ ...p, reason: "" }, proposalKeys)
     .replace(/\u2028/g, "\\u2028")
@@ -318,6 +328,12 @@ export async function envStandingRevoke(api: Api, v: SealView, st: Standing, rp:
  * names) goes in as text through visibleText. It has no duration, no "don't ask again" and no
  * checkbox: a proposal is decided alone, by a tap of its own. */
 export function proposalCard(api: Api, auth: Authenticator, v: SealView, p: EnvProposal, refresh: () => void): HTMLElement {
+  // A proposal this page cannot read is not drawn as one (its words could mislead) and
+  // offers no tap; the other cards still render.
+  if (!proposalReadable(p)) return h("div", { class: "card env-proposal" }, h("p", { class: "error" }, "A proposal arrived that this page cannot read safely; it cannot be decided here. Reload, or update the page."));
+  // Only the latest click's review may offer a tap: Commit then Discard (or the reverse)
+  // must never leave the other action's confirm button under the owner's finger.
+  let seq = 0;
   const w = proposalWords(p),
     status = h("div", { role: "status", class: "env-proposal-status" });
   const names = (label: string, list: string[], cls: string) => (list.length ? [h("dt", null, label), h("dd", { class: "mono " + cls }, visibleText(list.join(", ")))] : []);
@@ -331,10 +347,13 @@ export function proposalCard(api: Api, auth: Authenticator, v: SealView, p: EnvP
         type: "button",
         on: {
           click: async () => {
+            const mine = ++seq;
             b.disabled = true;
+            replace(status, "Checking what the broker asks you to sign…");
             try {
               // The broker's text is checked against this card before anything is offered to tap.
               const r = await envProposalReview(api, v, p, action, location.hostname);
+              if (mine !== seq) return;
               const confirm = h(
                 "button",
                 {
@@ -355,9 +374,14 @@ export function proposalCard(api: Api, auth: Authenticator, v: SealView, p: EnvP
                 },
                 `${verb} with passkey`,
               );
-              replace(status, h("details", { class: "signed" }, h("summary", null, "What you sign"), h("pre", null, visibleText(r.detail))), confirm, h("button", { class: "btn", type: "button", on: { click: () => replace(status) } }, "Cancel"));
+              replace(
+                status,
+                h("details", { class: "signed" }, h("summary", null, "What you sign"), h("pre", null, visibleText(r.detail))),
+                confirm,
+                h("button", { class: "btn", type: "button", on: { click: () => (seq++, replace(status)) } }, "Cancel"),
+              );
             } catch (e) {
-              replace(status, h("p", { class: "error" }, visibleText((e as Error).message)));
+              if (mine === seq) replace(status, h("p", { class: "error" }, visibleText((e as Error).message)));
             } finally {
               b.disabled = false;
             }

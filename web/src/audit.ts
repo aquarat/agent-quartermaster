@@ -196,7 +196,7 @@ export function objectRef(o: string): ObjectRef {
 /** Does the detail text carry requester-influenced strings (host names, enroll notes...)? */
 export function detailUntrusted(e: AuditEntry): boolean {
   if (!e.detail) return false;
-  return e.actor.startsWith("host:") || /^(request|enrollment|host|grant|standing):/.test(e.object) || e.action === "enroll_request";
+  return e.actor.startsWith("host:") || /^(request|enrollment|host|grant|standing|proposal):/.test(e.object) || e.action === "enroll_request";
 }
 
 export interface DayGroup {

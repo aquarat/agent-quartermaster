@@ -195,4 +195,30 @@ describe("env proposal card in a DOM", () => {
     set.revision--;
     panel.remove();
   });
+
+  test("Commit then Discard: only the last click's review offers a tap", async () => {
+    const id = vault.addProposal(STAGING, "put", { RACE_KEY: "v" }, { reason: "race" });
+    const panel = await draw();
+    const card = cardOf(panel, id);
+    click(card, "Commit");
+    click(card, "Discard");
+    await until(() => [...card.querySelectorAll("button")].some((b) => /with passkey$/.test(b.textContent ?? "")));
+    await new Promise((r) => setTimeout(r, 100)); // let the slower review land too
+    const confirms = [...card.querySelectorAll("button")].map((b) => b.textContent).filter((t) => /with passkey$/.test(t ?? ""));
+    expect(confirms).toEqual(["Discard with passkey"]);
+    click(card, "Cancel");
+    expect([...card.querySelectorAll("button")].some((b) => /with passkey$/.test(b.textContent ?? ""))).toBe(false);
+    panel.remove();
+  });
+
+  test("a proposal the page cannot read is not drawn as one and offers no tap", async () => {
+    const { proposalCard, envProposalReview } = await import("../src/envsets");
+    const p = (await api.envState!()).proposals!.at(-1)!;
+    for (const bad of [{ ...p, ref: "ZZZZZZ" }, { ...p, changes: 7 as unknown as string }, { ...p, extra: 1 } as typeof p, { ...p, new_service: "yes" as unknown as boolean }]) {
+      const el = proposalCard(api, auth, seal, bad, () => {});
+      expect(el.querySelectorAll("button").length).toBe(0);
+      expect(el.textContent).toContain("cannot read safely");
+      await expect(envProposalReview(api, seal, bad, "proposal-commit", "localhost")).rejects.toThrow("Unknown or incomplete env proposal");
+    }
+  });
 });

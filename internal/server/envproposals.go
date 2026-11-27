@@ -330,6 +330,9 @@ func (s *Server) reviewProposal(ctx context.Context, q *store.Q, sess string, pk
 	if err = q.IsOrgOwner(ctx, x.P.Org, sess, pk, s.now()); err != nil {
 		return "", errForbidden("organisation approval required")
 	}
+	if x.P.Status == "superseded" {
+		return "", errConflict("the set changed since this was proposed; the host must propose again")
+	}
 	if x.P.Status != "pending" {
 		return "", errConflict("decision no longer available")
 	}
