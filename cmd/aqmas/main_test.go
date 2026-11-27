@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -54,5 +55,40 @@ func TestParseArgsGroupsAndMulti(t *testing.T) {
 	f, _ = parseArgs([]string{"cf.dns.edit", "zone=a", "--ttl", "1h"}, spec)
 	if !reflect.DeepEqual(f.pos, []string{"cf.dns.edit", "zone=a"}) || f.str["ttl"] != "1h" {
 		t.Errorf("pos %q", f.pos)
+	}
+}
+
+func TestCommandHelp(t *testing.T) {
+	// Every command the dispatcher knows has its lines in the usage text, aliases included.
+	for _, cmd := range []string{"guide", "mcp", "ls", "catalogue", "targets", "reap-checkouts", "run", "get", "checkout", "co",
+		"checkout-shell", "cos", "signer", "sign", "ssh-agent", "ssh-key", "ci", "checkin", "cis", "checkin-shell", "upgrade",
+		"update", "help", "version", "enroll", "ssh", "cert", "mosh", "bastion", "status", "list", "cf", "ssh-config", "set"} {
+		text, ok := commandUsage(cmd)
+		if !ok || !strings.Contains(text, "aqmas ") {
+			t.Errorf("no usage lines for %q", cmd)
+		}
+	}
+	text, _ := commandUsage("ssh")
+	if !strings.Contains(text, "--level inspect|root") || !strings.Contains(text, "Log in with a short-lived certificate") || strings.Contains(text, "mosh [USER@]") {
+		t.Errorf("ssh help:\n%s", text)
+	}
+	if text, _ := commandUsage("co"); !strings.Contains(text, "checkout|co PATH") || strings.Contains(text, "aqmas run") {
+		t.Errorf("co help:\n%s", text)
+	}
+	if _, ok := commandUsage("bogus"); ok {
+		t.Error("help for an unknown command")
+	}
+	for args, want := range map[string]bool{"--help": true, "x -h": true, "help": true, "x --why y": false, "x -- cmd --help": false, "x -- -h": false, "": false} {
+		if got := wantsHelp(strings.Fields(args)); got != want {
+			t.Errorf("wantsHelp(%q) = %v", args, got)
+		}
+	}
+	helpCommand = "run"
+	if h := usageHint(); h != " (see: aqmas run --help)" {
+		t.Errorf("hint %q", h)
+	}
+	helpCommand = "nonsense"
+	if h := usageHint(); h != " (see: aqmas help)" {
+		t.Errorf("hint %q", h)
 	}
 }

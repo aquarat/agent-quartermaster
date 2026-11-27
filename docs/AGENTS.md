@@ -17,7 +17,8 @@ a signature, SSH logins with a key that stays in aqmas, a time-boxed API grant.
 **The rule: do not look for long-lived credentials on this host, do not ask the owner to
 paste one, and do not store one you were handed.** Ask aqmas each time. If aqmas does not
 hold what you need, say so to the owner; they can add it in the Vault tab of the approval
-page.
+page. If you have the values (a dev stack's `.env`, a token you just created), store them
+in aqmas with `aqmas set` ("Store values" below) instead of leaving them on this host.
 
 ## How an approval works
 
@@ -156,6 +157,46 @@ eval "$(aqmas checkin-shell acme/billing/staging-env)"
 `checkout` links a `.env` file that lives on a RAM-backed filesystem and disappears at
 check-in or expiry; a secret is written as `NAME=value`. Check in when you are done.
 
+### Store values (a new credential, or a changed one)
+
+```sh
+aqmas set check --from .env                                       # names and problems, never values
+aqmas set check --from .env acme/billing/staging-env              # ... and what an import would change
+aqmas set import acme/billing/staging-env --from .env --why "store the staging stack's settings"
+aqmas set import acme/dev/web-env --from .env --create --title "Web dev stack" --why "..."
+printf %s "$NEW_TOKEN" | aqmas set put acme/infra/deploy-env DEPLOY_TOKEN --why "rotated token"
+aqmas set unset acme/infra/deploy-env OLD_TOKEN --why "token retired at the provider"
+```
+
+Each of these asks the owner like any request: aqmas prints a **Ref**, a commitment and
+the key changes (names only), and waits. The owner's card shows the same Ref, the keys
+added, replaced and removed, and that the values come from this host; one tap commits the
+new revision, and from then on every request for the set gets these values. Exit 0 when
+committed, 3 when the owner discarded it, 4 when nobody decided in time or the set changed
+meanwhile (run it again).
+
+- **`import` replaces the whole set**: keys that are not in the file are removed. Use `put`
+  to add or change one key (the value comes from a hidden prompt, or exactly the bytes on
+  stdin) and `unset` to remove one.
+- **The set must exist, unless you pass `--create`.** `--create` makes a missing set (and
+  service) inside an organisation this host is admitted to; the title defaults to the set's
+  name. Without it a misspelt path fails instead of creating something new. Organisations
+  are the owner's: ask them for a new one.
+- **The file format is strict, so check it first** with `aqmas set check` (the import runs
+  the same check before it sends anything). Accepted: `NAME=value` lines with upper-case
+  names, whole-line `#` comments, blank lines, single-quoted values (literal, may span
+  lines) and double-quoted values (may span lines, escapes `\n \r \t \\ \"` only). Nothing
+  is expanded. Refused: duplicate names, `export`, an inline comment, names such as `PATH`
+  that would change how a command runs, and in an unquoted value `$`, `#`, a backtick,
+  quotes, a backslash or a leading/trailing space; wrap such a value in single quotes. Real
+  `.env` files often need a fix or two.
+- **Secrets** (single-value items) are replaced by the owner in the Vault, not from the CLI.
+- After storing, delete the plaintext file if it was only a carrier, and use the set with
+  `aqmas run` from then on.
+
+An owner device can still use the older one-use upload ticket from the Vault (`--ticket`
+for the hidden prompt, `--ticket-fd FD`); agents do not need it.
+
 ### Sign something
 
 ```sh
@@ -286,9 +327,10 @@ or, for any client that reads an `mcpServers` map:
 ```
 
 Tools: `aqmas_guide` (this text), `aqmas_status`, `aqmas_list_credentials`,
-`aqmas_list_targets`, `aqmas_run`, `aqmas_sign`, `aqmas_with_ssh_key`, `aqmas_ssh_exec`.
+`aqmas_list_targets`, `aqmas_run`, `aqmas_sign`, `aqmas_with_ssh_key`, `aqmas_ssh_exec`,
+`aqmas_store_env` (an `aqmas set import` of a file, as above).
 The tools that need the owner (`aqmas_run`, `aqmas_sign`, `aqmas_with_ssh_key`,
-`aqmas_ssh_exec`) **block until the owner decides** or
+`aqmas_ssh_exec`, `aqmas_store_env`) **block until the owner decides** or
 the tool's `approval_timeout_seconds` passes; they take a required `why`. There is no tool
 that returns a secret's value: `aqmas_run` runs your command with the value in its
 environment and returns the exit code and output. If your command prints the secret, the
